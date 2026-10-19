@@ -67,6 +67,8 @@ genai.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 futures-util = "0.3"
 ureq.workspace = true
+# The fresh v4 `Idempotency-Key` of every paid NeuroLate request (`neurolate/client.rs`).
+uuid.workspace = true
 
 # The OS credential store of the API keys. Not on wasm (no store) and not on Android: keyring
 # has no Android backend there and would silently link its in-memory mock; Android keys go

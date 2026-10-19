@@ -12,12 +12,14 @@ Main types:
 - `SURYA_DETECTOR_SPECS` (from `backend`): the Surya detector's explicit-download bundle (the
   pinned `text_detection` checkpoint), checked before a Surya batch and every Surya forward.
 - `TextDetectorRunMode`: detector mode (`Classic` local, `PaddleOcr` native or backend,
-  `AiCtd` via backend, `Surya` via backend); `plan_inputs()` is the one mode -> plan-input
-  mapping, shared by the page worker and the panel's per-page plan notice.
+  `AiCtd` via backend, `Surya` via backend, `NeuroLate` cloud); `plan_inputs()` is the one
+  mode -> plan-input mapping (`None` for the cloud mode, which has no tiling plan), shared by
+  the page worker and the panel's per-page plan notice.
 - `TextDetectorControllerEvent`: UI-facing detection progress/results/errors, model-download
   progress and the cancelled outcome.
 - `TranslationTextDetectorController`: command/event bridge + busy-state lifecycle; owns the
-  running batch's cancel flag (set on drop).
+  running batch's cancel flag (set on drop and by a download Cancel) and its separate stop flag
+  (the panel's "Stop after the current page", `request_stop`).
 - `DetectFailure` (from `pipeline`): cancelled vs localized failure of one detection.
 
 - `RegionDetectRequest` / `RegionDetection` / `RegionDetectEngine` (from `region_detect`): an
@@ -28,12 +30,14 @@ Worker flow:
 - `worker_loop` receives `WorkerCommand::Detect` and runs `run_detect_batch`, or
   `WorkerCommand::DetectRegion` and runs `run_region_command` (same backend gate, model ensure,
   cancel flag and download events as a batch; one region, no page progress).
-- `run_detect_batch` reads the PaddleOCR route once, gates the backend, ensures models,
-  processes pages sequentially in background (model engines through
-  `pipeline::detect_page_file`), applies the Rust mask dilation to every page result and emits
+- `run_detect_batch` reads the PaddleOCR route once, gates the backend, ensures models (for
+  NeuroLate: reads the API key once), processes pages sequentially in background (model engines
+  through `pipeline::detect_page_file`, NeuroLate through `neurolate::detect_page`), applies the Rust mask dilation to every page result and emits
   progress. One `ai_models::EnsureCtx` per batch: the batch's cancel flag (checked before
   every page and polled by every model download) and a sink that forwards download events.
-  A cancel ends the batch with `DetectCancelled`, never `DetectFailed`.
+  The batch's stop flag is checked ONLY before each page (never inside a page, a download or
+  a forward pass), so the page in flight finishes and is delivered first.
+  A cancel or a stop ends the batch with `DetectCancelled`, never `DetectFailed`.
 
 Submodules:
 - `classic`: the local classic detector (decode wrapper + pure gray-image pipeline).
@@ -43,6 +47,8 @@ Submodules:
 - `native` (desktop only): native ONNX PaddleOCR route read and runner.
 - `region`: in-memory region helpers for the Cleaning tools.
 - `region_detect`: an OCR selection's region detection (worker side) and its page merge.
+- `neurolate`: the NeuroLate cloud detector (page and crop requests) and the one owner of its
+  answer -> mask + blocks conversion (also used by the NeuroLate OCR engine).
 
 Notes:
 Scale, tiling, stitching, postprocess, block order/cap and mask normalization are owned by
@@ -54,6 +60,8 @@ mod backend;
 mod classic;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
+// `pub(crate)`: the NeuroLate OCR engine converts its answer's region with `region_from_image`.
+pub(crate) mod neurolate;
 mod pipeline;
 mod region;
 mod region_detect;
@@ -65,6 +73,7 @@ pub use ms_text_detect::DetectRect as TextDetectorRect;
 pub use pipeline::DetectFailure;
 pub use region::{detect_ai_ctd_mask_for_image, detect_paddle_mask_for_image, detect_surya_mask_for_image};
 
+use ms_ai_api::neurolate::OcrParams;
 use ms_config as config;
 use ms_sysprobe::ai_models;
 use ms_sysprobe::ai_models::{EnsureCtx, ModelDownloadEvent, ModelEnsureError};
@@ -122,6 +131,22 @@ pub enum TextDetectorRunMode {
     PaddleOcr(TextDetectorPaddleOcrOptions),
     AiCtd(TextDetectorAiCtdOptions),
     Surya(TextDetectorSuryaOptions),
+    /// The NeuroLate cloud detector (one paid request per page: `MASK`, or `MASK_AND_TEXT`
+    /// when the page's block texts are wanted too) with the request resolved by the tab.
+    NeuroLate(NeurolateDetect),
+}
+
+/// Each block's raw recognized text, aligned with a page result's `blocks` (`None` for a block
+/// without text): what a NeuroLate page detection with `NeurolateDetect::with_text` delivers.
+pub type PageBlockTexts = Vec<Option<String>>;
+
+/// What a NeuroLate page detection sends: the request parameters resolved by the tab
+/// (`crate::neurolate::request_params`) and whether the block texts are read in the same request
+/// (`NeurolateSettings::detect_with_text`; delivered with `PageDetected::texts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NeurolateDetect {
+    pub params: OcrParams,
+    pub with_text: bool,
 }
 
 impl TextDetectorRunMode {
@@ -129,14 +154,16 @@ impl TextDetectorRunMode {
     /// mapping from a run mode to its plan: the page worker dispatches through it and the
     /// detector panel's per-page notice plans with it, so the notice announces what runs.
     /// `Classic` maps to [`EngineKind::Classic`], whose plan mirrors the classic detector's own
-    /// downscale (`classic::MAX_DETECTOR_DIM`).
+    /// downscale (`classic::MAX_DETECTOR_DIM`). `None` for `NeuroLate`: the service sees the
+    /// whole page, nothing is planned locally.
     #[must_use]
-    pub fn plan_inputs(&self) -> (EngineKind, DetectParams) {
+    pub fn plan_inputs(&self) -> Option<(EngineKind, DetectParams)> {
         match self {
-            TextDetectorRunMode::Classic => (EngineKind::Classic, DetectParams::default()),
-            TextDetectorRunMode::PaddleOcr(_) => (EngineKind::Paddle, DetectParams::default()),
-            TextDetectorRunMode::AiCtd(options) => (EngineKind::Ctd, pipeline::ctd_detect_params(options)),
-            TextDetectorRunMode::Surya(_) => (EngineKind::Surya, DetectParams::default()),
+            TextDetectorRunMode::Classic => Some((EngineKind::Classic, DetectParams::default())),
+            TextDetectorRunMode::PaddleOcr(_) => Some((EngineKind::Paddle, DetectParams::default())),
+            TextDetectorRunMode::AiCtd(options) => Some((EngineKind::Ctd, pipeline::ctd_detect_params(options))),
+            TextDetectorRunMode::Surya(_) => Some((EngineKind::Surya, DetectParams::default())),
+            TextDetectorRunMode::NeuroLate(_) => None,
         }
     }
 }
@@ -154,6 +181,9 @@ pub enum TextDetectorControllerEvent {
     PageDetected {
         page_idx: usize,
         result: TextDetectorPageResult,
+        /// NeuroLate with `NeurolateDetect::with_text` only: each block's raw recognized text,
+        /// aligned with `result.blocks` (`None` for a block without text); `None` otherwise.
+        texts: Option<PageBlockTexts>,
     },
     PageFailed {
         page_idx: usize,
@@ -170,9 +200,9 @@ pub enum TextDetectorControllerEvent {
     DetectFailed {
         error: String,
     },
-    /// The batch's cancel flag stopped it (a model download or the page loop): a neutral end,
-    /// not a failure. Pages detected before it were already delivered. Also ends a cancelled
-    /// region detection.
+    /// The batch's cancel flag (a model download or the page loop) or its stop flag (between
+    /// pages) ended it: a neutral end, not a failure. Pages detected before it were already
+    /// delivered. Also ends a cancelled region detection.
     DetectCancelled,
     /// A region detection (`start_region_detection`) finished; the controller is idle again.
     RegionDetected(RegionDetection),
@@ -191,8 +221,16 @@ pub struct TranslationTextDetectorController {
     evt_rx: Receiver<WorkerEvent>,
     worker_thread: Option<JoinHandle<()>>,
     /// Cancel flag of the most recent batch; set on drop so a running model download or page
-    /// loop stops before the worker join.
+    /// loop stops before the worker join. The native PaddleOCR forward also observes it
+    /// mid-page, so the user's "Stop after the current page" must never set it.
     batch_cancel: Arc<AtomicBool>,
+    /// Stop flag of the most recent page batch (`request_stop`): checked by the worker only
+    /// before each page, so the page in flight still finishes and is delivered.
+    batch_stop: Arc<AtomicBool>,
+    /// A page batch (`start_detection`, not a region detection) is running: set when it is
+    /// dispatched, cleared on its end event (`DetectFinished` / `DetectFailed` /
+    /// `DetectCancelled`) or a worker disconnect.
+    batch_running: bool,
 }
 
 impl Default for TranslationTextDetectorController {
@@ -212,11 +250,19 @@ impl TranslationTextDetectorController {
             evt_rx,
             worker_thread: Some(worker_thread),
             batch_cancel: Arc::new(AtomicBool::new(false)),
+            batch_stop: Arc::new(AtomicBool::new(false)),
+            batch_running: false,
         }
     }
 
     pub fn is_busy(&self) -> bool {
         self.busy
+    }
+
+    /// Whether a page batch (not a region detection) is running; the panel offers Stop then.
+    #[must_use]
+    pub fn is_batch_running(&self) -> bool {
+        self.batch_running
     }
 
     pub fn start_detection(
@@ -233,8 +279,10 @@ impl TranslationTextDetectorController {
             return Err(t!("translation.text_detector.no_pages_status").to_string());
         }
         self.busy = true;
-        // A fresh flag per batch: the previous batch has ended (`busy` was clear).
+        self.batch_running = true;
+        // Fresh flags per batch: the previous batch has ended (`busy` was clear).
         self.batch_cancel = Arc::new(AtomicBool::new(false));
+        self.batch_stop = Arc::new(AtomicBool::new(false));
         if self
             .cmd_tx
             .send(WorkerCommand::Detect {
@@ -243,10 +291,12 @@ impl TranslationTextDetectorController {
                 mode,
                 mask_dilate_size: mask_dilate_size.clamp(0, 30),
                 cancel: Arc::clone(&self.batch_cancel),
+                stop: Arc::clone(&self.batch_stop),
             })
             .is_err()
         {
             self.busy = false;
+            self.batch_running = false;
             return Err(t!("translation.text_detector.worker_unavailable_error").to_string());
         }
         Ok(())
@@ -282,6 +332,16 @@ impl TranslationTextDetectorController {
         }
     }
 
+    /// The panel's "Stop after the current page": the running page batch finishes the page in
+    /// flight (its result is still delivered), then ends with `DetectCancelled` before the next
+    /// page. Never touches `batch_cancel`, so neither a model download nor the native forward
+    /// of the current page is interrupted. A no-op while idle or during a region detection.
+    pub fn request_stop(&self) {
+        if self.batch_running {
+            self.batch_stop.store(true, Ordering::Relaxed);
+        }
+    }
+
     pub fn poll_events(&mut self) -> Vec<TextDetectorControllerEvent> {
         let mut out = Vec::new();
         for _ in 0..DETECTOR_EVENT_POLL_BUDGET {
@@ -294,6 +354,7 @@ impl TranslationTextDetectorController {
                 }
                 Ok(WorkerEvent::DetectCancelled) => {
                     self.busy = false;
+                    self.batch_running = false;
                     out.push(TextDetectorControllerEvent::DetectCancelled);
                 }
                 Ok(WorkerEvent::RegionDetected(region)) => {
@@ -307,8 +368,8 @@ impl TranslationTextDetectorController {
                 Ok(WorkerEvent::DetectStarted { total, replace }) => {
                     out.push(TextDetectorControllerEvent::DetectStarted { total, replace });
                 }
-                Ok(WorkerEvent::PageDetected { page_idx, result }) => {
-                    out.push(TextDetectorControllerEvent::PageDetected { page_idx, result });
+                Ok(WorkerEvent::PageDetected { page_idx, result, texts }) => {
+                    out.push(TextDetectorControllerEvent::PageDetected { page_idx, result, texts });
                 }
                 Ok(WorkerEvent::PageFailed { page_idx, error }) => {
                     out.push(TextDetectorControllerEvent::PageFailed { page_idx, error });
@@ -318,6 +379,7 @@ impl TranslationTextDetectorController {
                 }
                 Ok(WorkerEvent::DetectFailed { error }) => {
                     self.busy = false;
+                    self.batch_running = false;
                     out.push(TextDetectorControllerEvent::DetectFailed { error });
                 }
                 Ok(WorkerEvent::DetectFinished {
@@ -325,6 +387,7 @@ impl TranslationTextDetectorController {
                     failed_pages,
                 }) => {
                     self.busy = false;
+                    self.batch_running = false;
                     out.push(TextDetectorControllerEvent::DetectFinished {
                         total_blocks,
                         failed_pages,
@@ -333,6 +396,7 @@ impl TranslationTextDetectorController {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.busy = false;
+                    self.batch_running = false;
                     out.push(TextDetectorControllerEvent::DetectFailed {
                         error: t!("translation.text_detector.worker_disconnected_error").to_string(),
                     });
@@ -365,6 +429,9 @@ enum WorkerCommand {
         mask_dilate_size: i32,
         /// The batch's cancel flag (`TranslationTextDetectorController::batch_cancel`).
         cancel: Arc<AtomicBool>,
+        /// The batch's stop flag (`TranslationTextDetectorController::batch_stop`), checked
+        /// only before each page.
+        stop: Arc<AtomicBool>,
     },
     DetectRegion {
         request: RegionDetectRequest,
@@ -386,6 +453,8 @@ enum WorkerEvent {
     PageDetected {
         page_idx: usize,
         result: TextDetectorPageResult,
+        /// See `TextDetectorControllerEvent::PageDetected::texts`.
+        texts: Option<PageBlockTexts>,
     },
     PageFailed {
         page_idx: usize,
@@ -420,8 +489,9 @@ fn worker_loop(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerEvent>) {
                 mode,
                 mask_dilate_size,
                 cancel,
+                stop,
             } => {
-                run_detect_batch(pages, replace, mode, mask_dilate_size, &cancel, &evt_tx);
+                run_detect_batch(pages, replace, mode, mask_dilate_size, &cancel, &stop, &evt_tx);
             }
             WorkerCommand::DetectRegion { request, cancel } => {
                 run_region_command(&request, &cancel, &evt_tx);
@@ -430,12 +500,26 @@ fn worker_loop(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerEvent>) {
     }
 }
 
+/// The failure of a page whose mode cannot be dispatched (a model mode without a plan, a
+/// NeuroLate mode without its key): a dispatch bug, logged, never a panic.
+fn mode_dispatch_failure(mode: &TextDetectorRunMode) -> DetectFailure {
+    ms_log::runtime_log::log_error(format!("[text-detector] mode {mode:?} cannot be dispatched (no plan or no key); page skipped"));
+    DetectFailure::Failed(t!("translation.text_detector.mode_dispatch_error").to_string())
+}
+
+/// Runs one page batch (`WorkerCommand::Detect`): backend gate, model ensure, then every page in
+/// order, emitting `DetectStarted`, per-page results / failures and progress, and exactly one
+/// end event (`DetectFinished`, `DetectFailed` or `DetectCancelled`). `cancel` (download Cancel,
+/// controller drop) is also polled by model downloads and the native forward; `stop` (the
+/// user's "Stop after the current page") is read only at the top of each page iteration, so a
+/// page already started is finished and delivered.
 fn run_detect_batch(
     pages: Vec<(usize, PathBuf)>,
     replace: bool,
     mode: TextDetectorRunMode,
     mask_dilate_size: i32,
     cancel: &AtomicBool,
+    stop: &AtomicBool,
     evt_tx: &Sender<WorkerEvent>,
 ) {
     // One download context for the whole batch: `ModelDownloadStarted` once, then every
@@ -456,7 +540,7 @@ fn run_detect_batch(
     // every page's dispatch agree. Other modes never consult it.
     let route = match &mode {
         TextDetectorRunMode::PaddleOcr(_) => pipeline::paddle_route(),
-        TextDetectorRunMode::Classic | TextDetectorRunMode::AiCtd(_) | TextDetectorRunMode::Surya(_) => {
+        TextDetectorRunMode::Classic | TextDetectorRunMode::AiCtd(_) | TextDetectorRunMode::Surya(_) | TextDetectorRunMode::NeuroLate(_) => {
             DetectorRoute::Backend
         }
     };
@@ -471,8 +555,8 @@ fn run_detect_batch(
         let _ = evt_tx.send(WorkerEvent::DetectFailed { error });
         return;
     }
-    match ensure_detector_models_for_mode(&mode, &mut ctx) {
-        Ok(()) => {}
+    let neurolate_key = match ensure_detector_models_for_mode(&mode, &mut ctx) {
+        Ok(key) => key,
         Err(ModelEnsureError::Cancelled) => {
             let _ = evt_tx.send(WorkerEvent::DetectCancelled);
             return;
@@ -481,29 +565,37 @@ fn run_detect_batch(
             let _ = evt_tx.send(WorkerEvent::DetectFailed { error });
             return;
         }
-    }
+    };
     let mut total_blocks = 0usize;
     let mut failed_pages = 0usize;
 
     for (done, (page_idx, path)) in pages.into_iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
+        // Between pages only: `stop` must never interrupt the page in flight (its result is
+        // applied), which is why it is not the `cancel` flag the native forward observes.
+        if cancel.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
             let _ = evt_tx.send(WorkerEvent::DetectCancelled);
             return;
         }
         // Model engines plan with `mode.plan_inputs()` (the same inputs the panel notice uses);
         // `route` is `Backend` for every mode but PaddleOCR (see above).
         let detect_result = match &mode {
-            TextDetectorRunMode::Classic => classic::detect_page_classic(&path).map_err(DetectFailure::Failed),
-            TextDetectorRunMode::PaddleOcr(_) | TextDetectorRunMode::AiCtd(_) | TextDetectorRunMode::Surya(_) => {
-                let (engine, params) = mode.plan_inputs();
-                pipeline::detect_page_file(&path, engine, &params, route, &mut ctx)
-            }
+            TextDetectorRunMode::Classic => classic::detect_page_classic(&path).map(|result| (result, None)).map_err(DetectFailure::Failed),
+            TextDetectorRunMode::PaddleOcr(_) | TextDetectorRunMode::AiCtd(_) | TextDetectorRunMode::Surya(_) => match mode.plan_inputs() {
+                Some((engine, params)) => pipeline::detect_page_file(&path, engine, &params, route, &mut ctx).map(|result| (result, None)),
+                None => Err(mode_dispatch_failure(&mode)),
+            },
+            // `cancel` (download Cancel, controller drop) abandons the paid request's wait;
+            // `stop` deliberately does not reach it (the page in flight is finished).
+            TextDetectorRunMode::NeuroLate(detect) => match &neurolate_key {
+                Some(key) => neurolate::detect_page(&path, key, *detect, cancel),
+                None => Err(mode_dispatch_failure(&mode)),
+            },
         };
         match detect_result {
-            Ok(mut result) => {
+            Ok((mut result, texts)) => {
                 apply_mask_dilation(&mut result, mask_dilate_size);
                 total_blocks += result.blocks.len();
-                let _ = evt_tx.send(WorkerEvent::PageDetected { page_idx, result });
+                let _ = evt_tx.send(WorkerEvent::PageDetected { page_idx, result, texts });
             }
             Err(DetectFailure::Cancelled) => {
                 let _ = evt_tx.send(WorkerEvent::DetectCancelled);
@@ -542,7 +634,7 @@ fn run_region_command(request: &RegionDetectRequest, cancel: &AtomicBool, evt_tx
     let mode = request.engine.run_mode();
     let route = match request.engine {
         RegionDetectEngine::PaddleOcr => pipeline::paddle_route(),
-        RegionDetectEngine::Surya => DetectorRoute::Backend,
+        RegionDetectEngine::Surya | RegionDetectEngine::NeuroLate(_) => DetectorRoute::Backend,
     };
     // Sends are best effort: a gone controller (dropped tab) has nobody to tell.
     if detector_mode_needs_backend(&mode, route) && let Err(error) = backend::ensure_v2_backend_ready() {
@@ -552,7 +644,7 @@ fn run_region_command(request: &RegionDetectRequest, cancel: &AtomicBool, evt_tx
     let event = match ensure_detector_models_for_mode(&mode, &mut ctx) {
         Err(ModelEnsureError::Cancelled) => WorkerEvent::DetectCancelled,
         Err(ModelEnsureError::Failed(error)) => fail(error),
-        Ok(()) => match region_detect::run_region_detection(request, route, &mut ctx) {
+        Ok(neurolate_key) => match region_detect::run_region_detection(request, route, neurolate_key.as_ref(), &mut ctx) {
             Ok(region) => {
                 ms_log::runtime_log::log_info(format!(
                     "[text-detector] region on page {}: {} blocks in {:?}",
@@ -571,28 +663,31 @@ fn run_region_command(request: &RegionDetectRequest, cancel: &AtomicBool, evt_tx
 
 /// Whether a detector mode needs the Python backend ready at batch start.
 ///
-/// `Classic` is fully local. `AiCtd`/`Surya` have no native path and always need the
-/// backend. `PaddleOcr` needs it only when `paddle_route` is not native (the web build always
-/// reports `Backend`). Pure: the caller reads the route.
+/// `Classic` is fully local and `NeuroLate` a cloud service. `AiCtd`/`Surya` have no native
+/// path and always need the backend. `PaddleOcr` needs it only when `paddle_route` is not
+/// native (the web build always reports `Backend`). Pure: the caller reads the route.
 fn detector_mode_needs_backend(mode: &TextDetectorRunMode, paddle_route: DetectorRoute) -> bool {
     match mode {
-        TextDetectorRunMode::Classic => false,
+        TextDetectorRunMode::Classic | TextDetectorRunMode::NeuroLate(_) => false,
         TextDetectorRunMode::AiCtd(_) | TextDetectorRunMode::Surya(_) => true,
         TextDetectorRunMode::PaddleOcr(_) => paddle_route == DetectorRoute::Backend,
     }
 }
 
-/// Ensures the app-managed model the batch's mode needs before the first page (cancellable and
-/// reporting through `ctx`). Classic needs none; Surya's checkpoint is only checked (its
+/// Ensures what the batch's (or region's) mode needs before the first page (cancellable and
+/// reporting through `ctx`) and returns the NeuroLate API key for a `NeuroLate` mode (`None`
+/// for every other mode). Classic needs nothing; Surya's checkpoint is only checked (its
 /// download is explicit), so a missing one fails the batch once with the "not downloaded"
-/// error instead of once per page.
-fn ensure_detector_models_for_mode(mode: &TextDetectorRunMode, ctx: &mut EnsureCtx<'_>) -> Result<(), ModelEnsureError> {
+/// error instead of once per page; NeuroLate reads its key once, so a missing key fails the
+/// batch once with the localized "no key" error.
+fn ensure_detector_models_for_mode(mode: &TextDetectorRunMode, ctx: &mut EnsureCtx<'_>) -> Result<Option<neurolate::NeurolateKey>, ModelEnsureError> {
     let models_root = config::models_dir();
     match mode {
-        TextDetectorRunMode::Classic => Ok(()),
-        TextDetectorRunMode::Surya(_) => backend::surya_detection_dir_in(&config::side_models_dir()).map(|_| ()),
-        TextDetectorRunMode::PaddleOcr(_) => ai_models::ensure_paddle_ocr_detector(&models_root, ctx).map(|_| ()),
-        TextDetectorRunMode::AiCtd(_) => ai_models::ensure_comic_text_detector_torch(&models_root, ctx).map(|_| ()),
+        TextDetectorRunMode::Classic => Ok(None),
+        TextDetectorRunMode::Surya(_) => backend::surya_detection_dir_in(&config::side_models_dir()).map(|_| None),
+        TextDetectorRunMode::PaddleOcr(_) => ai_models::ensure_paddle_ocr_detector(&models_root, ctx).map(|_| None),
+        TextDetectorRunMode::AiCtd(_) => ai_models::ensure_comic_text_detector_torch(&models_root, ctx).map(|_| None),
+        TextDetectorRunMode::NeuroLate(_) => neurolate::NeurolateKey::read().map(Some).map_err(ModelEnsureError::Failed),
     }
 }
 

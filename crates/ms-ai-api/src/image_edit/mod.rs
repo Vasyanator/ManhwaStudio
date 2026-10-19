@@ -18,12 +18,14 @@ Modules:
 - `composite` : the feathered composite inside the mask.
 - `pipeline`  : pure `prepare` / `finish` around the HTTP exchange (the owner of size) and
                 `run_image_edit`, the whole run (native; wasm stub).
-- `protocol`  : `EditProtocol` (pure adapters) and the HTTP request / response descriptions.
-- `multipart` : the `multipart/form-data` body builder.
+- `protocol`  : `EditProtocol` (pure adapters); re-exports the HTTP request / response
+                descriptions of `crate::http`.
+- `multipart` : compatibility re-export of `crate::http`'s `multipart/form-data` builder.
 - `error`     : `ImageEditError`, localized `Display`.
 - `adapters`  : one pure `EditProtocol` per API shape, `protocol_for`.
-- `executor`  : the native HTTP executor (ureq): steps, polls, cancel, deadlines, caps, key
-                injection on the provider's own origin only (crate-private, native only).
+- `executor`  : the native HTTP executor: steps, polls, cancel, deadlines, caps, key
+                injection on the provider's own origin only (crate-private, native only),
+                over the shared transport `crate::http::UreqTransport`.
 - `keys`      : `ImageEditKeySlot`, `key_slot` and read / store / clear onto `crate::keys`.
 - `key_state` : `ImageEditKeyState` (single-flight key check / store / delete) and
                 `ImageEditKeyRunner` (runs it on a worker); `ImageEditKeyStore` seam.
@@ -32,8 +34,8 @@ Modules:
 
 Notes:
 Everything here is target-neutral except `executor` (native only; `run_image_edit` is a
-`WebUnavailable` stub on wasm). Only the executor does network I/O; only `keys` and
-`key_state` touch the credential store (blocking: worker threads only).
+`WebUnavailable` stub on wasm). Only the executor does network I/O (through `crate::http`);
+only `keys` and `key_state` touch the credential store (blocking: worker threads only).
 */
 
 pub mod catalog;

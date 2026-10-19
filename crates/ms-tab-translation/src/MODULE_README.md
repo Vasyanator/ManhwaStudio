@@ -34,9 +34,10 @@ Long work is delegated to focused controllers:
   transport, page crop/cache handling, and per-engine load state. The AI API layer itself
   (services, credential-store keys, client, async bridge, model metadata, the connection widget
   and its request runner) lives in `ms-ai-api`.
-  `OcrEngine` has seven engines: MangaOCR, EasyOCR, PaddleOCR, PaddleOCR-VL, Surya and Baberu OCR
-  (backend IPC methods `ocr.*`; MangaOCR/PaddleOCR/Baberu also native ONNX) and AI API (`genai`,
-  no backend).
+  `OcrEngine` has eight engines: MangaOCR, EasyOCR, PaddleOCR, PaddleOCR-VL, Surya and Baberu OCR
+  (backend IPC methods `ocr.*`; MangaOCR/PaddleOCR/Baberu also native ONNX), AI API (`genai`,
+  no backend) and NeuroLate (cloud HTTP, paid per block; worker step in `ocr/neurolate.rs`, see
+  `ocr/MODULE_README.md`).
 - `ocr_model_download.rs` owns the install status and the explicit, user-started downloads of the
   EXTERNAL model bundles (Baberu OCR, the three PaddleOCR-VL variants, the EasyOCR model of each
   script, the Surya detection + recognition checkpoints; pinned specs in
@@ -54,14 +55,20 @@ Long work is delegated to focused controllers:
   same `TextDetectorRunMode::plan_inputs` the worker uses; the page sizes the root lends
   (`page_infos`, `TranslationDrawParams`) reach it through `draw_side_panel`.
   Dilation and Otsu come from `ms-raster` (see `text_detector/MODULE_README.md`).
-  PaddleOCR and Surya, which are also detectors, each have a "create mask and text blocks"
-  parameter (`OcrPanelOptions::{paddle,surya}_detect_mask`, per title in
-  `OCR.params.{paddle,surya}.detect_mask`, carried in `OcrRuntimeOptions`). With it on, a quick
+  PaddleOCR, Surya and NeuroLate, which are also detectors, each have a "create mask and text
+  blocks" parameter (`OcrPanelOptions::{paddle,surya}_detect_mask`, per title in
+  `OCR.params.{paddle,surya}.detect_mask`; NeuroLate's in `NeurolateSettings::detect_mask`,
+  `OCR.params.neurolate.detect_mask`; all carried in `OcrRuntimeOptions`). With it on, a quick
   OCR selection (once its OCR is dispatched) and the advanced window's Create bubble (on its
   ORIGINAL page selection, never the edited preview) also run that engine's detector on the same
-  crop (`text_detector::RegionDetectEngine::for_ocr`, the one trigger rule; block OCR never
-  does) and replace the detector mask and blocks inside the selection in both stores
-  (`tab/detector_region.rs`). A region dispatch starts the chapter's stored-detection load when
+  crop (`text_detector::RegionDetectEngine::selection_detects`, the one trigger rule; block OCR
+  never does) and replace the detector mask and blocks inside the selection in both stores
+  (`tab/detector_region.rs`). A quick NeuroLate selection runs no detector: its OCR request
+  carries an `OcrRegionWant` and the SAME paid `MASK_AND_TEXT` answer yields the text and the
+  region, which enters the same wait / merge path (`receive_ocr_region`); while the detector is
+  busy the OCR reads text only (`TEXT`) and the usual busy refusal is shown. The advanced
+  window's Create bubble with NeuroLate sends a separate `MASK` request on the original
+  selection through the detector's region command. A region dispatch starts the chapter's stored-detection load when
   it has not run, and an answer arriving while that load (or a save) runs, or before a load has
   succeeded (a dead load is retried by the next dispatch or panel draw), waits and is applied
   after it, in order, so a region never stands in for a stored page; Clear and a replacing page
@@ -387,14 +394,22 @@ is an author note addressed to the translator, not a replica.
   The `characters.json` watch uses `ms_docstore::signature`.
 - `ocr.rs`: `TranslationOcrController`, OCR load/recognize worker, framed IPC calls via
   `shared_client()` (with `begin_call`/`CallHandle` for cancel), AI API OCR request building over
-  `ms_ai_api` (tracked + stoppable via the controller's `GenerationTracker`), crop encoding, page
-  image LRU cache, and model-download/load-state events (per-command cancel tokens for the
-  app-managed model downloads).
+  `ms_ai_api` (tracked + stoppable via the controller's `GenerationTracker`), crop encoding (and
+  its page placement, `crop_image_with_placement`), page image LRU cache, and
+  model-download/load-state events (per-command cancel tokens for the app-managed model
+  downloads). `ocr/` holds its child modules (`ocr/MODULE_README.md`): `ocr/neurolate.rs`, the
+  NeuroLate worker step (one paid request, text + optional region).
 - `model_download_status.rs` (`pub`): `ModelDownloadStatus` (latest event of a job, empty once
   its last file is in) and `draw_model_download_status` (localized line / per-file bar); used by
   the OCR and detector panels and by `ms-tab-cleaning`.
 - `page_crop.rs`: the one uv selection -> page pixel rect rule (`uv_rect_to_pixel_rect`), used by
   the OCR crop and the detector's region detection of the same selection.
+- `neurolate.rs` + `neurolate/view.rs` (map: `neurolate/MODULE_README.md`): the tab's NeuroLate settings (`NeurolateSettings`:
+  language `Auto` / code, comic type `Auto` / webtoon / manga, the OCR engine's "create mask")
+  persisted under `OCR.params.neurolate`, the one owner of their "Auto" rules
+  (`effective_language`: MT source language when it maps, else KO; `resolve_comic_type`:
+  Ribbon / Custom / unknown -> webtoon, Pages -> manga) and of `request_params`, plus the shared
+  settings block `draw_neurolate_settings` (drawn by the detector panel; the OCR panel reuses it).
 - `ocr_case_fix.rs`: pure, GUI-free post-OCR ALL-CAPS normalization (detector +
   character state machine) used by `ocr.rs`'s post-processing helper.
 - `ocr_model_download.rs` (`pub`, reused by `ms-tab-cleaning`): `OcrModelDownloadController`
@@ -413,7 +428,8 @@ is an author note addressed to the translator, not a replica.
 - `text_detector/`: `TranslationTextDetectorController` and batch worker (`mod.rs`), the
   model-based entry point and fallback policy (`pipeline.rs`), the backend forward runner
   (`backend.rs`), native Paddle routing and runner (`native.rs`, desktop only), local classic
-  detector (`classic.rs`), and the region helpers reused by cleaning tools (`region.rs`). Own
+  detector (`classic.rs`), the NeuroLate cloud detector and its answer -> mask + blocks
+  conversion (`neurolate.rs`), and the region helpers reused by cleaning tools (`region.rs`). Own
   `MODULE_README.md`.
 - `machine_translation.rs`: `TranslationMtController`, `MtService`, AI API MT options, batch
   item/request types including optional ImageBubble image payloads, per-run worker thread
@@ -441,6 +457,15 @@ is an author note addressed to the translator, not a replica.
 - `tab/detector_region.rs` (child module of `tab`): the selection region-detection trigger, the
   merge of its answer into `text_detector_results` and the shared `TextMaskModel`, and the
   detector Save snapshot of the shown masks (`detection_pages_for_save`); unit tests inline.
+- `tab/block_bubbles.rs` (child module of `tab`): the one "detector block + recognized text ->
+  bubble" path (`block_uv_rect`, `insert_recognized_bubble`), used by block OCR's results and by
+  the NeuroLate detector mode's "recognize text right away" (`create_bubbles_from_page_texts`:
+  the page's block texts finished by `ocr::finish_recognized_text` with the OCR panel's text
+  options, blocks expanded like block OCR's, never merged).
+- `tab/neurolate.rs` (child module of `tab`): the step of the tab's ONE NeuroLate key panel
+  (`pump_neurolate_key` with the drawn panel's actions — the detector panel and the OCR panel
+  with NeuroLate selected —, `poll_neurolate_key` per frame only while its work is in flight) and
+  `neurolate_params` (the request parameters of every NeuroLate call).
 - `tab/route_inputs.rs` (child module of `tab`, desktop-only): `OcrRouteInputsRefresh`, the
   non-blocking refresh state machine of the OCR/detector routing inputs (injected reader, unit
   tests inline) and its production spawner over `ocr::read_ocr_route_inputs`.
@@ -621,6 +646,19 @@ is an author note addressed to the translator, not a replica.
   `DetectorRoute::route_kind`); never test the flag or the platform anywhere else. Every router
   reads the runtime through `local_ai::effective_ai_runtime`, never `AiRuntime::from_user_settings`
   directly. The tab publishes native ORT as armed only when `local_ai.native_onnx` is `Ok`.
+  The NeuroLate detector is a cloud route too (`AiRouteKind::Cloud`): never gated by `--no-ai`.
+- NeuroLate (cloud, paid): the tab holds ONE `NeurolateSettings` store and ONE
+  `NeurolateKeyPanel`; both panels edit / draw those, never copies. Every request's language
+  and comic type come from `crate::neurolate::request_params` (via `neurolate_params`), never
+  re-derived. The key panel is pumped only where NeuroLate UI is drawn or while its work is in
+  flight (its first pump reads the OS credential store). The API key is read on workers only
+  (`text_detector::neurolate::NeurolateKey::read`, once per batch / region) and never logged. A
+  paid request is never retried; the detector's batch cancel flag (download Cancel, controller
+  drop) abandons its wait, the user's Stop does not (the page in flight still finishes). The OCR
+  engine follows the same rules: its key is read on the OCR worker (load and every request), its
+  wait runs under the OCR `GenerationTracker` (panel Stop, controller drop: abandoned at once,
+  the request may still be charged), and block OCR's automatic retry is skipped for it
+  (`OcrEngine::retries_failed_block_request`).
 ## Editing map
 - To add or change an input action (its default binding, conditions, scope) or a hint text built
   from bindings, edit `input.rs` (and its golden in `input/tests.rs`; the root's
@@ -666,3 +704,10 @@ is an author note addressed to the translator, not a replica.
   `panels/bubbles.rs` and footer sync helpers in `tab.rs`.
 - To change composed text generation or export, edit `panels/composition.rs`.
 - To change advanced manual OCR crop behavior, edit `adv_rec.rs`; keep OCR dispatch in `tab.rs`.
+- To change NeuroLate's "Auto" rules, persisted keys or settings widgets, edit `neurolate.rs` /
+  `neurolate/view.rs`; the key panel step and request parameters, `tab/neurolate.rs`; the
+  detector mode and the answer -> mask + blocks conversion, `text_detector/neurolate.rs`.
+  The NeuroLate OCR engine's request / text join, `ocr/neurolate.rs`; when a selection rides on
+  its OCR answer, `RegionDetectEngine::{selection_detects, ocr_region_want}`
+  (`text_detector/region_detect.rs`) and `tab/detector_region.rs` (`ocr_region_want_for`,
+  `receive_ocr_region`).

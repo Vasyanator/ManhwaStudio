@@ -27,6 +27,12 @@
 //   system instruction has one owner (`default_ai_api_ocr_instruction`, worded for the OCR
 //   input language); an untouched stored default follows the language
 //   (`effective_ai_api_ocr_instruction`), a user edit is sent as typed.
+// - NeuroLate OCR (`OcrEngine::NeuroLate`, cloud, paid per block): the worker step lives in the
+//   child module `ocr/neurolate.rs` (`publish_neurolate_recognize` routes to it). It runs under
+//   the same `GenerationTracker` as AI API (Stop / drop abandon the wait), sends ONE request
+//   (`MASK_AND_TEXT` when the request carries an `OcrRegionWant`, else `TEXT`) and publishes
+//   the text plus, when wanted, the selection's detector region (`Recognized::region`). Its
+//   "load" is a key check. `crop_image_with_placement` gives the crop's page rect for it.
 // - Post-OCR processing (`apply_post_ocr_processing`) runs in the worker before
 //   the result is published, so every engine path and the stored last result
 //   share the same text: character substitution (`CharReplacementRule`) first,
@@ -78,6 +84,8 @@ use ms_onnx_runtime::OrtDownloadStage;
 // compiled for wasm. The worker command/event enums and the controller stay
 // target-neutral; only the bodies that build `genai` requests are gated below.
 use ms_ai_api::{AiApiService, AiApiTarget, GenerationSnapshot, GenerationTracker};
+use ms_ai_api::neurolate::OcrParams;
+use crate::text_detector::RegionDetection;
 #[cfg(not(target_arch = "wasm32"))]
 use ms_ai_api::{AiApiError, RepairRequest, RetryReason, TrackedAnswer, Validation};
 #[cfg(not(target_arch = "wasm32"))]
@@ -110,6 +118,11 @@ const OCR_BACKEND_TRANSPORT_RETRY_LIMIT: usize = 1;
 const OCR_PAGE_CACHE_MAX_ITEMS: usize = 8;
 const OCR_PAGE_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
+// The NeuroLate cloud OCR worker step (crop -> one paid request -> text + optional region).
+// Native-only: its HTTP client is not part of the web build.
+#[cfg(not(target_arch = "wasm32"))]
+mod neurolate;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum OcrLoadState {
     NotLoaded,
@@ -136,11 +149,14 @@ pub enum OcrEngine {
     /// Baberu OCR: native ONNX (vision on the selected EP, decoders on CPU) with a backend
     /// `ocr.baberu` fallback; ja/zh/en only.
     Baberu,
+    /// The NeuroLate cloud OCR service (`ms_ai_api::neurolate`, paid per text block): a cloud
+    /// route, never the backend socket, never gated by `--no-ai`. Worker: `ocr/neurolate.rs`.
+    NeuroLate,
 }
 
 impl OcrEngine {
-    /// The v2 framed-protocol method name for this engine, or `None` for the
-    /// AI-API engine (which runs over `genai`, not the backend socket).
+    /// The v2 framed-protocol method name for this engine, or `None` for the cloud engines
+    /// (AI API runs over `genai`, NeuroLate over its own HTTP client; neither uses the socket).
     fn backend_method(self) -> Option<&'static str> {
         use ms_backend_ipc::protocol;
         match self {
@@ -150,12 +166,32 @@ impl OcrEngine {
             OcrEngine::PaddleVl => Some(protocol::METHOD_OCR_PADDLE_VL),
             OcrEngine::Surya => Some(protocol::METHOD_OCR_SURYA),
             OcrEngine::Baberu => Some(protocol::METHOD_OCR_BABERU),
-            OcrEngine::AiApi => None,
+            OcrEngine::AiApi | OcrEngine::NeuroLate => None,
         }
     }
 
+    /// Whether the engine runs on the Python backend socket at all (every engine with a
+    /// backend method); `false` makes it a cloud route (`ocr_route_kind`).
     pub fn requires_backend(self) -> bool {
-        !matches!(self, Self::AiApi) && self.backend_method().is_some()
+        self.backend_method().is_some()
+    }
+
+    /// Whether a failed block-OCR request of this engine may be sent once more automatically
+    /// (the detector's "recognize blocks" retry). `false` for NeuroLate: its requests are paid
+    /// and a failure after the request left (a timeout) may already be charged, so a paid
+    /// request is never repeated without the user.
+    #[must_use]
+    pub(crate) fn retries_failed_block_request(self) -> bool {
+        match self {
+            OcrEngine::NeuroLate => false,
+            OcrEngine::MangaOcr
+            | OcrEngine::EasyOcr
+            | OcrEngine::PaddleOcr
+            | OcrEngine::PaddleVl
+            | OcrEngine::Surya
+            | OcrEngine::AiApi
+            | OcrEngine::Baberu => true,
+        }
     }
 }
 
@@ -187,6 +223,42 @@ pub struct OcrRuntimeOptions {
     /// OCR input language for the AI API default instruction (the MT source-language code;
     /// `auto` names none), see `effective_ai_api_ocr_instruction`.
     pub ai_api_source_lang: String,
+    /// NeuroLate request parameters, "Auto" already resolved (`crate::neurolate::request_params`).
+    pub neurolate: OcrParams,
+    /// NeuroLate's "create mask and text blocks" parameter (`NeurolateSettings::detect_mask`).
+    /// Read by the tab's selection trigger (`RegionDetectEngine::for_ocr`), never by the OCR
+    /// worker (the worker follows `OcrRecognizeRequest::region`).
+    pub neurolate_detect_mask: bool,
+}
+
+/// The "create mask and text blocks" parameters of the OCR engines that are also detectors, as
+/// the panel (`OcrPanelOptions` + `NeurolateSettings`) or a request (`OcrRuntimeOptions`) holds
+/// them. Read only by the one trigger rule, `RegionDetectEngine::selection_detects`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DetectMaskFlags {
+    pub(crate) paddle: bool,
+    pub(crate) surya: bool,
+    pub(crate) neurolate: bool,
+}
+
+impl DetectMaskFlags {
+    /// The flags a request snapshot carries.
+    #[must_use]
+    pub(crate) fn of_options(options: &OcrRuntimeOptions) -> Self {
+        Self { paddle: options.paddle_detect_mask, surya: options.surya_detect_mask, neurolate: options.neurolate_detect_mask }
+    }
+}
+
+/// What a NeuroLate selection OCR must also return: the detector region of its crop, taken
+/// from the same `MASK_AND_TEXT` answer (`text_detector::neurolate::region_from_image`). Set
+/// only by the tab's quick-selection trigger (`RegionDetectEngine::ocr_region_want`); block OCR and
+/// the advanced window never set it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OcrRegionWant {
+    /// The page the selection lies on (`RegionDetection::page_idx`).
+    pub page_idx: usize,
+    /// Square dilation radius of the region mask (the detector panel's setting).
+    pub mask_dilate_size: i32,
 }
 
 /// A single post-OCR character-substitution rule applied to recognized text.
@@ -235,15 +307,41 @@ fn apply_char_replacements(result: &mut OcrRecognizeResult, rules: &[CharReplace
 /// purpose. Every recognize route (AI API, native ONNX, backend IPC) must call this
 /// helper — engine parity of post-processing is a module contract.
 fn apply_post_ocr_processing(result: &mut OcrRecognizeResult, request: &OcrRecognizeRequest) {
+    post_process_result(result, request.fix_caps_lock, &request.char_replacements);
+}
+
+/// The text options a recognized text is finished with (the OCR panel's: line breaks, RTL
+/// columns, character substitutions, ALL-CAPS fix), for text that did not come through an OCR
+/// request (a NeuroLate page detection's block texts).
+#[derive(Debug, Clone)]
+pub(crate) struct OcrTextFinish {
+    pub(crate) join_newlines: bool,
+    pub(crate) reflect_strings: bool,
+    pub(crate) char_replacements: Vec<CharReplacementRule>,
+    pub(crate) fix_caps_lock: bool,
+}
+
+/// Finishes one block's raw recognized text exactly like an OCR request of that block: the one
+/// line join (`assemble_line_ocr_result`) and the one post-processing order
+/// (`apply_post_ocr_processing`'s body).
+#[must_use]
+pub(crate) fn finish_recognized_text(text: &str, finish: &OcrTextFinish) -> OcrRecognizeResult {
+    let mut result = assemble_line_ocr_result(text, finish.join_newlines, finish.reflect_strings);
+    post_process_result(&mut result, finish.fix_caps_lock, &finish.char_replacements);
+    result
+}
+
+/// The body of [`apply_post_ocr_processing`] over the two post-OCR fields themselves.
+fn post_process_result(result: &mut OcrRecognizeResult, fix_caps_lock: bool, char_replacements: &[CharReplacementRule]) {
     // Decide on the RAW engine output, before any substitution. A rule that repairs
     // a misread character with a lowercase letter (`"0" -> "o"`, a common fix) would
     // otherwise make an all-caps result look mixed-case and silently veto the fix,
     // publishing "HELLo WORLD" instead of "Hello world".
-    let fix_caps_lock = request.fix_caps_lock && ocr_case_fix::looks_like_caps_lock(result);
+    let fix_caps_lock = fix_caps_lock && ocr_case_fix::looks_like_caps_lock(result);
     // Substitutions run next, so the rewrite below sees the FINAL punctuation: a
     // rule may turn an engine artifact into a real sentence terminator (the default
     // `…` -> `...` rule does exactly that) and thereby open a new sentence.
-    apply_char_replacements(result, &request.char_replacements);
+    apply_char_replacements(result, char_replacements);
     if fix_caps_lock {
         ocr_case_fix::apply_caps_lock_fix(result);
     }
@@ -274,6 +372,9 @@ pub struct OcrRecognizeRequest {
     /// a result is byte-identical only when it has no Latin/Cyrillic letters at all
     /// (or the detector rejected it) — `"HELLO 日本"` still becomes `"Hello 日本"`.
     pub fix_caps_lock: bool,
+    /// `Some` when the answer must also carry the selection's detector region (NeuroLate only,
+    /// see [`OcrRegionWant`]); ignored by every other engine and with `image_override_png`.
+    pub region: Option<OcrRegionWant>,
 }
 
 #[derive(Debug, Clone)]
@@ -288,6 +389,10 @@ pub enum OcrControllerEvent {
     Recognized {
         request_id: u64,
         result: OcrRecognizeResult,
+        /// The selection's detector region from the same answer: `Some` exactly when the
+        /// request had `region` set (`Err` = the localized reason the region is unusable while
+        /// the text still is); `None` otherwise.
+        region: Option<Result<RegionDetection, String>>,
     },
     RecognizeFailed {
         request_id: u64,
@@ -497,14 +602,14 @@ impl TranslationOcrController {
                         });
                     }
                 }
-                Ok(WorkerEvent::RecognizeOk { request_id, result }) => {
+                Ok(WorkerEvent::RecognizeOk { request_id, result, region }) => {
                     self.last_error = None;
                     if self.state != OcrLoadState::Ready {
                         self.set_state(OcrLoadState::Ready);
                         out.push(OcrControllerEvent::StateChanged(OcrLoadState::Ready));
                     }
                     self.last_result = Some(result.clone());
-                    out.push(OcrControllerEvent::Recognized { request_id, result });
+                    out.push(OcrControllerEvent::Recognized { request_id, result, region });
                 }
                 Ok(WorkerEvent::RecognizeCancelled { request_id }) => {
                     // The engine itself is fine: a stop is not an error, so any earlier error
@@ -588,6 +693,8 @@ enum WorkerEvent {
     RecognizeOk {
         request_id: u64,
         result: OcrRecognizeResult,
+        /// See `OcrControllerEvent::Recognized::region`.
+        region: Option<Result<RegionDetection, String>>,
     },
     RecognizeErr {
         request_id: u64,
@@ -651,6 +758,13 @@ fn warmup_ocr_engine(
 ) -> Result<(), OcrFailure> {
     if engine == OcrEngine::AiApi {
         return validate_ai_api_options(options).map(|_target| ()).map_err(OcrFailure::from);
+    }
+    // NeuroLate has no local model: "loaded" means a key is stored (one credential-store read).
+    if engine == OcrEngine::NeuroLate {
+        return ms_ai_api::neurolate::read_key().map(|_key| ()).map_err(|error| {
+            ms_log::runtime_log::log_warn(format!("[ocr] NeuroLate load refused: {error:?}"));
+            OcrFailure::Failed(error.to_string())
+        });
     }
     // External models are never downloaded implicitly: a missing Baberu / PaddleOCR-VL /
     // EasyOCR / Surya model fails the load here, on every route, with the error naming the
@@ -815,7 +929,7 @@ pub(crate) fn external_model_specs(engine: OcrEngine, paddle_vl: PaddleVlVariant
         OcrEngine::PaddleVl => vec![paddle_vl.spec()],
         OcrEngine::EasyOcr => easyocr_selection(easy_langs).map(|(_, script)| vec![easyocr_spec(script)]).unwrap_or_default(),
         OcrEngine::Surya => SURYA_OCR_SPECS.to_vec(),
-        OcrEngine::MangaOcr | OcrEngine::PaddleOcr | OcrEngine::AiApi => Vec::new(),
+        OcrEngine::MangaOcr | OcrEngine::PaddleOcr | OcrEngine::AiApi | OcrEngine::NeuroLate => Vec::new(),
     }
 }
 
@@ -926,7 +1040,7 @@ fn resolve_external_model_dirs_in(
         // `SURYA_OCR_SPECS` order: detection, recognition.
         OcrEngine::Surya => ExternalModelDirs { surya_detection: dir_of(0), surya_recognition: dir_of(1), ..ExternalModelDirs::default() },
         // `external_model_specs` is empty for these: nothing to resolve.
-        OcrEngine::MangaOcr | OcrEngine::PaddleOcr | OcrEngine::AiApi => ExternalModelDirs::default(),
+        OcrEngine::MangaOcr | OcrEngine::PaddleOcr | OcrEngine::AiApi | OcrEngine::NeuroLate => ExternalModelDirs::default(),
     })
 }
 
@@ -1030,8 +1144,37 @@ fn publish_recognize(
     evt_tx: &Sender<WorkerEvent>,
 ) -> std::ops::ControlFlow<()> {
     let event = match result {
-        Ok(result) => WorkerEvent::RecognizeOk { request_id, result },
+        Ok(result) => WorkerEvent::RecognizeOk { request_id, result, region: None },
         Err(error) => WorkerEvent::RecognizeErr { request_id, error },
+    };
+    publish_worker_event(event, evt_tx)
+}
+
+/// Runs a NeuroLate recognize (`neurolate::run_neurolate_ocr`), post-processes its text like
+/// every engine and publishes it with the region it may carry (or the failure / cancel).
+/// Returns `ControlFlow::Break` if the event channel is gone.
+fn publish_neurolate_recognize(
+    request: &OcrRecognizeRequest,
+    page_cache: &mut PageImageCache,
+    generation: &GenerationTracker,
+    evt_tx: &Sender<WorkerEvent>,
+) -> std::ops::ControlFlow<()> {
+    let request_id = request.request_id;
+    #[cfg(not(target_arch = "wasm32"))]
+    let outcome = neurolate::run_neurolate_ocr(request, page_cache, generation);
+    // The NeuroLate client is native-only; the web build says so instead of faking a result.
+    #[cfg(target_arch = "wasm32")]
+    let outcome: Result<(OcrRecognizeResult, Option<Result<RegionDetection, String>>), OcrFailure> = {
+        let _ = (page_cache, generation);
+        Err(OcrFailure::Failed(ms_ai_api::neurolate::NeurolateError::WebUnavailable.to_string()))
+    };
+    let event = match outcome {
+        Ok((mut result, region)) => {
+            apply_post_ocr_processing(&mut result, request);
+            WorkerEvent::RecognizeOk { request_id, result, region }
+        }
+        Err(OcrFailure::Cancelled) => WorkerEvent::RecognizeCancelled { request_id },
+        Err(OcrFailure::Failed(error)) => WorkerEvent::RecognizeErr { request_id, error },
     };
     publish_worker_event(event, evt_tx)
 }
@@ -1115,7 +1258,8 @@ fn ocr_route(
         OcrEngine::EasyOcr
         | OcrEngine::PaddleVl
         | OcrEngine::Surya
-        | OcrEngine::AiApi => OcrRoute::Backend,
+        | OcrEngine::AiApi
+        | OcrEngine::NeuroLate => OcrRoute::Backend,
     }
 }
 
@@ -1124,17 +1268,18 @@ fn ocr_route(
 /// Reuses [`ocr_route`] so it can never disagree with the actual dispatch: a native route
 /// (MangaOCR ONNX, PaddleOCR or Baberu OCR under the native runtime with a non-`Suspect`
 /// guard) is [`AiRouteKind::Native`], every other local engine/model is
-/// [`AiRouteKind::Backend`]. `AiApi` is [`AiRouteKind::Cloud`]: it runs over `genai` and never
-/// touches the backend socket (its `ocr_route` value is `Backend` only because `OcrRoute` has
-/// no AI-API variant). A `Suspect` guard falls back to the backend. Pure and testable.
+/// [`AiRouteKind::Backend`]. `AiApi` and `NeuroLate` are [`AiRouteKind::Cloud`]: they run over
+/// HTTP and never touch the backend socket (their `ocr_route` value is `Backend` only because
+/// `OcrRoute` has no cloud variant). A `Suspect` guard falls back to the backend. Pure and
+/// testable.
 pub(crate) fn ocr_route_kind(
     engine: OcrEngine,
     manga_model_key: &str,
     runtime: config::AiRuntime,
     guard: config::OrtLoadDecision,
 ) -> AiRouteKind {
-    // Engines that never use the backend socket (AiApi over `genai`) are cloud routes,
-    // regardless of runtime/guard.
+    // Engines that never use the backend socket (AiApi over `genai`, NeuroLate over its own
+    // HTTP client) are cloud routes, regardless of runtime/guard.
     if !engine.requires_backend() {
         return AiRouteKind::Cloud;
     }
@@ -1223,8 +1368,8 @@ fn load_user_settings_for_routing() -> Value {
 /// the AI API answer), applying `join_newlines`/`reflect_strings` exactly like the backend
 /// path: split on newlines and drop blank lines; reverse line order when `reflect_strings`;
 /// join with `"\n"` (or `" "`) per `join_newlines`, then trim. The one owner of the
-/// Rust-side line join, so every route honours "keep line breaks" the same way.
-#[cfg(not(target_arch = "wasm32"))]
+/// Rust-side line join, so every route honours "keep line breaks" the same way (also the
+/// NeuroLate page texts through `finish_recognized_text`, on every target).
 fn assemble_line_ocr_result(
     text: &str,
     join_newlines: bool,
@@ -1482,6 +1627,11 @@ fn run_recognize_command(
             };
             return publish_recognize(request_id, result, evt_tx);
         }
+        // NeuroLate is a paid HTTP call like AI API: synchronous on this worker, stopped (the
+        // wait abandoned) through the same generation tracker; it may carry the region too.
+        if request.engine == OcrEngine::NeuroLate {
+            return publish_neurolate_recognize(request, page_cache, generation, evt_tx);
+        }
 
         // The external-model gate runs before the route decision, so a missing Baberu /
         // PaddleOCR-VL model fails the same way on the native and the backend route.
@@ -1700,7 +1850,7 @@ fn ensure_backend_ocr_models(
                 ensure_with_events(cancel, evt_tx, |ctx| ai_models::ensure_manga_ocr_onnx(&models_root, model, ctx))?;
             }
         }
-        OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Surya | OcrEngine::Baberu | OcrEngine::AiApi => {}
+        OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Surya | OcrEngine::Baberu | OcrEngine::AiApi | OcrEngine::NeuroLate => {}
     }
     Ok(())
 }
@@ -1720,8 +1870,30 @@ fn crop_image(
     request: &OcrRecognizeRequest,
     page_cache: &mut PageImageCache,
 ) -> Result<DynamicImage, String> {
+    crop_image_with_placement(request, page_cache).map(|(image, _placement)| image)
+}
+
+/// Where a page crop lies on its page: the pixel rect (`page_crop` rule) and the decoded page
+/// size `[w, h]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CropPlacement {
+    rect: page_crop::PixelRect,
+    source_size: [u32; 2],
+}
+
+/// The request's input image: the advanced window's override PNG (decoded; no placement, it
+/// has no page mapping), else the request's selection cut from the cached page with the one
+/// uv -> pixel rule, together with its placement.
+///
+/// # Errors
+/// The localized decode / empty-page / selection-too-small message.
+fn crop_image_with_placement(
+    request: &OcrRecognizeRequest,
+    page_cache: &mut PageImageCache,
+) -> Result<(DynamicImage, Option<CropPlacement>), String> {
     if let Some(image_override_png) = request.image_override_png.as_ref() {
         return image::load_from_memory(image_override_png)
+            .map(|image| (image, None))
             .map_err(|err| tf!("translation.ocr.decode_overlay_error", err = err));
     }
     let source = page_cache.get_or_load(&request.page_path)?;
@@ -1734,7 +1906,8 @@ fn crop_image(
     let Some(rect) = page_crop::uv_rect_to_pixel_rect(request.uv_rect, img_w, img_h) else {
         return Err(t!("translation.ocr.selection_too_small_error").to_string());
     };
-    Ok(source.crop_imm(rect.x, rect.y, rect.width, rect.height))
+    let placement = CropPlacement { rect, source_size: [img_w, img_h] };
+    Ok((source.crop_imm(rect.x, rect.y, rect.width, rect.height), Some(placement)))
 }
 
 fn encode_png(image: DynamicImage) -> Result<Vec<u8>, String> {
@@ -2105,6 +2278,11 @@ mod tests {
             ai_api_model: "gpt-4o-mini".to_string(),
             ai_api_system_instruction: String::new(),
             ai_api_source_lang: "auto".to_string(),
+            neurolate: ms_ai_api::neurolate::OcrParams {
+                language: ms_ai_api::neurolate::NeurolateLanguage::Ko,
+                comic_type: ms_ai_api::neurolate::NeurolateComicType::Webtoon,
+            },
+            neurolate_detect_mask: false,
         }
     }
 
@@ -2125,6 +2303,7 @@ mod tests {
             reflect_strings: false,
             char_replacements,
             fix_caps_lock,
+            region: None,
         }
     }
 
@@ -2206,9 +2385,34 @@ mod tests {
             Some(protocol::METHOD_OCR_BABERU)
         );
         assert_eq!(OcrEngine::AiApi.backend_method(), None);
+        assert_eq!(OcrEngine::NeuroLate.backend_method(), None);
         assert!(OcrEngine::Surya.requires_backend());
         assert!(OcrEngine::Baberu.requires_backend());
         assert!(!OcrEngine::AiApi.requires_backend());
+    }
+
+    /// `requires_backend` is exactly "has a backend method" (the former extra `!AiApi` test was
+    /// redundant: AiApi has none), so every local engine requires the backend socket and the
+    /// two cloud engines never do.
+    #[test]
+    fn requires_backend_table_is_unchanged_by_the_cloud_engines() {
+        for engine in all_engines() {
+            let expected = match engine {
+                OcrEngine::MangaOcr | OcrEngine::EasyOcr | OcrEngine::PaddleOcr | OcrEngine::PaddleVl | OcrEngine::Surya | OcrEngine::Baberu => true,
+                OcrEngine::AiApi | OcrEngine::NeuroLate => false,
+            };
+            assert_eq!(engine.requires_backend(), expected, "{engine:?}");
+            assert_eq!(engine.requires_backend(), engine.backend_method().is_some(), "{engine:?}");
+        }
+    }
+
+    /// A failed block-OCR request is retried automatically for every engine except the paid
+    /// NeuroLate (a paid request is never repeated without the user).
+    #[test]
+    fn only_neurolate_skips_the_automatic_block_retry() {
+        for engine in all_engines() {
+            assert_eq!(engine.retries_failed_block_request(), engine != OcrEngine::NeuroLate, "{engine:?}");
+        }
     }
 
     #[test]
@@ -2510,15 +2714,7 @@ mod tests {
         // historical `engine.requires_backend()`: every backend engine requires it,
         // AiApi never does — for either guard state.
         for guard in [OrtLoadDecision::Safe, OrtLoadDecision::Suspect] {
-            for engine in [
-                OcrEngine::MangaOcr,
-                OcrEngine::EasyOcr,
-                OcrEngine::PaddleOcr,
-                OcrEngine::PaddleVl,
-                OcrEngine::Surya,
-                OcrEngine::AiApi,
-                OcrEngine::Baberu,
-            ] {
+            for engine in all_engines() {
                 assert_eq!(
                     ocr_requires_backend(engine, "base_onnx", AiRuntime::Backend, guard),
                     engine.requires_backend(),
@@ -2615,15 +2811,6 @@ mod tests {
         assert!(!failure_state_changed(&flag, false));
     }
 
-    const ALL_ENGINES: [OcrEngine; 7] = [
-        OcrEngine::MangaOcr,
-        OcrEngine::EasyOcr,
-        OcrEngine::PaddleOcr,
-        OcrEngine::PaddleVl,
-        OcrEngine::Surya,
-        OcrEngine::AiApi,
-        OcrEngine::Baberu,
-    ];
 
     fn platform(on: bool, feature: PlatformFeature) -> Result<(), Unavailable> {
         if on { Ok(()) } else { Err(Unavailable::new(feature, UnavailableReason::NotOnThisPlatform)) }
@@ -2642,7 +2829,7 @@ mod tests {
                         platform(backend_platform, PlatformFeature::PythonBackend),
                         platform(native_platform, PlatformFeature::NativeOnnxRuntime),
                     );
-                    for engine in ALL_ENGINES {
+                    for engine in all_engines() {
                         for model in ["base_onnx", "base_torch"] {
                             for runtime in [AiRuntime::Backend, AiRuntime::Native] {
                                 for guard in [OrtLoadDecision::Safe, OrtLoadDecision::Suspect] {
@@ -2654,7 +2841,7 @@ mod tests {
                                     let result = ocr_route_availability(engine, model, runtime, guard, &local);
                                     match kind {
                                         AiRouteKind::Cloud => {
-                                            assert_eq!(engine, OcrEngine::AiApi, "{case}");
+                                            assert!(matches!(engine, OcrEngine::AiApi | OcrEngine::NeuroLate), "{case}");
                                             assert_eq!(result, Ok(AiRouteKind::Cloud), "{case}");
                                         }
                                         AiRouteKind::Native => {
@@ -2691,9 +2878,9 @@ mod tests {
     }
 
     /// The user's report: under `--no-ai` (and on a platform with neither local runtime)
-    /// the AI API OCR still runs.
+    /// the cloud OCR engines (AI API, NeuroLate) still run.
     #[test]
-    fn ai_api_ocr_runs_with_every_local_runtime_off() {
+    fn cloud_ocr_runs_with_every_local_runtime_off() {
         for local in [
             LocalAiAvailability::resolve(true, Ok(()), Ok(())),
             LocalAiAvailability::resolve(
@@ -2702,10 +2889,15 @@ mod tests {
                 platform(false, PlatformFeature::NativeOnnxRuntime),
             ),
         ] {
-            assert_eq!(
-                ocr_route_availability(OcrEngine::AiApi, "", AiRuntime::Native, OrtLoadDecision::Safe, &local),
-                Ok(AiRouteKind::Cloud)
-            );
+            for engine in [OcrEngine::AiApi, OcrEngine::NeuroLate] {
+                for runtime in [AiRuntime::Backend, AiRuntime::Native] {
+                    assert_eq!(
+                        ocr_route_availability(engine, "", runtime, OrtLoadDecision::Safe, &local),
+                        Ok(AiRouteKind::Cloud),
+                        "{engine:?} {runtime:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -2833,7 +3025,7 @@ mod tests {
 
     /// Every engine, spelled through an exhaustive match so a new variant fails to compile
     /// here until the routing matrix below covers it.
-    fn all_engines() -> [OcrEngine; 7] {
+    fn all_engines() -> [OcrEngine; 8] {
         let all = [
             OcrEngine::MangaOcr,
             OcrEngine::EasyOcr,
@@ -2842,6 +3034,7 @@ mod tests {
             OcrEngine::Surya,
             OcrEngine::AiApi,
             OcrEngine::Baberu,
+            OcrEngine::NeuroLate,
         ];
         for engine in all {
             match engine {
@@ -2851,7 +3044,8 @@ mod tests {
                 | OcrEngine::PaddleVl
                 | OcrEngine::Surya
                 | OcrEngine::AiApi
-                | OcrEngine::Baberu => {}
+                | OcrEngine::Baberu
+                | OcrEngine::NeuroLate => {}
             }
         }
         all
@@ -2875,7 +3069,8 @@ mod tests {
                         | OcrEngine::EasyOcr
                         | OcrEngine::PaddleVl
                         | OcrEngine::Surya
-                        | OcrEngine::AiApi => OcrRoute::Backend,
+                        | OcrEngine::AiApi
+                        | OcrEngine::NeuroLate => OcrRoute::Backend,
                     };
                     assert_eq!(
                         ocr_route(runtime, engine, "base_onnx", guard),
@@ -2909,7 +3104,7 @@ mod tests {
                     OcrEngine::PaddleVl => assert_eq!(specs, [variant.spec().id]),
                     OcrEngine::EasyOcr => assert_eq!(specs, [easyocr_spec(EasyOcrScript::Korean).id]),
                     OcrEngine::Surya => assert_eq!(specs, [SURYA_DETECTION_2025_05_07.id, SURYA_RECOGNITION_2025_09_23.id]),
-                    OcrEngine::MangaOcr | OcrEngine::PaddleOcr | OcrEngine::AiApi => assert!(specs.is_empty(), "{engine:?}"),
+                    OcrEngine::MangaOcr | OcrEngine::PaddleOcr | OcrEngine::AiApi | OcrEngine::NeuroLate => assert!(specs.is_empty(), "{engine:?}"),
                 }
             }
         }
@@ -3039,7 +3234,7 @@ mod tests {
         assert!(refusal.missing.is_empty());
         let lang_err = super::easyocr_selection("ko, ja").expect_err("refused");
         assert_eq!(refusal.message, super::easyocr_lang_error_message(&lang_err));
-        for engine in [OcrEngine::MangaOcr, OcrEngine::PaddleOcr, OcrEngine::AiApi] {
+        for engine in [OcrEngine::MangaOcr, OcrEngine::PaddleOcr, OcrEngine::AiApi, OcrEngine::NeuroLate] {
             assert_eq!(resolve(engine, &sample_options()), Ok(ExternalModelDirs::default()), "{engine:?}");
         }
         assert!(!root.exists(), "the gate must not create anything");

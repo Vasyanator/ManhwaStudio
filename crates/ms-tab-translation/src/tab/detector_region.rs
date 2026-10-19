@@ -6,10 +6,19 @@ and of what the detector's Save button writes.
 Main items:
 - `TranslationTabState::start_selection_region_detection`: the trigger of a selection OCR
   (quick rect, the advanced window's Create bubble on its ORIGINAL page selection). Runs only
-  when `RegionDetectEngine::for_ocr` says so (PaddleOCR / Surya with that engine's own
-  parameter on), starts the chapter's stored-detection load if it has not run, checks the
+  when `RegionDetectEngine::for_ocr` says so (PaddleOCR / Surya / NeuroLate with that engine's
+  own parameter on), starts the chapter's stored-detection load if it has not run, checks the
   detector route like a page run, and refuses with a toast and a status line while the detector
   is busy (nothing is queued in the controller).
+- `ocr_region_want_for` / `receive_ocr_region` / `drop_ocr_region`: a quick NeuroLate selection
+  takes its region from the OCR answer itself (one `MASK_AND_TEXT` request): the OCR request
+  carries an `OcrRegionWant` (none while the detector is busy or unavailable: the OCR then runs
+  in `TEXT` mode and the start above shows the usual refusal), the request id waits in
+  `pending_ocr_regions`, and the answer's region enters the SAME `receive_region_detection`
+  path. A failed or stopped OCR, Clear and a replacing page batch drop the wait; while it is
+  awaited no page batch starts (`detector_busy_for_batches`). The advanced
+  window's Create bubble never rides: it runs the detector (NeuroLate: a separate `MASK`
+  request).
 - `receive_region_detection` / `replay_pending_region_detections`: a result that arrives while
   the stored detection is loading (or being saved), or before it ever loaded (a load that died
   is retried by the next dispatch or panel draw), waits in `pending_region_detections` and is
@@ -45,7 +54,7 @@ use ms_theme::Severity;
 
 use super::{TranslationPanel, TranslationTabState, detector_rects_to_blocks_px, rasterize_resolved_blocks};
 use crate::panels::ocr::OcrPanelOptions;
-use crate::ocr::{OcrEngine, OcrRuntimeOptions};
+use crate::ocr::{DetectMaskFlags, OcrEngine, OcrRegionWant, OcrRuntimeOptions};
 use crate::panels::text_detector::TextDetectorAlgorithm;
 use crate::text_detector::{
     RegionDetectEngine, RegionDetectRequest, RegionDetection, SURYA_DETECTOR_SPECS, TextDetectorPageResult, empty_page_result,
@@ -54,12 +63,13 @@ use crate::text_detector::{
 
 /// Whether the text detector's mask and blocks are drawn on the canvas: while the Detector
 /// panel is open, and while the selected OCR engine's "create mask and text blocks" parameter is
-/// on (PaddleOCR / Surya, `RegionDetectEngine::from_flags`). Display only: the interactive
-/// detector modes (mask brush, lines edit) stay tied to the panel, which turns them off when it
-/// closes. The one owner of the overlay's visibility.
-pub(super) fn detector_overlay_visible_for(active_panel: TranslationPanel, ocr_options: &OcrPanelOptions) -> bool {
-    active_panel == TranslationPanel::TextDetector
-        || RegionDetectEngine::from_flags(ocr_options.engine, ocr_options.paddle_detect_mask, ocr_options.surya_detect_mask).is_some()
+/// on (PaddleOCR / Surya from `ocr_options`, NeuroLate from `neurolate_detect_mask`, the tab's
+/// `NeurolateSettings::detect_mask`; the rule is `RegionDetectEngine::selection_detects`).
+/// Display only: the interactive detector modes (mask brush, lines edit) stay tied to the panel,
+/// which turns them off when it closes. The one owner of the overlay's visibility.
+pub(super) fn detector_overlay_visible_for(active_panel: TranslationPanel, ocr_options: &OcrPanelOptions, neurolate_detect_mask: bool) -> bool {
+    let flags = DetectMaskFlags { paddle: ocr_options.paddle_detect_mask, surya: ocr_options.surya_detect_mask, neurolate: neurolate_detect_mask };
+    active_panel == TranslationPanel::TextDetector || RegionDetectEngine::selection_detects(ocr_options.engine, flags)
 }
 
 /// The page selection an OCR ran on: what its region detection crops.
@@ -79,13 +89,14 @@ fn region_algorithm(engine: RegionDetectEngine) -> TextDetectorAlgorithm {
     match engine {
         RegionDetectEngine::PaddleOcr => TextDetectorAlgorithm::PaddleOcr,
         RegionDetectEngine::Surya => TextDetectorAlgorithm::Surya,
+        RegionDetectEngine::NeuroLate(_) => TextDetectorAlgorithm::NeuroLate,
     }
 }
 
 impl TranslationTabState {
     /// [`detector_overlay_visible_for`] of this tab's current panel and OCR options.
     pub(super) fn detector_overlay_visible(&self) -> bool {
-        detector_overlay_visible_for(self.active_panel, &self.ocr_panel_options)
+        detector_overlay_visible_for(self.active_panel, &self.ocr_panel_options, self.neurolate_settings.detect_mask)
     }
 
     /// Starts the detector of the OCR `engine` on `selection` when `options` turn that engine's
@@ -93,6 +104,10 @@ impl TranslationTabState {
     /// first when it has not run (its result is applied before the region's). A refused start
     /// (route unavailable, detector busy, worker gone) sets the detector status line and shows a
     /// toast, never silent.
+    ///
+    /// `carried_by` is the id of the dispatched OCR request whose answer carries the region
+    /// (its request had an [`OcrRegionWant`] from [`Self::ocr_region_want_for`]): then no
+    /// detector runs, the id waits in `pending_ocr_regions` for [`Self::receive_ocr_region`].
     pub(super) fn start_selection_region_detection(
         &mut self,
         ctx: &egui::Context,
@@ -100,11 +115,20 @@ impl TranslationTabState {
         engine: OcrEngine,
         options: &OcrRuntimeOptions,
         selection: OcrSelection,
+        carried_by: Option<u64>,
     ) {
         let Some(region_engine) = RegionDetectEngine::for_ocr(engine, options) else {
             return;
         };
         let algorithm = region_algorithm(region_engine);
+        if let Some(request_id) = carried_by {
+            // Checked by `ocr_region_want_for` before the request left; the stored detection
+            // must still be in the stores before the answer's region is merged.
+            self.ensure_text_detection_storage_loaded(project);
+            self.pending_ocr_regions.insert(request_id);
+            self.set_text_detector_status(tf!("translation.tab.region_detecting_status", engine = algorithm.title()), Severity::Info);
+            return;
+        }
         if let Err(reason) = self.detector_algorithm_availability(algorithm) {
             self.report_region_refusal(ctx, reason.status_text(algorithm), Severity::Error);
             return;
@@ -131,6 +155,61 @@ impl TranslationTabState {
                 self.report_region_refusal(ctx, tf!("translation.tab.region_detect_error", error = error), Severity::Error);
             }
         }
+    }
+
+    /// The region a quick selection's OCR request with `engine` / `options` on page `page_idx`
+    /// must also return (`RegionDetectEngine::ocr_region_want`: NeuroLate with its parameter on),
+    /// or `None` — always for other engines, and while the region could not start now (its route
+    /// unavailable, the detector busy with a batch or another region): the OCR then reads text
+    /// only and [`Self::start_selection_region_detection`] reports the refusal as for any engine.
+    pub(super) fn ocr_region_want_for(&self, engine: OcrEngine, options: &OcrRuntimeOptions, page_idx: usize) -> Option<OcrRegionWant> {
+        let want = RegionDetectEngine::ocr_region_want(engine, options, page_idx, self.text_detector_options.mask_dilate_size)?;
+        let algorithm = RegionDetectEngine::for_ocr(engine, options).map(region_algorithm)?;
+        let can_start = self.detector_algorithm_availability(algorithm).is_ok() && !self.text_detector_controller.is_busy();
+        can_start.then_some(want)
+    }
+
+    /// Takes the region part of a finished OCR answer (`OcrControllerEvent::Recognized::region`)
+    /// for request `request_id`: when that request's region is awaited (`pending_ocr_regions`), an
+    /// `Ok` region goes through [`Self::receive_region_detection`] (the one wait / merge path) and
+    /// an `Err` or a missing region is reported as a region failure. A region nobody waits for
+    /// any more (dropped by Clear or a replacing batch) is discarded with a log line.
+    pub(super) fn receive_ocr_region(&mut self, ctx: &egui::Context, request_id: u64, region: Option<Result<RegionDetection, String>>) {
+        if !self.pending_ocr_regions.remove(&request_id) {
+            if region.is_some() {
+                ms_log::runtime_log::log_info(format!("[text-detector] region of OCR request {request_id} discarded: no longer awaited (cleared or replaced)"));
+            }
+            return;
+        }
+        match region {
+            Some(Ok(region)) => self.receive_region_detection(ctx, region),
+            // A cloud region has no model files to re-probe: the plain region failure report.
+            Some(Err(error)) => self.report_region_refusal(ctx, tf!("translation.tab.region_detect_error", error = error), Severity::Error),
+            None => {
+                ms_log::runtime_log::log_error(format!("[text-detector] OCR request {request_id} answered without the awaited region (dispatch bug)"));
+                let error = t!("translation.text_detector.neurolate_no_result_error");
+                self.report_region_refusal(ctx, tf!("translation.tab.region_detect_error", error = error), Severity::Error);
+            }
+        }
+    }
+
+    /// The OCR request `request_id` ended without an answer (failed or stopped): when its region
+    /// was awaited, the wait ends and the detector status line says why (`status`; the OCR's own
+    /// toast already told the user, so no second one).
+    pub(super) fn drop_ocr_region(&mut self, request_id: u64, status: String, severity: Severity) {
+        if self.pending_ocr_regions.remove(&request_id) {
+            self.set_text_detector_status(status, severity);
+        }
+    }
+
+    /// Whether a page batch must not start now (the panel disables its detect / save / block-OCR
+    /// buttons and the batch starters refuse): the detector worker runs a batch or a region, OR a
+    /// quick selection's region is still awaited from its OCR answer (`pending_ocr_regions`). The
+    /// second keeps the ordering rule the controller gives detector regions — a region and a
+    /// batch never overlap, so a batch can neither overwrite a paid region nor drop it — until the
+    /// carried answer is merged or dropped (Clear, which stays enabled, also drops it).
+    pub(super) fn detector_busy_for_batches(&self) -> bool {
+        self.text_detector_controller.is_busy() || !self.pending_ocr_regions.is_empty()
     }
 
     /// Shows a region-detection refusal or failure on the detector status line and as a toast.
@@ -272,8 +351,9 @@ impl TranslationTabState {
     /// A region detection failed: status + toast, and for Surya a re-probe of its checkpoint so
     /// the detector panel draws the download button the error names.
     pub(super) fn region_detection_failed(&mut self, ctx: &egui::Context, engine: RegionDetectEngine, error: String) {
-        if engine == RegionDetectEngine::Surya {
-            self.ocr_model_downloads.request_bundle_status(&SURYA_DETECTOR_SPECS);
+        match engine {
+            RegionDetectEngine::Surya => self.ocr_model_downloads.request_bundle_status(&SURYA_DETECTOR_SPECS),
+            RegionDetectEngine::PaddleOcr | RegionDetectEngine::NeuroLate(_) => {}
         }
         self.report_region_refusal(ctx, tf!("translation.tab.region_detect_error", error = error), Severity::Error);
     }
@@ -414,6 +494,11 @@ mod tests {
     fn region_engines_map_to_their_detector_algorithms() {
         assert_eq!(region_algorithm(RegionDetectEngine::PaddleOcr), TextDetectorAlgorithm::PaddleOcr);
         assert_eq!(region_algorithm(RegionDetectEngine::Surya), TextDetectorAlgorithm::Surya);
+        let params = ms_ai_api::neurolate::OcrParams {
+            language: ms_ai_api::neurolate::NeurolateLanguage::Ko,
+            comic_type: ms_ai_api::neurolate::NeurolateComicType::Webtoon,
+        };
+        assert_eq!(region_algorithm(RegionDetectEngine::NeuroLate(params)), TextDetectorAlgorithm::NeuroLate);
     }
 
     fn tab_with_model() -> (TranslationTabState, Arc<Mutex<TextMaskModel>>) {
@@ -556,11 +641,214 @@ mod tests {
     #[test]
     fn detector_overlay_visibility_follows_the_panel_or_the_engine_parameter() {
         let options = |engine: OcrEngine, paddle: bool, surya: bool| OcrPanelOptions { engine, paddle_detect_mask: paddle, surya_detect_mask: surya, ..Default::default() };
-        assert!(detector_overlay_visible_for(TranslationPanel::TextDetector, &options(OcrEngine::MangaOcr, false, false)));
-        assert!(!detector_overlay_visible_for(TranslationPanel::None, &options(OcrEngine::MangaOcr, true, true)));
-        assert!(detector_overlay_visible_for(TranslationPanel::Ocr, &options(OcrEngine::PaddleOcr, true, false)));
-        assert!(!detector_overlay_visible_for(TranslationPanel::Ocr, &options(OcrEngine::PaddleOcr, false, true)));
-        assert!(detector_overlay_visible_for(TranslationPanel::None, &options(OcrEngine::Surya, false, true)));
-        assert!(!detector_overlay_visible_for(TranslationPanel::Bubbles, &options(OcrEngine::Surya, true, false)));
+        assert!(detector_overlay_visible_for(TranslationPanel::TextDetector, &options(OcrEngine::MangaOcr, false, false), false));
+        assert!(!detector_overlay_visible_for(TranslationPanel::None, &options(OcrEngine::MangaOcr, true, true), true));
+        assert!(detector_overlay_visible_for(TranslationPanel::Ocr, &options(OcrEngine::PaddleOcr, true, false), false));
+        assert!(!detector_overlay_visible_for(TranslationPanel::Ocr, &options(OcrEngine::PaddleOcr, false, true), true));
+        assert!(detector_overlay_visible_for(TranslationPanel::None, &options(OcrEngine::Surya, false, true), false));
+        assert!(!detector_overlay_visible_for(TranslationPanel::Bubbles, &options(OcrEngine::Surya, true, false), true));
+        assert!(detector_overlay_visible_for(TranslationPanel::Ocr, &options(OcrEngine::NeuroLate, false, false), true));
+        assert!(!detector_overlay_visible_for(TranslationPanel::Ocr, &options(OcrEngine::NeuroLate, true, true), false));
+    }
+
+    /// The OCR runtime options of `engine` with NeuroLate's "create mask" set to `detect_mask`.
+    fn ocr_options_for(engine: OcrEngine, detect_mask: bool) -> OcrRuntimeOptions {
+        let settings = crate::neurolate::NeurolateSettings { detect_mask, ..Default::default() };
+        super::super::build_ocr_runtime_options(&OcrPanelOptions { engine, ..Default::default() }, "ko", &settings, None)
+    }
+
+    /// A quick NeuroLate selection asks its OCR request for the region (idle detector); other
+    /// engines, and NeuroLate with its parameter off, never do.
+    #[test]
+    fn only_a_neurolate_selection_rides_on_its_ocr_request() {
+        let tab = TranslationTabState::default();
+        let want = tab.ocr_region_want_for(OcrEngine::NeuroLate, &ocr_options_for(OcrEngine::NeuroLate, true), 4);
+        assert_eq!(want, Some(OcrRegionWant { page_idx: 4, mask_dilate_size: tab.text_detector_options.mask_dilate_size }));
+        assert_eq!(tab.ocr_region_want_for(OcrEngine::NeuroLate, &ocr_options_for(OcrEngine::NeuroLate, false), 4), None);
+        for engine in [OcrEngine::PaddleOcr, OcrEngine::Surya, OcrEngine::MangaOcr, OcrEngine::AiApi] {
+            assert_eq!(tab.ocr_region_want_for(engine, &ocr_options_for(engine, true), 4), None, "{engine:?}");
+        }
+    }
+
+    /// A page path that does not exist (the detector worker fails on it without touching disk
+    /// further).
+    fn absent_page() -> PathBuf {
+        std::env::temp_dir().join(format!("ms_tab_translation_absent_page_{}.png", std::process::id()))
+    }
+
+    /// Occupies the tab's detector controller with a Classic batch on an absent page: busy at
+    /// once (the worker only fails to decode it; no model, backend or network).
+    fn occupy_detector(tab: &mut TranslationTabState) {
+        assert!(!absent_page().exists());
+        tab.text_detector_controller
+            .start_detection(vec![(0, absent_page())], false, crate::text_detector::TextDetectorRunMode::Classic, 0)
+            .unwrap_or_else(|error| panic!("detector starts: {error}"));
+        assert!(tab.text_detector_controller.is_busy());
+    }
+
+    /// A minimal `ProjectData` whose every path is the fictional `/home/u/title/chapter` (nothing
+    /// here reads or writes it).
+    fn fictional_project() -> ProjectData {
+        let dir = PathBuf::from("/home/u/title/chapter");
+        ProjectData {
+            project_dir: dir.clone(),
+            image_dir: dir.clone(),
+            pages: Vec::new(),
+            bubbles: Arc::new(Vec::new()),
+            paths: ms_project::ProjectPaths {
+                project_dir: dir.clone(),
+                title_dir: dir.clone(),
+                notes_file: dir.clone(),
+                char_favorites_file: dir.clone(),
+                color_presets_file: dir.clone(),
+                bubbles_file: dir.clone(),
+                src_dir: dir.clone(),
+                clean_layers_dir: dir.clone(),
+                cleaned_dir: dir.clone(),
+                alt_vers_dir: dir.clone(),
+                saved_dir: dir.clone(),
+                image_bubbles_dir: dir.clone(),
+                text_images_dir: dir.clone(),
+                layers_dir: dir.clone(),
+                text_detection_dir: dir.clone(),
+                characters_dir: dir.clone(),
+                terms_file: dir.clone(),
+                settings_file: dir.clone(),
+                unsaved_dir: dir.clone(),
+                unsaved_bubbles_file: dir.clone(),
+                unsaved_clean_layers_dir: dir.clone(),
+                unsaved_image_bubbles_dir: dir.clone(),
+                unsaved_text_images_dir: dir.clone(),
+                unsaved_layers_dir: dir,
+            },
+            comic_type: None,
+            canvas_settings: ms_project::CanvasSettings::default(),
+            settings_data: serde_json::Value::Null,
+            session: Default::default(),
+        }
+    }
+
+    /// While the detector is busy a NeuroLate selection asks for NO region: its OCR is the one
+    /// paid call (TEXT), and the start path then shows the usual busy refusal.
+    #[test]
+    fn a_busy_detector_wants_no_region_so_one_selection_is_one_call() {
+        let mut tab = TranslationTabState::default();
+        occupy_detector(&mut tab);
+        let options = ocr_options_for(OcrEngine::NeuroLate, true);
+        assert_eq!(tab.ocr_region_want_for(OcrEngine::NeuroLate, &options, 0), None);
+    }
+
+    /// A carried region only records its request id (and the "detecting" status): no detector
+    /// run starts. A selection without a carrier takes today's detector path, refused while busy.
+    #[test]
+    fn a_carried_region_starts_no_detector_run() {
+        let mut tab = TranslationTabState::default();
+        let ctx = egui::Context::default();
+        let project = fictional_project();
+        // The stored-detection load is not started here (a job is "running").
+        tab.text_detection_storage_busy = true;
+        let options = ocr_options_for(OcrEngine::NeuroLate, true);
+        let selection = OcrSelection { page_idx: 0, page_path: absent_page(), uv_rect: [0.0, 0.0, 1.0, 1.0] };
+        tab.start_selection_region_detection(&ctx, &project, OcrEngine::NeuroLate, &options, selection.clone(), Some(11));
+        assert_eq!(tab.pending_ocr_regions, std::collections::HashSet::from([11]));
+        assert!(!tab.text_detector_controller.is_busy(), "no detector run for a carried region");
+        assert_eq!(tab.text_detector_status_severity, Severity::Info);
+
+        let mut busy = TranslationTabState::default();
+        occupy_detector(&mut busy);
+        busy.text_detection_storage_busy = true;
+        busy.start_selection_region_detection(&ctx, &project, OcrEngine::NeuroLate, &options, selection, None);
+        assert!(busy.pending_ocr_regions.is_empty());
+        assert_eq!(busy.text_detector_status_severity, Severity::Warning, "busy refusal");
+    }
+
+    /// An awaited OCR region blocks page batches like a running region detection; once it is
+    /// merged or dropped, a batch may start again.
+    #[test]
+    fn an_awaited_ocr_region_blocks_page_batches() {
+        let mut tab = TranslationTabState::default();
+        let project = fictional_project();
+        assert!(!tab.detector_busy_for_batches());
+        tab.pending_ocr_regions.insert(3);
+        assert!(tab.detector_busy_for_batches());
+        tab.set_text_detector_status("before", Severity::Info);
+        tab.start_text_detection_for_all_pages(&project);
+        assert_eq!(tab.text_detector_status, "before", "the batch start was refused");
+        assert!(!tab.text_detector_controller.is_busy());
+
+        tab.drop_ocr_region(3, "stopped".to_string(), Severity::Info);
+        assert!(!tab.detector_busy_for_batches());
+        // Not refused by the gate any more: this project has no pages, so the controller itself
+        // answers (an error status), which proves the start went through.
+        tab.start_text_detection_for_all_pages(&project);
+        assert_eq!(tab.text_detector_status_severity, Severity::Error);
+    }
+
+    fn neurolate_region_on_page_0() -> RegionDetection {
+        let params = ms_ai_api::neurolate::OcrParams { language: ms_ai_api::neurolate::NeurolateLanguage::Ko, comic_type: ms_ai_api::neurolate::NeurolateComicType::Webtoon };
+        RegionDetection { engine: RegionDetectEngine::NeuroLate(params), ..region_on_page_0(vec![0, 255, 0, 0]) }
+    }
+
+    /// An OCR-carried region waits like a detector's while the stored detection loads, is
+    /// merged once by the same path, and ends the wait of its request.
+    #[test]
+    fn ocr_carried_region_waits_for_the_stored_load_and_merges_once() {
+        let (mut tab, model) = tab_with_model();
+        let ctx = egui::Context::default();
+        tab.pending_ocr_regions.insert(7);
+        tab.text_detection_storage_busy = true;
+        tab.receive_ocr_region(&ctx, 7, Some(Ok(neurolate_region_on_page_0())));
+        assert!(tab.pending_ocr_regions.is_empty(), "the request's wait ended");
+        assert!(tab.text_detector_results.is_empty(), "held while the load runs");
+        assert_eq!(tab.pending_region_detections.len(), 1);
+
+        tab.apply_loaded_detection_pages(vec![(0, stored_page())]);
+        tab.text_detection_storage_busy = false;
+        tab.text_detection_storage_loaded_for = Some(PathBuf::from("/home/u/title/chapter"));
+        tab.replay_pending_region_detections(&ctx);
+        tab.replay_pending_region_detections(&ctx);
+        let page = tab.text_detector_results.get(&0).expect("page kept");
+        assert_eq!(page.blocks, vec![rect(0.0, 0.0, 1.0, 1.0), rect(4.5, 0.0, 6.0, 1.0), rect(2.0, 2.0, 3.0, 3.0)], "merged once");
+        assert_eq!(page.mask_alpha.iter().filter(|&&px| px == 0).count(), 3, "only the rect changed");
+        assert_eq!(model.lock().expect("model lock").page(0).map(|shown| shown.mask_alpha.clone()), Some(page.mask_alpha.clone()));
+        // A second answer for the same request id is no longer awaited.
+        tab.receive_ocr_region(&ctx, 7, Some(Ok(neurolate_region_on_page_0())));
+        assert!(tab.pending_region_detections.is_empty());
+    }
+
+    /// A failed or stopped OCR, and an unusable region, end the wait and say so on the detector
+    /// status line; nothing is merged.
+    #[test]
+    fn failed_cancelled_or_unusable_ocr_regions_clear_the_wait_and_the_status() {
+        let (mut tab, _model) = tab_with_model();
+        let ctx = egui::Context::default();
+        tab.text_detection_storage_loaded_for = Some(PathBuf::from("/home/u/title/chapter"));
+        tab.pending_ocr_regions.extend([1, 2, 3]);
+        tab.drop_ocr_region(1, "failed".to_string(), Severity::Error);
+        assert_eq!((tab.text_detector_status.as_str(), tab.text_detector_status_severity), ("failed", Severity::Error));
+        tab.drop_ocr_region(2, "stopped".to_string(), Severity::Info);
+        assert_eq!((tab.text_detector_status.as_str(), tab.text_detector_status_severity), ("stopped", Severity::Info));
+        tab.receive_ocr_region(&ctx, 3, Some(Err("bad size".to_string())));
+        assert_eq!(tab.text_detector_status_severity, Severity::Error);
+        assert!(tab.text_detector_status.contains("bad size"));
+        assert!(tab.pending_ocr_regions.is_empty());
+        assert!(tab.text_detector_results.is_empty() && tab.pending_region_detections.is_empty());
+        // A request whose region nobody awaits leaves the status alone.
+        tab.drop_ocr_region(9, "other".to_string(), Severity::Warning);
+        assert_ne!(tab.text_detector_status, "other");
+    }
+
+    /// Clear drops the awaited OCR regions: their answers are discarded, never merged into the
+    /// cleared stores.
+    #[test]
+    fn clear_drops_awaited_ocr_regions() {
+        let (mut tab, _model) = tab_with_model();
+        let ctx = egui::Context::default();
+        tab.text_detection_storage_loaded_for = Some(PathBuf::from("/home/u/title/chapter"));
+        tab.pending_ocr_regions.insert(5);
+        tab.clear_detector_result_stores();
+        tab.receive_ocr_region(&ctx, 5, Some(Ok(neurolate_region_on_page_0())));
+        assert!(tab.text_detector_results.is_empty());
+        assert!(tab.pending_region_detections.is_empty());
     }
 }

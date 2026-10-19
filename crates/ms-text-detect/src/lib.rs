@@ -11,6 +11,7 @@ Modules:
 - `mask`       : detector mask normalization to 0/255 with the pixel guard.
 - `db`         : DB postprocess (probability map, f32 or u8 -> quads).
 - `glyph_mask` : glyph mask from quads over the full-resolution page.
+- `polygon_mask`: polygons with per-polygon holes -> 0/255 `BinaryMask` (cloud OCR masks).
 - `plan`       : the one owner of the per-engine scale and tiling decision and the panel notice.
 - `stitch`     : feathered stitching of per-tile probability maps.
 - `runner`     : the forward-pass seam (`ProbMapRunner`) and the `ProbMap` it returns.
@@ -39,8 +40,10 @@ mod num;
 pub use db::Quad;
 
 pub mod mask;
+pub mod polygon_mask;
 
 pub use blocks::DetectRect;
+pub use polygon_mask::{MaskPolygon, rasterize_polygons};
 
 pub mod pipeline;
 pub mod plan;

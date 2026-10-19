@@ -11,12 +11,18 @@ Main types:
   router's claim; the crop writes crop metadata instead of dispatching OCR.
 - `route_inputs::OcrRouteInputsRefresh` (child module `tab/route_inputs.rs`, desktop-only): the
   cached OCR/detector routing inputs, re-read from `user_config` by a background worker.
+- `neurolate_settings` / `neurolate_key` (wiring in child module `tab/neurolate.rs`): the ONE
+  NeuroLate settings store (persisted under `OCR.params.neurolate`) and the ONE key + limit
+  panel, shared by the detector and OCR panels; `neurolate_params` resolves the request.
 - `AdvancedRecognitionWindow`: floating OCR preview/editor for manual region recognition.
 - `OcrToast`: short-lived foreground notification (`text`, `severity`, `hide_at_s`); its colour
   comes from `ms_theme::Severity` (toasts and detector status never hand-type colours).
 - `OcrPendingBubbleInsert`: deferred bubble-create payload after OCR response.
 - `BuiltOcrRequest`: OCR request + resolved page index for a scene selection.
-- `TextDetectorOcrTask`: OCR task derived from text-detector block (`page_idx`, `uv_rect`, retry).
+- `tab/block_bubbles.rs`: block + recognized text -> bubble (block OCR results and the NeuroLate
+  page texts of `PageDetected::texts`), `block_uv_rect` for block OCR tasks.
+- `TextDetectorOcrTask`: OCR task derived from text-detector block (`page_idx`, `uv_rect`, retry);
+  `block_ocr_retry_after_failure` decides its one automatic retry (never for NeuroLate).
 - `TextDetectorOcrRetryState`: delayed retry state for failed text-detector OCR task.
 - `TextDetectorLineSelection` / `TextDetectorLineDragState`: runtime состояния
   режима ручного редактирования строк детектора (выбор/перетаскивание/resize).
@@ -118,9 +124,11 @@ Text detector flow:
 - `SessionCapabilities::chapter_storage`: false in a single-image session (scratch deleted on
   exit): no lazy load, no Save button, a stray save request is refused.
 - `poll_text_detection_storage_events`: applies load/save completion results.
-- `tab/detector_region.rs`: an OCR selection's region detection (PaddleOCR / Surya with that
-  engine's `*_detect_mask` parameter; started from `start_ocr_for_scene_rect` and the advanced
-  window's Create bubble, answered through `poll_text_detector_events`) merged into both detector
+- `tab/detector_region.rs`: an OCR selection's region detection (PaddleOCR / Surya / NeuroLate
+  with that engine's own "create mask" parameter; started from `start_ocr_for_scene_rect` and the
+  advanced window's Create bubble, answered through `poll_text_detector_events`, or for a quick
+  NeuroLate selection by the OCR answer itself, `Recognized::region` -> `receive_ocr_region`,
+  awaited in `pending_ocr_regions`) merged into both detector
   stores (held in `pending_region_detections` while a storage job runs), and
   `detection_pages_for_save`, the Save snapshot of the SHOWN masks (shared model, brush edits
   included), taken under the model lock with only the written masks copied.
@@ -133,7 +141,8 @@ Text detector flow:
   availability helpers for detector OCR actions.
 - `collect_detected_block_rects_px`: resolved detector blocks with current panel options.
 - `textdetector_ocr_is_running`: aggregate detector-OCR busy state.
-- `text_detector_run_mode`, `text_detector_running_status`: detector mode/status selection.
+- `text_detector_run_mode`, `text_detector_running_status`: detector mode/status selection
+  (the NeuroLate mode carries `neurolate_params`, see `tab/neurolate.rs`).
 - `start_text_detection_for_current_page`, `start_text_detection_for_all_pages`:
   detector run entry points.
 - `start_text_detector_ocr_for_indices`: queues OCR tasks for detected blocks.
@@ -246,7 +255,7 @@ use ms_memory::{
 use ms_models::SessionCapabilities;
 use ms_models::text_mask_model::{TextMaskModel, TextMaskPage};
 use ms_sysprobe::paste_image;
-use ms_project::{Bubble, Page, ProjectData};
+use ms_project::{Bubble, ComicType, Page, ProjectData};
 use ms_config::app_tab::AppTab;
 use ms_tabs_simple::characters::load_character_names;
 use crate::adv_rec::{
@@ -284,12 +293,14 @@ use crate::panels::machine_translation::{
     MtPanelOptions, MtPanelProgress, MtPanelRun, MtPanelTab, MtStopNotice, draw_machine_translation_panel,
 };
 use crate::panels::ocr::{
-    CharReplacementRuleUi, OcrPanelModelView, OcrPanelOptions, OcrSelectionHints, draw_ocr_panel, selected_mode_requirement,
+    CharReplacementRuleUi, OcrPanelModelView, OcrPanelNeurolate, OcrPanelOptions, OcrSelectionHints, draw_ocr_panel, selected_mode_requirement,
 };
 use crate::panels::text_detector::{
-    DetectorUnavailable, TextDetectorAlgorithm, TextDetectorPanelOptions, TextDetectorPanelView, TextDetectorPlanNoticeCache,
-    detector_page_size, draw_text_detector_panel,
+    DetectorUnavailable, TextDetectorAlgorithm, TextDetectorNeurolate, TextDetectorPanelOptions, TextDetectorPanelView,
+    TextDetectorPlanNoticeCache, detector_page_size, draw_text_detector_panel,
 };
+use crate::neurolate::NeurolateSettings;
+use ms_ai_api::neurolate::NeurolateKeyPanel;
 use crate::text_detector::{
     RegionDetection, SURYA_DETECTOR_SPECS, TextDetectorControllerEvent, TextDetectorPageResult, TextDetectorRect, TextDetectorRunMode,
     TranslationTextDetectorController,
@@ -321,6 +332,10 @@ mod canvas_input;
 // An OCR selection's region detection (trigger, merge into both detector stores) and the
 // detector Save snapshot of the shown masks.
 mod detector_region;
+// The tab's NeuroLate key panel step and the resolved NeuroLate request parameters.
+mod neurolate;
+// Detector block + recognized text -> bubble, shared by block OCR and NeuroLate page texts.
+mod block_bubbles;
 // Off-GUI-thread refresh of the OCR / detector routing inputs (desktop-only).
 #[cfg(not(target_arch = "wasm32"))]
 mod route_inputs;
@@ -574,6 +589,13 @@ struct TextDetectorOcrTask {
     retry_attempt: u8,
 }
 
+/// The retry of a block-OCR task whose request failed: the same selection once more, only for a
+/// first attempt sent with an engine that may repeat a request automatically (never NeuroLate:
+/// a paid request is not sent twice without the user; `None` engine = unknown, no retry).
+fn block_ocr_retry_after_failure(task: TextDetectorOcrTask, engine: Option<OcrEngine>) -> Option<TextDetectorOcrTask> {
+    (task.retry_attempt == 0 && engine.is_some_and(OcrEngine::retries_failed_block_request)).then_some(TextDetectorOcrTask { retry_attempt: 1, ..task })
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TextDetectorOcrRetryState {
     task: TextDetectorOcrTask,
@@ -647,6 +669,7 @@ struct TranslationSettingsSaveRequest {
     mt_options: MtPanelOptions,
     composition_options: CompositionPanelOptions,
     text_detector_options: TextDetectorPanelOptions,
+    neurolate: NeurolateSettings,
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -670,7 +693,7 @@ pub struct TranslationTabState {
     /// Key / metadata requests of the OCR panel's AI API connection widget
     /// (`ocr_panel_options.ai_api`), polled by `poll_ai_api_events`.
     ocr_ai_api_tasks: AiApiTaskRunner,
-    ocr_engine_states: [OcrLoadState; 7],
+    ocr_engine_states: [OcrLoadState; 8],
     /// Install status and explicit downloads of the external OCR models (Baberu OCR,
     /// PaddleOCR-VL variants); polled every frame by `poll_ocr_model_downloads`.
     ocr_model_downloads: OcrModelDownloadController,
@@ -696,6 +719,11 @@ pub struct TranslationTabState {
     text_detector_controller: TranslationTextDetectorController,
     text_detector_options: TextDetectorPanelOptions,
     text_detector_plan_notice: TextDetectorPlanNoticeCache,
+    /// The ONE store of the NeuroLate language / comic type / "create mask" choices, read by the
+    /// detector panel, the OCR panel and every NeuroLate request (persisted with `OCR`).
+    neurolate_settings: NeurolateSettings,
+    /// The ONE NeuroLate key + limit panel of the tab, shared by the detector and OCR panels.
+    neurolate_key: NeurolateKeyPanel,
     text_detector_results: HashMap<usize, TextDetectorPageResult>,
     text_detector_mask_textures: HashMap<usize, TextDetectorMaskTexturePage>,
     text_mask_model: Option<Arc<Mutex<TextMaskModel>>>,
@@ -734,6 +762,10 @@ pub struct TranslationTabState {
     /// (`detector_region::replay_pending_region_detections`), so a region never replaces a
     /// stored page the load has not delivered yet.
     pending_region_detections: Vec<RegionDetection>,
+    /// Quick-selection OCR requests whose answer also carries the selection's region (NeuroLate
+    /// `MASK_AND_TEXT`, `detector_region::receive_ocr_region`); dropped by Clear and a replacing
+    /// page batch like `pending_region_detections`.
+    pending_ocr_regions: HashSet<u64>,
     /// The running canvas-wide rect selection (quick / advanced OCR, image crop), driven from the
     /// router's claim (`canvas_input::advance_selection`).
     canvas_selection: Option<CanvasSelection>,
@@ -747,6 +779,9 @@ pub struct TranslationTabState {
     pending_textdetector_ocr_tasks: VecDeque<TextDetectorOcrTask>,
     textdetector_ocr_active_request_id: Option<u64>,
     textdetector_ocr_active_task: Option<TextDetectorOcrTask>,
+    /// The engine the active block-OCR request was sent with (its automatic retry policy,
+    /// `OcrEngine::retries_failed_block_request`); set and cleared with the active task.
+    textdetector_ocr_active_engine: Option<OcrEngine>,
     textdetector_ocr_retry_state: Option<TextDetectorOcrRetryState>,
     textdetector_ocr_total: usize,
     textdetector_ocr_done: usize,
@@ -857,7 +892,7 @@ impl TranslationTabState {
             ocr_controller: TranslationOcrController::default(),
             ocr_panel_options: OcrPanelOptions::default(),
             ocr_ai_api_tasks: AiApiTaskRunner::default(),
-            ocr_engine_states: [OcrLoadState::NotLoaded; 7],
+            ocr_engine_states: [OcrLoadState::NotLoaded; 8],
             ocr_model_downloads: OcrModelDownloadController::new(),
             ocr_loading_engine: None,
             ocr_model_download: ModelDownloadStatus::default(),
@@ -875,6 +910,8 @@ impl TranslationTabState {
             text_detector_controller: TranslationTextDetectorController::default(),
             text_detector_options: TextDetectorPanelOptions::default(),
             text_detector_plan_notice: TextDetectorPlanNoticeCache::default(),
+            neurolate_settings: NeurolateSettings::default(),
+            neurolate_key: NeurolateKeyPanel::new(),
             text_detector_results: HashMap::new(),
             text_detector_mask_textures: HashMap::new(),
             text_mask_model: None,
@@ -894,6 +931,7 @@ impl TranslationTabState {
             text_detection_storage_loaded_for: None,
             text_detection_storage_busy: false,
             pending_region_detections: Vec::new(),
+            pending_ocr_regions: HashSet::new(),
             text_detection_storage_rx: None,
             canvas_selection: None,
             advanced_recognition: AdvancedRecognitionWindow::default(),
@@ -906,6 +944,7 @@ impl TranslationTabState {
             pending_textdetector_ocr_tasks: VecDeque::new(),
             textdetector_ocr_active_request_id: None,
             textdetector_ocr_active_task: None,
+            textdetector_ocr_active_engine: None,
             textdetector_ocr_retry_state: None,
             textdetector_ocr_total: 0,
             textdetector_ocr_done: 0,
@@ -1011,6 +1050,7 @@ impl Drop for TranslationTabState {
             mt_options: MtPanelOptions::default(),
             composition_options: CompositionPanelOptions::default(),
             text_detector_options: TextDetectorPanelOptions::default(),
+            neurolate: NeurolateSettings::default(),
         });
         if let Some(handle) = self.settings_save_thread.take() {
             let _ = handle.join();
@@ -1028,6 +1068,7 @@ impl TranslationTabState {
             OcrEngine::AiApi => 4,
             OcrEngine::PaddleVl => 5,
             OcrEngine::Baberu => 6,
+            OcrEngine::NeuroLate => 7,
         }
     }
 
@@ -1595,7 +1636,12 @@ impl TranslationTabState {
                             .current()
                             .filter(|_| self.ocr_loading_engine == Some(selected_engine_before)),
                     },
+                    OcrPanelNeurolate { settings: &mut self.neurolate_settings, key: &mut self.neurolate_key, project_type: project.comic_type },
                 );
+                // Pumped only while its UI is drawn (see `tab/neurolate.rs`).
+                if self.ocr_panel_options.engine == OcrEngine::NeuroLate {
+                    self.pump_neurolate_key(ctx, actions.neurolate_key);
+                }
                 if actions.options_changed {
                     self.ocr_settings_dirty = true;
                     if selected_engine_before != self.ocr_panel_options.engine
@@ -1622,7 +1668,7 @@ impl TranslationTabState {
                         self.mark_ocr_load_requested_for_engine(self.ocr_panel_options.engine);
                         self.ocr_controller.request_load(
                             self.ocr_panel_options.engine,
-                            build_ocr_runtime_options(&self.ocr_panel_options, &self.mt_panel_options.source_lang),
+                            build_ocr_runtime_options(&self.ocr_panel_options, &self.mt_panel_options.source_lang, &self.neurolate_settings, project.comic_type),
                         );
                     }
                 }
@@ -1721,7 +1767,8 @@ impl TranslationTabState {
                     progress: self.text_detector_progress,
                     model_download: self.text_detector_model_download.current(),
                     surya_model: surya_model.as_ref(),
-                    detect_busy: self.text_detector_controller.is_busy(),
+                    detect_busy: self.detector_busy_for_batches(),
+                    batch_running: self.text_detector_controller.is_batch_running(),
                     ocr_busy,
                     has_pages,
                     availability,
@@ -1733,17 +1780,32 @@ impl TranslationTabState {
                     edit_mask_mode: self.text_detector_edit_mask_mode,
                     page_size,
                 };
+                let neurolate = TextDetectorNeurolate {
+                    settings: &mut self.neurolate_settings,
+                    key: &mut self.neurolate_key,
+                    mt_source_lang: &self.mt_panel_options.source_lang,
+                    project_type: project.comic_type,
+                };
                 let actions = draw_text_detector_panel(
                     ui,
                     &mut self.text_detector_options,
                     &mut self.text_detector_plan_notice,
                     &view,
+                    neurolate,
                 );
                 if actions.options_changed {
                     self.text_detector_settings_dirty = true;
                 }
+                // NeuroLate settings persist with the OCR section (shared with the OCR panel).
+                self.ocr_settings_dirty |= actions.neurolate_changed;
+                if self.text_detector_options.algorithm == TextDetectorAlgorithm::NeuroLate {
+                    self.pump_neurolate_key(ctx, actions.neurolate_key);
+                }
                 if actions.cancel_detection {
                     self.text_detector_controller.cancel_detection();
+                }
+                if actions.stop_detection {
+                    self.text_detector_controller.request_stop();
                 }
                 self.apply_detector_model_panel_action(actions.surya_model_download);
                 if actions.toggle_edit_lines_mode {
@@ -2316,7 +2378,8 @@ impl TranslationTabState {
                     self.ocr_model_download.record(event);
                     ctx.request_repaint();
                 }
-                OcrControllerEvent::Recognized { request_id, result } => {
+                OcrControllerEvent::Recognized { request_id, result, region } => {
+                    self.receive_ocr_region(ctx, request_id, region);
                     let manual_target = if self.manual_ocr_active_request_id == Some(request_id) {
                         self.manual_ocr_active_request_id = None;
                         self.manual_ocr_result_target.take()
@@ -2364,26 +2427,12 @@ impl TranslationTabState {
                         self.push_toast(ctx, quick_msg, Severity::Success, 3.0);
                     }
                     if let Some(pending_insert) = self.pending_bubble_inserts.remove(&request_id) {
-                        let original_text =
-                            build_bubble_original_text(&result, pending_insert.join_newlines);
-                        if !original_text.trim().is_empty()
-                            && canvas.create_bubble_with_original_text_at_page_uv_rect(
-                                pending_insert.page_idx,
-                                pending_insert.uv_rect,
-                                original_text,
-                            )
-                        {
-                            if let Some(rank) = pending_insert.recent_character_rank {
-                                let _ = self.apply_recent_character_rank_to_latest_bubble(
-                                    canvas, project, rank,
-                                );
-                            }
-                            canvas.flush_pending_bubble_upserts_now(project);
-                        }
+                        self.insert_recognized_bubble(canvas, project, &pending_insert, &result);
                     }
                     if self.textdetector_ocr_active_request_id == Some(request_id) {
                         self.textdetector_ocr_active_request_id = None;
                         self.textdetector_ocr_active_task = None;
+                        self.textdetector_ocr_active_engine = None;
                         self.textdetector_ocr_retry_state = None;
                         self.textdetector_ocr_done = self.textdetector_ocr_done.saturating_add(1);
                         if !result.text.trim().is_empty() {
@@ -2403,6 +2452,7 @@ impl TranslationTabState {
                     self.push_toast(ctx, msg, Severity::Success, 2.2);
                 }
                 OcrControllerEvent::RecognizeFailed { request_id, error } => {
+                    self.drop_ocr_region(request_id, tf!("translation.tab.region_detect_error", error = error), Severity::Error);
                     let manual_target = if self.manual_ocr_active_request_id == Some(request_id) {
                         self.manual_ocr_active_request_id = None;
                         self.manual_ocr_result_target.take()
@@ -2415,15 +2465,11 @@ impl TranslationTabState {
                         .apply_recognition_error(request_id, error.clone());
                     if self.textdetector_ocr_active_request_id == Some(request_id) {
                         self.textdetector_ocr_active_request_id = None;
-                        if let Some(task) = self.textdetector_ocr_active_task.take()
-                            && task.retry_attempt == 0
-                        {
+                        let engine = self.textdetector_ocr_active_engine.take();
+                        if let Some(task) = self.textdetector_ocr_active_task.take().and_then(|task| block_ocr_retry_after_failure(task, engine)) {
                             let now_s = ctx.input(|i| i.time);
                             self.textdetector_ocr_retry_state = Some(TextDetectorOcrRetryState {
-                                task: TextDetectorOcrTask {
-                                    retry_attempt: 1,
-                                    ..task
-                                },
+                                task,
                                 retry_at_s: now_s + TEXT_DETECTOR_OCR_RETRY_DELAY_SECS,
                             });
                             self.set_text_detector_status(
@@ -2461,6 +2507,7 @@ impl TranslationTabState {
                 // A user stop: drop the request's pending targets like a failure, but report it
                 // neutrally (no error toast, no detector retry).
                 OcrControllerEvent::RecognizeCancelled { request_id } => {
+                    self.drop_ocr_region(request_id, t!("translation.tab.recognition_cancelled_status").to_string(), Severity::Info);
                     if self.manual_ocr_active_request_id == Some(request_id) {
                         self.manual_ocr_active_request_id = None;
                         self.manual_ocr_result_target = None;
@@ -2487,7 +2534,7 @@ impl TranslationTabState {
         }
     }
 
-    fn poll_text_detector_events(&mut self, ctx: &egui::Context) {
+    fn poll_text_detector_events(&mut self, ctx: &egui::Context, canvas: &mut CanvasView, project: &ProjectData) {
         // Regions held back by a storage job that has ended since.
         self.replay_pending_region_detections(ctx);
         for event in self.text_detector_controller.poll_events() {
@@ -2512,7 +2559,12 @@ impl TranslationTabState {
                         Severity::Info,
                     );
                 }
-                TextDetectorControllerEvent::PageDetected { page_idx, result } => {
+                TextDetectorControllerEvent::PageDetected { page_idx, result, texts } => {
+                    // NeuroLate "recognize text right away": the block texts of this page become
+                    // bubbles exactly as block OCR makes them.
+                    if let Some(texts) = texts {
+                        self.create_bubbles_from_page_texts(canvas, project, page_idx, &result, &texts);
+                    }
                     self.text_detector_results.insert(page_idx, result);
                     self.text_detector_mask_textures.remove(&page_idx);
                     self.sync_text_mask_page_from_result(page_idx);
@@ -2763,6 +2815,7 @@ impl TranslationTabState {
         self.text_detector_mask_textures.clear();
         self.clear_text_mask_model();
         self.pending_region_detections.clear();
+        self.pending_ocr_regions.clear();
     }
 
     /// Applies the chapter's stored detection: fills only pages that hold no result yet (a page
@@ -3065,10 +3118,10 @@ impl TranslationTabState {
     /// Builds the run mode for the selected algorithm (`TextDetectorPanelOptions::run_mode`,
     /// the same mode the panel's plan notice uses), or the localized refusal text when
     /// [`TextDetectorAlgorithm::availability`] says it cannot run now.
-    fn text_detector_run_mode(&self) -> Result<TextDetectorRunMode, String> {
+    fn text_detector_run_mode(&self, project: &ProjectData) -> Result<TextDetectorRunMode, String> {
         let algorithm = self.text_detector_options.algorithm;
         self.text_detector_availability().map_err(|reason| reason.status_text(algorithm))?;
-        Ok(self.text_detector_options.run_mode())
+        Ok(self.text_detector_options.run_mode(self.neurolate_detect(project)))
     }
 
     fn text_detector_running_status(&self) -> &'static str {
@@ -3077,6 +3130,7 @@ impl TranslationTabState {
             TextDetectorAlgorithm::PaddleOcr => t!("translation.tab.detecting_paddle_status"),
             TextDetectorAlgorithm::Ai => t!("translation.tab.detecting_ai_status"),
             TextDetectorAlgorithm::Surya => t!("translation.tab.detecting_surya_status"),
+            TextDetectorAlgorithm::NeuroLate => t!("translation.tab.detecting_neurolate_status"),
         }
     }
 
@@ -3085,7 +3139,7 @@ impl TranslationTabState {
         project: &ProjectData,
         canvas: &CanvasView,
     ) {
-        if self.text_detector_controller.is_busy() {
+        if self.detector_busy_for_batches() {
             return;
         }
         let page_idx = canvas.current_page_idx();
@@ -3093,7 +3147,7 @@ impl TranslationTabState {
             self.set_text_detector_status(t!("translation.tab.current_page_not_found_status"), Severity::Error);
             return;
         };
-        let mode = match self.text_detector_run_mode() {
+        let mode = match self.text_detector_run_mode(project) {
             Ok(mode) => mode,
             Err(error) => {
                 self.set_text_detector_status(error, Severity::Error);
@@ -3123,7 +3177,7 @@ impl TranslationTabState {
     }
 
     fn start_text_detection_for_all_pages(&mut self, project: &ProjectData) {
-        if self.text_detector_controller.is_busy() {
+        if self.detector_busy_for_batches() {
             return;
         }
         let pages = project
@@ -3131,7 +3185,7 @@ impl TranslationTabState {
             .iter()
             .map(|page| (page.idx, page.path.clone()))
             .collect::<Vec<_>>();
-        let mode = match self.text_detector_run_mode() {
+        let mode = match self.text_detector_run_mode(project) {
             Ok(mode) => mode,
             Err(error) => {
                 self.set_text_detector_status(error, Severity::Error);
@@ -3195,24 +3249,11 @@ impl TranslationTabState {
                 continue;
             };
             let blocks = detector_blocks_with_options(result, &self.text_detector_options);
-            if blocks.is_empty() {
-                continue;
-            }
-            let source_w = result.source_size[0].max(1) as f32;
-            let source_h = result.source_size[1].max(1) as f32;
             for rect in blocks {
-                let u1 = (rect.x1 / source_w).clamp(0.0, 1.0);
-                let v1 = (rect.y1 / source_h).clamp(0.0, 1.0);
-                let u2 = (rect.x2 / source_w).clamp(0.0, 1.0);
-                let v2 = (rect.y2 / source_h).clamp(0.0, 1.0);
-                if (u2 - u1) <= 0.0001 || (v2 - v1) <= 0.0001 {
+                let Some(uv_rect) = block_bubbles::block_uv_rect(&rect, result.source_size) else {
                     continue;
-                }
-                tasks.push_back(TextDetectorOcrTask {
-                    page_idx,
-                    uv_rect: [u1, v1, u2, v2],
-                    retry_attempt: 0,
-                });
+                };
+                tasks.push_back(TextDetectorOcrTask { page_idx, uv_rect, retry_attempt: 0 });
             }
         }
 
@@ -3225,6 +3266,7 @@ impl TranslationTabState {
         self.pending_textdetector_ocr_tasks = tasks;
         self.textdetector_ocr_active_request_id = None;
         self.textdetector_ocr_active_task = None;
+        self.textdetector_ocr_active_engine = None;
         self.textdetector_ocr_retry_state = None;
         self.textdetector_ocr_total = self.pending_textdetector_ocr_tasks.len();
         self.textdetector_ocr_done = 0;
@@ -3285,7 +3327,7 @@ impl TranslationTabState {
             let request = OcrRecognizeRequest {
                 request_id,
                 engine: self.ocr_panel_options.engine,
-                options: build_ocr_runtime_options(&self.ocr_panel_options, &self.mt_panel_options.source_lang),
+                options: build_ocr_runtime_options(&self.ocr_panel_options, &self.mt_panel_options.source_lang, &self.neurolate_settings, project.comic_type),
                 page_path: page.path.clone(),
                 uv_rect: task.uv_rect,
                 image_override_png: None,
@@ -3293,6 +3335,8 @@ impl TranslationTabState {
                 reflect_strings: self.ocr_panel_options.reflect_strings,
                 char_replacements: self.ocr_panel_options.runtime_char_replacements(),
                 fix_caps_lock: self.ocr_panel_options.fix_caps_lock,
+                // Block OCR reads text only (NeuroLate: `TEXT` mode), never a region.
+                region: None,
             };
             if self.ocr_panel_options.create_bubble {
                 self.pending_bubble_inserts.insert(
@@ -3339,6 +3383,7 @@ impl TranslationTabState {
             }
             self.textdetector_ocr_active_request_id = Some(request_id);
             self.textdetector_ocr_active_task = Some(task);
+            self.textdetector_ocr_active_engine = Some(self.ocr_panel_options.engine);
             break;
         }
 
@@ -3366,6 +3411,7 @@ impl TranslationTabState {
         self.textdetector_ocr_recognized = 0;
         self.textdetector_ocr_active_request_id = None;
         self.textdetector_ocr_active_task = None;
+        self.textdetector_ocr_active_engine = None;
         self.textdetector_ocr_retry_state = None;
         self.pending_textdetector_ocr_tasks.clear();
         self.text_detector_progress = None;
@@ -3405,6 +3451,7 @@ impl TranslationTabState {
         self.textdetector_ocr_recognized = 0;
         self.textdetector_ocr_active_request_id = None;
         self.textdetector_ocr_active_task = None;
+        self.textdetector_ocr_active_engine = None;
         self.textdetector_ocr_retry_state = None;
         self.pending_textdetector_ocr_tasks.clear();
         self.text_detector_progress = None;
@@ -4437,6 +4484,7 @@ impl TranslationTabState {
             request_id,
             &self.ocr_panel_options,
             &self.mt_panel_options.source_lang,
+            &self.neurolate_settings,
         ) else {
             self.push_toast(
                 ctx,
@@ -4613,10 +4661,11 @@ impl TranslationTabState {
                 // The window's ORIGINAL page selection (never its edited / rotated preview),
                 // with the engine parameters as they are now.
                 if let Some(page) = project.pages.iter().find(|page| page.idx == page_idx) {
-                    let options = build_ocr_runtime_options(&self.ocr_panel_options, &self.mt_panel_options.source_lang);
+                    let options = build_ocr_runtime_options(&self.ocr_panel_options, &self.mt_panel_options.source_lang, &self.neurolate_settings, project.comic_type);
                     let engine = self.ocr_panel_options.engine;
                     let selection = detector_region::OcrSelection { page_idx, page_path: page.path.clone(), uv_rect };
-                    self.start_selection_region_detection(ctx, project, engine, &options, selection);
+                    // Never carried by an OCR answer: NeuroLate sends a separate `MASK` request.
+                    self.start_selection_region_detection(ctx, project, engine, &options, selection, None);
                 }
             }
             AdvancedRecognitionAction::Close => {
@@ -4644,13 +4693,14 @@ impl TranslationTabState {
         let request_id = self.next_ocr_request_id;
         self.next_ocr_request_id = self.next_ocr_request_id.saturating_add(1);
 
-        let Some(built_request) = build_ocr_request(
+        let Some(mut built_request) = build_ocr_request(
             canvas,
             project,
             scene_rect,
             request_id,
             &self.ocr_panel_options,
             &self.mt_panel_options.source_lang,
+            &self.neurolate_settings,
         ) else {
             self.push_toast(
                 ctx,
@@ -4689,6 +4739,9 @@ impl TranslationTabState {
             page_path: built_request.request.page_path.clone(),
             uv_rect: built_request.request.uv_rect,
         };
+        // NeuroLate: the same request also returns the region (none while the detector is busy).
+        built_request.request.region = self.ocr_region_want_for(region_engine, &region_options, built_request.page_idx);
+        let carried_by = built_request.request.region.is_some().then_some(request_id);
         self.dispatch_manual_ocr_request(
             ctx,
             built_request,
@@ -4697,7 +4750,7 @@ impl TranslationTabState {
         );
         // The detector runs on the same selection only when the OCR itself was dispatched.
         if self.manual_ocr_active_request_id == Some(request_id) {
-            self.start_selection_region_detection(ctx, project, region_engine, &region_options, region_selection);
+            self.start_selection_region_detection(ctx, project, region_engine, &region_options, region_selection, carried_by);
         }
     }
 }
@@ -5186,12 +5239,13 @@ impl CanvasHooks for TranslationTabState {
         if self.detector_overlay_visible() {
             self.ensure_text_detection_storage_loaded(project);
         }
-        self.poll_text_detector_events(ctx);
+        self.poll_text_detector_events(ctx, canvas, project);
         self.poll_text_detection_storage_events(project);
         self.poll_ocr_events(ctx, canvas, project);
         self.poll_ocr_model_downloads(ctx);
         self.poll_mt_events(ctx, canvas);
         self.poll_ai_api_events(ctx);
+        self.poll_neurolate_key(ctx);
         // The canvas-wide rect selections (mouse and finger alike) come from the router's
         // claim; the canvas raises its own capture area while one is armed.
         self.drive_canvas_selection(ctx, canvas, project);
@@ -5518,6 +5572,8 @@ impl TranslationTabState {
         let ocr = project.settings_data.get("OCR").and_then(Value::as_object);
         // A missing or unknown variant key loads as the default variant (saved back as its key).
         self.ocr_panel_options.paddle_vl_model = paddle_vl_model_from_settings(ocr);
+        // Absent or unknown values load as the defaults: never the previous title's choices.
+        self.neurolate_settings = crate::neurolate::settings_from_json(ocr.and_then(|ocr| ocr.get("params")).and_then(Value::as_object));
         if let Some(ocr_obj) = ocr {
             if let Some(engine_raw) = ocr_obj.get("engine").and_then(Value::as_str) {
                 self.ocr_panel_options.engine = parse_ocr_engine_key(engine_raw);
@@ -5957,6 +6013,7 @@ impl TranslationTabState {
             mt_options: self.mt_panel_options.clone(),
             composition_options: self.composition_panel_options.clone(),
             text_detector_options: self.text_detector_options.clone(),
+            neurolate: self.neurolate_settings,
         };
         if self.settings_save_tx.send(request).is_ok() {
             self.ocr_settings_dirty = false;
@@ -7046,6 +7103,7 @@ fn spawn_translation_settings_saver_thread()
                 &latest.mt_options,
                 &latest.composition_options,
                 &latest.text_detector_options,
+                &latest.neurolate,
             ) {
                 // Structured log: a malformed `settings.json` is now left untouched, so this
                 // is where the user-facing trace of a skipped save lives.
@@ -7073,6 +7131,7 @@ fn save_translation_settings_to_project_file(
     mt_options: &MtPanelOptions,
     composition_options: &CompositionPanelOptions,
     text_detector_options: &TextDetectorPanelOptions,
+    neurolate: &NeurolateSettings,
 ) -> Result<(), String> {
     let doc = ms_docstore::DocRef::new(settings_file, ms_docstore::DocKind::ProjectSettings);
     // Default options = the historical layout (2-space pretty, no trailing newline, parent
@@ -7083,7 +7142,7 @@ fn save_translation_settings_to_project_file(
         let Some(root_obj) = root.as_object_mut() else {
             return Err(format!("settings root of '{}' is not a JSON object", settings_file.display()));
         };
-        apply_translation_settings_sections(root_obj, ocr_options, mt_options, composition_options, text_detector_options);
+        apply_translation_settings_sections(root_obj, ocr_options, mt_options, composition_options, text_detector_options, neurolate);
         Ok(())
     })
     .map_err(|err| format!("failed to save translation settings '{}': {err}", settings_file.display()))
@@ -7096,12 +7155,14 @@ const STALE_TEXT_DETECTOR_PARAM_KEYS: [&str; 4] =
 
 /// Writes the four sections the translation tab owns (`OCR`, `machine_translation`,
 /// `composition`, `text_detector`) into the `settings.json` root; other keys are untouched.
+/// The NeuroLate settings go under `OCR.params.neurolate`.
 fn apply_translation_settings_sections(
     root_obj: &mut Map<String, Value>,
     ocr_options: &OcrPanelOptions,
     mt_options: &MtPanelOptions,
     composition_options: &CompositionPanelOptions,
     text_detector_options: &TextDetectorPanelOptions,
+    neurolate: &NeurolateSettings,
 ) {
 
     let mut ocr_obj = root_obj
@@ -7279,6 +7340,7 @@ fn apply_translation_settings_sections(
         Value::String(ocr_options.ai_api.system_instruction.clone()),
     );
     params_obj.insert("ai_api".to_string(), Value::Object(ai_api_obj));
+    neurolate.write_json(&mut params_obj);
     ocr_obj.insert("params".to_string(), Value::Object(params_obj));
     root_obj.insert("OCR".to_string(), Value::Object(ocr_obj));
 
@@ -7577,6 +7639,7 @@ fn parse_text_detector_algorithm_key(raw: &str) -> TextDetectorAlgorithm {
         "surya" | "suryaocr" | "surya_ocr" | "surya-det" | "surya_det" => {
             TextDetectorAlgorithm::Surya
         }
+        "neurolate" => TextDetectorAlgorithm::NeuroLate,
         _ => TextDetectorAlgorithm::Classic,
     }
 }
@@ -7592,6 +7655,7 @@ fn parse_ocr_engine_key(engine: &str) -> OcrEngine {
         "surya" | "suryaocr" | "surya_ocr" => OcrEngine::Surya,
         "baberu" | "baberu_ocr" | "baberuocr" => OcrEngine::Baberu,
         "aiapi" | "ai_api" | "ai-api" | "genai" => OcrEngine::AiApi,
+        "neurolate" => OcrEngine::NeuroLate,
         "paddle_onnx" | "paddleonnx" | "paddle-onnx" | "onnx" => OcrEngine::PaddleOcr,
         "mangaocr" | "manga_ocr" | "manga" | "mocr" => OcrEngine::MangaOcr,
         _ => OcrEngine::MangaOcr,
@@ -7607,6 +7671,7 @@ fn ocr_engine_to_project_key(engine: OcrEngine) -> &'static str {
         OcrEngine::Surya => "surya",
         OcrEngine::AiApi => "ai_api",
         OcrEngine::Baberu => "baberu",
+        OcrEngine::NeuroLate => "neurolate",
     }
 }
 
@@ -7669,8 +7734,10 @@ fn detect_mask_param(engine_params: &Map<String, Value>) -> Option<bool> {
 }
 
 /// Snapshots the OCR panel state into worker options. `ocr_source_lang` is the OCR input
-/// language (the MT panel's source-language code) the AI API default instruction is worded for.
-fn build_ocr_runtime_options(ocr_options: &OcrPanelOptions, ocr_source_lang: &str) -> OcrRuntimeOptions {
+/// language (the MT panel's source-language code) the AI API default instruction is worded for;
+/// with `neurolate` (the tab's NeuroLate settings) and `project_type` it also resolves the
+/// NeuroLate request parameters (`crate::neurolate::request_params`).
+fn build_ocr_runtime_options(ocr_options: &OcrPanelOptions, ocr_source_lang: &str, neurolate: &NeurolateSettings, project_type: Option<ComicType>) -> OcrRuntimeOptions {
     let surya_is_active = ocr_options.engine == OcrEngine::Surya;
     OcrRuntimeOptions {
         manga_model: ocr_options.manga_model.clone(),
@@ -7715,11 +7782,15 @@ fn build_ocr_runtime_options(ocr_options: &OcrPanelOptions, ocr_source_lang: &st
         ai_api_model: ocr_options.ai_api.model.clone(),
         ai_api_system_instruction: ocr_options.ai_api.system_instruction.clone(),
         ai_api_source_lang: ocr_source_lang.to_string(),
+        neurolate: crate::neurolate::request_params(neurolate, ocr_source_lang, project_type),
+        neurolate_detect_mask: neurolate.detect_mask,
     }
 }
 
 /// Builds the recognize request for a canvas selection on the page it overlaps most (`None`
-/// when it overlaps no page). `ocr_source_lang` as in `build_ocr_runtime_options`.
+/// when it overlaps no page). `ocr_source_lang` and `neurolate` as in
+/// `build_ocr_runtime_options`. The request carries no region (the quick-selection trigger
+/// sets it).
 fn build_ocr_request(
     canvas: &CanvasView,
     project: &ProjectData,
@@ -7727,6 +7798,7 @@ fn build_ocr_request(
     request_id: u64,
     ocr_options: &OcrPanelOptions,
     ocr_source_lang: &str,
+    neurolate: &NeurolateSettings,
 ) -> Option<BuiltOcrRequest> {
     let mut best_area = 0.0_f32;
     let mut best_page: Option<(&Page, Rect)> = None;
@@ -7763,7 +7835,7 @@ fn build_ocr_request(
         request: OcrRecognizeRequest {
             request_id,
             engine: ocr_options.engine,
-            options: build_ocr_runtime_options(ocr_options, ocr_source_lang),
+            options: build_ocr_runtime_options(ocr_options, ocr_source_lang, neurolate, project.comic_type),
             page_path: page.path.clone(),
             uv_rect: [u1, v1, u2, v2],
             image_override_png: None,
@@ -7771,6 +7843,7 @@ fn build_ocr_request(
             reflect_strings: ocr_options.reflect_strings,
             char_replacements: ocr_options.runtime_char_replacements(),
             fix_caps_lock: ocr_options.fix_caps_lock,
+            region: None,
         },
         page_idx: page.idx,
     })
@@ -8334,6 +8407,7 @@ mod settings_persistence_tests {
             &MtPanelOptions::default(),
             &CompositionPanelOptions::default(),
             &TextDetectorPanelOptions::default(),
+            &crate::neurolate::NeurolateSettings::default(),
         )
     }
 
@@ -8418,6 +8492,7 @@ mod ocr_model_settings_tests {
             &MtPanelOptions::default(),
             &CompositionPanelOptions::default(),
             &TextDetectorPanelOptions::default(),
+            &crate::neurolate::NeurolateSettings::default(),
         );
         root.get("OCR").and_then(Value::as_object).cloned().unwrap_or_default()
     }

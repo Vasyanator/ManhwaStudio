@@ -14,7 +14,8 @@ caller: k = cleaning geometry upscale_factor_for(W, H, frame_constraints(offer.r
                                             reference PNG (same xk, alpha kept), native mask,
                                             size labels, endpoint -> PreparedCall { EditCall }
   -> adapter (EditProtocol, per ApiShape)   EditCall -> HttpRequestSpec; response -> NextStep
-  -> native executor                        HTTP, polling, cancel, download, key injection
+  -> native executor                        polling, cancel, download, key injection
+       over crate::http::UreqTransport       (the shared transport: agents, caps, timeouts)
   -> pipeline::finish(request, prepared, bytes)
                                             bounded decode; size != (kW, kH) -> SizeMismatch;
                                             downscale_box /k; composite_feathered; alpha 255; W x H
@@ -23,8 +24,9 @@ caller: k = cleaning geometry upscale_factor_for(W, H, frame_constraints(offer.r
 `adapters::protocol_for(shape)`, `executor::execute`, a cancel check (an answer that arrived
 after a cancel is dropped), `finish`; one `runtime_log` line per run. Everything in this
 directory is target-neutral except `executor.rs` (native only; `run_image_edit` is a
-`WebUnavailable` stub on wasm); the network lives only in the executor, the credential store
-only behind `keys.rs` / `key_state.rs`.
+`WebUnavailable` stub on wasm); the network lives only in the executor (through the
+crate-private `crate::http` transport, shared with the crate's other REST clients), the
+credential store only behind `keys.rs` / `key_state.rs`.
 
 ## Files and submodules
 - `mod.rs`: the public surface (re-exports).
@@ -45,19 +47,22 @@ only behind `keys.rs` / `key_state.rs`.
 - `pipeline.rs`: `prepare` / `finish`, endpoint resolution, `run_image_edit` (native run over
   the executor; `run_with` takes the transport so tests script it).
 - `executor.rs` (native, crate-private): `execute` drives the `EditProtocol` steps over the
-  `HttpTransport` seam (`UreqTransport`); `ExecutorLimits` (timeouts, run deadline, poll
-  schedule, retry backoff, body caps) and the pure policy `retry_allowed`, `auth_allowed`,
-  `poll_delay`, `retry_delay`, `log_body`.
+  `crate::http::HttpTransport` seam (`UreqTransport`); `ExecutorLimits` (timeouts, run deadline,
+  poll schedule, retry backoff, body caps), `poll_delay`, `retry_delay` and
+  `failing_body_summary`. It uses `crate::http`'s `retry_allowed`, `auth_allowed` and `log_body`
+  and maps `HttpError` onto `ImageEditError` at the transport boundary.
 - `keys.rs`: `ImageEditKeySlot` (`Chat(AiApiTarget)` | `Named { user, label }`), `key_slot`
   (provider + `EndpointChoice` -> slot), the one dispatch `ImageEditKeySlot::{read, store,
   clear}` onto `crate::keys`, and `read_key` / `store_key` / `clear_key`.
 - `adapters/`: one pure `EditProtocol` per `ApiShape` plus `protocol_for`; see its
   `MODULE_README.md`.
-- `protocol.rs`: `EditProtocol`, `EditCall`, `HttpRequestSpec`, `HttpResponse`, `NextStep`,
-  `StepCtx`, `JobRef` (job id plus the provider-issued poll / cancel URLs the adapters reuse),
-  `AuthScheme`.
-- `multipart.rs`: `MultipartForm` -> `MultipartBody`.
-- `error.rs`: `ImageEditError` (localized `Display`, `Clone`).
+- `protocol.rs`: `EditProtocol`, `EditCall`, `NextStep`, `StepCtx`, `JobRef` (job id plus the
+  provider-issued poll / cancel URLs the adapters reuse); re-exports `HttpMethod`,
+  `AuthScheme`, `HttpBody`, `HttpRequestSpec`, `HttpResponse` from `crate::http` (their owner).
+- `multipart.rs`: compatibility re-export of `crate::http`'s `MultipartForm` -> `MultipartBody`.
+- `error.rs`: `ImageEditError` (localized `Display`, `Clone`); `From<HttpError>` maps the
+  transport failures 1:1 (`RequestBuild`, `Network`, `Timeout`, `BodyTooLarge` ->
+  `DownloadTooLarge`).
 - `key_state.rs`: `ImageEditKeyState` (the key block's state; pure single-flight `select_slot`
   / `begin` / `apply`), `ImageEditKeyRunner` (runs the one in-flight check / store / delete on
   an `ms_thread` worker; `pump` per frame), the `ImageEditKeyStore` seam and its impl for
@@ -138,11 +143,13 @@ only behind `keys.rs` / `key_state.rs`.
 - Add or correct a model / size rule: `catalog.rs` row (+ `size_rule.rs` constant with its
   source); keep `SizeEvidence` honest; update the pinned tests.
 - Change the size pipeline: `pipeline.rs` (with `codec.rs`, `composite.rs`).
-- Add an API shape: `adapters/` (file + `protocol_for` arm); HTTP behaviour (timeouts,
-  retries, auth host rule, caps): `executor.rs`; a provider host that may receive the key
+- Add an API shape: `adapters/` (file + `protocol_for` arm); image-edit HTTP policy (timeouts,
+  retries, polling, caps, which origin may get the key): `executor.rs`; the transport itself
+  (agents, redirects, header forms, the origin comparison, log digest): `crate::http`; a provider host that may receive the key
   besides its base URL: `provider.rs` `auth_host_suffixes`; where a key lives: `keys.rs`.
 - Opt-in live check of a provider: `crates/ms-ai-api/tests/live_image_edit.rs`.
-- Change the request contract for adapters: `protocol.rs`, `multipart.rs`.
+- Change the request contract for adapters: `protocol.rs`; the shared request types and the
+  multipart encoding: `crate::http` (`request.rs`, `multipart.rs`).
 - Add an error: `error.rs` variant + `ai_api.image_edit.error.*` key in
   `crates/ms-i18n/locales/en.json` and `ru.json`.
 - Change the picker's layout or notes: `view.rs` (texts `ai_api.image_edit.{provider,endpoint,

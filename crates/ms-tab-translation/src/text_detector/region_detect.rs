@@ -1,18 +1,24 @@
 /*
 FILE OVERVIEW: crates/ms-tab-translation/src/text_detector/region_detect.rs
-Region detection for an OCR selection: the detector of the selected OCR engine (PaddleOCR or
-Surya) runs on exactly the page pixels the OCR crop reads, and its mask and blocks replace the
-page's detector result inside the selection.
+Region detection for an OCR selection: the detector of the selected OCR engine (PaddleOCR,
+Surya or the NeuroLate cloud service) runs on exactly the page pixels the OCR crop reads, and its
+mask and blocks replace the page's detector result inside the selection.
 
 Key items:
 - `RegionDetectEngine`: the OCR engines that are also text detectors, and the one rule of when a
-  selection OCR also detects (`for_ocr`: engine + that engine's own "create mask" parameter).
+  selection OCR also detects (`selection_detects`: engine + that engine's own "create mask"
+  parameter; `for_ocr` maps it onto the request options). `rides_on_ocr_answer`: NeuroLate's
+  region comes from the OCR answer itself, never from a detector run.
+- `RegionDetectEngine::ocr_region_want()`: the `OcrRegionWant` a quick selection's OCR request
+  carries (NeuroLate with its parameter on), so one `MASK_AND_TEXT` request yields the text and
+  the region.
 - `RegionDetectRequest`: what the tab asks the detector worker for (page, uv selection, engine,
   dilation).
 - `RegionDetection`: the worker's answer — the selection's pixel rect, its mask at the rect size
   and its blocks in PAGE pixels.
-- `run_region_detection()`: worker side (decode, `page_crop` rect, crop, `pipeline::detect_image`,
-  Rust dilation, offset to page pixels).
+- `run_region_detection()`: worker side (decode, `page_crop` rect, crop, then
+  `pipeline::detect_image` + Rust dilation + offset to page pixels, or for NeuroLate one paid
+  `MASK` request on the crop converted by `neurolate::region_from_image`).
 - `merge_region_into_page()` / `empty_page_result()`: pure "replace inside the rect" merge into a
   page result.
 
@@ -25,8 +31,10 @@ crop, so it stops at the selection border. Worker-thread only, except the pure m
 */
 
 use super::pipeline::{self, DetectFailure, DetectorRoute};
-use super::{TextDetectorPageResult, TextDetectorPaddleOcrOptions, TextDetectorRect, TextDetectorRunMode, TextDetectorSuryaOptions, dilate_mask_alpha};
-use crate::ocr::{OcrEngine, OcrRuntimeOptions};
+use super::neurolate::{self, NeurolateKey};
+use super::{NeurolateDetect, TextDetectorPageResult, TextDetectorPaddleOcrOptions, TextDetectorRect, TextDetectorRunMode, TextDetectorSuryaOptions, dilate_mask_alpha};
+use crate::ocr::{DetectMaskFlags, OcrEngine, OcrRegionWant, OcrRuntimeOptions};
+use ms_ai_api::neurolate::OcrParams;
 use crate::page_crop;
 use ms_models::text_mask_model::{RegionMergeError, replace_mask_region};
 use ms_sysprobe::ai_models::EnsureCtx;
@@ -39,27 +47,61 @@ use std::path::PathBuf;
 pub enum RegionDetectEngine {
     PaddleOcr,
     Surya,
+    /// The NeuroLate cloud detector with the request parameters resolved by the tab
+    /// (`crate::neurolate::request_params`).
+    NeuroLate(OcrParams),
 }
 
 impl RegionDetectEngine {
-    /// The detector a selection OCR with `engine` also runs: `Some` only for PaddleOCR and Surya
-    /// with that engine's own "create mask and text blocks" parameter on. The one owner of the
-    /// trigger rule.
+    /// Whether a selection OCR with `engine` also creates the detector mask and blocks: only
+    /// PaddleOCR, Surya and NeuroLate, each by its own parameter in `flags`. The ONE owner of
+    /// the trigger rule (the request trigger and the overlay visibility both ask it).
     #[must_use]
-    pub(crate) fn for_ocr(engine: OcrEngine, options: &OcrRuntimeOptions) -> Option<Self> {
-        Self::from_flags(engine, options.paddle_detect_mask, options.surya_detect_mask)
+    pub(crate) fn selection_detects(engine: OcrEngine, flags: DetectMaskFlags) -> bool {
+        match engine {
+            OcrEngine::PaddleOcr => flags.paddle,
+            OcrEngine::Surya => flags.surya,
+            OcrEngine::NeuroLate => flags.neurolate,
+            OcrEngine::MangaOcr | OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Baberu | OcrEngine::AiApi => false,
+        }
     }
 
-    /// The rule of [`Self::for_ocr`] over the two engine parameters themselves (the panel's
-    /// `OcrPanelOptions` hold the same flags): `Some` only for PaddleOCR / Surya with their own
-    /// flag on.
+    /// The detector a selection OCR with `engine` and `options` also runs ([`Self::selection_detects`]
+    /// over the request's flags); NeuroLate carries the request's resolved parameters.
     #[must_use]
-    pub(crate) fn from_flags(engine: OcrEngine, paddle_detect_mask: bool, surya_detect_mask: bool) -> Option<Self> {
+    pub(crate) fn for_ocr(engine: OcrEngine, options: &OcrRuntimeOptions) -> Option<Self> {
+        if !Self::selection_detects(engine, DetectMaskFlags::of_options(options)) {
+            return None;
+        }
         match engine {
-            OcrEngine::PaddleOcr => paddle_detect_mask.then_some(Self::PaddleOcr),
-            OcrEngine::Surya => surya_detect_mask.then_some(Self::Surya),
+            OcrEngine::PaddleOcr => Some(Self::PaddleOcr),
+            OcrEngine::Surya => Some(Self::Surya),
+            OcrEngine::NeuroLate => Some(Self::NeuroLate(options.neurolate)),
             OcrEngine::MangaOcr | OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Baberu | OcrEngine::AiApi => None,
         }
+    }
+
+    /// Whether a quick selection's region of this engine comes from the OCR answer itself (one
+    /// NeuroLate `MASK_AND_TEXT` request) instead of a separate detector run. Only the quick
+    /// selection rides; the advanced window's Create bubble always runs the detector (NeuroLate:
+    /// a separate `MASK` request on the original selection).
+    #[must_use]
+    pub(crate) fn rides_on_ocr_answer(self) -> bool {
+        match self {
+            Self::NeuroLate(_) => true,
+            Self::PaddleOcr | Self::Surya => false,
+        }
+    }
+
+    /// What a quick selection's OCR request must also return (`OcrRecognizeRequest::region`):
+    /// `Some` exactly when the selection detects ([`Self::for_ocr`]) with an engine whose region
+    /// rides on the OCR answer (NeuroLate). `page_idx` is the selection's page,
+    /// `mask_dilate_size` the detector panel's dilation.
+    #[must_use]
+    pub(crate) fn ocr_region_want(engine: OcrEngine, options: &OcrRuntimeOptions, page_idx: usize, mask_dilate_size: i32) -> Option<OcrRegionWant> {
+        Self::for_ocr(engine, options)
+            .filter(|region_engine| region_engine.rides_on_ocr_answer())
+            .map(|_| OcrRegionWant { page_idx, mask_dilate_size })
     }
 
     /// The page-detector mode of the same engine (backend gate and model ensure reuse it).
@@ -68,13 +110,9 @@ impl RegionDetectEngine {
         match self {
             Self::PaddleOcr => TextDetectorRunMode::PaddleOcr(TextDetectorPaddleOcrOptions::default()),
             Self::Surya => TextDetectorRunMode::Surya(TextDetectorSuryaOptions),
-        }
-    }
-
-    fn engine_kind(self) -> EngineKind {
-        match self {
-            Self::PaddleOcr => EngineKind::Paddle,
-            Self::Surya => EngineKind::Surya,
+            // A region runs its own `MASK` request (`run_region_detection`); the mode serves the
+            // gate and the key read only.
+            Self::NeuroLate(params) => TextDetectorRunMode::NeuroLate(NeurolateDetect { params, with_text: false }),
         }
     }
 }
@@ -110,13 +148,16 @@ pub struct RegionDetection {
 
 /// Runs `request.engine`'s detector on the selection of the page file. Decodes the page, cuts the
 /// selection with the OCR crop rule (`page_crop::uv_rect_to_pixel_rect`), detects on the crop
-/// (`route` decides PaddleOCR native vs backend, as for pages), dilates the crop mask and offsets
-/// the blocks to page pixels. Worker-thread only (decode, inference / IPC, model ensure).
+/// (`route` decides PaddleOCR native vs backend, as for pages; NeuroLate sends the crop with
+/// `neurolate_key`, read once by the caller), dilates the crop mask and offsets the blocks to
+/// page pixels. Worker-thread only (decode, inference / IPC / HTTP, model ensure).
 ///
 /// # Errors
-/// [`DetectFailure::Cancelled`] when `ctx.cancel` stopped a model download, else `Failed` with
-/// the localized open / empty-page / selection-too-small message or `detect_image`'s error.
-pub(super) fn run_region_detection(request: &RegionDetectRequest, route: DetectorRoute, ctx: &mut EnsureCtx<'_>) -> Result<RegionDetection, DetectFailure> {
+/// [`DetectFailure::Cancelled`] when `ctx.cancel` stopped a model download or the NeuroLate
+/// wait, else `Failed` with the localized open / empty-page / selection-too-small message,
+/// `detect_image`'s error, or the NeuroLate request / answer error (a NeuroLate request without
+/// a key is an internal error).
+pub(super) fn run_region_detection(request: &RegionDetectRequest, route: DetectorRoute, neurolate_key: Option<&NeurolateKey>, ctx: &mut EnsureCtx<'_>) -> Result<RegionDetection, DetectFailure> {
     let page = pipeline::decode_page_rgb(&request.page_path)?;
     let source_size = [page.width(), page.height()];
     let Some(rect) = page_crop::uv_rect_to_pixel_rect(request.uv_rect, source_size[0], source_size[1]) else {
@@ -130,7 +171,22 @@ pub(super) fn run_region_detection(request: &RegionDetectRequest, route: Detecto
         request.page_path.display(),
         rect.xyxy()
     ));
-    let detection = pipeline::detect_image(request.engine.engine_kind(), &crop, &DetectParams::default(), route, ctx)?;
+    let engine_kind = match request.engine {
+        RegionDetectEngine::PaddleOcr => EngineKind::Paddle,
+        RegionDetectEngine::Surya => EngineKind::Surya,
+        RegionDetectEngine::NeuroLate(params) => {
+            let Some(key) = neurolate_key else {
+                ms_log::runtime_log::log_error("[text-detector] NeuroLate region requested without a key (dispatch bug)");
+                return Err(DetectFailure::Failed(t!("translation.text_detector.mode_dispatch_error").to_string()));
+            };
+            let image = neurolate::recognize_image(key, params, &crop, ctx.cancel)?;
+            return neurolate::region_from_image(request.page_idx, request.engine, source_size, rect, &image, request.mask_dilate_size).map_err(|error| {
+                ms_log::runtime_log::log_error(format!("[text-detector] NeuroLate region answer of page {} rejected: {error}", request.page_idx));
+                DetectFailure::Failed(error)
+            });
+        }
+    };
+    let detection = pipeline::detect_image(engine_kind, &crop, &DetectParams::default(), route, ctx)?;
     let mut mask_alpha = detection.mask.alpha;
     dilate_mask_alpha(&mut mask_alpha, detection.mask.size, request.mask_dilate_size);
     let blocks = offset_blocks(&detection.blocks, rect.x, rect.y);
@@ -146,7 +202,7 @@ fn region_contains_block_centre(rect: [u32; 4], block: &TextDetectorRect) -> boo
 }
 
 /// Moves crop-pixel blocks to page pixels (the crop's top-left is `(dx, dy)`).
-fn offset_blocks(blocks: &[TextDetectorRect], dx: u32, dy: u32) -> Vec<TextDetectorRect> {
+pub(super) fn offset_blocks(blocks: &[TextDetectorRect], dx: u32, dy: u32) -> Vec<TextDetectorRect> {
     // u32 -> f32 is exact for every page side the detector accepts (its pixel limit keeps sides
     // far below 2^24), which is the space the blocks already live in.
     let (dx, dy) = (dx as f32, dy as f32);
@@ -290,10 +346,10 @@ mod tests {
         assert_eq!(offset_blocks(&[rect(1.0, 2.0, 3.0, 4.0)], 10, 20), vec![rect(11.0, 22.0, 13.0, 24.0)]);
     }
 
-    /// Only PaddleOCR and Surya detect, each by its own parameter.
-    #[test]
-    fn only_paddle_and_surya_detect_by_their_own_parameter() {
-        let options = |paddle: bool, surya: bool| OcrRuntimeOptions {
+    const PARAMS: OcrParams = OcrParams { language: ms_ai_api::neurolate::NeurolateLanguage::Ja, comic_type: ms_ai_api::neurolate::NeurolateComicType::Manga };
+
+    fn options_with(flags: DetectMaskFlags) -> OcrRuntimeOptions {
+        OcrRuntimeOptions {
             manga_model: String::new(),
             paddle_lang: String::new(),
             paddle_vl_script: String::new(),
@@ -305,20 +361,70 @@ mod tests {
             surya_drop_repeated_text: false,
             surya_max_sliding_window: 0,
             surya_max_tokens: 0,
-            paddle_detect_mask: paddle,
-            surya_detect_mask: surya,
+            paddle_detect_mask: flags.paddle,
+            surya_detect_mask: flags.surya,
             ai_api_service: ms_ai_api::AiApiService::OpenAi,
             ai_api_base_url: String::new(),
             ai_api_model: String::new(),
             ai_api_system_instruction: String::new(),
             ai_api_source_lang: String::new(),
-        };
-        assert_eq!(RegionDetectEngine::for_ocr(OcrEngine::PaddleOcr, &options(true, false)), Some(RegionDetectEngine::PaddleOcr));
-        assert_eq!(RegionDetectEngine::for_ocr(OcrEngine::PaddleOcr, &options(false, true)), None);
-        assert_eq!(RegionDetectEngine::for_ocr(OcrEngine::Surya, &options(false, true)), Some(RegionDetectEngine::Surya));
-        assert_eq!(RegionDetectEngine::for_ocr(OcrEngine::Surya, &options(true, false)), None);
-        for engine in [OcrEngine::MangaOcr, OcrEngine::EasyOcr, OcrEngine::PaddleVl, OcrEngine::Baberu, OcrEngine::AiApi] {
-            assert_eq!(RegionDetectEngine::for_ocr(engine, &options(true, true)), None, "{engine:?}");
+            neurolate: PARAMS,
+            neurolate_detect_mask: flags.neurolate,
         }
+    }
+
+    const ALL_ENGINES: [OcrEngine; 8] = [
+        OcrEngine::MangaOcr,
+        OcrEngine::EasyOcr,
+        OcrEngine::PaddleOcr,
+        OcrEngine::PaddleVl,
+        OcrEngine::Surya,
+        OcrEngine::AiApi,
+        OcrEngine::Baberu,
+        OcrEngine::NeuroLate,
+    ];
+
+    /// Only PaddleOCR, Surya and NeuroLate detect, each by its own parameter: the full truth
+    /// table over every engine and every flag combination.
+    #[test]
+    fn only_detector_engines_detect_by_their_own_parameter() {
+        for paddle in [false, true] {
+            for surya in [false, true] {
+                for neurolate in [false, true] {
+                    let flags = DetectMaskFlags { paddle, surya, neurolate };
+                    for engine in ALL_ENGINES {
+                        let expected = match engine {
+                            OcrEngine::PaddleOcr => paddle.then_some(RegionDetectEngine::PaddleOcr),
+                            OcrEngine::Surya => surya.then_some(RegionDetectEngine::Surya),
+                            OcrEngine::NeuroLate => neurolate.then_some(RegionDetectEngine::NeuroLate(PARAMS)),
+                            OcrEngine::MangaOcr | OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Baberu | OcrEngine::AiApi => None,
+                        };
+                        let case = format!("{engine:?} {flags:?}");
+                        assert_eq!(RegionDetectEngine::selection_detects(engine, flags), expected.is_some(), "{case}");
+                        assert_eq!(RegionDetectEngine::for_ocr(engine, &options_with(flags)), expected, "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Only a NeuroLate region rides on the OCR answer: the quick selection asks the OCR request
+    /// for it; PaddleOCR / Surya (their own detector run) and engines that do not detect never.
+    #[test]
+    fn only_neurolate_regions_ride_on_the_ocr_request() {
+        assert!(RegionDetectEngine::NeuroLate(PARAMS).rides_on_ocr_answer());
+        assert!(!RegionDetectEngine::PaddleOcr.rides_on_ocr_answer());
+        assert!(!RegionDetectEngine::Surya.rides_on_ocr_answer());
+        let all_on = options_with(DetectMaskFlags { paddle: true, surya: true, neurolate: true });
+        for engine in ALL_ENGINES {
+            let want = RegionDetectEngine::ocr_region_want(engine, &all_on, 3, 5);
+            if engine == OcrEngine::NeuroLate {
+                assert_eq!(want, Some(OcrRegionWant { page_idx: 3, mask_dilate_size: 5 }));
+            } else {
+                assert_eq!(want, None, "{engine:?}");
+            }
+        }
+        let neurolate_off = options_with(DetectMaskFlags { paddle: true, surya: true, neurolate: false });
+        assert_eq!(RegionDetectEngine::ocr_region_want(OcrEngine::NeuroLate, &neurolate_off, 3, 5), None, "parameter off");
     }
 }

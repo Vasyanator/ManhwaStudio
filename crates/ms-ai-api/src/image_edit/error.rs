@@ -16,6 +16,7 @@ is passed through so the user sees the provider's own reason).
 use std::fmt;
 
 use crate::error::AiApiError;
+use crate::http::HttpError;
 
 /// Failure of an image-edit run, from request validation through the HTTP exchange to the
 /// size-exact finish of the result.
@@ -133,10 +134,24 @@ impl From<AiApiError> for ImageEditError {
     }
 }
 
+/// A failure of the shared transport (`crate::http`) maps 1:1 onto the image-edit variant with
+/// the same meaning, so the executor's retry rule and log lines see image-edit errors only.
+impl From<HttpError> for ImageEditError {
+    fn from(error: HttpError) -> Self {
+        match error {
+            HttpError::RequestBuild { detail } => Self::RequestBuild { detail },
+            HttpError::Network { detail } => Self::Network { detail },
+            HttpError::Timeout { stage } => Self::Timeout { stage },
+            HttpError::BodyTooLarge { limit_bytes } => Self::DownloadTooLarge { limit_bytes },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ImageEditError;
     use crate::error::AiApiError;
+    use crate::http::HttpError;
 
     // No UI locale is installed in this test binary, so only the Display == user_message
     // contract is asserted, never the localized text itself.
@@ -158,5 +173,13 @@ mod tests {
         let source = AiApiError::EmptyKey;
         let wrapped = ImageEditError::from(source.clone());
         assert_eq!(wrapped.to_string(), source.to_string());
+    }
+
+    #[test]
+    fn http_error_maps_onto_image_edit_error() {
+        assert!(matches!(ImageEditError::from(HttpError::RequestBuild { detail: "bad name".to_string() }), ImageEditError::RequestBuild { detail } if detail == "bad name"));
+        assert!(matches!(ImageEditError::from(HttpError::Network { detail: "reset".to_string() }), ImageEditError::Network { detail } if detail == "reset"));
+        assert!(matches!(ImageEditError::from(HttpError::Timeout { stage: "poll".to_string() }), ImageEditError::Timeout { stage } if stage == "poll"));
+        assert!(matches!(ImageEditError::from(HttpError::BodyTooLarge { limit_bytes: 42 }), ImageEditError::DownloadTooLarge { limit_bytes: 42 }));
     }
 }

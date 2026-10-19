@@ -131,6 +131,10 @@ android/app/src/main/assets/
 # clone needs them. Regenerate with tools/make_region_postprocess_fixtures.py (whitelisted below).
 !crates/ms-region-postprocess/fixtures/**
 
+# Recorded NeuroLate API responses of ms-ai-api (sanitized: zero request ids, a fake key prefix
+# and name, no images). The client's parser tests read them, so a clean clone needs them.
+!crates/ms-ai-api/fixtures/**
+
 # ag-psd is a standalone project (github.com/Vasyanator/ag-psd-rs) consumed from
 # crates.io (ag-psd = "0.2.0"); its local dev checkout is not part of this repo.
 crates/ag-psd/

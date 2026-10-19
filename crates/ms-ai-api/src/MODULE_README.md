@@ -12,7 +12,8 @@ real "Stop" and its status widget, plus the validated executor (one format-repai
 tolerant answer readers of `structured.rs`. Every feature that talks to
 a hosted model goes through it; today that is the translation tab's AI API OCR engine and AI API
 machine translation (`crates/ms-tab-translation`). The cloud image-edit layer (`image_edit/`:
-hosted image-editing models with a size-exact pipeline) lives here too.
+hosted image-editing models with a size-exact pipeline) and the NeuroLate cloud OCR /
+text-detection client (`neurolate/`) live here too.
 
 Layer: one level above `ms-widgets`; it uses `ms-i18n` (localized texts), `ms-log`
 (diagnostics), `ms-thread` (workers), `ms-theme` (`Severity`, status colours), `ms-widgets` (`WheelComboBox`),
@@ -91,9 +92,17 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
 - `quota.rs`: `is_probable_quota_or_limit_error`.
 - `encoding.rs`: `base64_encode` / strict `base64_decode` (`Base64Error`), the one base64 codec
   (chat parts, image-edit bodies and responses).
+- `http/` (crate-private): the shared HTTP plumbing of the crate's hand-rolled REST clients —
+  request / response descriptions, the `multipart/form-data` builder, `HttpError` and the
+  native `ureq` transport (`HttpTransport` seam, `UreqTransport`, `auth_allowed`,
+  `retry_allowed`, `log_body`); no caller policy. See its `MODULE_README.md`.
 - `image_edit/`: the cloud image-edit layer (provider and model catalogue, size-rule data, the
   size-exact pipeline, one adapter per API shape in `adapters/`, the native HTTP executor, the
   provider / model picker `view.rs` and its single-flight key state `key_state.rs`); see its
+  `MODULE_README.md`.
+- `neurolate/`: the NeuroLate cloud OCR / text-detection client (key slot `"neurolate:api"`,
+  typed request / response model, the never-retried, abandonable paid `recognize`, the free
+  key / limit fetch, the key + limit panel `NeurolateKeyPanel` and its view); see its
   `MODULE_README.md`.
 - `connection.rs`: `AiApiConnectionState` (+ redacted `Debug`), `AiApiConnectionActions`,
   `AiApiEventOutcome`, `AiApiNotice`; `begin_requests` / `apply_event` (GUI-free, unit-tested).
@@ -138,8 +147,8 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
   are persistence contracts shared by OCR and MT (the "OCR" in the name is historical). A key
   bound to no target (an image-edit provider) lives in a named slot of the same service, user
   name `"image_edit:{provider_key}"` or `"image_edit:{provider_key}@{region}"` (region-bound
-  keys), built only by `NamedKeyUser` — also a frozen persistence contract; the `:` keeps it
-  disjoint from every target user name. A key is
+  keys), and the NeuroLate key under `"neurolate:api"`, built only by `NamedKeyUser` — also
+  frozen persistence contracts; the `:` keeps them disjoint from every target user name. A key is
   never logged, never put in an error, never put in a URL (OpenRouter gets it in the
   `Authorization` header only). `read_api_key` returns `Ok("")` when no key is stored. Key
   requests and events carry the `AiApiTarget`; storing or clearing needs a valid target.
@@ -300,8 +309,8 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
 - Add or correct a model capability: `model_caps.rs` (keep carve-outs before their family
   prefix; add a test per group).
 - Change base-URL rules: `target.rs`; how the URL reaches `genai`: `client.rs`, `metadata.rs`.
-- Change key storage: `keys.rs` (keep `KEYRING_SERVICE`, both target user-name forms and the
-  named `image_edit:` forms).
+- Change key storage: `keys.rs` (keep `KEYRING_SERVICE`, both target user-name forms, the
+  named `image_edit:` forms and `neurolate:api`).
 - Change the model list or account status: `metadata.rs`, `openrouter.rs`.
 - Change live generation progress, Stop semantics or the streaming executor: `generation.rs`;
   its look: `generation_view.rs` (`ai_api.generation.*` keys).
@@ -315,3 +324,8 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
   `ru.json`.
 - Cloud image editing (providers, models, size rules, pipeline, adapters, executor, picker and
   key block): `image_edit/`.
+- NeuroLate OCR / detection (request fields, statuses, the key + limit panel): `neurolate/`.
+- Shared HTTP transport behaviour (agents, redirects, key header forms, body cap, timeout
+  mapping, the key-origin rule, the logged-body digest) or the multipart encoding: `http/`.
+  Every REST client of the crate uses it; its policy knobs (timeouts, caps, retries) stay with
+  each caller.

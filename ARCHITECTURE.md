@@ -85,8 +85,9 @@ shared wiki view). The studio never references
 - `ms-log` — session log (`runtime_log`) and opt-in trace log (`trace_log!` / `trace_scope!`).
 - `ms-text-detect` — GUI-free text-detection domain (block sort and cap, mask normalization, DB
   postprocess, glyph mask, per-engine scale/tiling plan, tile stitching and the runner pipeline
-  with the CTD, Paddle and Surya postprocess); the model forward pass is supplied by the caller
-  through `ProbMapRunner`. No logging, wasm-buildable.
+  with the CTD, Paddle and Surya postprocess, and the polygons-with-holes -> 0/255 mask raster
+  `polygon_mask` used for cloud detector answers); the model forward pass is supplied by the
+  caller through `ProbMapRunner`. No logging, wasm-buildable.
 - `ms-custom-fonts` — GUI-free custom fonts: the kind-tagged recipe (hybrid = weighted blend of
   2-4 real fonts by one of five blend algorithms, optionally split shape / spacing / kerning
   weights; combined planned), its SHA-256 key and the compiler that turns a recipe plus
@@ -164,6 +165,11 @@ shared wiki view). The studio never references
   pipeline — integer ×k replicate up / box down only, output must be exactly k·W×k·H, composite
   only inside the mask. The size VALIDITY decision stays with the cleaning frame
   (`region_edit_v2::geometry`); `image_edit` carries rule data mapped 1:1 onto it.
+  `neurolate/` is the GUI-free NeuroLate cloud OCR / text-detection client (typed form-field
+  protocol, a paid POST that carries a fresh `Idempotency-Key`, is never retried and is abandoned — not aborted — on cancel, with
+  a process-wide cap on unfinished paid requests; the free key/limit fetch; the key + limit
+  panel). Crate-private `http/` is the one native transport, multipart builder and
+  key-origin check shared by `image_edit` and `neurolate`.
 
 **UI engines and tabs (levels 8-12)**
 - `ms-canvas` — the shared page + bubble canvas; declares `CanvasHooks`.
@@ -505,7 +511,8 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   (desktop: the OS keyring; Android: the Keystore-backed `ms_platform::credentials` store over the
   Kotlin `CredentialBridge`, where an undecryptable value is an error, never "no key"): AI API keys
   (`ms_ai_api::keys`; per service, per service + base URL for compatible endpoints, and frozen
-  `image_edit:{provider}[@{region}]` names for image-edit providers) and the Hugging Face token (`ms_sysprobe::hf_token`, a cached
+  `image_edit:{provider}[@{region}]` names for image-edit providers, frozen `neurolate:api` for
+  the NeuroLate key) and the Hugging Face token (`ms_sysprobe::hf_token`, a cached
   process-wide value seeded off-thread). Keyring I/O never runs on the GUI thread; a token is
   never logged and reaches the backend only as a per-request field.
 - **Threads** — spawned through `ms_thread` on any path that also runs on wasm; `rayon` for CPU

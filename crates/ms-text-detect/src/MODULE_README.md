@@ -24,7 +24,7 @@ channel in scaled space -> the engine postprocess runs ONCE (Paddle: `db` on the
 
 Callers: `ms-onnx` (DB postprocess and glyph mask for native Paddle OCR detection and, as a
 producer of `ProbMap`, the native Paddle forward), `ms-tab-translation` (detection entry points,
-runners, region helpers, the panel's plan notice).
+runners, region helpers, the panel's plan notice), cloud OCR polygon masks).
 
 ## Files and submodules
 - `lib.rs`: crate root and module map.
@@ -35,6 +35,14 @@ runners, region helpers, the panel's plan notice).
 - `mask.rs`: `binary_alpha_from_gray` (decoded `GrayImage` -> `BinaryMask`, zero area -> empty,
   `MaskError::TooLarge` above `MAX_MASK_PIXELS` = 100 M), plus `exceeds_pixel_limit` and
   `normalize_binary_alpha` for callers that guard before allocating (classic mask promotion).
+- `polygon_mask.rs`: `MaskPolygon` (outer ring + its own hole rings, page pixels, f32) and
+  `rasterize_polygons([w, h], &[MaskPolygon]) -> Result<BinaryMask, MaskError>` (both re-exported
+  at the root) for services that answer a text mask as polygons (NeuroLate). Holes are PER
+  POLYGON: each polygon is filled into a scratch the size of its outer ring's span bbox (outer
+  -> 255, own holes -> 0) and ORed into the page, so a hole never clears a sibling polygon. All
+  rings go through `ms_raster::fill_polygon_spans` in page coordinates (no vertex translation);
+  rings under 3 points fill nothing; zero area -> empty mask; the `MAX_MASK_PIXELS` guard of
+  `mask.rs` applies before allocation.
 - `db.rs` (+ `db/`): `Quad` (re-exported at the crate root) and the DB postprocess
   (`boxes_from_bitmap_with(.., &DbParams)`: binarize, contours, min-area box, box score, unclip,
   rescale; `boxes_from_bitmap` = `DbParams::PADDLE`), generic over `ProbValue` (`f32` raw
@@ -107,6 +115,7 @@ runners, region helpers, the panel's plan notice).
 ## Editing map
 - To change how blocks are ordered or capped, edit `blocks.rs`.
 - To change mask normalization or the pixel guard, edit `mask.rs`.
+- To change how polygon masks (outer + holes) are combined, edit `polygon_mask.rs`.
 - To change DB box extraction, edit `db.rs` (preset knobs in `DbParams`); for the Paddle glyph
   mask, `glyph_mask.rs`.
 - To change the CTD mask refinement or seg resize, edit `ctd/` and keep the fixture parity exact.

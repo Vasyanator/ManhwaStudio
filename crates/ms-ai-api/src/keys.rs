@@ -13,8 +13,9 @@ Named slots: a key that belongs to no `AiApiTarget` (an image-edit provider such
 region-bound DashScope account) lives in the same credential-store service under a
 `NamedKeyUser`, whose user name `"image_edit:{provider_key}"` /
 `"image_edit:{provider_key}@{region}"` is a frozen persistence contract built only here. The
-`image_edit:` prefix contains a `:`, which no target user name does, so the two families never
-collide.
+NeuroLate cloud OCR key lives in the named slot `"neurolate:api"` (`NamedKeyUser::neurolate`),
+frozen the same way. Both prefixes contain a `:`, which no target user name does, so named and
+target slots never collide.
 
 Key functions:
 - read_api_key()  : `Ok("")` when no key is stored (for a compatible service: for that URL).
@@ -48,6 +49,10 @@ pub const KEYRING_SERVICE: &str = "ManhwaStudio AI API OCR";
 /// never change it.
 const IMAGE_EDIT_USER_PREFIX: &str = "image_edit:";
 
+/// Credential-store user name of the `NeuroLate` API key (`ms_ai_api::neurolate`). A persistence
+/// contract: never change it.
+const NEUROLATE_USER: &str = "neurolate:api";
+
 /// The credential-store user name of a named key slot (a key bound to no `AiApiTarget`). Built
 /// only by its constructors, so every named user name has one frozen shape; the user name is
 /// not a secret and may be logged.
@@ -65,6 +70,12 @@ impl NamedKeyUser {
             Some(region) => Self(format!("{IMAGE_EDIT_USER_PREFIX}{provider_key}@{region}")),
             None => Self(format!("{IMAGE_EDIT_USER_PREFIX}{provider_key}")),
         }
+    }
+
+    /// The slot of the `NeuroLate` API key: `"neurolate:api"` (frozen).
+    #[must_use]
+    pub fn neurolate() -> Self {
+        Self(NEUROLATE_USER.to_string())
     }
 
     /// The exact credential-store user name.
@@ -321,13 +332,15 @@ mod tests {
         assert_eq!(credential_user(&target(AiApiService::AnthropicCompatible, "https://proxy.example/api")), "anthropic_compatible@https://proxy.example/api/");
     }
 
-    // Persistence contract: changing a named user name orphans every image-edit key users saved.
+    // Persistence contract: changing a named user name orphans every image-edit / NeuroLate key
+    // users saved.
     #[test]
     fn named_user_names_are_frozen() {
         assert_eq!(NamedKeyUser::image_edit("bfl", None).as_str(), "image_edit:bfl");
         assert_eq!(NamedKeyUser::image_edit("dashscope", Some("intl")).as_str(), "image_edit:dashscope@intl");
         assert_ne!(NamedKeyUser::image_edit("dashscope", Some("intl")), NamedKeyUser::image_edit("dashscope", Some("cn")));
         assert_ne!(NamedKeyUser::image_edit("dashscope", Some("intl")), NamedKeyUser::image_edit("dashscope", None));
+        assert_eq!(NamedKeyUser::neurolate().as_str(), "neurolate:api");
     }
 
     // A named slot never aliases a target slot: target user names are `service.key()` or
@@ -337,7 +350,9 @@ mod tests {
         for service in AiApiService::ALL {
             assert!(!service.key().contains(':'), "{service:?}");
             assert!(!service.key().starts_with("image_edit"), "{service:?}");
+            assert!(!service.key().starts_with("neurolate"), "{service:?}");
         }
+        assert!(!NamedKeyUser::neurolate().as_str().starts_with(super::IMAGE_EDIT_USER_PREFIX), "the NeuroLate slot is not an image-edit slot");
         let compatible = credential_user(&target(AiApiService::OpenAiCompatible, "http://127.0.0.1:8080"));
         assert!(!compatible.starts_with(NamedKeyUser::image_edit("openai_compatible", None).as_str()));
     }

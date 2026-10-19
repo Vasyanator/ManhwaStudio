@@ -51,6 +51,14 @@ UI specifics:
 - PaddleOCR and Surya, which are also text detectors, each have their own "create mask and
   text blocks" parameter (`paddle_detect_mask` / `surya_detect_mask`, `draw_detect_mask_checkbox`):
   a selection OCR then also runs that engine's detector on the selected area (the tab's trigger).
+- NeuroLate (cloud, paid per text block) is a plain ungated selectable like AI API. Its body is
+  the tab's ONE NeuroLate settings block (`crate::neurolate::draw_neurolate_settings` with the
+  "create mask and text blocks" checkbox, id salt `translation.ocr.neurolate`, shared store with
+  the detector panel, edits folded into `options_changed`) and the key + limit panel
+  (`ms_ai_api::neurolate::draw_neurolate_key_panel`, actions in
+  `OcrPanelActions::neurolate_key`). While a request of the selected NeuroLate engine is in
+  flight the generation widget is replaced by a spinner, "Waiting for NeuroLate…" and a Stop
+  (`OcrPanelActions::stop_generation`): the result is dropped, the request may still be charged.
 - The selection hints name the bindings of the canvas gestures (`OcrSelectionHints`, from the
   input registry), finger alternatives included: which OCR a finger long-press drag makes is a
   binding (`translation.ocr.quick_rect` by default), not a panel setting. A title's stored
@@ -73,6 +81,12 @@ use crate::panels::ocr_langs::{
     PADDLEOCR_MAIN_LANGUAGES, lang_label,
 };
 use ms_widgets::{AiButton, AiCaps, AiRequirement, WheelComboBox};
+use crate::neurolate::{NeurolateSettings, NeurolateSettingsView, draw_neurolate_settings};
+use ms_ai_api::neurolate::{NeurolateKeyActions, NeurolateKeyPanel, draw_neurolate_key_panel};
+use ms_project::ComicType;
+
+/// Id salt of the NeuroLate section in this panel (the key panel scopes itself with `_key`).
+const NEUROLATE_ID_SALT: &str = "translation.ocr.neurolate";
 
 /// Runtime (not `const`) because `t!` is not const; resolves the active catalog value.
 #[must_use]
@@ -287,6 +301,18 @@ pub struct OcrPanelActions {
     /// Cancel of the app-managed model download the engine's load / recognize runs (drawn
     /// under the status line while the state is `DownloadingModel`).
     pub cancel_model_download: bool,
+    /// The NeuroLate key panel's buttons (for `NeurolateKeyPanel::pump`); empty unless
+    /// NeuroLate is selected.
+    pub neurolate_key: NeurolateKeyActions,
+}
+
+/// What the panel lends to its NeuroLate section: the tab's ONE NeuroLate settings store and
+/// key panel (shared with the detector panel), and the project type "Auto" resolves with (the
+/// MT source language comes from `OcrPanelModelView::source_lang`).
+pub(crate) struct OcrPanelNeurolate<'a> {
+    pub(crate) settings: &'a mut NeurolateSettings,
+    pub(crate) key: &'a mut NeurolateKeyPanel,
+    pub(crate) project_type: Option<ComicType>,
 }
 
 /// Per-frame inputs of the OCR panel's external-model parts, lent by the tab.
@@ -318,7 +344,7 @@ fn engine_button_requirement(engine: OcrEngine) -> Option<AiRequirement> {
         OcrEngine::Surya => Some(AiRequirement::Torch),
         // Native ONNX Runtime or the backend's onnxruntime: no PyTorch involved.
         OcrEngine::Baberu => Some(AiRequirement::Onnx),
-        OcrEngine::AiApi => None,
+        OcrEngine::AiApi | OcrEngine::NeuroLate => None,
     }
 }
 
@@ -349,7 +375,7 @@ pub(crate) fn selected_mode_requirement(options: &OcrPanelOptions) -> Option<AiR
         OcrEngine::PaddleVl => Some(AiRequirement::Torch),
         OcrEngine::Surya => Some(AiRequirement::Torch),
         OcrEngine::Baberu => Some(AiRequirement::Onnx),
-        OcrEngine::AiApi => None,
+        OcrEngine::AiApi | OcrEngine::NeuroLate => None,
     }
 }
 
@@ -363,7 +389,7 @@ fn engine_marker(engine: OcrEngine) -> Option<&'static str> {
         OcrEngine::PaddleVl => Some("Torch"),
         OcrEngine::Surya => Some("Torch"),
         OcrEngine::Baberu => Some("ONNX"),
-        OcrEngine::AiApi => None,
+        OcrEngine::AiApi | OcrEngine::NeuroLate => None,
     }
 }
 
@@ -410,10 +436,11 @@ fn engine_select_button(
 /// widget is drawn and its "Stop" sets `OcrPanelActions::stop_generation`. `model` lends
 /// the external-model state of the selected engine (download block, load gating) and
 /// whether the MT source language is Korean (Baberu warning). `selection` names the bindings of
-/// the canvas OCR selections and whether their modes are held.
+/// the canvas OCR selections and whether their modes are held. `neurolate` lends the NeuroLate
+/// section (drawn only with NeuroLate selected; its settings edits set `options_changed`).
 // Parameters represent distinct required inputs with no natural grouping.
 #[allow(clippy::too_many_arguments)]
-pub fn draw_ocr_panel(
+pub(crate) fn draw_ocr_panel(
     ui: &mut egui::Ui,
     state: OcrLoadState,
     options: &mut OcrPanelOptions,
@@ -422,6 +449,7 @@ pub fn draw_ocr_panel(
     selection: OcrSelectionHints<'_>,
     generation: &GenerationSnapshot,
     model: OcrPanelModelView<'_>,
+    neurolate: OcrPanelNeurolate<'_>,
 ) -> OcrPanelActions {
     let mut actions = OcrPanelActions::default();
     let caps = AiCaps::current();
@@ -506,6 +534,11 @@ pub fn draw_ocr_panel(
                 t!("translation.ocr_panel.baberu_hint"),
             );
         }
+        // Cloud like AI API: ungated, it runs with every local AI runtime off.
+        actions.options_changed |= ui
+            .selectable_value(&mut options.engine, OcrEngine::NeuroLate, ms_ai_api::neurolate::LABEL)
+            .on_hover_text(t!("translation.ocr_panel.neurolate_engine_hint"))
+            .changed();
     });
     ui.add_enabled_ui(selected_engine_enabled, |ui| {
         match options.engine {
@@ -639,6 +672,11 @@ pub fn draw_ocr_panel(
             OcrEngine::AiApi => {
                 draw_ai_api_options(ui, options, model.source_lang, &mut actions);
             }
+            OcrEngine::NeuroLate => {
+                let view = NeurolateSettingsView { mt_source_lang: model.source_lang, project_type: neurolate.project_type, show_detect_mask: true, show_detect_with_text: false };
+                actions.options_changed |= draw_neurolate_settings(ui, NEUROLATE_ID_SALT, neurolate.settings, view);
+                actions.neurolate_key = draw_neurolate_key_panel(ui, NEUROLATE_ID_SALT, ui.available_width(), neurolate.key);
+            }
         }
     });
     // Outside the engine-options gate: downloading needs only the network, so a model can
@@ -668,7 +706,9 @@ pub fn draw_ocr_panel(
     // flight stays visible and stoppable whatever is selected or collapsed.
     if generation.active {
         ui.separator();
-        if draw_generation_status(ui, generation) {
+        // NeuroLate streams nothing: a plain wait with its own Stop instead of the counters.
+        let stop_clicked = if options.engine == OcrEngine::NeuroLate { draw_neurolate_wait(ui) } else { draw_generation_status(ui, generation) };
+        if stop_clicked {
             actions.stop_generation = Some(*generation);
         }
     }
@@ -794,6 +834,18 @@ pub fn draw_ocr_panel(
     }
 
     actions
+}
+
+/// The wait of a NeuroLate request in flight: a spinner (which also keeps frames coming), the
+/// waiting text and a Stop whose tooltip says the result is dropped while the request may still
+/// be charged. Returns whether Stop was clicked.
+fn draw_neurolate_wait(ui: &mut egui::Ui) -> bool {
+    ui.horizontal_wrapped(|ui| {
+        ui.spinner();
+        ui.colored_label(ms_theme::status::INFO, t!("translation.ocr_panel.neurolate_waiting_status"));
+        ui.button(t!("translation.ocr_panel.neurolate_stop_button")).on_hover_text(t!("translation.ocr_panel.neurolate_stop_tooltip")).clicked()
+    })
+    .inner
 }
 
 /// The "also create the detector mask and text blocks" parameter of an engine that is also a
@@ -1278,7 +1330,7 @@ mod tests {
 
     /// Every engine, spelled through an exhaustive match so a new variant fails to compile here
     /// until the truth table below covers it.
-    fn all_engines() -> [OcrEngine; 7] {
+    fn all_engines() -> [OcrEngine; 8] {
         let all = [
             OcrEngine::MangaOcr,
             OcrEngine::EasyOcr,
@@ -1287,6 +1339,7 @@ mod tests {
             OcrEngine::Surya,
             OcrEngine::AiApi,
             OcrEngine::Baberu,
+            OcrEngine::NeuroLate,
         ];
         for engine in all {
             match engine {
@@ -1296,7 +1349,8 @@ mod tests {
                 | OcrEngine::PaddleVl
                 | OcrEngine::Surya
                 | OcrEngine::AiApi
-                | OcrEngine::Baberu => {}
+                | OcrEngine::Baberu
+                | OcrEngine::NeuroLate => {}
             }
         }
         all
@@ -1308,7 +1362,7 @@ mod tests {
         match engine {
             OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Surya => true,
             OcrEngine::MangaOcr => matches!(manga_model, "base_torch" | " BASE_TORCH "),
-            OcrEngine::PaddleOcr | OcrEngine::AiApi | OcrEngine::Baberu => false,
+            OcrEngine::PaddleOcr | OcrEngine::AiApi | OcrEngine::Baberu | OcrEngine::NeuroLate => false,
         }
     }
 
@@ -1338,6 +1392,16 @@ mod tests {
             Some(AiRequirement::TorchOrOnnx)
         );
         assert_eq!(engine_button_requirement(OcrEngine::AiApi), None);
+    }
+
+    /// The cloud engines need no local runtime: ungated buttons, no marker, no requirement.
+    #[test]
+    fn cloud_engines_have_no_runtime_requirement() {
+        for engine in [OcrEngine::AiApi, OcrEngine::NeuroLate] {
+            assert_eq!(engine_button_requirement(engine), None, "{engine:?}");
+            assert_eq!(engine_marker(engine), None, "{engine:?}");
+            assert_eq!(selected_mode_requirement(&OcrPanelOptions { engine, ..Default::default() }), None, "{engine:?}");
+        }
     }
 
     #[test]

@@ -297,7 +297,7 @@ repository's). Measured over `src/` and `crates/` (excluding `target/` and the e
 `egui-large-image`, `egui-shader-layers`, `ag-psd` checkouts and the gitignored `egui` / `winit`
 forks): 35 Rust files exceed 3000 lines and 14 exceed 5000; without the exempt test modules, 33
 and 12 — all of them in `crates/`. Among them `crates/ms-tab-ps-editor/src/lib.rs` (10584),
-`crates/ms-tab-translation/src/tab.rs` (9486) and `crates/ms-text-render/src/pipeline.rs` (8211) —
+`crates/ms-tab-translation/src/tab.rs` (8695) and `crates/ms-text-render/src/pipeline.rs` (8211) —
 why the hard gate needs >5000 lines AND a new responsibility. Scale example: custom kerning took
 `src/tabs/settings/typesetting/font_properties_window.rs` from 1230 to 2467 lines in one change —
 nothing should have stopped that one, but the NEXT feature to land there must pause.

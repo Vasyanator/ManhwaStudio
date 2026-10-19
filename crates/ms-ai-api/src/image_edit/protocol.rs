@@ -8,7 +8,8 @@ turns a prepared `EditCall` into an `HttpRequestSpec` and each HTTP response int
 and the API key (an adapter only names the `AuthScheme`, it never sees the key).
 
 Key structures:
-- HttpMethod, AuthScheme, HttpBody, HttpRequestSpec, HttpResponse
+- HttpMethod, AuthScheme, HttpBody, HttpRequestSpec, HttpResponse (re-exported from
+  `crate::http::request`, their owner)
 - EditCall (what an adapter receives), StepPhase, JobRef, StepCtx, NextStep
 
 Key traits:
@@ -25,63 +26,12 @@ use std::time::Duration;
 
 use super::catalog::SizeParamStyle;
 use super::error::ImageEditError;
-use super::multipart::MultipartBody;
 use super::provider::ImageEditProvider;
 use super::size_rule::AspectTierEntry;
 
-/// HTTP method of a request description.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HttpMethod {
-    Get,
-    Post,
-    Put,
-    /// Only for best-effort cancel requests (Runway `DELETE /v1/tasks/{id}`).
-    Delete,
-}
-
-/// How the executor attaches the API key to a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthScheme {
-    /// `Authorization: Bearer {key}`.
-    Bearer,
-    /// `{header}: {key}` (e.g. `x-key`, `x-goog-api-key`, `Api-Key`).
-    Header(&'static str),
-    /// `Authorization: {prefix} {key}` (e.g. fal's `Key`).
-    KeyPrefix(&'static str),
-}
-
-/// A request body.
-#[derive(Debug, Clone, PartialEq)]
-pub enum HttpBody {
-    /// No body.
-    Empty,
-    /// `application/json`.
-    Json(serde_json::Value),
-    /// `multipart/form-data` (its content type carries the boundary).
-    Multipart(MultipartBody),
-}
-
-/// One HTTP request, described by an adapter and executed by the executor.
-#[derive(Debug, Clone, PartialEq)]
-pub struct HttpRequestSpec {
-    pub method: HttpMethod,
-    /// Absolute https URL (http only for the user's own server).
-    pub url: String,
-    /// Extra headers (never the key; never `Authorization`).
-    pub headers: Vec<(&'static str, String)>,
-    pub body: HttpBody,
-    /// How to attach the key; `None` for unauthenticated requests (signed download URLs).
-    pub auth: Option<AuthScheme>,
-}
-
-/// An HTTP response as the executor hands it to an adapter (body already size-capped).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HttpResponse {
-    pub status: u16,
-    /// The `Content-Type` header, if any.
-    pub content_type: Option<String>,
-    pub body: Vec<u8>,
-}
+// The request / response descriptions are the crate's shared HTTP types (`crate::http`, their
+// owner); re-exported so adapters keep naming them through this contract module.
+pub use crate::http::{AuthScheme, HttpBody, HttpMethod, HttpRequestSpec, HttpResponse};
 
 /// Everything an adapter needs to build the submit request; produced by `pipeline::prepare`.
 #[derive(Debug, Clone)]

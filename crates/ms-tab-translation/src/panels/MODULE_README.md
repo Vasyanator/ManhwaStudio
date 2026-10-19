@@ -47,7 +47,14 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   writing-system restriction: auto / korean / chinese / japanese. The six runtime engine-selection buttons are `AiButton`s gated on a
   per-engine `AiRequirement` (`engine_button_requirement`, permissive on an unknown capability so a
   not-yet-probed native ONNX runtime does not lock selection out); each shows a runtime marker badge
-  (`engine_marker`: Torch / ONNX / Torch/ONNX). AiApi is network-only and stays a plain ungated
+  (`engine_marker`: Torch / ONNX / Torch/ONNX). NeuroLate (cloud, paid per block) is a plain
+  ungated selectable like AiApi; its body is the tab's ONE NeuroLate settings block
+  (`crate::neurolate::draw_neurolate_settings` WITH the "create mask and text blocks" checkbox,
+  salt `translation.ocr.neurolate`) plus the key + limit panel, both lent through
+  `OcrPanelNeurolate` (settings edits fold into `options_changed`, key buttons come back as
+  `OcrPanelActions::neurolate_key`); while a request of the selected NeuroLate engine is in flight
+  a spinner, "Waiting for NeuroLate…" and a Stop (tooltip: the result is dropped, the request may
+  still be charged) replace the generation widget and use the same `stop_generation`. AiApi is network-only and stays a plain ungated
   `selectable_value`: it works with every local AI runtime off (`--no-ai`, Android); `tab.rs` never
   disables the panel as a whole and names an unavailable local route's reason under it.
   Cascade: `selected_mode_requirement` (model-aware; MangaOCR `base_torch` needs Torch, its ONNX
@@ -90,11 +97,21 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   actions, and line/mask edit mode toggles. `tab.rs` lends it a per-frame
   `TextDetectorPanelView` snapshot. It also owns `TextDetectorAlgorithm::availability`, the ONE
   "can this detector run" decision (the local-AI rule of `ms_local_ai::local_ai` for the algorithm's
-  route — Paddle native or backend, CTD/Surya backend — then reported-missing PyTorch) shared by the panel's
+  route — Paddle native or backend, CTD/Surya backend, NeuroLate cloud (always allowed) — then reported-missing PyTorch) shared by the panel's
   detect-button gate and hint and by `tab.rs`'s run-mode refusal; never re-derive it elsewhere.
   The hint under disabled detect buttons names the same reason a refused run reports.
+  With NeuroLate selected it draws the shared NeuroLate settings block
+  (`crate::neurolate::draw_neurolate_settings`, salt `translation.text_detector.neurolate`) and
+  the key + limit panel over the tab's ONE store and key panel (`TextDetectorNeurolate`), and,
+  the "recognize text right away" checkbox (`NeurolateSettings::detect_with_text`), and,
+  instead of a plan notice, the line that the whole page goes to a paid service (worded for
+  masks AND texts while that checkbox is on); settings edits
+  come back as `neurolate_changed` (persisted with the OCR section) and the key buttons as
+  `neurolate_key`.
   A batch's model download (`TextDetectorPanelView::model_download`) is drawn under the status
-  with a Cancel (`TextDetectorPanelActions::cancel_detection`).
+  with a Cancel (`TextDetectorPanelActions::cancel_detection`); otherwise, while a page batch
+  runs (`TextDetectorPanelView::batch_running`), with a Stop
+  (`TextDetectorPanelActions::stop_detection`, "after the current page").
 - Both `ocr.rs` (engine load / recognize downloads, `OcrPanelModelView::engine_download`, Cancel
   -> `OcrPanelActions::cancel_model_download`) and `text_detector.rs` draw app-managed model
   downloads only through `crate::model_download_status`; never format that text here.

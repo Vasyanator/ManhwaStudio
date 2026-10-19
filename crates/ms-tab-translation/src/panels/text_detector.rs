@@ -4,34 +4,47 @@ Translation panel UI for text detection controls.
 
 Main types:
 - `TextDetectorAlgorithm`: detector backend mode selector (`Classic` /
-  `PaddleOcr` / `Ai` / `Surya`).
+  `PaddleOcr` / `Ai` / `Surya` / `NeuroLate`).
 - `TextDetectorPanelOptions`: editable UI options for detector run.
 - `TextDetectorPanelActions`: one-frame UI actions returned to tab logic.
 - `TextDetectorPanelView`: read-only per-frame snapshot the tab lends the panel.
 - `TextDetectorPlanNoticeCache`: the current page's `PlanNotice`, recomputed only when the
   engine, its params or the page size change (`plan_detection` allocates its tile list).
+- `TextDetectorNeurolate`: what the panel lends to the NeuroLate section (the tab's ONE
+  NeuroLate settings store and key panel, plus what "Auto" resolves with).
 - `DetectorUnavailable`: why the selected algorithm cannot run; produced only by
   `TextDetectorAlgorithm::availability`, the one owner of the "can detect" decision
   (panel button gate, panel hint and the tab's run-mode check all route through it). Its
   local-AI half is the shared rule of `ms_local_ai::local_ai` (`--no-ai` / platform per runtime).
 
 Flow:
-- `draw_text_detector_panel(ui, options, plan_notices, view)`: renders status, options, the
+- `draw_text_detector_panel(ui, options, plan_notices, view, neurolate)`: renders status, options, the
   current page's plan notice (`plan_notice_text`, planned through the cache after the option
   widgets ran) and action buttons. The Save button is drawn only while
   `view.storage_available` (false in a single-image session).
 - `TextDetectorPanelOptions::run_mode()` -> `TextDetectorRunMode::plan_inputs()` ->
   `ms_text_detect::plan_detection` is the one chain both the notice and the worker use, so
-  the notice announces exactly the resize / tiling the run will do.
+  the notice announces exactly the resize / tiling the run will do. `NeuroLate` has no plan:
+  the panel shows the paid-service notice instead (the whole page is sent, every block is
+  charged).
+- With `NeuroLate` selected, the shared NeuroLate settings block (`crate::neurolate::
+  draw_neurolate_settings`, language and comic type; edits reported as
+  `TextDetectorPanelActions::neurolate_changed`, persisted with the OCR section) and the
+  key + limit panel (`ms_ai_api::neurolate::draw_neurolate_key_panel`, actions in
+  `TextDetectorPanelActions::neurolate_key`) are drawn under the algorithm buttons.
 - Algorithm selection uses frameless [`AiButton`] toggles (one per algorithm, wrapped
   ~3 per row) that self-gate on each algorithm's runtime capability and show a runtime
-  marker; `Classic` has no runtime dependency and is a plain selectable.
+  marker; `Classic` (local) and `NeuroLate` (cloud) have no runtime dependency and are plain
+  selectables.
 - AI mode advanced params hold the CTD detection size (the plan's tile side); shared mask
   dilation lives in the common section with other detector-wide options; device selection
   is configured globally in `Настройки -> ИИ бэкенд`.
 - While the batch downloads a model, the status line is followed by that download
   (`model_download_status::draw_model_download_status`, `view.model_download`) and a Cancel
   -> `TextDetectorPanelActions::cancel_detection` (the batch ends with `DetectCancelled`).
+  Otherwise, while a page batch runs (`view.batch_running`), a Stop button there ->
+  `TextDetectorPanelActions::stop_detection`: the batch ends after the page in flight, whose
+  result is still applied.
 - With `Surya` selected, the shared external-model download block
   (`panels::ocr_model_download`) is drawn for its checkpoint bundle
   (`text_detector::SURYA_DETECTOR_SPECS`, snapshot `view.surya_model`, request
@@ -42,12 +55,15 @@ Flow:
 */
 
 use crate::model_download_status::draw_model_download_status;
+use crate::neurolate::{NeurolateSettings, NeurolateSettingsView, draw_neurolate_settings, request_params};
+use ms_ai_api::neurolate::{NeurolateKeyActions, NeurolateKeyPanel, draw_neurolate_key_panel};
+use ms_project::ComicType;
 use crate::ocr_model_download::{OcrModelPanelSnapshot, bundle_key};
 use crate::panels::ocr_model_download::{ModelDownloadAction, draw_ocr_model_download};
 use ms_local_ai::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOff};
 use ms_sysprobe::ai_models::ModelDownloadEvent;
 use crate::text_detector::{
-    DetectorRoute, SURYA_DETECTOR_SPECS, TextDetectorAiCtdOptions, TextDetectorPaddleOcrOptions, TextDetectorRunMode,
+    DetectorRoute, NeurolateDetect, SURYA_DETECTOR_SPECS, TextDetectorAiCtdOptions, TextDetectorPaddleOcrOptions, TextDetectorRunMode,
     TextDetectorSuryaOptions,
 };
 use ms_models::page_view::{PageImageInfo, SourcePageLoadState};
@@ -61,15 +77,21 @@ pub enum TextDetectorAlgorithm {
     PaddleOcr,
     Ai,
     Surya,
+    /// The NeuroLate cloud detector (paid per text block).
+    NeuroLate,
 }
 
 /// Selectable detector algorithms in display order (wrapped ~3 per row).
-const DETECTOR_ALGORITHMS: [TextDetectorAlgorithm; 4] = [
+const DETECTOR_ALGORITHMS: [TextDetectorAlgorithm; 5] = [
     TextDetectorAlgorithm::Classic,
     TextDetectorAlgorithm::PaddleOcr,
     TextDetectorAlgorithm::Ai,
     TextDetectorAlgorithm::Surya,
+    TextDetectorAlgorithm::NeuroLate,
 ];
+
+/// Id salt of the NeuroLate section in this panel (the key panel scopes itself with `_key`).
+const NEUROLATE_ID_SALT: &str = "translation.text_detector.neurolate";
 
 impl TextDetectorAlgorithm {
     pub fn key(self) -> &'static str {
@@ -78,6 +100,7 @@ impl TextDetectorAlgorithm {
             TextDetectorAlgorithm::PaddleOcr => "paddleocr",
             TextDetectorAlgorithm::Ai => "ai",
             TextDetectorAlgorithm::Surya => "surya",
+            TextDetectorAlgorithm::NeuroLate => "neurolate",
         }
     }
 
@@ -87,6 +110,7 @@ impl TextDetectorAlgorithm {
             TextDetectorAlgorithm::PaddleOcr => "PaddleOCR",
             TextDetectorAlgorithm::Ai => "ComicTextDetector",
             TextDetectorAlgorithm::Surya => "Surya",
+            TextDetectorAlgorithm::NeuroLate => ms_ai_api::neurolate::LABEL,
         }
     }
 
@@ -98,6 +122,7 @@ impl TextDetectorAlgorithm {
     /// additionally fail only when the backend has REPORTED PyTorch missing (`Some(false)`) —
     /// an unknown capability (`None`) is permissive so a not-yet-probed backend does not lock
     /// them out. The local-AI reason is checked first, so it always wins over `TorchMissing`.
+    /// `NeuroLate` is a cloud route: the rule always allows it (never gated by `--no-ai`).
     pub(crate) fn availability(
         self,
         paddle_route: DetectorRoute,
@@ -108,6 +133,7 @@ impl TextDetectorAlgorithm {
             TextDetectorAlgorithm::Classic => return Ok(()),
             TextDetectorAlgorithm::PaddleOcr => (paddle_route.route_kind(), false),
             TextDetectorAlgorithm::Ai | TextDetectorAlgorithm::Surya => (AiRouteKind::Backend, true),
+            TextDetectorAlgorithm::NeuroLate => (AiRouteKind::Cloud, false),
         };
         kind.availability(local_ai).map_err(DetectorUnavailable::LocalAi)?;
         if needs_torch && torch_available == Some(false) {
@@ -151,7 +177,7 @@ impl DetectorUnavailable {
     fn panel_hint_text(self, algorithm: TextDetectorAlgorithm) -> Option<String> {
         match algorithm {
             TextDetectorAlgorithm::Classic => None,
-            TextDetectorAlgorithm::PaddleOcr | TextDetectorAlgorithm::Ai | TextDetectorAlgorithm::Surya => {
+            TextDetectorAlgorithm::PaddleOcr | TextDetectorAlgorithm::Ai | TextDetectorAlgorithm::Surya | TextDetectorAlgorithm::NeuroLate => {
                 Some(self.status_text(algorithm))
             }
         }
@@ -159,7 +185,8 @@ impl DetectorUnavailable {
 }
 
 /// Runtime capability an algorithm's selection button gates on, or `None` when it
-/// has no local-runtime dependency (`Classic` is a pure local heuristic).
+/// has no local-runtime dependency (`Classic` is a pure local heuristic, `NeuroLate` a cloud
+/// service).
 /// `PaddleOCR` runs on onnxruntime (native or backend); `ComicTextDetector` and
 /// `Surya` run on PyTorch in the backend.
 fn algorithm_requirement(algorithm: TextDetectorAlgorithm) -> Option<AiRequirement> {
@@ -168,14 +195,15 @@ fn algorithm_requirement(algorithm: TextDetectorAlgorithm) -> Option<AiRequireme
         TextDetectorAlgorithm::PaddleOcr => Some(AiRequirement::Onnx),
         TextDetectorAlgorithm::Ai => Some(AiRequirement::Torch),
         TextDetectorAlgorithm::Surya => Some(AiRequirement::Torch),
+        TextDetectorAlgorithm::NeuroLate => None,
     }
 }
 
 /// Short runtime marker badge for an algorithm ("Torch"/"ONNX"), or `None` for the
-/// dependency-free `Classic` algorithm.
+/// runtime-free `Classic` and `NeuroLate` algorithms.
 fn algorithm_marker(algorithm: TextDetectorAlgorithm) -> Option<&'static str> {
     match algorithm {
-        TextDetectorAlgorithm::Classic => None,
+        TextDetectorAlgorithm::Classic | TextDetectorAlgorithm::NeuroLate => None,
         TextDetectorAlgorithm::PaddleOcr => Some("ONNX"),
         TextDetectorAlgorithm::Ai => Some("Torch"),
         TextDetectorAlgorithm::Surya => Some("Torch"),
@@ -196,12 +224,13 @@ fn algorithm_hover(algorithm: TextDetectorAlgorithm) -> &'static str {
         TextDetectorAlgorithm::Surya => {
             t!("translation.text_detector_panel.algo_surya_hint")
         }
+        TextDetectorAlgorithm::NeuroLate => t!("translation.text_detector_panel.algo_neurolate_hint"),
     }
 }
 
 /// Renders one detector-algorithm selection button. Runtime algorithms use a
 /// frameless [`AiButton`] that self-gates on [`algorithm_requirement`] and shows a
-/// runtime marker; `Classic` (no requirement) is a plain frameless selectable.
+/// runtime marker; `Classic` / `NeuroLate` (no requirement) are plain frameless selectables.
 /// Returns `true` when the click selected this algorithm.
 fn algorithm_select_button(
     ui: &mut egui::Ui,
@@ -259,8 +288,10 @@ impl TextDetectorPanelOptions {
     /// [`TextDetectorAlgorithm::availability`] before starting a run). The panel's plan notice
     /// and the tab's run both build their mode here, so they plan with the same inputs.
     /// Page-batch dilation is passed to the worker separately, so the CTD options carry 0.
+    /// `neurolate` is the resolved NeuroLate page request (`crate::neurolate::request_params`
+    /// plus "recognize text right away"), used only by the `NeuroLate` algorithm.
     #[must_use]
-    pub fn run_mode(&self) -> TextDetectorRunMode {
+    pub fn run_mode(&self, neurolate: NeurolateDetect) -> TextDetectorRunMode {
         match self.algorithm {
             TextDetectorAlgorithm::Classic => TextDetectorRunMode::Classic,
             TextDetectorAlgorithm::PaddleOcr => TextDetectorRunMode::PaddleOcr(TextDetectorPaddleOcrOptions::default()),
@@ -269,6 +300,7 @@ impl TextDetectorPanelOptions {
                 mask_dilate_size: 0,
             }),
             TextDetectorAlgorithm::Surya => TextDetectorRunMode::Surya(TextDetectorSuryaOptions),
+            TextDetectorAlgorithm::NeuroLate => TextDetectorRunMode::NeuroLate(neurolate),
         }
     }
 }
@@ -296,10 +328,11 @@ pub struct TextDetectorPlanNoticeCache {
 impl TextDetectorPlanNoticeCache {
     /// The plan notice for `options` on a page of `page_size` (`None` = size unknown: no
     /// notice). A page the plan refuses (too large) also yields `None`; the refusal is logged
-    /// once per input change, and the run reports it as a page error.
-    pub fn notice(&mut self, options: &TextDetectorPanelOptions, page_size: Option<[u32; 2]>) -> Option<PlanNotice> {
+    /// once per input change, and the run reports it as a page error. A mode without a local
+    /// plan (`NeuroLate`; `neurolate` is its page request) has no notice either.
+    pub fn notice(&mut self, options: &TextDetectorPanelOptions, neurolate: NeurolateDetect, page_size: Option<[u32; 2]>) -> Option<PlanNotice> {
         let size = page_size?;
-        let (engine, params) = options.run_mode().plan_inputs();
+        let (engine, params) = options.run_mode(neurolate).plan_inputs()?;
         let key = (engine, params, size);
         if self.key != Some(key) {
             self.key = Some(key);
@@ -388,8 +421,27 @@ pub struct TextDetectorPanelActions {
     pub options_changed: bool,
     /// Cancel of the running batch, offered while it downloads a model.
     pub cancel_detection: bool,
+    /// "Stop after the current page" of the running page batch, offered while it detects pages
+    /// (`TranslationTextDetectorController::request_stop`).
+    pub stop_detection: bool,
     /// Download / cancel requested in the Surya checkpoint's download block.
     pub surya_model_download: ModelDownloadAction,
+    /// The NeuroLate language / comic type changed (persisted with the OCR section).
+    pub neurolate_changed: bool,
+    /// The NeuroLate key panel's buttons (for `NeurolateKeyPanel::pump`); empty unless
+    /// `NeuroLate` is selected.
+    pub neurolate_key: NeurolateKeyActions,
+}
+
+/// What the panel lends to its NeuroLate section: the tab's ONE NeuroLate settings store and
+/// key panel (shared with the OCR panel), and the inputs "Auto" resolves with.
+pub(crate) struct TextDetectorNeurolate<'a> {
+    pub(crate) settings: &'a mut NeurolateSettings,
+    pub(crate) key: &'a mut NeurolateKeyPanel,
+    /// The MT panel's source language code (the "Auto" language).
+    pub(crate) mt_source_lang: &'a str,
+    /// The project's comic type (the "Auto" type).
+    pub(crate) project_type: Option<ComicType>,
 }
 
 /// Read-only per-frame state the tab lends to [`draw_text_detector_panel`]. Every
@@ -407,6 +459,9 @@ pub struct TextDetectorPanelView<'a> {
     /// `Surya` was selected at the start of the frame; drawn only while `Surya` is selected.
     pub surya_model: Option<&'a OcrModelPanelSnapshot>,
     pub detect_busy: bool,
+    /// A page batch (not a region detection) is running
+    /// (`TranslationTextDetectorController::is_batch_running`): the Stop button is offered.
+    pub batch_running: bool,
     pub ocr_busy: bool,
     pub has_pages: bool,
     /// Result of [`TextDetectorAlgorithm::availability`] for the selected algorithm.
@@ -429,13 +484,15 @@ pub struct TextDetectorPanelView<'a> {
 /// Draws the text-detector side panel: status, algorithm selector, display and
 /// post-processing options, CTD advanced params, the current page's plan notice, and the
 /// detect/save/clear/OCR buttons.
-/// Edits `options` in place and returns this frame's user actions; starts no work itself.
-/// `plan_notices` is the tab-owned notice cache, queried with the options as edited this frame.
-pub fn draw_text_detector_panel(
+/// Edits `options` (and, with `NeuroLate` selected, `neurolate.settings`) in place and returns
+/// this frame's user actions; starts no work itself. `plan_notices` is the tab-owned notice
+/// cache, queried with the options as edited this frame.
+pub(crate) fn draw_text_detector_panel(
     ui: &mut egui::Ui,
     options: &mut TextDetectorPanelOptions,
     plan_notices: &mut TextDetectorPlanNoticeCache,
     view: &TextDetectorPanelView<'_>,
+    neurolate: TextDetectorNeurolate<'_>,
 ) -> TextDetectorPanelActions {
     let TextDetectorPanelView {
         status_text,
@@ -444,6 +501,7 @@ pub fn draw_text_detector_panel(
         model_download,
         surya_model,
         detect_busy,
+        batch_running,
         ocr_busy,
         has_pages,
         availability,
@@ -469,6 +527,14 @@ pub fn draw_text_detector_panel(
         if ui.button(t!("translation.common.cancel_button")).clicked() {
             actions.cancel_detection = true;
         }
+    } else if batch_running
+        && ui
+            .button(t!("translation.text_detector.stop_button"))
+            .on_hover_text(t!("translation.text_detector.stop_tooltip"))
+            .clicked()
+    {
+        // Not the download Cancel: the page in flight finishes and is applied first.
+        actions.stop_detection = true;
     }
     ui.separator();
 
@@ -490,6 +556,11 @@ pub fn draw_text_detector_panel(
         && snapshot.bundle_key == bundle_key(&SURYA_DETECTOR_SPECS)
     {
         actions.surya_model_download = draw_ocr_model_download(ui, snapshot);
+    }
+    if options.algorithm == TextDetectorAlgorithm::NeuroLate {
+        let settings_view = NeurolateSettingsView { mt_source_lang: neurolate.mt_source_lang, project_type: neurolate.project_type, show_detect_mask: false, show_detect_with_text: true };
+        actions.neurolate_changed = draw_neurolate_settings(ui, NEUROLATE_ID_SALT, neurolate.settings, settings_view);
+        actions.neurolate_key = draw_neurolate_key_panel(ui, NEUROLATE_ID_SALT, ui.available_width(), neurolate.key);
     }
 
     actions.options_changed |= ui
@@ -585,11 +656,24 @@ pub fn draw_text_detector_panel(
     // What the run will do to the CURRENT page (the plan the worker uses), shown before the
     // detect buttons so the user sees the resize / tile count before starting. Planned here,
     // after the option widgets, so an option changed this frame is already reflected.
-    if let Some(notice) = plan_notices.notice(options, page_size).as_ref() {
+    let neurolate_detect = NeurolateDetect {
+        params: request_params(neurolate.settings, neurolate.mt_source_lang, neurolate.project_type),
+        with_text: neurolate.settings.detect_with_text,
+    };
+    if let Some(notice) = plan_notices.notice(options, neurolate_detect, page_size).as_ref() {
         ui.small(plan_notice_text(notice));
         if let Some(size_text) = plan_ctd_size_text(notice) {
             ui.small(size_text);
         }
+    } else if options.algorithm == TextDetectorAlgorithm::NeuroLate {
+        // No local plan: say instead that the page leaves the machine and costs money.
+        // With the texts read too, every block's text is charged as well.
+        let notice = if neurolate_detect.with_text {
+            t!("translation.text_detector_panel.neurolate_with_text_notice_label")
+        } else {
+            t!("translation.text_detector_panel.neurolate_notice_label")
+        };
+        ui.colored_label(ms_theme::status::WARNING, egui::RichText::new(notice).small());
     }
     let detect_enabled = has_pages && availability.is_ok() && !detect_busy && !ocr_busy;
     if ui
@@ -662,10 +746,13 @@ mod tests {
         plan_notice_text,
     };
     use ms_local_ai::local_ai::{LocalAiAvailability, LocalAiOff, LocalAiOffReason, LocalRuntime};
-    use crate::text_detector::{DetectorRoute, TextDetectorRunMode};
+    use crate::text_detector::{DetectorRoute, NeurolateDetect, TextDetectorRunMode};
     use ms_models::page_view::{PageImageInfo, SourcePageLoadState};
     use ms_platform::{PlatformFeature, Unavailable, UnavailableReason};
+    use ms_ai_api::neurolate::{NeurolateComicType, NeurolateLanguage, OcrParams};
     use ms_text_detect::{EngineKind, PlanMode, PlanNotice};
+
+    const NEUROLATE: NeurolateDetect = NeurolateDetect { params: OcrParams { language: NeurolateLanguage::Ko, comic_type: NeurolateComicType::Webtoon }, with_text: true };
 
     const TORCH_STATES: [Option<bool>; 3] = [None, Some(true), Some(false)];
 
@@ -674,8 +761,9 @@ mod tests {
     }
 
     /// Every `--no-ai` x backend platform x native platform x Paddle route x torch state:
-    /// `Classic` always runs; Paddle needs the runtime of its route; CTD/Surya need the backend
-    /// and, after it, a PyTorch not reported missing; the local-AI reason wins over PyTorch.
+    /// `Classic` and the cloud `NeuroLate` always run (`--no-ai` included); Paddle needs the
+    /// runtime of its route; CTD/Surya need the backend and, after it, a PyTorch not reported
+    /// missing; the local-AI reason wins over PyTorch.
     #[test]
     fn availability_all_combinations() {
         for no_ai in [false, true] {
@@ -697,7 +785,7 @@ mod tests {
                                 );
                                 let got = algorithm.availability(route, &local, torch);
                                 let expected: Result<(), &str> = match algorithm {
-                                    TextDetectorAlgorithm::Classic => Ok(()),
+                                    TextDetectorAlgorithm::Classic | TextDetectorAlgorithm::NeuroLate => Ok(()),
                                     TextDetectorAlgorithm::PaddleOcr => match route {
                                         DetectorRoute::Native if !native_ok => Err("native"),
                                         DetectorRoute::Backend if !backend_ok => Err("backend"),
@@ -743,7 +831,7 @@ mod tests {
     #[test]
     fn panel_hint_matches_the_run_refusal() {
         let off = LocalAiOff { runtime: LocalRuntime::NativeOnnx, reason: LocalAiOffReason::DisabledByFlag };
-        for algorithm in [TextDetectorAlgorithm::PaddleOcr, TextDetectorAlgorithm::Ai, TextDetectorAlgorithm::Surya] {
+        for algorithm in [TextDetectorAlgorithm::PaddleOcr, TextDetectorAlgorithm::Ai, TextDetectorAlgorithm::Surya, TextDetectorAlgorithm::NeuroLate] {
             for reason in [DetectorUnavailable::LocalAi(off), DetectorUnavailable::TorchMissing] {
                 assert_eq!(reason.panel_hint_text(algorithm), Some(reason.status_text(algorithm)), "{algorithm:?}");
             }
@@ -845,13 +933,18 @@ mod tests {
             (TextDetectorAlgorithm::Surya, EngineKind::Surya),
         ] {
             options.algorithm = algorithm;
-            assert_eq!(options.run_mode().plan_inputs().0, engine, "{algorithm:?}");
+            assert_eq!(options.run_mode(NEUROLATE).plan_inputs().map(|(kind, _)| kind), Some(engine), "{algorithm:?}");
         }
         options.algorithm = TextDetectorAlgorithm::Ai;
-        let TextDetectorRunMode::AiCtd(ctd) = options.run_mode() else {
+        let TextDetectorRunMode::AiCtd(ctd) = options.run_mode(NEUROLATE) else {
             panic!("CTD algorithm must build an AiCtd mode");
         };
         assert_eq!((ctd.detect_size, ctd.mask_dilate_size), (1000, 0));
+        // NeuroLate carries the resolved request parameters and has no local plan.
+        options.algorithm = TextDetectorAlgorithm::NeuroLate;
+        let mode = options.run_mode(NEUROLATE);
+        assert!(matches!(mode, TextDetectorRunMode::NeuroLate(detect) if detect == NEUROLATE), "{mode:?}");
+        assert_eq!(mode.plan_inputs(), None);
     }
 
     /// The cache yields exactly what `plan_detection` says for the current inputs, follows
@@ -860,31 +953,34 @@ mod tests {
     fn notice_cache_follows_inputs() {
         let mut cache = TextDetectorPlanNoticeCache::default();
         let mut options = TextDetectorPanelOptions { algorithm: TextDetectorAlgorithm::Ai, ..TextDetectorPanelOptions::default() };
-        assert_eq!(cache.notice(&options, None), None);
+        assert_eq!(cache.notice(&options, NEUROLATE, None), None);
         let expected = |options: &TextDetectorPanelOptions, size: [u32; 2]| {
-            let (engine, params) = options.run_mode().plan_inputs();
+            let (engine, params) = options.run_mode(NEUROLATE).plan_inputs()?;
             ms_text_detect::plan_detection(engine, size, &params).map(|plan| plan.notice()).ok()
         };
         let tall = [800, 16_000];
-        let first = cache.notice(&options, Some(tall));
+        let first = cache.notice(&options, NEUROLATE, Some(tall));
         assert_eq!(first, expected(&options, tall));
         let first = first.expect("a 800x16000 page has a CTD plan");
         assert!(first.tiles > 1, "a tall page is tiled: {first:?}");
         assert_eq!(first.ctd_detect_size, Some(1280));
         // Detect size change: 1000 is snapped down to 960.
         options.ai_detect_size = 1000;
-        let snapped = cache.notice(&options, Some(tall)).expect("plan");
+        let snapped = cache.notice(&options, NEUROLATE, Some(tall)).expect("plan");
         assert_eq!(snapped.ctd_detect_size, Some(960));
         // Page change.
-        assert_eq!(cache.notice(&options, Some([800, 1200])), expected(&options, [800, 1200]));
+        assert_eq!(cache.notice(&options, NEUROLATE, Some([800, 1200])), expected(&options, [800, 1200]));
         // Engine change.
         options.algorithm = TextDetectorAlgorithm::Classic;
-        let classic = cache.notice(&options, Some([2000, 3200])).expect("classic plan");
+        let classic = cache.notice(&options, NEUROLATE, Some([2000, 3200])).expect("classic plan");
         assert_eq!(classic.mode, PlanMode::Resized);
         assert_eq!(classic.scale_percent, [50, 50]);
         assert_eq!(classic.ctd_detect_size, None);
         // A page above the pixel limit has no plan, hence no notice.
-        assert_eq!(cache.notice(&options, Some([u32::MAX, u32::MAX])), None);
+        assert_eq!(cache.notice(&options, NEUROLATE, Some([u32::MAX, u32::MAX])), None);
+        // The cloud mode has no plan, hence no notice (the panel shows its paid-service line).
+        options.algorithm = TextDetectorAlgorithm::NeuroLate;
+        assert_eq!(cache.notice(&options, NEUROLATE, Some([800, 1200])), None);
     }
 
     #[test]
@@ -902,6 +998,7 @@ mod tests {
             algorithm_requirement(TextDetectorAlgorithm::Surya),
             Some(AiRequirement::Torch)
         );
+        assert_eq!(algorithm_requirement(TextDetectorAlgorithm::NeuroLate), None);
     }
 
     #[test]
@@ -913,16 +1010,18 @@ mod tests {
         );
         assert_eq!(algorithm_marker(TextDetectorAlgorithm::Ai), Some("Torch"));
         assert_eq!(algorithm_marker(TextDetectorAlgorithm::Surya), Some("Torch"));
+        assert_eq!(algorithm_marker(TextDetectorAlgorithm::NeuroLate), None);
     }
 
     #[test]
     fn every_algorithm_is_listed_once() {
-        assert_eq!(DETECTOR_ALGORITHMS.len(), 4);
+        assert_eq!(DETECTOR_ALGORITHMS.len(), 5);
         for algorithm in [
             TextDetectorAlgorithm::Classic,
             TextDetectorAlgorithm::PaddleOcr,
             TextDetectorAlgorithm::Ai,
             TextDetectorAlgorithm::Surya,
+            TextDetectorAlgorithm::NeuroLate,
         ] {
             assert_eq!(
                 DETECTOR_ALGORITHMS

@@ -9,9 +9,23 @@ local detector, and the region-image helpers the Cleaning tab reuses for its mas
 ## Architecture
 - `mod.rs` is the public surface: result/option/mode/event types, `TranslationTextDetectorController`
   and its `ms_thread` worker. `run_detect_batch` reads the PaddleOCR route ONCE, gates the backend
-  (route-aware), ensures models, dispatches each page sequentially (Classic -> `classic.rs`, the
-  model engines -> `pipeline::detect_page_file` with `TextDetectorRunMode::plan_inputs()`), then applies the Rust mask dilation to EVERY page
-  result (`dilate_mask_alpha`, radius from the tab, clamped 0..=30).
+  (route-aware), ensures models (NeuroLate: reads its API key once), dispatches each page
+  sequentially (Classic -> `classic.rs`, the model engines -> `pipeline::detect_page_file` with
+  `TextDetectorRunMode::plan_inputs()`, NeuroLate -> `neurolate::detect_page`), then applies the
+  Rust mask dilation to EVERY page result (`dilate_mask_alpha`, radius from the tab, clamped
+  0..=30).
+- `neurolate.rs` is the cloud detector: the page (or an OCR selection's crop) is encoded as PNG
+  and sent in ONE paid `MASK` request (`ms_ai_api::neurolate::recognize`, never retried; a
+  whole page is sent with `kind=PAGE`, so a small page is never read as one block, while a
+  selection crop leaves `kind` to the server's size default); the
+  answer is converted by the one owner `detection_from_image` (polygons with holes ->
+  `ms_text_detect::rasterize_polygons`, blocks -> `finalize_blocks`), wrapped as a page result
+  (`page_result_from_image`) or a region (`region_from_image`, also used by the NeuroLate OCR
+  engine for its own answer). With "recognize text right away" (`NeurolateDetect::with_text`) a
+  page is sent in `MASK_AND_TEXT` instead, and `PageDetected::texts` carries each block's raw text
+  aligned with the finalized blocks (`page_texts_from_image` over `finalize_paired`, the
+  `finalize_blocks` order with payloads; `usable_block` / `block_text` decide which blocks and
+  texts count, for the OCR engine too); the tab turns them into bubbles (`tab/block_bubbles.rs`).
 - `pipeline.rs` is the one model-based entry point, `detect_image(engine, &RgbImage, &DetectParams,
   route)`: `ms_text_detect::plan_detection` -> `run_detection` with a runner. PaddleOCR on the native
   route runs `native::NativePaddleRunner` first; a native failure that the backend may not share
@@ -52,8 +66,16 @@ local detector, and the region-image helpers the Cleaning tab reuses for its mas
 - `classic.rs`: `detect_page_classic` (decode wrapper) over the pure `detect_classic_from_gray`
   (downscale to 1600, Otsu, (2, 1) dilation, connected components, nearest mask promotion).
 - `region.rs`: `detect_{ai_ctd,paddle,surya}_mask_for_image`, `region_mask`, `color_image_to_rgb`.
-- `region_detect.rs`: `RegionDetectEngine` (`for_ocr`: the one trigger rule — PaddleOCR / Surya
-  with that engine's own `*_detect_mask` parameter), `RegionDetectRequest`, `RegionDetection`,
+- `neurolate.rs`: `NeurolateKey` (redacted `Debug`, read once per batch / region),
+  `detect_page`, `recognize_image`, `detection_from_image`, `page_result_from_image`,
+  `region_from_image` (`pub(crate)` for the OCR engine), fixture-driven unit tests over the
+  sanitized live answers in `crates/ms-ai-api/fixtures/neurolate/`.
+- `region_detect.rs`: `RegionDetectEngine` (`selection_detects`: the one trigger rule —
+  PaddleOCR / Surya / NeuroLate with that engine's own parameter, `ocr::DetectMaskFlags`;
+  `for_ocr` maps it onto a request's `OcrRuntimeOptions`, and the `NeuroLate(OcrParams)` engine
+  carries its resolved request parameters; `rides_on_ocr_answer` / `ocr_region_want`: a quick
+  NeuroLate selection takes its region from the OCR's own `MASK_AND_TEXT` answer, converted by
+  `neurolate::region_from_image`), `RegionDetectRequest`, `RegionDetection`,
   `run_region_detection` (worker), the pure `merge_region_into_page` / `empty_page_result`, and
   their unit tests.
 - `tests.rs`: unit tests (routing, gate, batch sizing, IPC runner over a fake transport, fallback
@@ -80,7 +102,15 @@ local detector, and the region-image helpers the Cleaning tab reuses for its mas
 - `TextDetectorRunMode::plan_inputs()` is the ONE mode -> `(EngineKind, DetectParams)` mapping.
   The page worker dispatches through it and the detector panel's per-page notice
   (`panels/text_detector.rs`) plans with it, so the notice shows exactly the resize / tiling the
-  run does. Never build plan inputs for a mode anywhere else.
+  run does. Never build plan inputs for a mode anywhere else. It is `None` only for `NeuroLate`
+  (no local plan; the panel shows the paid-service notice); a model mode reaching dispatch
+  without a plan, or NeuroLate without its key, is a logged `mode_dispatch_error` page failure,
+  never a panic.
+- NeuroLate: a cloud route (no backend gate, never `--no-ai`-gated). Only blocks with
+  `OcrBlock::has_usable_mask` contribute (an EMPTY region's mask is its own rectangle); the
+  answered image size must equal the sent size (polygons are image-absolute), and a per-image
+  error is a page error. The batch's `cancel` flag is the request's `abandon` (returns at once;
+  the detached request may still be charged); `stop` never reaches it. The key is never logged.
 - Native Paddle batches: `ms_native_runtime::paddle_det_max_batch` (4 tiles on the CPU provider,
   1 on any accelerator, to bound GPU memory). A native failure is retried on the backend only
   for runner and runner-output errors; plan, page-size and mask-limit errors are final (identical on both routes).
@@ -97,6 +127,12 @@ local detector, and the region-image helpers the Cleaning tab reuses for its mas
   flag is set is treated as the cancel), never a page failure; the batch ends with
   `DetectCancelled`. The page batch owns one flag per batch, set by the controller's drop and
   checked before every page.
+- Stop after the current page (`request_stop`, the panel's Stop): a SEPARATE per-batch stop flag
+  (`batch_stop`), set only while a page batch runs (`is_batch_running`; a region detection does
+  not count) and checked only before each page, never inside a download or a forward pass. The
+  page in flight finishes and its result is delivered, then the batch ends with
+  `DetectCancelled`. Stop never sets the cancel flag: the native PaddleOCR forward observes that
+  one mid-page, so reusing it would drop the current page.
 - Region detection: one region at a time and only while the controller is idle (busy is shared
   with page batches; nothing is queued, the caller reports the refusal). Its crop is exactly the
   OCR crop of the same selection (`page_crop::uv_rect_to_pixel_rect`, one owner). The merge
@@ -123,5 +159,7 @@ local detector, and the region-image helpers the Cleaning tab reuses for its mas
 - Classic thresholds and component filters: `classic.rs`.
 - Which OCR selections also detect, the region worker and the region merge: `region_detect.rs`;
   the tab's trigger / apply: `../tab/detector_region.rs`.
+- NeuroLate request / answer handling: `neurolate.rs`; its parameters: `../neurolate.rs`; the
+  client and wire format: `crates/ms-ai-api/src/neurolate/`.
 - Scale, tiling, stitching, postprocess, block order/cap, mask normalization:
   `crates/ms-text-detect/src/`.

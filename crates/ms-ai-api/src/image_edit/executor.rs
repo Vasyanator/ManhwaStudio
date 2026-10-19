@@ -8,15 +8,18 @@ only where it may go, applies timeouts, the run deadline, response size caps, ca
 the retry policy. Adapters stay pure; nothing else in the layer does I/O.
 
 Key structures:
-- HttpTransport (crate-private seam: `UreqTransport` in production, a fake in tests)
-- UreqTransport, ExecutorLimits, SendOptions
+- ExecutorLimits, RunContext
 
 Key functions:
 - execute()          : run one call to its final image bytes.
-- retry_allowed()    : only GET is ever retried (a POST is a paid request).
-- auth_allowed()     : the key goes only to the origin of the call's resolved base URL or to
-                       a host the provider's data trusts (`auth_host_suffixes`, BFL).
-- poll_delay(), retry_delay(), log_body(), failing_body_summary(): the remaining pure policy.
+- poll_delay(), retry_delay(), failing_body_summary(): the image-edit pure policy.
+
+Dependencies:
+- `crate::http`: the transport seam (`HttpTransport`, `UreqTransport` in production, a fake in
+  tests), `SendOptions`, and the shared pure policy `retry_allowed` (only GET is ever retried),
+  `auth_allowed` (the key goes only to the origin of the call's resolved base URL or to a host
+  the provider's data trusts, `auth_host_suffixes`) and `log_body`. Transport failures arrive
+  as `HttpError` and are mapped 1:1 onto `ImageEditError` at the `send` boundary.
 
 Notes:
 Native only (the module is not compiled on wasm, where `run_image_edit` is a stub). Runs on a
@@ -27,12 +30,11 @@ the adapter's cancel request for the latest job (best effort). Any error that en
 the user cancelled (a poll out of retries, an oversized body) counts as the cancel, so it never
 skips that request. Requests that carry a key never
 follow redirects (a custom key header would otherwise travel to the redirect target);
-unauthenticated downloads do. The key is never logged; `runtime_log` keeps only the provider's
+unauthenticated downloads do (both enforced by `crate::http::UreqTransport`). The key is never logged; `runtime_log` keeps only the provider's
 error message of a failing JSON body (bodies may echo the prompt), the 2 KB digest with base64
 runs elided goes to the opt-in trace log.
 */
 
-use std::io::Read;
 use std::time::{Duration, Instant};
 
 use ms_log::runtime_log;
@@ -40,22 +42,19 @@ use ms_log::runtime_log;
 use super::adapters::{is_success, provider_message};
 use super::error::ImageEditError;
 use super::pipeline::TRACE_CATEGORY;
-use super::protocol::{AuthScheme, EditCall, EditProtocol, HttpBody, HttpMethod, HttpRequestSpec, HttpResponse, JobRef, NextStep, StepCtx, StepPhase};
+use super::protocol::{EditCall, EditProtocol, JobRef, NextStep, StepCtx, StepPhase};
 use super::request::{CancelFlag, ImageEditStage};
+use crate::http::{AuthScheme, HttpRequestSpec, HttpResponse, HttpTransport, SendOptions, auth_allowed, log_body, retry_allowed};
 
 /// Log tag of every executor line.
 const LOG_TAG: &str = "[AI API/image_edit]";
-/// Longest failing response body kept in a log line, in characters.
-const LOG_BODY_CHARS: usize = 2048;
-/// Shortest run of base64 characters that is elided from a logged body.
-const LOG_BASE64_RUN: usize = 100;
 /// Granularity of cancel-aware waits.
 const WAIT_SLICE: Duration = Duration::from_millis(100);
 
 /// Time and size limits of one run. `Default` is the production policy; tests zero the delays.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutorLimits {
-    /// TCP / TLS connect timeout of every request.
+    /// TCP / TLS connect timeout of every request (handed to `UreqTransport::new`).
     pub connect: Duration,
     /// Whole-request timeout of the paid submit (synchronous providers render inside it).
     pub submit: Duration,
@@ -94,109 +93,6 @@ impl Default for ExecutorLimits {
     }
 }
 
-/// Per-request options handed to the transport.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct SendOptions {
-    /// Whole-request timeout.
-    pub timeout: Duration,
-    /// Body cap in bytes; a longer body is `DownloadTooLarge`.
-    pub cap: u64,
-    /// Step name for `Timeout` errors and logs (technical text).
-    pub stage: &'static str,
-}
-
-/// One blocking HTTP exchange. `auth` is the already-vetted scheme and key. Any HTTP status,
-/// error statuses included, is an `Ok` response; only transport failures are errors.
-pub(crate) trait HttpTransport {
-    /// Sends `request` and reads its body up to `options.cap`.
-    ///
-    /// # Errors
-    /// `Network` (connection, TLS, IO), `Timeout { stage }`, `DownloadTooLarge` over the cap,
-    /// `RequestBuild` when the body cannot be serialized.
-    fn send(&self, request: &HttpRequestSpec, auth: Option<(AuthScheme, &str)>, options: SendOptions) -> Result<HttpResponse, ImageEditError>;
-}
-
-/// The production transport over two `ureq` agents: one that never follows redirects (for
-/// requests carrying a key) and one that does (unauthenticated downloads).
-#[derive(Debug)]
-pub(crate) struct UreqTransport {
-    keyed: ureq::Agent,
-    anonymous: ureq::Agent,
-}
-
-impl UreqTransport {
-    /// Agents with the connect timeout of `limits`.
-    pub(crate) fn new(limits: &ExecutorLimits) -> Self {
-        Self { keyed: ureq::AgentBuilder::new().timeout_connect(limits.connect).redirects(0).build(), anonymous: ureq::AgentBuilder::new().timeout_connect(limits.connect).build() }
-    }
-}
-
-impl HttpTransport for UreqTransport {
-    fn send(&self, request: &HttpRequestSpec, auth: Option<(AuthScheme, &str)>, options: SendOptions) -> Result<HttpResponse, ImageEditError> {
-        let agent = if auth.is_some() { &self.keyed } else { &self.anonymous };
-        let method = match request.method {
-            HttpMethod::Get => "GET",
-            HttpMethod::Post => "POST",
-            HttpMethod::Put => "PUT",
-            HttpMethod::Delete => "DELETE",
-        };
-        let mut builder = agent.request(method, &request.url).timeout(options.timeout);
-        for (name, value) in &request.headers {
-            builder = builder.set(name, value);
-        }
-        builder = match auth {
-            Some((AuthScheme::Bearer, key)) => builder.set("Authorization", &format!("Bearer {key}")),
-            Some((AuthScheme::Header(name), key)) => builder.set(name, key),
-            Some((AuthScheme::KeyPrefix(prefix), key)) => builder.set("Authorization", &format!("{prefix} {key}")),
-            None => builder,
-        };
-        let result = match &request.body {
-            HttpBody::Empty => builder.call(),
-            HttpBody::Json(value) => {
-                let bytes = serde_json::to_vec(value).map_err(|error| ImageEditError::RequestBuild { detail: error.to_string() })?;
-                builder.set("Content-Type", "application/json").send_bytes(&bytes)
-            }
-            HttpBody::Multipart(form) => builder.set("Content-Type", &form.content_type).send_bytes(&form.bytes),
-        };
-        let response = match result {
-            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
-            Err(ureq::Error::Transport(transport)) => return Err(transport_error(&transport, options.stage)),
-        };
-        let status = response.status();
-        let content_type = response.header("Content-Type").map(str::to_string);
-        let mut body = Vec::new();
-        response.into_reader().take(options.cap.saturating_add(1)).read_to_end(&mut body).map_err(|error| io_error(&error, options.stage))?;
-        if u64::try_from(body.len()).map_or(true, |len| len > options.cap) {
-            return Err(ImageEditError::DownloadTooLarge { limit_bytes: options.cap });
-        }
-        Ok(HttpResponse { status, content_type, body })
-    }
-}
-
-/// Maps a `ureq` transport failure: a timed-out socket is `Timeout`, the rest `Network`.
-fn transport_error(transport: &ureq::Transport, stage: &'static str) -> ImageEditError {
-    let timed_out = std::error::Error::source(transport).and_then(|source| source.downcast_ref::<std::io::Error>()).is_some_and(|error| matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock));
-    if timed_out { ImageEditError::Timeout { stage: stage.to_string() } } else { ImageEditError::Network { detail: transport.to_string() } }
-}
-
-/// Maps a body read failure the same way.
-fn io_error(error: &std::io::Error, stage: &'static str) -> ImageEditError {
-    match error.kind() {
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => ImageEditError::Timeout { stage: stage.to_string() },
-        _ => ImageEditError::Network { detail: error.to_string() },
-    }
-}
-
-/// Whether a failed request with `method` may be sent again. Only GET (status polls,
-/// downloads): a POST submit is a paid request and is NEVER retried, whatever failed.
-#[must_use]
-pub(crate) fn retry_allowed(method: HttpMethod) -> bool {
-    match method {
-        HttpMethod::Get => true,
-        HttpMethod::Post | HttpMethod::Put | HttpMethod::Delete => false,
-    }
-}
-
 /// The delay before retry number `attempt` (0-based), or `None` when the retries are spent.
 #[must_use]
 pub(crate) fn retry_delay(attempt: usize, limits: &ExecutorLimits) -> Option<Duration> {
@@ -211,98 +107,6 @@ pub(crate) fn poll_delay(polls: u32, requested: Duration, limits: &ExecutorLimit
     requested.max(schedule)
 }
 
-/// The scheme, lowercase host and port of an absolute http(s) URL; `None` for anything else
-/// (other schemes, userinfo, whitespace, an empty host, a bad port).
-fn origin(url: &str) -> Option<(String, String, u16)> {
-    if url.chars().any(char::is_whitespace) {
-        return None;
-    }
-    let (scheme, rest) = url.split_once("://")?;
-    let scheme = scheme.to_ascii_lowercase();
-    let default_port = match scheme.as_str() {
-        "https" => 443,
-        "http" => 80,
-        _ => return None,
-    };
-    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
-    if authority.is_empty() || authority.contains('@') {
-        return None;
-    }
-    // An IPv6 literal keeps its brackets; the port follows the closing one.
-    let (host, port) = if authority.starts_with('[') {
-        let close = authority.find(']')?;
-        let (host, tail) = authority.split_at(close + 1);
-        let port = if tail.is_empty() { None } else { Some(tail.strip_prefix(':')?) };
-        (host, port)
-    } else {
-        match authority.rsplit_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (authority, None),
-        }
-    };
-    if host.is_empty() {
-        return None;
-    }
-    let port = match port {
-        Some(port) => port.parse::<u16>().ok()?,
-        None => default_port,
-    };
-    Some((scheme, host.to_ascii_lowercase(), port))
-}
-
-/// Whether the API key may be attached to `url`: when it has exactly the origin (scheme, host,
-/// port) of the call's resolved `base_url` — the provider's own API host, or the user's own
-/// server — or when it is https on port 443 and its host is one of the provider's
-/// `trusted_suffixes` or a subdomain of one (dot boundary: `api.eu1.bfl.ai` matches `bfl.ai`,
-/// `evilbfl.ai` does not). Signed result URLs on CDNs and any other host never get the key.
-#[must_use]
-pub(crate) fn auth_allowed(url: &str, base_url: &str, trusted_suffixes: &[&str]) -> bool {
-    let Some(target) = origin(url) else { return false };
-    if origin(base_url).is_some_and(|base| base == target) {
-        return true;
-    }
-    let (scheme, host, port) = target;
-    scheme == "https"
-        && port == 443
-        && trusted_suffixes.iter().any(|suffix| {
-            let suffix = suffix.to_ascii_lowercase();
-            host == suffix || host.strip_suffix(&suffix).is_some_and(|prefix| prefix.ends_with('.'))
-        })
-}
-
-/// A failing response body for a log line: lossy UTF-8, runs of base64 characters of at least
-/// `LOG_BASE64_RUN` replaced by `<base64: N chars>`, cut to `LOG_BODY_CHARS` characters.
-#[must_use]
-pub(crate) fn log_body(body: &[u8]) -> String {
-    let text = String::from_utf8_lossy(body);
-    let is_b64 = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=');
-    let mut out = String::new();
-    let mut run = String::new();
-    let flush = |run: &mut String, out: &mut String| {
-        if run.chars().count() >= LOG_BASE64_RUN {
-            out.push_str("<base64: ");
-            out.push_str(&run.chars().count().to_string());
-            out.push_str(" chars>");
-        } else {
-            out.push_str(run);
-        }
-        run.clear();
-    };
-    for c in text.chars() {
-        if is_b64(c) {
-            run.push(c);
-        } else {
-            flush(&mut run, &mut out);
-            out.push(c);
-        }
-    }
-    flush(&mut run, &mut out);
-    if out.chars().count() > LOG_BODY_CHARS {
-        out = out.chars().take(LOG_BODY_CHARS).collect();
-        out.push_str("...");
-    }
-    out
-}
 
 /// What `runtime_log` may keep of a failing response body: the provider's own error message
 /// (`adapters::provider_message`) of a JSON body, never the whole JSON (validation errors echo
@@ -448,7 +252,7 @@ impl Execution<'_> {
         let step = StepCtx { call: self.run.call, phase: state.phase, polls: state.polls, job: state.job.as_ref() };
         let Some(request) = self.protocol.cancel_request(&step) else { return };
         let options = SendOptions { timeout: self.limits.poll, cap: self.limits.response_cap, stage: "cancel" };
-        match vet_auth(&request, self.run).and_then(|auth| self.transport.send(&request, auth, options)) {
+        match vet_auth(&request, self.run).and_then(|auth| self.transport.send(&request, auth, options).map_err(ImageEditError::from)) {
             Ok(response) if is_success(response.status) => runtime_log::log_info(format!("{LOG_TAG} {provider} job cancelled at the provider ({reason})")),
             Ok(response) => log_failing_body(provider, &format!("cancel request ({reason}) answered HTTP {}", response.status), &response.body),
             Err(error) => runtime_log::log_warn(format!("{LOG_TAG} {provider} cancel request ({reason}) failed: {error:?}")),
@@ -465,7 +269,9 @@ impl Execution<'_> {
             if remaining.is_zero() {
                 return Err(ImageEditError::Timeout { stage: "run".to_string() });
             }
-            let result = self.transport.send(request, auth, SendOptions { timeout: timeout.min(remaining), cap, stage });
+            // Mapped onto `ImageEditError` at once, so the transient test below and every log
+            // line see the image-edit variants (`HttpError` maps 1:1).
+            let result = self.transport.send(request, auth, SendOptions { timeout: timeout.min(remaining), cap, stage }).map_err(ImageEditError::from);
             let transient = match &result {
                 Ok(response) => response.status >= 500,
                 Err(ImageEditError::Network { .. } | ImageEditError::Timeout { .. }) => true,
@@ -530,7 +336,8 @@ pub(crate) mod tests {
     use std::collections::VecDeque;
     use std::time::Duration;
 
-    use super::{ExecutorLimits, HttpTransport, RunContext, SendOptions, auth_allowed, execute, failing_body_summary, log_body, poll_delay, retry_allowed, retry_delay};
+    use super::{ExecutorLimits, RunContext, execute, failing_body_summary, poll_delay, retry_delay};
+    use crate::http::{HttpError, HttpTransport, SendOptions, retry_allowed};
     use crate::image_edit::adapters::test_support::call;
     use crate::image_edit::catalog::SizeParamStyle;
     use crate::image_edit::error::ImageEditError;
@@ -555,27 +362,27 @@ pub(crate) mod tests {
     /// A transport that answers from a script and records what was sent.
     #[derive(Debug, Default)]
     pub(crate) struct FakeTransport {
-        pub answers: RefCell<VecDeque<Result<HttpResponse, ImageEditError>>>,
+        pub answers: RefCell<VecDeque<Result<HttpResponse, HttpError>>>,
         pub sent: RefCell<Vec<Sent>>,
         /// Fired after the n-th send (1-based), to simulate a cancel during a request.
         pub cancel_after: Option<(usize, CancelFlag)>,
     }
 
     impl FakeTransport {
-        pub(crate) fn new(answers: Vec<Result<HttpResponse, ImageEditError>>) -> Self {
+        pub(crate) fn new(answers: Vec<Result<HttpResponse, HttpError>>) -> Self {
             Self { answers: RefCell::new(answers.into()), ..Self::default() }
         }
     }
 
     impl HttpTransport for FakeTransport {
-        fn send(&self, request: &HttpRequestSpec, auth: Option<(AuthScheme, &str)>, options: SendOptions) -> Result<HttpResponse, ImageEditError> {
+        fn send(&self, request: &HttpRequestSpec, auth: Option<(AuthScheme, &str)>, options: SendOptions) -> Result<HttpResponse, HttpError> {
             self.sent.borrow_mut().push(Sent { method: request.method, url: request.url.clone(), auth: auth.map(|(scheme, key)| (scheme, key.to_string())), stage: options.stage });
             if let Some((after, flag)) = &self.cancel_after
                 && self.sent.borrow().len() == *after
             {
                 flag.cancel();
             }
-            self.answers.borrow_mut().pop_front().unwrap_or_else(|| Err(ImageEditError::Network { detail: "script exhausted".to_string() }))
+            self.answers.borrow_mut().pop_front().unwrap_or_else(|| Err(HttpError::Network { detail: "script exhausted".to_string() }))
         }
     }
 
@@ -644,42 +451,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_key_goes_only_to_the_base_url_origin() {
-        let base = "https://api.openai.com/v1";
-        assert!(auth_allowed("https://api.openai.com/v1/images/edits", base, &[]));
-        assert!(auth_allowed("HTTPS://API.OPENAI.COM:443/v1/x", base, &[]));
-        assert!(!auth_allowed("http://api.openai.com/v1/images/edits", base, &[]));
-        assert!(!auth_allowed("https://api.openai.com.evil.example/v1", base, &[]));
-        assert!(!auth_allowed("https://api.openai.com:8443/v1", base, &[]));
-        assert!(!auth_allowed("https://evil.example@api.openai.com/v1", base, &[]));
-        assert!(!auth_allowed("https://cdn.aimlapi.com/generations/x.png", "https://api.aimlapi.com/v1", &[]));
-        assert!(!auth_allowed("ftp://api.openai.com/v1", base, &[]));
-        assert!(!auth_allowed("https://api.openai.com /v1", base, &[]));
-        // The user's own server: plain http on its own port, IPv6 literals.
-        assert!(auth_allowed("http://127.0.0.1:1234/v1/images/edits", "http://127.0.0.1:1234/v1", &[]));
-        assert!(!auth_allowed("http://127.0.0.1:1235/v1/images/edits", "http://127.0.0.1:1234/v1", &[]));
-        assert!(auth_allowed("http://[::1]:8080/v1/images/edits", "http://[::1]:8080/v1", &[]));
-        assert!(!auth_allowed("http://[::1]/v1", "http://[::1]:8080/v1", &[]));
-        // BFL: a regional polling host on a dot boundary, https:443 only.
-        let bfl = ["bfl.ai"];
-        assert!(auth_allowed("https://api.eu1.bfl.ai/v1/get_result?id=x", "https://api.bfl.ai", &bfl));
-        assert!(auth_allowed("https://bfl.ai/v1/x", "https://api.bfl.ai", &bfl));
-        assert!(!auth_allowed("https://evilbfl.ai/v1/x", "https://api.bfl.ai", &bfl));
-        assert!(!auth_allowed("https://api.bfl.ai.evil.example/v1/x", "https://api.bfl.ai", &bfl));
-        assert!(!auth_allowed("http://api.us1.bfl.ai/v1/x", "https://api.bfl.ai", &bfl));
-        assert!(!auth_allowed("https://api.us1.bfl.ai:8443/v1/x", "https://api.bfl.ai", &bfl));
-        assert!(!auth_allowed("https://api.us1.bfl.ai/v1/x", "https://api.bfl.ai", &[]));
-    }
-
-    #[test]
-    fn logged_bodies_elide_base64_and_are_capped() {
-        let body = format!("{{\"error\":\"bad\",\"b64_json\":\"{}\"}}", "A".repeat(5000));
-        assert_eq!(log_body(body.as_bytes()), "{\"error\":\"bad\",\"b64_json\":\"<base64: 5000 chars>\"}");
-        let long = "word ".repeat(1000);
-        assert_eq!(log_body(long.as_bytes()).chars().count(), 2048 + 3);
-    }
-
-    #[test]
     fn async_run_polls_then_downloads_without_auth() {
         let call = async_call();
         let transport = FakeTransport::new(vec![Ok(resp(200, b"queued")), Ok(resp(200, b"running")), Ok(resp(200, b"done")), Ok(resp(200, b"IMAGE"))]);
@@ -694,7 +465,7 @@ pub(crate) mod tests {
     #[test]
     fn a_failed_submit_is_never_retried() {
         let call = async_call();
-        for answer in [Ok(resp(503, b"busy")), Err(ImageEditError::Network { detail: "reset".to_string() }), Err(ImageEditError::Timeout { stage: "submit".to_string() })] {
+        for answer in [Ok(resp(503, b"busy")), Err(HttpError::Network { detail: "reset".to_string() }), Err(HttpError::Timeout { stage: "submit".to_string() })] {
             let transport = FakeTransport::new(vec![answer, Ok(resp(200, b"queued"))]);
             let (result, _) = run(&transport, &AsyncProtocol { cancel_url: None }, &call, &CancelFlag::new());
             assert!(result.is_err());
@@ -705,7 +476,7 @@ pub(crate) mod tests {
     #[test]
     fn polls_and_downloads_retry_transient_failures_three_times() {
         let call = async_call();
-        let flaky = vec![Ok(resp(200, b"queued")), Ok(resp(502, b"")), Err(ImageEditError::Network { detail: "reset".to_string() }), Ok(resp(200, b"done")), Ok(resp(500, b"")), Ok(resp(200, b"IMAGE"))];
+        let flaky = vec![Ok(resp(200, b"queued")), Ok(resp(502, b"")), Err(HttpError::Network { detail: "reset".to_string() }), Ok(resp(200, b"done")), Ok(resp(500, b"")), Ok(resp(200, b"IMAGE"))];
         let transport = FakeTransport::new(flaky);
         let (result, _) = run(&transport, &AsyncProtocol { cancel_url: None }, &call, &CancelFlag::new());
         assert_eq!(result.ok(), Some(b"IMAGE".to_vec()));
@@ -763,7 +534,7 @@ pub(crate) mod tests {
     fn a_poll_out_of_retries_after_a_cancel_still_cancels_the_job() {
         let call = async_call();
         let cancel = CancelFlag::new();
-        let network = || Err(ImageEditError::Network { detail: "reset".to_string() });
+        let network = || Err(HttpError::Network { detail: "reset".to_string() });
         // The cancel lands during the LAST poll attempt: no backoff wait follows to see it.
         let mut transport = FakeTransport::new(vec![Ok(resp(200, b"queued")), network(), network(), network(), network(), Ok(resp(200, b""))]);
         transport.cancel_after = Some((5, cancel.clone()));
@@ -777,7 +548,7 @@ pub(crate) mod tests {
     fn a_non_transient_error_after_a_cancel_still_cancels_the_job() {
         let call = async_call();
         let cancel = CancelFlag::new();
-        let mut transport = FakeTransport::new(vec![Ok(resp(200, b"queued")), Err(ImageEditError::DownloadTooLarge { limit_bytes: 1 }), Ok(resp(200, b""))]);
+        let mut transport = FakeTransport::new(vec![Ok(resp(200, b"queued")), Err(HttpError::BodyTooLarge { limit_bytes: 1 }), Ok(resp(200, b""))]);
         transport.cancel_after = Some((2, cancel.clone()));
         let (result, _) = run(&transport, &AsyncProtocol { cancel_url: Some("https://queue.example.run/jobs/j1/cancel".to_string()) }, &call, &cancel);
         assert!(matches!(result, Err(ImageEditError::Cancelled)));

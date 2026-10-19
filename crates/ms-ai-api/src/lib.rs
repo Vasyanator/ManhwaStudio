@@ -20,9 +20,15 @@ Modules:
 - `quota`     : provider-agnostic "out of credits / rate limited" error classifier.
 - `encoding`  : the one base64 codec (encoder for binary chat parts and image-edit bodies,
                 strict decoder for image-edit responses).
+- `http`      : crate-private shared HTTP plumbing for the hand-rolled REST clients (request
+                descriptions, multipart builder, `HttpError`, the native `ureq` transport with
+                the key-origin rule and log-safe body digest).
 - `image_edit`: the cloud image-edit layer (provider / model catalogue, size-rule data, the
                 size-exact pipeline, the per-API-shape adapters and the native HTTP executor,
                 the provider / model picker and its single-flight key state).
+- `neurolate` : the NeuroLate cloud OCR / text-detection client (key slot `"neurolate:api"`,
+                typed request / response model, the never-retried paid `recognize` with its
+                abandon contract, the free key / limit fetch, the key + limit panel and view).
 - `connection`: `AiApiConnectionState` (widget state), its actions, `apply_event`.
 - `connection_view`: `draw_connection`, the shared egui connection widget, and its reusable
                 `draw_key_block`.
@@ -61,11 +67,13 @@ pub mod encoding;
 pub mod error;
 pub mod generation;
 pub mod generation_view;
+pub(crate) mod http;
 pub mod image_edit;
 pub mod keys;
 pub mod metadata;
 pub mod model_caps;
 pub mod model_id;
+pub mod neurolate;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod openrouter;
 pub mod quota;

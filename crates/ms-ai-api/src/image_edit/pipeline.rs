@@ -42,7 +42,9 @@ use super::adapters::protocol_for;
 #[cfg(not(target_arch = "wasm32"))]
 use super::catalog::lookup;
 #[cfg(not(target_arch = "wasm32"))]
-use super::executor::{ExecutorLimits, HttpTransport, RunContext, UreqTransport, execute};
+use super::executor::{ExecutorLimits, RunContext, execute};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::http::{HttpTransport, UreqTransport};
 use super::request::{CancelFlag, ImageEditStage};
 
 /// The provider call of a run plus what `finish` needs to map the answer back.
@@ -198,7 +200,7 @@ pub(crate) const TRACE_CATEGORY: &str = "IMAGE_EDIT";
 #[cfg(not(target_arch = "wasm32"))]
 pub fn run_image_edit(request: &ImageEditRequest, key: &str, cancel: &CancelFlag, mut on_stage: impl FnMut(ImageEditStage)) -> Result<ImageEditOutcome, ImageEditError> {
     let limits = ExecutorLimits::default();
-    run_with(&UreqTransport::new(&limits), &limits, request, &RunInputs { key, cancel }, &mut on_stage)
+    run_with(&UreqTransport::new(limits.connect), &limits, request, &RunInputs { key, cancel }, &mut on_stage)
 }
 
 /// Web stub: the browser build has no HTTP executor.

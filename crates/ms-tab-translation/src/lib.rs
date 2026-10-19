@@ -22,6 +22,8 @@ Submodules:
 - `model_download_status`: the one owner of how an app-managed model download is shown
   (latest event, text, progress bar); `pub` because the Cleaning tools draw it too.
 - `ocr_case_fix`: pure post-OCR "ALL CAPS" -> sentence-case normalization.
+- `neurolate`: the tab's NeuroLate settings (language, comic type, "create mask") with the one
+  owner of their "Auto" rules and request parameters, and their shared settings view.
 - `page_crop`: the one uv selection -> page pixel rect rule (OCR crop and the detector's region
   detection of the same selection).
 - `text_detector`: text detector controller/worker (classic + Paddle/CTD/Surya backend modes).
@@ -53,6 +55,8 @@ mod ai_mt_response;
 // through `translate_texts_via_translator`.
 pub mod machine_translation;
 mod machine_translators;
+// The tab's NeuroLate settings and request-parameter rules (detector mode, OCR engine).
+mod neurolate;
 // `pub` rather than crate-private: the `cleaning` tab's mask generation, region-inpaint editor
 // and LaMa / SDXL engines show their model downloads through it.
 pub mod model_download_status;

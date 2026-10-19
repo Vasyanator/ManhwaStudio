@@ -4,7 +4,7 @@ Unit and characterization tests of the detector module (all submodules): routing
 backend gate, the IPC runner's batch sizing and its request/response handling over a fake
 transport, the native runner's error mapping, the native -> backend fallback decision, error
 texts, the region helpers' conversion / size / dilation contract, the classic pipeline and the
-Otsu/dilation adapters.
+Otsu/dilation adapters, and the controller's batch cancel / "Stop after the current page" flags.
 
 Notes:
 The `characterization_*` expected values were OBSERVED from the code before the detector
@@ -330,8 +330,14 @@ fn native_runner_only_for_paddle_on_the_native_route() {
     }
 }
 
+/// NeuroLate request parameters for the cloud mode's tests.
+const NEUROLATE_PARAMS: OcrParams = OcrParams {
+    language: ms_ai_api::neurolate::NeurolateLanguage::Ko,
+    comic_type: ms_ai_api::neurolate::NeurolateComicType::Webtoon,
+};
+
 /// The batch gate needs the backend for CTD and Surya always, for PaddleOCR only off the
-/// native route, and never for Classic.
+/// native route, and never for Classic or the cloud NeuroLate.
 #[test]
 fn backend_gate_follows_mode_and_paddle_route() {
     let paddle = TextDetectorRunMode::PaddleOcr(TextDetectorPaddleOcrOptions::default());
@@ -341,6 +347,7 @@ fn backend_gate_follows_mode_and_paddle_route() {
         assert!(!detector_mode_needs_backend(&TextDetectorRunMode::Classic, route));
         assert!(detector_mode_needs_backend(&TextDetectorRunMode::AiCtd(TextDetectorAiCtdOptions::default()), route));
         assert!(detector_mode_needs_backend(&TextDetectorRunMode::Surya(TextDetectorSuryaOptions), route));
+        assert!(!detector_mode_needs_backend(&TextDetectorRunMode::NeuroLate(NeurolateDetect { params: NEUROLATE_PARAMS, with_text: false }), route));
     }
 }
 
@@ -353,16 +360,26 @@ fn ctd_params_carry_the_detect_size() {
     assert_eq!(ctd_detect_params(&options).ctd_detect_size, 0);
 }
 
-/// Every run mode maps to its engine; only CTD carries non-default params (its detect size).
+/// Every local run mode maps to its engine; only CTD carries non-default params (its detect
+/// size); the cloud NeuroLate mode alone has no plan.
 #[test]
 fn run_modes_map_to_their_plan_inputs() {
-    assert_eq!(TextDetectorRunMode::Classic.plan_inputs(), (EngineKind::Classic, DetectParams::default()));
+    assert_eq!(TextDetectorRunMode::Classic.plan_inputs(), Some((EngineKind::Classic, DetectParams::default())));
     let paddle = TextDetectorRunMode::PaddleOcr(TextDetectorPaddleOcrOptions::default());
-    assert_eq!(paddle.plan_inputs(), (EngineKind::Paddle, DetectParams::default()));
+    assert_eq!(paddle.plan_inputs(), Some((EngineKind::Paddle, DetectParams::default())));
     let surya = TextDetectorRunMode::Surya(TextDetectorSuryaOptions);
-    assert_eq!(surya.plan_inputs(), (EngineKind::Surya, DetectParams::default()));
+    assert_eq!(surya.plan_inputs(), Some((EngineKind::Surya, DetectParams::default())));
     let ctd = TextDetectorRunMode::AiCtd(TextDetectorAiCtdOptions { detect_size: 1000, mask_dilate_size: 0 });
-    assert_eq!(ctd.plan_inputs(), (EngineKind::Ctd, DetectParams { ctd_detect_size: 1000 }));
+    assert_eq!(ctd.plan_inputs(), Some((EngineKind::Ctd, DetectParams { ctd_detect_size: 1000 })));
+    assert_eq!(TextDetectorRunMode::NeuroLate(NeurolateDetect { params: NEUROLATE_PARAMS, with_text: true }).plan_inputs(), None);
+}
+
+/// A region engine runs the page mode of the same engine; NeuroLate keeps its parameters.
+#[test]
+fn region_engines_run_their_page_modes() {
+    assert!(matches!(RegionDetectEngine::PaddleOcr.run_mode(), TextDetectorRunMode::PaddleOcr(_)));
+    assert!(matches!(RegionDetectEngine::Surya.run_mode(), TextDetectorRunMode::Surya(_)));
+    assert!(matches!(RegionDetectEngine::NeuroLate(NEUROLATE_PARAMS).run_mode(), TextDetectorRunMode::NeuroLate(detect) if detect == NeurolateDetect { params: NEUROLATE_PARAMS, with_text: false }));
 }
 
 // -------------------------------------------------------------------------
@@ -689,30 +706,46 @@ fn region_mask_skips_empty_regions_and_dilates() {
 }
 
 // -------------------------------------------------------------------------
-// Batch cancel
+// Batch cancel and stop
 // -------------------------------------------------------------------------
+
+/// A controller over test channels (no worker thread): the returned receiver sees the commands
+/// it dispatches, the returned sender plays the worker's events.
+fn test_controller() -> (TranslationTextDetectorController, Receiver<WorkerCommand>, Sender<WorkerEvent>) {
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (worker_tx, worker_rx) = std::sync::mpsc::channel();
+    let controller = TranslationTextDetectorController {
+        busy: false,
+        cmd_tx,
+        evt_rx: worker_rx,
+        worker_thread: None,
+        batch_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        batch_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        batch_running: false,
+    };
+    (controller, cmd_rx, worker_tx)
+}
+
+/// Runs a one-page Classic batch over a page path that is never read and returns its events.
+fn run_unread_batch(cancel: bool, stop: bool) -> Vec<WorkerEvent> {
+    let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+    let cancel = std::sync::atomic::AtomicBool::new(cancel);
+    let stop = std::sync::atomic::AtomicBool::new(stop);
+    run_detect_batch(vec![(0, PathBuf::from("never-read.png"))], false, TextDetectorRunMode::Classic, 0, &cancel, &stop, &evt_tx);
+    evt_rx.try_iter().collect()
+}
 
 /// A batch whose cancel flag is set ends as `DetectCancelled` (no page runs, no failure), and
 /// the controller turns that into a neutral end that releases `busy`.
 #[test]
 fn a_cancelled_batch_ends_as_cancelled_not_as_an_error() {
-    let (evt_tx, evt_rx) = std::sync::mpsc::channel();
-    let cancel = std::sync::atomic::AtomicBool::new(true);
-    run_detect_batch(vec![(0, PathBuf::from("never-read.png"))], false, TextDetectorRunMode::Classic, 0, &cancel, &evt_tx);
-    let events: Vec<WorkerEvent> = evt_rx.try_iter().collect();
+    let events = run_unread_batch(true, false);
     assert!(matches!(events.first(), Some(WorkerEvent::DetectStarted { total: 1, .. })));
     assert!(matches!(events.last(), Some(WorkerEvent::DetectCancelled)), "{events:?}");
     assert!(!events.iter().any(|event| matches!(event, WorkerEvent::DetectFailed { .. } | WorkerEvent::PageFailed { .. })));
 
-    let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
-    let (worker_tx, worker_rx) = std::sync::mpsc::channel();
-    let mut controller = TranslationTextDetectorController {
-        busy: true,
-        cmd_tx,
-        evt_rx: worker_rx,
-        worker_thread: None,
-        batch_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    };
+    let (mut controller, _cmd_rx, worker_tx) = test_controller();
+    controller.busy = true;
     let flag = std::sync::Arc::clone(&controller.batch_cancel);
     worker_tx.send(WorkerEvent::DetectCancelled).expect("the controller listens");
     assert!(matches!(controller.poll_events().as_slice(), [TextDetectorControllerEvent::DetectCancelled]));
@@ -721,22 +754,105 @@ fn a_cancelled_batch_ends_as_cancelled_not_as_an_error() {
     assert!(flag.load(std::sync::atomic::Ordering::Relaxed), "the drop stops a running batch");
 }
 
+/// A batch whose stop flag is set ends exactly like a cancelled one: `DetectCancelled` before
+/// the page, no page result and no failure.
+#[test]
+fn a_stopped_batch_ends_as_cancelled_before_the_next_page() {
+    let events = run_unread_batch(false, true);
+    assert!(matches!(events.first(), Some(WorkerEvent::DetectStarted { total: 1, .. })));
+    assert!(matches!(events.last(), Some(WorkerEvent::DetectCancelled)), "{events:?}");
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        WorkerEvent::DetectFailed { .. } | WorkerEvent::PageFailed { .. } | WorkerEvent::PageDetected { .. }
+    )));
+}
+
 /// The panel's Cancel sets the running batch's flag and is a no-op while idle.
 #[test]
 fn cancel_detection_sets_the_flag_only_while_busy() {
-    let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
-    let (_worker_tx, worker_rx) = std::sync::mpsc::channel();
-    let mut controller = TranslationTextDetectorController {
-        busy: false,
-        cmd_tx,
-        evt_rx: worker_rx,
-        worker_thread: None,
-        batch_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    };
+    let (mut controller, _cmd_rx, _worker_tx) = test_controller();
     let flag = std::sync::Arc::clone(&controller.batch_cancel);
     controller.cancel_detection();
     assert!(!flag.load(std::sync::atomic::Ordering::Relaxed), "an idle controller has no batch to stop");
     controller.busy = true;
     controller.cancel_detection();
     assert!(flag.load(std::sync::atomic::Ordering::Relaxed), "the running batch must stop");
+}
+
+/// Stop reaches the dispatched batch's own stop flag, only while a page batch runs, and never
+/// sets the cancel flag the native forward observes mid-page.
+#[test]
+fn request_stop_sets_only_the_stop_flag_of_a_running_batch() {
+    let (mut controller, cmd_rx, _worker_tx) = test_controller();
+    controller.request_stop();
+    assert!(!controller.batch_stop.load(std::sync::atomic::Ordering::Relaxed), "an idle controller has no batch to stop");
+
+    controller
+        .start_detection(vec![(0, PathBuf::from("never-read.png"))], false, TextDetectorRunMode::Classic, 0)
+        .expect("an idle controller starts a batch");
+    assert!(controller.is_batch_running());
+    let Ok(WorkerCommand::Detect { cancel, stop, .. }) = cmd_rx.try_recv() else {
+        panic!("start_detection dispatches a Detect command");
+    };
+    assert!(!stop.load(std::sync::atomic::Ordering::Relaxed), "a new batch starts unstopped");
+    controller.request_stop();
+    assert!(stop.load(std::sync::atomic::Ordering::Relaxed), "Stop reaches the running batch");
+    assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed), "Stop must not cancel the page in flight");
+}
+
+/// A region detection makes the controller busy but is not a page batch: Stop ignores it.
+#[test]
+fn request_stop_ignores_a_region_detection() {
+    let (mut controller, cmd_rx, _worker_tx) = test_controller();
+    let request = RegionDetectRequest {
+        page_idx: 0,
+        page_path: PathBuf::from("never-read.png"),
+        uv_rect: [0.0, 0.0, 1.0, 1.0],
+        engine: RegionDetectEngine::PaddleOcr,
+        mask_dilate_size: 0,
+    };
+    controller.start_region_detection(request).expect("an idle controller starts a region detection");
+    assert!(controller.is_busy());
+    assert!(!controller.is_batch_running());
+    assert!(matches!(cmd_rx.try_recv(), Ok(WorkerCommand::DetectRegion { .. })));
+    controller.request_stop();
+    assert!(!controller.batch_stop.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(!controller.batch_cancel.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+/// Every end event of a page batch releases both `busy` and `batch_running`; a new batch then
+/// gets a fresh, unstopped flag.
+#[test]
+fn batch_end_events_release_busy_and_batch_running() {
+    let ends = [
+        WorkerEvent::DetectCancelled,
+        WorkerEvent::DetectFailed { error: String::from("failed") },
+        WorkerEvent::DetectFinished { total_blocks: 0, failed_pages: 0 },
+    ];
+    for end in ends {
+        let (mut controller, _cmd_rx, worker_tx) = test_controller();
+        controller
+            .start_detection(vec![(0, PathBuf::from("never-read.png"))], false, TextDetectorRunMode::Classic, 0)
+            .expect("an idle controller starts a batch");
+        controller.request_stop();
+        worker_tx.send(end).expect("the controller listens");
+        let events = controller.poll_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(!controller.is_busy(), "{events:?}");
+        assert!(!controller.is_batch_running(), "{events:?}");
+        controller.request_stop();
+        controller
+            .start_detection(vec![(0, PathBuf::from("never-read.png"))], false, TextDetectorRunMode::Classic, 0)
+            .expect("the ended batch released the controller");
+        assert!(!controller.batch_stop.load(std::sync::atomic::Ordering::Relaxed), "a new batch gets a fresh stop flag");
+    }
+
+    let (mut controller, _cmd_rx, worker_tx) = test_controller();
+    controller
+        .start_detection(vec![(0, PathBuf::from("never-read.png"))], false, TextDetectorRunMode::Classic, 0)
+        .expect("an idle controller starts a batch");
+    drop(worker_tx);
+    assert!(matches!(controller.poll_events().as_slice(), [TextDetectorControllerEvent::DetectFailed { .. }]));
+    assert!(!controller.is_busy());
+    assert!(!controller.is_batch_running());
 }
