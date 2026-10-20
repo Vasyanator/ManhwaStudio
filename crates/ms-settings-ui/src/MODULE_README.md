@@ -88,7 +88,8 @@ not the dependency list.
   «Сбросить выученные ограничения» on a worker. Offline it draws no editor. A pending edit is
   sent by the section's own poll, or on a worker when the pane state is dropped.
 - `ai_backend_panel.rs`: AI runtime selection, ONNX provider/device/build, model limit,
-  backend health readout, ORT crash-guard reset. The provider list is the UNION of the offline
+  backend health readout (incl. the PyTorch build line and its kernel-mismatch warning, read
+  from `AiBackendHealthSnapshot::torch_build`), ORT crash-guard reset. The provider list is the UNION of the offline
   native set and the providers the backend reports; backend-only providers (e.g. MIGraphX,
   ROCm) stay selectable for backend ONNX. Without `PlatformFeature::PythonBackend` (Android,
   web) it offers no "Backend" runtime and draws only the native ONNX selection (backend status,

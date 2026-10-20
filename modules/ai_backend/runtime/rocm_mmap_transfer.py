@@ -80,6 +80,8 @@ import os
 import threading
 from typing import TYPE_CHECKING, Any, Callable, Iterator, NamedTuple
 
+from .torch_flavour import is_rocm_build
+
 if TYPE_CHECKING:  # pragma: no cover - typing only, torch is imported lazily
     import torch
 
@@ -351,7 +353,7 @@ def invalidate_maps_cache() -> None:
 
 
 def _is_rocm_build() -> bool:
-    """Whether the imported Torch is a ROCm/HIP build (cached per process)."""
+    """Whether the imported Torch is a ROCm/HIP build (`torch_flavour.is_rocm_build`, cached per process)."""
     global _rocm_build
     if _rocm_build is not None:
         return _rocm_build
@@ -361,8 +363,7 @@ def _is_rocm_build() -> bool:
         # Torch absent or not importable yet (ONNX-only install, import order):
         # report "not ROCm" without caching, so a later call can still decide.
         return False
-    hip_version = getattr(getattr(torch, "version", None), "hip", None)
-    _rocm_build = isinstance(hip_version, str) and bool(hip_version.strip())
+    _rocm_build = is_rocm_build(torch)
     return _rocm_build
 
 

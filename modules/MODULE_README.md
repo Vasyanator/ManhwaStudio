@@ -18,7 +18,10 @@ Python modules may use local browser profiles, Selenium, CloakBrowser/Playwright
 
 - `new_project/`: headless browser-fetch daemons (Selenium / CloakBrowser) hosted in-process by the AI backend; no UI here anymore.
 - `browser_f.py`: Selenium browser/profile construction and cookie/header transfer helpers.
-- `ai_device.py`: PyTorch/ONNX device selection helpers used by backend services.
+- `ai_device.py`: PyTorch/ONNX device selection helpers used by backend services, and the
+  CUDA/ROCm diagnosis report (GPU listing via subprocesses only, build flavour from
+  `ai_backend/runtime/torch_flavour.py`, AMD verdict for self-contained ROCm wheels on Windows and
+  Linux). Tests: `test_ai_device.py`.
 - `lama_mpe.py` / `ffc.py`: LaMa MPE inpainting runtime used by the backend.
 - `ai_backend/`: Python AI service runtime called by the Rust application over framed IPC
   (`ms-backend-ipc`; dotted method names such as `ocr.manga`, `inpaint.lama_v2`, indexed in

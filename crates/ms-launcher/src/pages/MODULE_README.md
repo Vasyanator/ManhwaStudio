@@ -41,7 +41,7 @@ state arrives.
   `tar + zstd` archive creation for `.mschapter` export.
 - `settings_page.rs`: launcher settings tabs, system CPU/RAM/GPU probes,
   AI package probes, `General.ai_install_type` reconciliation, PyTorch/full-dependency upgrade
-  flow, and a background-driven Python environment console. The tab set, ordering, tab labels, and
+  flow (its choice step draws the installer's shared `ms_installer::torch::draw_torch_choice`), and a background-driven Python environment console. The tab set, ordering, tab labels, and
   the shared General/AiBackend/Tutorials sections come from the shared section registry
   (`crate::settings_shared`): `active_tab` is a `SettingsSectionId`, the vertical tab sidebar (`show_sidebar`, left of the
   section content, below the title; tabs in their own `ScrollArea`, "Save log" pinned under it)

@@ -54,7 +54,15 @@ ms-native-runtime` line (`ARCHITECTURE.md` §2).
   resident PaddleOCR-VL variant (`ocr.paddleocrvl.model`); readiness of the SELECTED variant is
   `paddle_vl_ready_for`, so a variant switch never shows a stale "ready". The large-model pool
   part of the pushed `model_manager` payload lands in `AiBackendHealthSnapshot::large_pool`
-  (parsed by `large_models::parse_pool_status`; `None` when not reported).
+  (parsed by `large_models::parse_pool_status`; `None` when not reported). The snapshot's
+  `torch` object (protocol v18) lands in `AiBackendHealthSnapshot::torch_build` as
+  `TorchBuildInfo` (flavour from `ms_config::torch_choice::TorchFlavour`, versions, visible GPUs
+  with `GfxArch`, installed per-arch ROCm kernel wheels), strictly parsed: `null` / absent is
+  `None`, an unknown flavour token or a bad shape is a typed `TorchBuildError`.
+  `TorchBuildInfo::kernel_mismatch` is the one "main GPU's arch has no installed ROCm kernels"
+  rule (primary device = first discrete, else first; only for the split-kernel whl-next layout,
+  `rocm_split_kernels`, where an empty wheel list means no kernels; silent for a pytorch.org
+  ROCm build with bundled kernels).
 
 ## Contracts and invariants
 - `large_models` mirrors only the backend's wire ids; step SEMANTICS are
@@ -65,6 +73,8 @@ ms-native-runtime` line (`ARCHITECTURE.md` §2).
   machine translators are never gated by it. A platform reason wins over the flag.
 - Every route-availability decision goes through `AiRouteKind::availability`; routers read the
   runtime through `effective_ai_runtime`, never `AiRuntime::from_user_settings` directly.
+- `torch_build` is diagnostic only (the AI backend pane): nothing gates a feature on it, and the
+  flavour / arch vocabulary is `ms_config::torch_choice`'s, never redefined here.
 - `backend_health` owns no endpoint/socket state; transport is `ms_backend_ipc`. The probe runs on
   its own thread; nothing here runs on the GUI thread or blocks it.
 - The i18n keys keep their `translation.backend_health.*` / `translation.local_ai.*` names

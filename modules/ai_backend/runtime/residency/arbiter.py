@@ -60,6 +60,7 @@ from ..memory_budget import (
     read_device_budget,
     read_host_budget,
 )
+from ..torch_flavour import is_rocm_build
 from ..torch_support import is_torch_available
 from .footprint import Sample, estimate_footprint, measured_footprint, normalize_device, remeasured_footprint
 from .holdings import (
@@ -128,15 +129,14 @@ class BudgetProbes(Protocol):
 
 
 def _is_rocm_build() -> bool:
-    """Whether the installed torch is a ROCm/HIP build; `False` without torch."""
+    """Whether the installed torch is a ROCm/HIP build (`torch_flavour.is_rocm_build`); `False` without torch."""
     if not is_torch_available():
         return False
     import torch
 
     # A partial or stand-in torch module (tests, broken installs) may lack `version`:
-    # that reads as "not ROCm", never as an error out of a lease.
-    version = getattr(torch, "version", None)
-    return bool(getattr(version, "hip", None))
+    # `is_rocm_build` reads that as "not ROCm", never as an error out of a lease.
+    return is_rocm_build(torch)
 
 
 class MemoryBudgetProbes:

@@ -2,7 +2,7 @@
 
 ## Purpose
 Everything the application needs from the HOST it runs on, and nothing about the
-application's own layers: GPU/accelerator capabilities, the app-local Python runtime,
+application's own layers: GPU/accelerator capabilities, AMD adapters and their gfx architecture, the app-local Python runtime,
 desktop region capture, which AI Python packages are installed, the app-managed AI model
 tree on Hugging Face, the Hugging Face credential in the OS secret store, and the
 process-global Torch-availability slot. Independent modules with nothing in common except
@@ -13,12 +13,13 @@ This is a standalone workspace crate. `src/lib.rs` mounts it under the historica
 names with
 `pub(crate) use ms_sysprobe::{ai_install_probe, python_manager};` and
 `pub(crate) use ms_sysprobe::hf_token;`, so those call sites keep writing
-`crate::python_manager::…` and friends; `gpu_utils`, `paste_image`, `screen_capture`,
+`crate::python_manager::…` and friends; `amd_adapters`, `gpu_utils`, `paste_image`, `screen_capture`,
 `ai_backend_capabilities` and `ai_models` have no root shim (callers name `ms_sysprobe::` directly).
 
 ## Architecture
-No shared state and one cross-module call (`ai_install_probe` runs its snippet through
-`python_manager`): `lib.rs` is a plain list of `pub mod`. Each
+No shared state and two cross-module calls (`ai_install_probe` runs its snippet through
+`python_manager`; `gpu_utils` derives AMD presence and its tool-less gfx fallback from
+`amd_adapters`): `lib.rs` is a plain list of `pub mod`. Each
 module talks to the OS through one of three mechanisms — a subprocess whose stdout it
 parses (`nvidia-smi`, `rocminfo`, `vulkaninfo`, `grim`, `screencapture`), a Win32 API call
 (`windows-sys`), or a filesystem probe — and every one of them is a `Result`/`Option`
@@ -28,6 +29,11 @@ Callers own the threading: nothing here spawns a worker for you.
 
 ## Files and submodules
 - `lib.rs`: crate root. Mounts the modules and the `ms-i18n` macros. Nothing else.
+- `amd_adapters/`: AMD display adapters with their PCI ids, gfx processor (`GfxArch`; Linux:
+  KFD topology, else the table; Windows: the table), integrated flag and Windows driver version
+  — Linux via sysfs + KFD, Windows via SetupAPI + the driver registry key (no rocminfo, lspci,
+  WMI or OpenCL). Owns the ONE pinned PCI device-id -> gfx table (`device_ids.rs`, sources
+  pinned in its header). Detail: `amd_adapters/MODULE_README.md`.
 - `ai_backend_capabilities.rs`: one process-global atomic tri-state mirroring whether the
   running AI backend has Torch, so a UI gate is an atomic load rather than an IPC round
   trip. The health-snapshot handler is the only writer; `Unknown` (never probed) is a
@@ -79,10 +85,14 @@ Callers own the threading: nothing here spawns a worker for you.
   (`None` / `Base` / `Full`). Report parsing and classification are target-neutral; only the
   spawn half is `#[cfg(not(wasm32))]`. Edit here for a new probed package or a changed level
   rule; PERSISTING the level is the caller's job (`lib.rs`).
-- `gpu_utils.rs`: vendor/architecture detection (NVIDIA, AMD, Apple), CUDA/ROCm runtime
-  versions, Linux driver + ROCm installation state, ROCm 7.2 LLVM-target support, Windows
-  DirectML accelerators, and the WebGPU adapter enumeration whose returned index IS Dawn's
-  `device_id` (DXGI on Windows, `vulkaninfo --summary` on Linux, empty on macOS). Also the
+- `gpu_utils.rs`: vendor/architecture detection (NVIDIA, AMD, Apple; AMD presence =
+  `amd_adapters` non-empty, so chipset functions never count), CUDA versions and the system ROCm
+  version (`/opt/rocm/.info/version`, else `hipcc` "HIP version" — never rocminfo's HSA
+  "Runtime Version"), Linux driver + ROCm installation state, ROCm 7.2 LLVM-target support
+  (gfx tokens validated by `GfxArch`), Windows DirectML accelerators (WMI
+  `Win32_VideoController` names), and the WebGPU adapter enumeration whose returned index is
+  used as Dawn's `device_id` (`vulkaninfo --summary` on Linux; WMI names on Windows, where the
+  match with Dawn's DXGI order is an unproven assumption; empty on macOS). Also the
   build-aware runtime gates `native_cuda_build_available` / `native_openvino_runtime_available`.
   Edit here for a new accelerator/runtime probe.
 - `python_manager.rs`: the only owner of Python interpreter discovery (`installer_files/venv`,
@@ -118,7 +128,7 @@ Callers own the threading: nothing here spawns a worker for you.
 - Python is only DISCOVERED here, never installed. Downloads and dependency installation
   belong to `src/installer/`, which calls into this crate for the discovery contract.
 - Crate boundary: dependencies are `ms-log` (diagnostics), `ms-i18n` (user-facing strings),
-  `ms-config` (the `AiInstallType` level only), `ms-thread` (the AI probe's worker),
+  `ms-config` (the `AiInstallType` level and the `torch_choice::GfxArch` vocabulary only), `ms-thread` (the AI probe's worker),
   `image` (the capture contract), `serde`/`serde_json` (probe output, model markers),
   `sha2` + `thiserror` (`ai_models::external`), `ms-download` (`ai_models`, native-only: the resumable HTTP stream and the busy guard), `keyring` (`hf_token`, not wasm/Android), `ms-platform` (clipboard reads, capability table), and `windows-sys` on
   Windows. No probe may READ OR WRITE a config document, and the crate must NOT gain a
@@ -129,6 +139,8 @@ Callers own the threading: nothing here spawns a worker for you.
   larger list), so verify with `cargo clippy -p ms-sysprobe --target x86_64-pc-windows-gnu`.
 
 ## Editing map
+- To add an AMD device id, or a field of the AMD adapter probe, see `amd_adapters/` (never a
+  second id or name -> gfx table elsewhere).
 - To add a GPU / accelerator / runtime probe, see `gpu_utils.rs`; keep the "unknown is not
   absent" rule and add a pure parser plus its test for any new text format.
 - To change where Python is looked for, or how a Python child is spawned or killed, see

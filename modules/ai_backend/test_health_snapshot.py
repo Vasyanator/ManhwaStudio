@@ -14,6 +14,9 @@ Unit tests for `server._build_health_snapshot`:
   `small_models`, `large_models`, `limits` and `budget`, each isolated (a
   failing part becomes the error placeholder, the rest survives); the budget
   probes only devices that hold or reserve bytes;
+- the snapshot carries `torch` = `torch_flavour.torch_health_payload()` (patched
+  module-wide here by an autouse fixture, so no test probes this machine's GPU;
+  the payload itself is tested in `runtime/test_torch_flavour.py`);
 - `server.build_app_state` wires ONE arbiter into both pools and the services,
   and lists FLUX.2 / FLUX.3 as the `flux2_klein` / `flux3_klein` profiles
   adapters, the snapshot carrying `inpaint.flux3_klein` (in-memory settings
@@ -68,6 +71,7 @@ from modules.ai_backend.runtime.memory_budget import DeviceBudget, HostBudget
 from modules.ai_backend.runtime.model_manager import SmallModelManager
 from modules.ai_backend.runtime.residency.arbiter import ResidencyArbiter
 from modules.ai_backend.runtime.residency.holdings import FootprintHint, Runtime
+from modules.ai_backend import server as server_module
 from modules.ai_backend.server import _build_health_snapshot, build_app_state
 from modules.ai_backend.translate.machine_translation import MachineTranslationService
 from modules.ai_backend.watermark.service import WatermarkRemovalService
@@ -87,6 +91,23 @@ class _RaisingService:
 
 
 GIB = 1 << 30
+
+#: The `torch` payload every snapshot of this module carries (see `_fake_torch_payload`).
+_FAKE_TORCH_PAYLOAD = {
+    "flavour": "rocm",
+    "version": "2.13.0+rocm10.1.0",
+    "hip_version": "10.1.0",
+    "cuda_version": None,
+    "devices": [{"index": 0, "name": "Fake GPU", "gcn_arch": "gfx1201", "integrated": False}],
+    "rocm_device_archs": ["gfx1201"],
+    "rocm_split_kernels": True,
+}
+
+
+@pytest.fixture(autouse=True)
+def _fake_torch_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace the snapshot's torch facts: the real ones import torch and query this machine's GPU."""
+    monkeypatch.setattr(server_module, "torch_health_payload", lambda: dict(_FAKE_TORCH_PAYLOAD))
 
 
 class _FakeProbes:
@@ -153,6 +174,17 @@ def test_snapshot_all_ok_has_full_shape() -> None:
     assert snap["ocr"]["suryaocr"] == {"status": "ok", "name": "suryaocr"}
     # `baberuocr` is the key the Rust health parser reads for `ocr.baberu`.
     assert snap["ocr"]["baberuocr"] == {"status": "ok", "name": "baberuocr"}
+    assert snap["torch"] == _FAKE_TORCH_PAYLOAD
+
+
+def test_snapshot_torch_none_is_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No torch (or a failed fact): the key stays present with `None`, so the
+    # Rust side can tell "no torch facts" from an old backend without the key.
+    monkeypatch.setattr(server_module, "torch_health_payload", lambda: None)
+    snap = _build_health_snapshot(_make_state())
+    assert "torch" in snap
+    assert snap["torch"] is None
+    json.dumps(snap)
 
 
 def test_one_raising_service_does_not_kill_snapshot() -> None:
@@ -189,7 +221,7 @@ def test_one_raising_service_does_not_kill_snapshot() -> None:
     # Shape/keys unchanged.
     assert set(snap.keys()) == {
         "ok", "service", "backend_version", "snapshot_unix_s",
-        "is_torch_available", "ocr", "text_detector", "inpaint", "watermark",
+        "is_torch_available", "torch", "ocr", "text_detector", "inpaint", "watermark",
         "image_processing", "machine_translation", "model_manager",
     }
 

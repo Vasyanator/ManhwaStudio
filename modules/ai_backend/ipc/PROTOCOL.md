@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `17` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `18` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `crates/ms-backend-ipc/src/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -78,7 +78,7 @@ WebSocket is only a carrier.
 
 | Field             | Type   | Required on            | Meaning                                                                 |
 |-------------------|--------|------------------------|-------------------------------------------------------------------------|
-| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 17. Optional/ignored on others.  |
+| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 18. Optional/ignored on others.  |
 | `id`              | u64    | all framed messages    | Correlation id. `0` means a server-initiated frame (events, hello).     |
 | `kind`            | string | all                    | One of `hello`,`request`,`response`,`progress`,`event`,`cancel`,`error`.|
 | `method`          | string | `request`              | Method name, e.g. `ocr.manga`. See §5.                                  |
@@ -1222,7 +1222,7 @@ Events are `kind:"event"`, `id:0`, with a `topic`. Payload fields are inline in
 
 | topic        | trigger                                    | payload (inline header fields)                                                                                                                                                                                                  | blob              |
 |--------------|--------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------|
-| `health`     | periodic (~1s) snapshot push               | `ok: bool`, `service: "mf_ai_backend"`, `backend_version: string`, `snapshot_unix_s: float`, `is_torch_available: bool`, `ocr: {easyocr, mangaocr, paddleocr, paddleocrvl, suryaocr, baberuocr}` (each that service's own `health()` object with at least `ready: bool`; `paddleocrvl` is `{ready, device, model, last_error}` where `model` is the resident variant label or `null`, and `baberuocr` is `{ready, device, last_error}` where `device` is the effective vision device, e.g. `"CUDAExecutionProvider:0"` or `"CPUExecutionProvider"`, or `null` when nothing is resident; its decoders always run on the CPU), `text_detector: {ctd, paddle, surya}`, `inpaint: {lama_v2, lama_mpe, aot, flux_fill, flux2_klein, flux3_klein}` (`flux3_klein` since v15: `Flux3KleinService.health()`), `watermark: object`, `image_processing: {reline}`, `machine_translation: object`, `model_manager: object` (see "`model_manager` payload" below). (Warming-up form: `snapshot_state:"warming_up"` plus `ok/service/backend_version/snapshot_unix_s/is_torch_available`.) | none              |
+| `health`     | periodic (~1s) snapshot push               | `ok: bool`, `service: "mf_ai_backend"`, `backend_version: string`, `snapshot_unix_s: float`, `is_torch_available: bool`, `ocr: {easyocr, mangaocr, paddleocr, paddleocrvl, suryaocr, baberuocr}` (each that service's own `health()` object with at least `ready: bool`; `paddleocrvl` is `{ready, device, model, last_error}` where `model` is the resident variant label or `null`, and `baberuocr` is `{ready, device, last_error}` where `device` is the effective vision device, e.g. `"CUDAExecutionProvider:0"` or `"CPUExecutionProvider"`, or `null` when nothing is resident; its decoders always run on the CPU), `text_detector: {ctd, paddle, surya}`, `inpaint: {lama_v2, lama_mpe, aot, flux_fill, flux2_klein, flux3_klein}` (`flux3_klein` since v15: `Flux3KleinService.health()`), `watermark: object`, `image_processing: {reline}`, `machine_translation: object`, `model_manager: object` (see "`model_manager` payload" below), `torch: object|null` (since v18, see "`torch` payload" below). (Warming-up form: `snapshot_state:"warming_up"` plus `ok/service/backend_version/snapshot_unix_s/is_torch_available`.) | none              |
 | `device`     | device/provider selection changed          | the full `device.get` result shape (selected/available torch + onnx fields)                                                                                                                                                    | none              |
 | `model_load` | model load/unload progress (new in v2)     | `model: string`, `phase: string` (e.g. `"start"\|"progress"\|"done"\|"unload"`), `loaded: int` (optional), `total: int` (optional), `message: string` (optional)                                                               | none              |
 | `log`        | optional backend log line stream (opt-in)  | `level: string` (e.g. `"info"\|"warn"\|"error"`), `message: string`, `ts_unix_s: float` (optional)                                                                                                                             | none              |
@@ -1252,6 +1252,32 @@ also carries, each built in isolation (a failing part becomes
   initializes a GPU, and it is probed without the arbiter's warm-up matmul.
 Clients must ignore keys they do not know (the Rust health parser reads
 `serde_json::Value` fields by name).
+
+**`torch` payload** (since v18, `runtime/torch_flavour.torch_health_payload`).
+`null` when torch is unavailable or a build fact could not be read (logged by the
+backend); absent from the warming-up form. Otherwise:
+`{flavour: "cpu"|"cuda"|"rocm", version: string, hip_version: string|null,
+cuda_version: string|null, devices: [{index: int, name: string,
+gcn_arch: string|null, integrated: bool}], rocm_device_archs: [string],
+rocm_split_kernels: bool}` —
+`version` is `torch.__version__`; `devices` are the visible CUDA/ROCm devices in
+index order, `gcn_arch` the lower-cased base AMD arch (`gfx1201`, no `:feature`
+suffix; `null` on CUDA); `rocm_device_archs` the sorted gfx archs of the installed
+`amd-torch-device-gfxN` wheels (family wheels excluded; empty for a CPU/CUDA
+build and for a pytorch.org ROCm build, which bundles its kernels);
+`rocm_split_kernels` is true when the `rocm-sdk-core` distribution is installed
+(the AMD whl-next layout: torch ships without GPU kernels, each arch's kernels come
+from its `amd-torch-device-gfxN` wheel), false otherwise (also for CPU/CUDA).
+Diagnostic only: the Rust client shows it in the AI backend pane and, on a
+split-kernel ROCm build, warns when the main GPU's arch is not among
+`rocm_device_archs` (an empty list included); nothing gates on it.
+
+**Installer `user_config` keys** (since v18, shared on disk, not on the wire):
+`General.torch_flavour` (`"cpu"|"cuda"|"rocm"`) and `General.torch_rocm_gfx`
+(`"gfxNNNN"`, present only with `"rocm"`) record the torch build the installer
+chose (`ms_config::torch_choice`). Written by the installer after a successful
+torch install, absent for installs that predate the record; the backend never
+reads them.
 
 ---
 

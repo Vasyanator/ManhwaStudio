@@ -139,6 +139,16 @@ that defines the type.
   at startup by `src/startup/services.rs`, edited by the shared General pane) and `effective(available, setting)` /
   `enabled_with(available)`. The platform capability stays `ms_platform::PlatformFeature::
   CanvasTouchGestures` (this crate does not depend on `ms-platform`): the caller passes it in.
+- `torch_choice.rs`: the shared torch-build vocabulary — `TorchFlavour` (frozen tokens
+  `"cpu"`/`"cuda"`/`"rocm"`, plus the mapping from a torch local version tag `+cpu` / `+cu…` /
+  `+rocm…`), `GfxArch` (a validated AMD processor name `gfxNNNN`: `parse` rejects `gfx000` and
+  generic/family names; `from_kfd_target_version` decodes the KFD topology integer;
+  `extra_name()` is the AMD wheel extra `device-gfxNNNN`) and `TorchChoiceRecord`, the
+  installer's recorded choice under `General.torch_flavour` / `General.torch_rocm_gfx`
+  (`from_user_settings` pure; `write_into_general` edits a `General` map inside the caller's
+  docstore transaction). The keys are NOT in `user_config_defaults()`: absent means
+  `Unrecorded`, the legacy path every reader must keep. The AMD device-id -> gfx table is NOT
+  here (`ms_sysprobe::amd_adapters`), nor are torch pins (`ms_installer::torch::catalog`).
 - `single_image.rs`: the image-set (single-image) editing mode's shared names — `INPUT_FILE_TYPES`
   (the ONE readable-input table: extensions + MIME; consumed by the launcher picker, the Linux
   desktop entry, the Windows "Open with" registration and the CLI error text), the soft size
@@ -193,7 +203,7 @@ binary that installs a UI locale). Those crates enable `test-support` from their
   `UserConfig`) unless `JsonConfig::with_kind` names it.
 - **Persisted spellings are frozen.** `AppTab::key()`, `Flux2Variant::wire()` /
   `dir_name()` / `settings_file_name()`, `MemoryProfile::as_config_str()`,
-  `StorageMode::as_config_str()` (A11) and the
+  `StorageMode::as_config_str()` (A11), `TorchFlavour::as_token()`, the `GfxArch` spelling and the
   `bubble_status` field names are on disk in users' documents. They are byte-stable across
   releases AND across UI languages, and are never localized
   (`dev-docs/i18n_exclusions.md` A3/A5/B1). Localized labels (`title()`, `label()`,
@@ -226,6 +236,8 @@ binary that installs a UI locale). Those crates enable `test-support` from their
   precedence table test); `ms-os-integration`'s `copy_identity::program_root_for` must keep
   making a launch from a record land on its copy under the new order.
 - A new path root, model directory or config file name: `lib.rs`, next to its neighbours.
+- A torch flavour, the gfx name rule or the recorded-choice keys: `torch_choice.rs` (never add
+  the keys to the defaults tree; absent must stay `Unrecorded`).
 - A new user or project setting's default: the corresponding tree in `lib.rs`. Remember that
   `merge_missing` adds but never removes — a renamed key leaves the old one on disk.
 - Autosave interval/threshold bounds or defaults: the `AUTOSAVE_*` consts in `lib.rs`; the

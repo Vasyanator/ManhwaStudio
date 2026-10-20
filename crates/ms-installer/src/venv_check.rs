@@ -14,7 +14,8 @@ Main responsibilities:
 Key structures:
 - EnvironmentReadiness: ready / not ready with a typed reason.
 - NotReadyReason: missing install type, missing interpreter, failed probe, missing packages,
-  outdated/absent PyTorch.
+  a PyTorch that does not satisfy the recorded choice (absent, outdated, wrong flavour, missing
+  ROCm device packages).
 
 Key functions:
 - check_environment(): runs the whole check for a runtime root.
@@ -23,15 +24,17 @@ Notes:
 A failed probe (for example `pip freeze` not starting) is reported as NOT ready. This check
 must never claim readiness it could not verify.
 The package requirements come from this crate's `utils`, and the two decisions that could drift
-from the repair worker are shared with it as single predicates: `installed_torch_is_current`
-(minimum PyTorch version) and `missing_specs_for_readiness` (which softens the strict install
+from the repair worker are shared with it as single predicates: `torch::torch_readiness` /
+`installed_torch_is_current` (PyTorch against the recorded choice, `torch/readiness.rs`) and `utils::missing_specs_for_readiness` (which softens the strict install
 rule only for interchangeable distributions of the same module).
 */
 
 use std::path::Path;
 
+use crate::torch::{TorchReadiness, required_torch_version, torch_readiness};
 use crate::utils;
 use ms_config as config;
+use ms_config::torch_choice::TorchChoiceRecord;
 use ms_log::runtime_log;
 use ms_sysprobe::python_manager;
 
@@ -59,9 +62,10 @@ pub enum NotReadyReason {
     ProbeFailed(String),
     /// The interpreter works but required packages are absent (dependency specs).
     MissingPackages(Vec<String>),
-    /// A `Full` environment whose PyTorch is absent or older than the required
-    /// version. Carries the installed version, when there is one.
-    TorchNotCurrent { installed: Option<String> },
+    /// A `Full` environment whose PyTorch does not satisfy the recorded torch choice
+    /// (`General.torch_flavour` / `torch_rocm_gfx`; legacy version-only rule when
+    /// unrecorded). `readiness` is never `Current`; `required` is the record's version.
+    TorchNotReady { readiness: TorchReadiness, required: &'static str },
 }
 
 impl NotReadyReason {
@@ -80,17 +84,10 @@ impl NotReadyReason {
                 "venv_check.reason_missing_packages",
                 packages = packages.join(", ")
             ),
-            Self::TorchNotCurrent { installed: None } => tf!(
-                "venv_check.reason_torch_missing",
-                required = utils::REQUIRED_TORCH_VERSION
-            ),
-            Self::TorchNotCurrent {
-                installed: Some(version),
-            } => tf!(
-                "venv_check.reason_torch_outdated",
-                installed = version,
-                required = utils::REQUIRED_TORCH_VERSION
-            ),
+            // `Current` never reaches this variant; it would read as "missing".
+            Self::TorchNotReady { readiness, required } => readiness
+                .user_message(required)
+                .unwrap_or_else(|| tf!("venv_check.reason_torch_missing", required = *required)),
         }
     }
 }
@@ -125,8 +122,11 @@ fn read_user_settings(root_dir: &Path) -> Result<serde_json::Value, String> {
 /// interpreter, failed probe) is reported as not ready with the reason attached.
 #[must_use]
 pub fn check_environment(root_dir: &Path) -> EnvironmentReadiness {
-    let install_type = match read_user_settings(root_dir) {
-        Ok(settings) => config::AiInstallType::from_user_settings(&settings),
+    let (install_type, torch_record) = match read_user_settings(root_dir) {
+        Ok(settings) => (
+            config::AiInstallType::from_user_settings(&settings),
+            TorchChoiceRecord::from_user_settings(&settings),
+        ),
         Err(err) => {
             // An unreadable user config cannot prove readiness; treat it like an
             // unknown install type so the user gets the installer choice screen.
@@ -134,7 +134,7 @@ pub fn check_environment(root_dir: &Path) -> EnvironmentReadiness {
                 "[check-venv] failed to read user settings of '{}': {err}",
                 root_dir.display()
             ));
-            config::AiInstallType::None
+            (config::AiInstallType::None, TorchChoiceRecord::Unrecorded)
         }
     };
     match install_type {
@@ -177,13 +177,17 @@ pub fn check_environment(root_dir: &Path) -> EnvironmentReadiness {
         ));
     }
 
-    // PyTorch carries a MINIMUM VERSION, not just a presence requirement, and the
-    // predicate is shared with the repair worker's "skip the Torch stage?" decision.
-    if install_type == config::AiInstallType::Full && !utils::installed_torch_is_current(&installed)
-    {
-        return EnvironmentReadiness::NotReady(NotReadyReason::TorchNotCurrent {
-            installed: utils::installed_torch_version(&installed).map(str::to_string),
-        });
+    // PyTorch carries a VERSION and FLAVOUR requirement (the recorded choice), not just a
+    // presence requirement, and the decision is shared with the repair worker's "skip the
+    // Torch stage?" (`installed_torch_is_current` is `torch_readiness == Current`).
+    if install_type == config::AiInstallType::Full {
+        let readiness = torch_readiness(&installed, &torch_record);
+        if readiness != TorchReadiness::Current {
+            return EnvironmentReadiness::NotReady(NotReadyReason::TorchNotReady {
+                readiness,
+                required: required_torch_version(&torch_record),
+            });
+        }
     }
 
     EnvironmentReadiness::Ready

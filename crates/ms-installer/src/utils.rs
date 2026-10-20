@@ -8,7 +8,9 @@ Main responsibilities:
 - download and unpack uv and app release assets;
 - create the managed Python environment and install Python dependencies;
 - install static base dependencies for every install and torch-dependent extras only for full installs;
-- install CPU or GPU PyTorch wheels selected by the UI;
+- sequence the Torch stage (owned by `torch/`: pins, options, command, readiness) inside the
+  install, repair and update workers, and provide it the pip / uv runner, retry loop and
+  progress helpers (`pub(crate)`);
 - provision ONLY the Python environment for the installer's environment-repair mode
   (`run_environment_repair_worker`): no app archive, executable, icon, shortcut, registry or
   elevation work, and no destruction of an existing working environment;
@@ -50,10 +52,6 @@ use web_time::SystemTime;
 use web_time::Duration;
 
 use ms_config as config;
-use ms_sysprobe::gpu_utils::{
-    RuntimeVersion, detect_amd_gpu_linux, detect_cuda_runtime_version,
-    detect_nvidia_compute_capability, detect_nvidia_gpu, detect_rocm_runtime_version,
-};
 use ms_sysprobe::python_manager;
 use ms_config::version_format::{compare_release_versions, version_core};
 // The Windows records (registry entries, shortcuts, elevation) are owned by
@@ -84,8 +82,11 @@ use zip::ZipArchive;
 use super::install::INSTALL_SUBDIR_NAME;
 use super::install::{
     EMBEDDED_APP_ICON_ICO, EMBEDDED_APP_ICON_PNG, InstallDependencyProfile,
-    InstallEvent, TorchBackend, TorchChoicePrompt, TorchInstallSelection, TorchPreflightResult,
-    TorchWheelOption,
+    InstallEvent,
+};
+use super::torch::{
+    TorchChoicePrompt, TorchInstallSelection, TorchPreflightResult, detect_torch_preflight, install_torch_stage,
+    installed_torch_is_current, installed_torch_version, read_torch_choice_record, write_torch_constraints,
 };
 #[cfg(target_os = "windows")]
 use super::install::{UninstallEvent, run_windows_uninstall_window, send_uninstall_progress};
@@ -105,10 +106,8 @@ const MACOS_BINARY_ASSET_NAME_AARCH64: &str = "manhwastudio_rs_macos_arm64";
 const LINUX_BINARY_ASSET_NAME_X86_64: &str = "manhwastudio_rs";
 const LINUX_BINARY_ASSET_NAME_AARCH64: &str = "manhwastudio_rs_linux_arm64";
 const PYTHON_VERSION_REQUEST: &str = "3.11";
-const TORCH_VERSION: &str = "2.9.1";
-const TORCHVISION_VERSION: &str = "0.24.1";
 const PADDLE_CU126_INDEX_URL: &str = "https://www.paddlepaddle.org.cn/packages/stable/cu126/";
-const ENABLE_PADDLE_CUDA_EXTRA_PACKAGES_INSTALL: bool = false;
+pub(crate) const ENABLE_PADDLE_CUDA_EXTRA_PACKAGES_INSTALL: bool = false;
 const BASE_DEPENDENCIES: &[&str] = &[
     "cloakbrowser",
     "deep-translator",
@@ -149,6 +148,8 @@ const TORCH_DEPENDENCIES: &[&str] = &[
     "tqdm",
 ];
 
+/// Sends a stage + overall progress update (values clamped to 0..=1); a closed channel is
+/// ignored.
 pub(super) fn send_progress(
     tx: &mpsc::Sender<InstallEvent>,
     stage_value: f32,
@@ -164,7 +165,8 @@ pub(super) fn send_progress(
     });
 }
 
-fn send_console_line(tx: &mpsc::Sender<InstallEvent>, line: impl Into<String>) {
+/// Sends one installer-console line; a closed channel (window gone) is ignored.
+pub(crate) fn send_console_line(tx: &mpsc::Sender<InstallEvent>, line: impl Into<String>) {
     let _ = tx.send(InstallEvent::ConsoleLine(line.into()));
 }
 
@@ -466,6 +468,8 @@ pub(super) fn run_install_worker(
         cancel,
         label: t!("installer.utils.base_deps_label"),
         dependencies: BASE_DEPENDENCIES,
+        // A fresh environment has no torch yet, so there is nothing to constrain.
+        constraints: None,
         overall_start: base_deps_range.0,
         overall_end: base_deps_range.1,
     })?;
@@ -488,7 +492,7 @@ pub(super) fn run_install_worker(
             );
         }
         InstallDependencyProfile::Full => {
-            install_torch_stage(
+            let installed = install_torch_stage(
                 &root_dir,
                 &pip_runner,
                 &python_exe,
@@ -497,16 +501,20 @@ pub(super) fn run_install_worker(
                 (torch_range.0, torch_range.1),
                 cancel,
             )?;
-            let install_cuda_extra_packages = ENABLE_PADDLE_CUDA_EXTRA_PACKAGES_INSTALL
-                && matches!(&torch_selection, TorchInstallSelection::InstallGpu(option) if option.backend == TorchBackend::Cuda);
+            // Every later PyPI install keeps the torch just installed (`-c`), whatever its flavour.
+            let constraints = write_torch_constraints(&root_dir, &installed)?;
+            let install_cuda_extra_packages = ENABLE_PADDLE_CUDA_EXTRA_PACKAGES_INSTALL && torch_selection.is_cuda();
             install_torch_python_dependencies(
-                &root_dir,
-                &pip_runner,
-                &python_exe,
-                tx,
+                &PostTorchInstallTarget {
+                    root_dir: &root_dir,
+                    pip_runner: &pip_runner,
+                    python_exe: &python_exe,
+                    tx,
+                    cancel,
+                    constraints: constraints.as_deref(),
+                },
                 install_cuda_extra_packages,
                 (torch_deps_range.0, torch_deps_range.1),
-                cancel,
             )?;
         }
     }
@@ -585,6 +593,8 @@ pub(super) fn run_environment_repair_worker(
     );
 
     let installed = freeze_installed_packages(&pip_runner, &python_exe, &root_dir, None)?;
+    // A repaired environment may already hold a torch: the base installs must keep it too.
+    let constraints = write_torch_constraints(&root_dir, &installed)?;
     let _ = tx.send(InstallEvent::Step(
         t!("installer.utils.installing_base_deps_status").to_string(),
     ));
@@ -597,6 +607,7 @@ pub(super) fn run_environment_repair_worker(
             cancel,
             label: t!("installer.utils.base_deps_label"),
             dependencies: BASE_DEPENDENCIES,
+            constraints: constraints.as_deref(),
             overall_start: base_deps_range.0,
             overall_end: base_deps_range.1,
         },
@@ -623,10 +634,11 @@ pub(super) fn run_environment_repair_worker(
         InstallDependencyProfile::Full => {
             // A current PyTorch is left alone: re-running the Torch stage would
             // force-reinstall a multi-gigabyte wheel that the environment already has.
-            // The predicate is shared with the readiness check, so "ready" and "nothing
-            // left for the worker to do" can never drift apart.
+            // The predicate (against the recorded choice) is shared with the readiness check,
+            // so "ready" and "nothing left for the worker to do" can never drift apart.
+            let record = read_torch_choice_record(&root_dir);
             let current_torch =
-                installed_torch_is_current(&installed).then(|| installed_torch_version(&installed));
+                installed_torch_is_current(&installed, &record).then(|| installed_torch_version(&installed));
             match current_torch.flatten() {
                 Some(version) => {
                     send_console_line(
@@ -641,20 +653,23 @@ pub(super) fn run_environment_repair_worker(
                         t!("installer.utils.pytorch_stage_done"),
                     );
                 }
-                None => install_torch_stage(
-                    &root_dir,
-                    &pip_runner,
-                    &python_exe,
-                    &torch_selection,
-                    tx,
-                    (torch_range.0, torch_range.1),
-                    cancel,
-                )?,
+                None => {
+                    install_torch_stage(
+                        &root_dir,
+                        &pip_runner,
+                        &python_exe,
+                        &torch_selection,
+                        tx,
+                        (torch_range.0, torch_range.1),
+                        cancel,
+                    )?;
+                }
             }
 
             // Re-probe: the Torch stage pulls in transitive packages, so the pre-Torch
             // snapshot would over-report the missing torch extras.
             let installed = freeze_installed_packages(&pip_runner, &python_exe, &root_dir, None)?;
+            let constraints = write_torch_constraints(&root_dir, &installed)?;
             install_missing_static_dependencies(
                 DependencyInstallRequest {
                     root_dir: &root_dir,
@@ -664,6 +679,7 @@ pub(super) fn run_environment_repair_worker(
                     cancel,
                     label: t!("installer.utils.torch_deps_label"),
                     dependencies: TORCH_DEPENDENCIES,
+                    constraints: constraints.as_deref(),
                     overall_start: torch_deps_range.0,
                     overall_end: torch_deps_range.1,
                 },
@@ -794,64 +810,6 @@ fn install_missing_static_dependencies(
         dependencies: &missing,
         ..request
     })
-}
-
-pub fn run_torch_upgrade_worker(
-    root_dir: PathBuf,
-    torch_selection: TorchInstallSelection,
-    install_full_dependencies: bool,
-    tx: &mpsc::Sender<InstallEvent>,
-) -> Result<(), String> {
-    // The launcher's settings page offers no cancel for this worker (it runs to completion
-    // while the page shows its progress), so its command retries see a flag that never sets.
-    let never_cancelled = AtomicBool::new(false);
-    let cancel = &never_cancelled;
-    let _ = tx.send(InstallEvent::Step(
-        t!("installer.utils.preparing_pytorch_env_status").to_string(),
-    ));
-    let python_exe = python_manager::resolve_python_executable(&root_dir)
-        .map_err(|err| tf!("installer.utils.find_python_for_pytorch_error", err = err))?;
-    let pip_runner = resolve_runtime_pip_runner(&root_dir, &python_exe);
-    send_console_line(
-        tx,
-        format!(
-            "[PyTorch] Python: {}; installer: {}",
-            python_exe.display(),
-            pip_runner.label()
-        ),
-    );
-
-    let torch_range = if install_full_dependencies {
-        (0.0, 0.42)
-    } else {
-        (0.0, 1.0)
-    };
-    install_torch_stage(
-        &root_dir,
-        &pip_runner,
-        &python_exe,
-        &torch_selection,
-        tx,
-        (torch_range.0, torch_range.1),
-        cancel,
-    )?;
-
-    if install_full_dependencies {
-        let install_cuda_extra_packages = ENABLE_PADDLE_CUDA_EXTRA_PACKAGES_INSTALL
-            && matches!(&torch_selection, TorchInstallSelection::InstallGpu(option) if option.backend == TorchBackend::Cuda);
-        install_torch_python_dependencies(
-            &root_dir,
-            &pip_runner,
-            &python_exe,
-            tx,
-            install_cuda_extra_packages,
-            (0.42, 1.0),
-            cancel,
-        )?;
-    }
-
-    send_progress(tx, 1.0, t!("installer.utils.pytorch_install_complete"), 1.0, t!("installer.common.ready"));
-    Ok(())
 }
 
 pub(crate) fn run_update_binary_stage(root_dir: PathBuf, tx: &mpsc::Sender<UpdateWorkerEvent>, cancel: &AtomicBool) {
@@ -1447,8 +1405,8 @@ fn maybe_update_torch(
 ) -> Result<UpdateContinuationOutcome, String> {
     let installed = freeze_installed_packages(pip_runner, python_exe, root_dir, Some(tx))?;
     // Same predicate as the repair worker and the readiness check: one definition of
-    // "the installed PyTorch is new enough".
-    if installed_torch_is_current(&installed) {
+    // "the installed PyTorch satisfies the recorded choice".
+    if installed_torch_is_current(&installed, &read_torch_choice_record(root_dir)) {
         send_update_progress(
             tx,
             1.0,
@@ -1499,11 +1457,11 @@ fn install_missing_dependencies_for_update(
     // PyTorch itself is deliberately absent from this list: the update flow installs
     // or refreshes it through the dedicated Torch stage (`maybe_update_torch`), which
     // needs the right wheel index.
-    let mut required = BASE_DEPENDENCIES.to_vec();
-    if install_type == config::AiInstallType::Full {
-        required.extend(TORCH_DEPENDENCIES.iter().copied());
-    }
+    let required = required_dependency_specs(install_type);
     let missing = missing_dependency_specs(&required, &installed);
+    // Keep the installed torch (any flavour) through these PyPI installs.
+    let constraints = write_torch_constraints(root_dir, &installed)?;
+    let constraint_args = constraint_args(constraints.as_deref());
 
     if missing.is_empty() {
         send_update_progress(
@@ -1522,11 +1480,13 @@ fn install_missing_dependencies_for_update(
         let start_ratio = idx as f32 / total;
         let end_ratio = (idx + 1) as f32 / total;
         let _ = tx.send(UpdateWorkerEvent::Step(tf!("installer.utils.installing_missing_dep_status", dep = dep)));
+        let mut args = vec![*dep];
+        args.extend(constraint_args.iter().map(String::as_str));
         run_pip_install_with_retry(
             pip_runner,
             python_exe,
             root_dir,
-            &[*dep],
+            &args,
             RetryRun { action_name: &tf!("installer.utils.install_missing_dep_action", dep = dep), attempts: 3, tx: Some(&install_tx), cancel },
         )?;
         send_update_progress(
@@ -1685,44 +1645,6 @@ fn parse_pip_freeze_line(line: &str) -> Option<(String, String)> {
     Some((normalize_package_name(name), version.trim().to_string()))
 }
 
-/// Package name of PyTorch itself.
-///
-/// PyTorch is not part of [`TORCH_DEPENDENCIES`] and is deliberately absent from
-/// [`required_dependency_specs`]: unlike every other dependency it has a VERSION
-/// requirement, not a presence requirement, so it is expressed by
-/// [`installed_torch_is_current`] instead.
-const TORCH_PACKAGE_NAME: &str = "torch";
-
-/// The PyTorch version a `Full` environment must provide at minimum.
-pub const REQUIRED_TORCH_VERSION: &str = TORCH_VERSION;
-
-/// Returns the installed PyTorch version, if the environment has one.
-///
-/// `installed` is a `pip freeze` snapshot keyed by normalized package name (see
-/// [`freeze_installed_packages`]).
-#[must_use]
-pub fn installed_torch_version(installed: &HashMap<String, String>) -> Option<&str> {
-    installed.get(TORCH_PACKAGE_NAME).map(String::as_str)
-}
-
-/// Whether `installed` provides a PyTorch at or above [`REQUIRED_TORCH_VERSION`].
-///
-/// This is the SINGLE predicate behind both "is this environment ready?" (the
-/// `--check-venv` flow) and "may the repair worker skip the Torch stage?". They must
-/// never disagree: a readiness answer of "ready" has to imply that the worker would
-/// have nothing left to do.
-///
-/// An absent torch is not current. A version string that does not parse as a version
-/// compares BELOW the requirement (see `compare_release_versions`), so an unreadable
-/// version is treated as "not current" — the safe direction, because it can only
-/// cause an extra repair offer, never a false "ready". Local wheel suffixes
-/// (`2.9.1+cu126`, `2.12.0+rocm7.2`) compare above the bare requirement, as intended.
-#[must_use]
-pub fn installed_torch_is_current(installed: &HashMap<String, String>) -> bool {
-    installed_torch_version(installed)
-        .is_some_and(|version| compare_release_versions(version, REQUIRED_TORCH_VERSION).is_ge())
-}
-
 /// Returns the full dependency spec list a working environment must provide for
 /// `install_type`.
 ///
@@ -1731,9 +1653,9 @@ pub fn installed_torch_is_current(installed: &HashMap<String, String>) -> bool {
 /// need a user decision must detect the missing install type themselves — this
 /// function never guesses a *smaller* requirement than reality.
 ///
-/// PyTorch itself is NOT in this list: its requirement is a minimum version, which a
-/// presence-only spec cannot express. Callers checking a `Full` environment must also
-/// consult [`installed_torch_is_current`].
+/// PyTorch itself is NOT in this list: its requirement is a version and flavour rule against
+/// the recorded choice, which a presence-only spec cannot express. Callers checking a `Full`
+/// environment must also consult [`installed_torch_is_current`].
 ///
 /// The returned specs are raw dependency strings (they may carry version pins and
 /// environment markers); filter them with [`missing_dependency_specs`].
@@ -2898,7 +2820,8 @@ pub enum PipInstallRunner {
 }
 
 impl PipInstallRunner {
-    fn label(&self) -> String {
+    /// Short display name of the runner for console lines (`uv pip (<path>)` / `python -m pip`).
+    pub(crate) fn label(&self) -> String {
         match self {
             Self::Uv(path) => format!("uv pip ({})", path.display()),
             Self::PythonPip => "python -m pip".to_string(),
@@ -2950,10 +2873,38 @@ struct DependencyInstallRequest<'a> {
     cancel: &'a AtomicBool,
     label: &'a str,
     dependencies: &'a [&'a str],
+    /// `-c` constraints file passed to every install of the request (the installed torch
+    /// pins, `torch::write_torch_constraints`); `None` when no torch is installed.
+    constraints: Option<&'a Path>,
     overall_start: f32,
     overall_end: f32,
 }
 
+/// The environment a post-torch dependency install targets
+/// ([`install_torch_python_dependencies`]).
+pub(crate) struct PostTorchInstallTarget<'a> {
+    pub(crate) root_dir: &'a Path,
+    pub(crate) pip_runner: &'a PipInstallRunner,
+    pub(crate) python_exe: &'a Path,
+    pub(crate) tx: &'a mpsc::Sender<InstallEvent>,
+    /// Checked before every pip command and during its retry backoff.
+    pub(crate) cancel: &'a AtomicBool,
+    /// `-c` constraints file pinning the installed torch (`torch::write_torch_constraints`).
+    pub(crate) constraints: Option<&'a Path>,
+}
+
+/// The `-c <file>` arguments for `constraints` (empty for `None`).
+fn constraint_args(constraints: Option<&Path>) -> Vec<String> {
+    constraints
+        .map(|path| vec!["-c".to_string(), path.to_string_lossy().into_owned()])
+        .unwrap_or_default()
+}
+
+/// Upgrades pip / wheel / setuptools, then installs `request.dependencies` one spec per
+/// command, every command under `request.constraints`; progress maps onto the request range.
+///
+/// # Errors
+/// The localized cancel text or the last output of the failed install command.
 fn install_static_python_dependencies(request: DependencyInstallRequest<'_>) -> Result<(), String> {
     let DependencyInstallRequest {
         root_dir,
@@ -2963,9 +2914,14 @@ fn install_static_python_dependencies(request: DependencyInstallRequest<'_>) -> 
         cancel,
         label,
         dependencies,
+        constraints,
         overall_start,
         overall_end,
     } = request;
+    let constraint_args = constraint_args(constraints);
+    let with_constraints = |args: &[&str]| -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).chain(constraint_args.iter().cloned()).collect()
+    };
     let total_units = (dependencies.len() + 1).max(1) as f32;
 
     let _ = tx.send(InstallEvent::Step(
@@ -2978,11 +2934,12 @@ fn install_static_python_dependencies(request: DependencyInstallRequest<'_>) -> 
         overall_start,
         tf!("installer.utils.stage_installing_label", label = label),
     );
+    let upgrade_args = with_constraints(&["--upgrade", "pip", "wheel", "setuptools"]);
     run_pip_install_with_retry(
         pip_runner,
         python_exe,
         root_dir,
-        &["--upgrade", "pip", "wheel", "setuptools"],
+        &upgrade_args.iter().map(String::as_str).collect::<Vec<_>>(),
         RetryRun { action_name: t!("installer.utils.update_pip_action"), attempts: 1, tx: Some(tx), cancel },
     )?;
 
@@ -3006,11 +2963,12 @@ fn install_static_python_dependencies(request: DependencyInstallRequest<'_>) -> 
             tf!("installer.utils.stage_installing_label", label = label),
         );
 
+        let dep_args = with_constraints(&[*dep]);
         run_pip_install_with_retry(
             pip_runner,
             python_exe,
             root_dir,
-            &[*dep],
+            &dep_args.iter().map(String::as_str).collect::<Vec<_>>(),
             RetryRun { action_name: &tf!("installer.utils.install_dep_action", dep = dep), attempts: 3, tx: Some(tx), cancel },
         )?;
 
@@ -3028,15 +2986,18 @@ fn install_static_python_dependencies(request: DependencyInstallRequest<'_>) -> 
     Ok(())
 }
 
-fn install_torch_python_dependencies(
-    root_dir: &Path,
-    pip_runner: &PipInstallRunner,
-    python_exe: &Path,
-    tx: &mpsc::Sender<InstallEvent>,
+/// Installs the torch-dependent extras (`TORCH_DEPENDENCIES`) one spec per call after the
+/// Torch stage, each under `target.constraints`, plus the Paddle CUDA packages when
+/// `install_cuda_extra_packages`; progress maps onto `overall_range`.
+///
+/// # Errors
+/// The localized cancel text or the last output of the failed install command.
+pub(crate) fn install_torch_python_dependencies(
+    target: &PostTorchInstallTarget<'_>,
     install_cuda_extra_packages: bool,
     overall_range: (f32, f32),
-    cancel: &AtomicBool,
 ) -> Result<(), String> {
+    let PostTorchInstallTarget { root_dir, pip_runner, python_exe, tx, cancel, constraints } = *target;
     let (overall_start, overall_end) = overall_range;
     install_static_python_dependencies(DependencyInstallRequest {
         root_dir,
@@ -3046,6 +3007,7 @@ fn install_torch_python_dependencies(
         cancel,
         label: t!("installer.utils.torch_deps_label"),
         dependencies: TORCH_DEPENDENCIES,
+        constraints,
         overall_start,
         overall_end: if install_cuda_extra_packages {
             lerp(overall_start, overall_end, 0.88)
@@ -3112,245 +3074,14 @@ fn install_cuda_paddle_packages(
     Ok(())
 }
 
-fn install_torch_stage(
-    root_dir: &Path,
-    pip_runner: &PipInstallRunner,
-    python_exe: &Path,
-    selection: &TorchInstallSelection,
-    tx: &mpsc::Sender<InstallEvent>,
-    overall_range: (f32, f32),
-    cancel: &AtomicBool,
-) -> Result<(), String> {
-    let (overall_start, overall_end) = overall_range;
-    match selection {
-        TorchInstallSelection::SkipCpu => {
-            let _ = tx.send(InstallEvent::Step(t!("installer.utils.installing_cpu_pytorch_status").to_string()));
-            send_progress(
-                tx,
-                0.0,
-                "PyTorch: CPU",
-                overall_start,
-                t!("installer.utils.stage_install_pytorch"),
-            );
-
-            let torch_spec = format!("torch=={TORCH_VERSION}");
-            let torchvision_spec = format!("torchvision=={TORCHVISION_VERSION}");
-            run_pip_install_with_retry(
-                pip_runner,
-                python_exe,
-                root_dir,
-                &[
-                    "--force-reinstall",
-                    "--no-cache-dir",
-                    &torch_spec,
-                    &torchvision_spec,
-                ],
-                RetryRun { action_name: t!("installer.utils.install_cpu_pytorch_action"), attempts: 3, tx: Some(tx), cancel },
-            )?;
-
-            send_progress(
-                tx,
-                1.0,
-                t!("installer.utils.pytorch_installed_cpu_status"),
-                overall_end,
-                t!("installer.utils.pytorch_stage_done"),
-            );
-            Ok(())
-        }
-        TorchInstallSelection::InstallGpu(option) => {
-            let _ = tx.send(InstallEvent::Step(tf!("installer.utils.installing_pytorch_status", option = option.label)));
-            send_progress(
-                tx,
-                0.0,
-                format!("PyTorch: {}", option.label),
-                overall_start,
-                t!("installer.utils.stage_install_pytorch"),
-            );
-
-            let torch_spec = format!("torch=={TORCH_VERSION}");
-            let torchvision_spec = format!("torchvision=={TORCHVISION_VERSION}");
-            let index_url = format!("https://download.pytorch.org/whl/{}", option.wheel_tag);
-            let args = [
-                "--force-reinstall".to_string(),
-                "--no-cache-dir".to_string(),
-                torch_spec,
-                torchvision_spec,
-                "--index-url".to_string(),
-                index_url,
-            ];
-            let args_ref = args.iter().map(String::as_str).collect::<Vec<_>>();
-
-            run_pip_install_with_retry(
-                pip_runner,
-                python_exe,
-                root_dir,
-                &args_ref,
-                RetryRun { action_name: &tf!("installer.utils.install_pytorch_action", option = option.label), attempts: 3, tx: Some(tx), cancel },
-            )?;
-
-            send_progress(
-                tx,
-                1.0,
-                tf!("installer.utils.pytorch_installed_status", option = option.label),
-                overall_end,
-                t!("installer.utils.pytorch_stage_done"),
-            );
-            Ok(())
-        }
-    }
-}
-
-pub fn detect_torch_preflight() -> TorchPreflightResult {
-    if cfg!(target_os = "macos") {
-        return TorchPreflightResult::Skip {
-            reason: t!("installer.utils.macos_skip_gpu_wheels_status").to_string(),
-        };
-    }
-
-    let has_nvidia = detect_nvidia_gpu();
-    let has_amd_linux = cfg!(target_os = "linux") && detect_amd_gpu_linux();
-    if !has_nvidia && !has_amd_linux {
-        return TorchPreflightResult::Skip {
-            reason: t!("installer.utils.no_gpu_keep_cpu_status").to_string(),
-        };
-    }
-
-    let mut options = Vec::new();
-    let mut detected = Vec::new();
-    let mut failures = Vec::new();
-
-    if has_nvidia {
-        let cuda_capability = detect_nvidia_compute_capability();
-        if let Some(capability) = cuda_capability {
-            detected.push(format!("NVIDIA SM {capability}"));
-        } else {
-            failures.push(
-                t!("installer.utils.nvidia_no_sm_status")
-                    .to_string(),
-            );
-        }
-        if let Some(cuda_version) = detect_cuda_runtime_version() {
-            detected.push(format!("CUDA {cuda_version}"));
-            let cuda_options = build_cuda_torch_options(cuda_version, cuda_capability);
-            if cuda_options.is_empty()
-                && let Some(capability) = cuda_capability
-            {
-                if capability < RuntimeVersion::new(6, 1) {
-                    failures.push(tf!("installer.utils.nvidia_sm_too_low_error", capability = capability));
-                } else if capability < RuntimeVersion::new(7, 5) {
-                    failures.push(tf!("installer.utils.nvidia_sm_cuda_mismatch_error", capability = capability));
-                }
-            }
-            options.extend(cuda_options);
-        } else {
-            failures.push(t!("installer.utils.nvidia_no_cuda_version_status").to_string());
-        }
-    }
-
-    if has_amd_linux {
-        if let Some(rocm_version) = detect_rocm_runtime_version() {
-            detected.push(format!("ROCm {rocm_version}"));
-            options.extend(build_rocm_torch_options(rocm_version));
-        } else {
-            failures.push(t!("installer.utils.amd_no_rocm_version_status").to_string());
-        }
-    }
-
-    if options.is_empty() {
-        let reason = if !failures.is_empty() {
-            tf!("installer.utils.skip_pytorch_cpu_status", failures = failures.join("; "))
-        } else {
-            t!("installer.utils.cuda_rocm_below_min_status").to_string()
-        };
-        return TorchPreflightResult::Skip { reason };
-    }
-
-    let recommended_index = choose_recommended_torch_option(&options);
-    let summary = if detected.is_empty() {
-        t!("installer.utils.gpu_variants_available_status").to_string()
-    } else {
-        tf!("installer.utils.detected_status", detected = detected.join(", "))
-    };
-
-    TorchPreflightResult::Choose(TorchChoicePrompt {
-        options,
-        recommended_index,
-        summary,
-    })
-}
-
-fn build_cuda_torch_options(
-    cuda_version: RuntimeVersion,
-    cuda_capability: Option<RuntimeVersion>,
-) -> Vec<TorchWheelOption> {
-    let variants = [
-        (RuntimeVersion::new(12, 6), "CUDA 12.6", "cu126"),
-        (RuntimeVersion::new(12, 8), "CUDA 12.8", "cu128"),
-        (RuntimeVersion::new(13, 0), "CUDA 13.0", "cu130"),
-    ];
-
-    let mut options = variants
-        .into_iter()
-        .filter(|(required, _, _)| *required <= cuda_version)
-        .map(|(required, label, wheel_tag)| TorchWheelOption {
-            backend: TorchBackend::Cuda,
-            wheel_tag: wheel_tag.to_string(),
-            label: format!("{label} ({wheel_tag})"),
-            version: required,
-        })
-        .collect::<Vec<_>>();
-
-    if let Some(capability) = cuda_capability {
-        if capability < RuntimeVersion::new(6, 1) {
-            return Vec::new();
-        }
-        if capability < RuntimeVersion::new(7, 5) {
-            options.retain(|option| option.version == RuntimeVersion::new(12, 6));
-        }
-    }
-
-    options
-}
-
-fn build_rocm_torch_options(rocm_version: RuntimeVersion) -> Vec<TorchWheelOption> {
-    let required = RuntimeVersion::new(6, 4);
-    if rocm_version < required {
-        return Vec::new();
-    }
-
-    vec![TorchWheelOption {
-        backend: TorchBackend::Rocm,
-        wheel_tag: "rocm6.4".to_string(),
-        label: "ROCm 6.4 (rocm6.4)".to_string(),
-        version: required,
-    }]
-}
-
-fn choose_recommended_torch_option(options: &[TorchWheelOption]) -> usize {
-    options
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, option)| {
-            (
-                option.version,
-                match option.backend {
-                    TorchBackend::Cuda => 2_u8,
-                    TorchBackend::Rocm => 1_u8,
-                },
-            )
-        })
-        .map(|(idx, _)| idx)
-        .unwrap_or(0)
-}
-
 /// How a retried command is run: its user-facing name, the attempt budget, the console sink
 /// (`None` = silent) and the cancel flag checked before every attempt and during the backoff.
 #[derive(Clone, Copy)]
-struct RetryRun<'a> {
-    action_name: &'a str,
-    attempts: usize,
-    tx: Option<&'a mpsc::Sender<InstallEvent>>,
-    cancel: &'a AtomicBool,
+pub(crate) struct RetryRun<'a> {
+    pub(crate) action_name: &'a str,
+    pub(crate) attempts: usize,
+    pub(crate) tx: Option<&'a mpsc::Sender<InstallEvent>>,
+    pub(crate) cancel: &'a AtomicBool,
 }
 
 fn run_uv_pip_install_with_retry(
@@ -3372,7 +3103,12 @@ fn run_uv_pip_install_with_retry(
     run_command_with_retry(uv_exe, cwd, &args_ref, run, &[])
 }
 
-fn run_pip_install_with_retry(
+/// Runs `pip install <pip_args>` into `python_exe`'s environment through `pip_runner`
+/// (`uv pip install --python <py>` or `python -m pip install`) under the retry rules of `run`.
+///
+/// # Errors
+/// See `run_command_with_retry`.
+pub(crate) fn run_pip_install_with_retry(
     pip_runner: &PipInstallRunner,
     python_exe: &Path,
     cwd: &Path,
@@ -3394,6 +3130,42 @@ fn run_pip_install_with_retry(
             run_command_with_retry(python_exe, cwd, &args_ref, run, &[])
         }
     }
+}
+
+/// Uninstalls `names` from `python_exe`'s environment through `pip_runner`
+/// (`uv pip uninstall --python <py> <names…>` or `python -m pip uninstall -y <names…>`) under
+/// the retry rules of `run`. Does nothing when `names` is empty.
+///
+/// # Errors
+/// See `run_command_with_retry`.
+pub(crate) fn run_pip_uninstall_with_retry(
+    pip_runner: &PipInstallRunner,
+    python_exe: &Path,
+    cwd: &Path,
+    names: &[String],
+    run: RetryRun<'_>,
+) -> Result<(), String> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let (executable, mut args) = match pip_runner {
+        PipInstallRunner::Uv(uv_exe) => (
+            uv_exe.as_path(),
+            vec![
+                "pip".to_string(),
+                "uninstall".to_string(),
+                "--python".to_string(),
+                python_exe.to_string_lossy().into_owned(),
+            ],
+        ),
+        PipInstallRunner::PythonPip => (
+            python_exe,
+            vec!["-m".to_string(), "pip".to_string(), "uninstall".to_string(), "-y".to_string()],
+        ),
+    };
+    args.extend(names.iter().cloned());
+    let args_ref = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_command_with_retry(executable, cwd, &args_ref, run, &[])
 }
 
 /// Wait before the retry that follows `failed_attempts` failed runs of a command: 2, 4, 8 s,
@@ -3985,9 +3757,8 @@ mod tests {
         LINUX_BINARY_ASSET_NAME_AARCH64, LINUX_BINARY_ASSET_NAME_X86_64,
         MACOS_BINARY_ASSET_NAME_AARCH64, MACOS_BINARY_ASSET_NAME_X86_64,
         WINDOWS_BINARY_ASSET_NAME_AARCH64, WINDOWS_BINARY_ASSET_NAME_X86_64,
-        BASE_DEPENDENCIES, ONNXRUNTIME_DISTRIBUTIONS, REQUIRED_TORCH_VERSION, TORCH_DEPENDENCIES,
-        dependency_package_name, installed_torch_is_current,
-        installed_torch_version, missing_dependency_specs,
+        BASE_DEPENDENCIES, ONNXRUNTIME_DISTRIBUTIONS, TORCH_DEPENDENCIES,
+        dependency_package_name, missing_dependency_specs,
         missing_specs_for_readiness, normalize_package_name,
         parse_executable_version_output, parse_pip_freeze_packages, platform_binary_asset_name,
         platform_executable_file_name, required_dependency_specs,
@@ -4039,39 +3810,6 @@ mod tests {
         for dep in &base {
             assert!(full.contains(dep), "Full must be a superset of Base ({dep})");
         }
-    }
-
-    #[test]
-    fn torch_requirement_is_version_aware() {
-        assert!(
-            !installed_torch_is_current(&installed_map(&[])),
-            "an absent torch is not current"
-        );
-        assert!(
-            !installed_torch_is_current(&installed_map(&[("torch", "1.13.1")])),
-            "a torch below the requirement is not current"
-        );
-        assert!(
-            installed_torch_is_current(&installed_map(&[("torch", REQUIRED_TORCH_VERSION)])),
-            "exactly the required version is current"
-        );
-        assert!(
-            installed_torch_is_current(&installed_map(&[("torch", "2.12.0")])),
-            "a newer torch is current"
-        );
-        assert!(
-            installed_torch_is_current(&installed_map(&[("torch", "2.12.0+rocm7.2")])),
-            "a local wheel suffix must not drop the version below the requirement"
-        );
-        assert!(
-            !installed_torch_is_current(&installed_map(&[("torch", "not-a-version")])),
-            "an unreadable version must fail closed, never pass as current"
-        );
-        assert_eq!(
-            installed_torch_version(&installed_map(&[("torch", "2.9.1")])),
-            Some("2.9.1")
-        );
-        assert_eq!(installed_torch_version(&installed_map(&[])), None);
     }
 
     /// The readiness view accepts any interchangeable onnxruntime distribution, while

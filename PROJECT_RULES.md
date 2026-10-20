@@ -115,7 +115,13 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   `cfg`), file dialogs (`ms_platform::file_dialog`), system clipboard reads
   (`ms_platform::clipboard`), finger-gesture rules on canvases (`ms_input::touch`: no
   canvas or tool reads raw `Event::Touch` or decides pan/pinch/long-press itself), input
-  bindings, their display labels and conflicts (`ms-input`: `InputRegistry`, `InputRouter`).
+  bindings, their display labels and conflicts (`ms-input`: `InputRegistry`, `InputRouter`),
+  AMD PCI device id -> gfx (`ms_sysprobe::amd_adapters`: one pinned table; KFD topology wins on
+  Linux), torch pins and ROCm device extras (`ms_installer::torch::catalog`), the backend's
+  "which torch build is this" (`modules/ai_backend/runtime/torch_flavour.py`).
+- ROCm PyTorch comes only from AMD's whl-next index in its OWN uv call (`--index-url` alone):
+  PyPI squats AMD's package names, so the two are never resolved together; every later PyPI
+  install passes the `-c` torch constraints file (`ms_installer::torch::constraints`).
 - Python backend on ROCm: never advise or enable `expandable_segments:True`; checkpoint weights
   move to the GPU only via `modules/ai_backend/runtime/rocm_mmap_transfer.py`; every
   user-facing backend error text passes through `runtime/error_text.py::sanitize_torch_error`.

@@ -115,7 +115,8 @@ shared wiki view). The studio never references
 - `ms-text-render` — the production text renderer (cosmic-text shaping, vector-first glyph
   raster, effects); re-exported to the typing crate as `render_next`.
 - `ms-page-ops` — journalled structural page operations; owns `Page` and `ProjectPaths`.
-- `ms-sysprobe` — system probes, app-managed AI model catalogue, Hugging Face token;
+- `ms-sysprobe` — system probes, app-managed AI model catalogue, Hugging Face token, AMD
+  adapter enumeration with the one PCI device id -> gfx table (`amd_adapters`);
   `python_manager` is the only way to find or spawn Python.
 - `ms-onnx-runtime` — locates, downloads and loads the native onnxruntime library per build.
 - `ms-window-geometry` — startup monitor and window geometry; the only direct `winit` user.
@@ -152,7 +153,9 @@ shared wiki view). The studio never references
   but never takes `Ui` / `Painter`.
 - `ms-tabs-simple` — Characters, Terms, Notes, Wiki tabs.
 - `ms-installer` — install/update (release selection + `SHA256SUMS` verification in `release`),
-  Python environment, `venv_check`.
+  Python environment, `venv_check`, PyTorch flavours (`torch/`: CPU / CUDA from PyPI and
+  pytorch.org, ROCm from AMD's whl-next index with a per-gfx device extra; the persisted choice
+  `General.torch_flavour` / `torch_rocm_gfx`, vocabulary in `ms_config::torch_choice`).
 - `ms-ai-api` — the multi-provider LLM API layer over `genai` (re-exported): services
   (including OpenAI- / Anthropic-compatible endpoints at a user base URL, key optional),
   client, keyring key storage, model listing, account status, the hard-coded image-input
@@ -437,6 +440,9 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   `crates/ms-backend-ipc/src/protocol.rs`. `PROTOCOL_VERSION` (mirrored in
   `modules/ai_backend/ipc/protocol.py`, a test guards the mirror) is the only compatibility
   gate, compared in the `hello` handshake; it also covers the on-disk `user_config` semantics.
+  The `health` payload carries the typed torch build (flavour, versions, visible GPUs with their
+  gfx, installed ROCm device kernels; backend owner `runtime/torch_flavour.py`), parsed into
+  `ms_local_ai::backend_health`.
 - **Process ownership.** One app-global supervisor (`ms_settings_ui::ai_backend_supervisor`)
   starts and stops the backend for studio and launcher; autostart waits for storage-mode
   conversions. `ms_local_ai::backend_health` keeps the pushed health snapshot that AI

@@ -20,14 +20,16 @@ and screens but fixes the target to the given root, starts on the dependency-pro
 
 `utils.rs` owns the non-UI installer/update backend: release lookup, the sequencing of
 downloads (the network layer itself is `download.rs`), executable replacement handoff, archive extraction, managed Python/venv setup, static dependency
-installation, optional full PyTorch setup, the install-continuation elevation wrappers, the
+installation, the sequencing of the optional full PyTorch stage, the install-continuation elevation wrappers, the
 sequencing of the Windows integration inside install and uninstall, and uninstall cleanup. The
 Windows records themselves (registry keys, `.lnk` shortcuts, elevation probe and UAC relaunch,
 their names and values) are owned by `ms-os-integration` (`crates/ms-os-integration/src/`);
 `utils.rs` and `install.rs` only call them and turn `IntegrationError::user_message()` into
 their messages.
-Launcher settings reuse the same `utils.rs` PyTorch preflight/install helpers when upgrading a
-base install to full or replacing the installed PyTorch wheel. Installer workers report progress
+`torch/` owns everything PyTorch-specific: the pin set and wheel options, the preflight, the
+install command and stage, and the readiness predicate (see `torch/MODULE_README.md`).
+Launcher settings reuse the same `torch::detect_torch_preflight` / `torch::run_torch_upgrade_worker`
+when upgrading a base install to full or replacing the installed PyTorch wheel. Installer workers report progress
 through typed events consumed by the UI; command output is surfaced as console/progress events
 rather than blocking the frame loop.
 For Windows installs under Program Files, the root install directory is created first and receives
@@ -49,7 +51,12 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   polled each frame).
 - `update.rs`: update window shell, background release re-check, test-version override,
   executable-update progress, PyTorch choice continuation, completion state, and no-update exit.
-- `utils.rs`: worker pipeline and platform helpers used by installer and updater UI.
+- `utils.rs`: worker pipeline and platform helpers used by installer and updater UI: dependency
+  lists, the pip / uv runner and its retry loop (`pub(crate)` for `torch/`).
+- `torch/`: the PyTorch seam — pins (`catalog.rs`), choice types and the one choice widget
+  (`choice_ui.rs`, drawn by the installer, the update window and the launcher), preflight, install command and
+  stage, `run_torch_upgrade_worker`, the recorded choice store, the constraints file and the
+  `torch_readiness` / `installed_torch_is_current` predicate.
 - `release.rs` (+ `release/tests.rs`): the one owner of the app release feed
   (`APP_RELEASES_API`, `APP_ZIP_ASSET_NAME`, `APP_CHECKSUMS_ASSET_NAME`), of the selection of
   the release to update to / install from (`select_app_release`, pure; `fetch_latest_app_release`),
@@ -69,8 +76,8 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   every window of this crate calls first in its creator closure.
 - `venv_check.rs`: the non-interactive, GUI-free readiness check behind `--check-venv`. It
   lives here rather than in `ms-sysprobe` because it reads `utils.rs`' own package
-  requirements and shares `installed_torch_is_current` / `missing_specs_for_readiness` with
-  the repair worker; `ms-sysprobe` sits BELOW this crate, so hosting it there would make
+  requirements and shares `torch::installed_torch_is_current` / `utils::missing_specs_for_readiness`
+  with the repair worker; `ms-sysprobe` sits BELOW this crate, so hosting it there would make
   the two circular.
 
 ## Contracts and invariants
@@ -158,12 +165,21 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   in the root) is reused verbatim, and only a broken installer-owned `installer_files/venv` may be
   removed before a fresh uv-managed venv is created.
 - Repair installs only the packages that `pip freeze` does not report (`missing_dependency_specs`),
-  and skips the Torch stage exactly when `utils::installed_torch_is_current` says so.
-- The required dependency set per install type is `utils::required_dependency_specs`: base group
+  and skips the Torch stage exactly when `torch::installed_torch_is_current` (against the recorded
+  torch choice, `torch::read_torch_choice_record`) says so.
+- Every PyPI install that runs while a torch is installed — the torch extras after the Torch
+  stage, repair (base and extras), the update continuation's missing dependencies and the
+  launcher upgrade — passes `-c installer_files/torch-constraints.txt`
+  (`torch::write_torch_constraints`, exact installed torch / torchvision, every flavour), so no
+  later install can swap the chosen torch for the PyPI build. A fresh install's base step runs
+  before any torch and has no constraints.
+- The required dependency set per install type is `utils::required_dependency_specs` (used by
+  readiness, repair and the update continuation alike): base group
   for `Base`/`None`, plus the torch extras for `Full`. PyTorch is NOT in that list: its requirement
-  is a MINIMUM VERSION (`REQUIRED_TORCH_VERSION`), expressed by the single predicate
-  `installed_torch_is_current`, which the readiness check (`src/venv_check.rs`), the repair worker
-  and the update flow all share — a "ready" verdict must imply the worker has nothing left to do.
+  is a VERSION and FLAVOUR rule against the recorded choice (`torch::torch_readiness`), expressed
+  by the single predicate `installed_torch_is_current`, which the readiness check
+  (`src/venv_check.rs`), the repair worker and the update flow all share — a "ready" verdict must
+  imply the worker has nothing left to do.
 - Two views of "missing" exist on purpose. Installation uses the strict
   `missing_dependency_specs` (one concrete distribution per spec). Readiness uses
   `missing_specs_for_readiness`, which additionally accepts any interchangeable distribution of the
@@ -280,6 +296,6 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   pin rules, edit `release.rs` (and keep the release script's manifest in step).
 - To change install/update worker steps, release assets, command execution, or archive handling,
   edit `utils.rs`.
-- To change PyTorch preflight, backend selection, or dependency groups, edit `utils.rs` and keep
-  the UI choice types in `install.rs` synchronized.
+- To change PyTorch pins, preflight, wheel options, the install command or the readiness rule,
+  edit `torch/`; to change dependency groups, edit `utils.rs`.
 - To change app-managed AI model download behavior, edit `ms_sysprobe::ai_models`, not this module.

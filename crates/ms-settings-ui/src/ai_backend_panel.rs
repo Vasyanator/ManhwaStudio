@@ -44,7 +44,8 @@ Key items:
   the completion channel of the off-thread writes (`PendingChanges`).
 - `AiBackendPanelOutcome`: the landed setting changes of one frame.
 - `draw_ai_backend_panel`: renders health, process controls, device selection and
-  CUDA/ROCm diagnostics.
+  CUDA/ROCm diagnostics (led by the PyTorch build line from the health snapshot's
+  `torch_build`, with a warning when the main GPU's arch has no installed ROCm kernels).
 */
 
 use crate::ai_backend_supervisor::{AiBackendHandle, AiBackendProcessCommand};
@@ -53,7 +54,8 @@ use crate::settings_warnings::{SettingChange, SettingKey, WarningSet};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::settings_warnings::item_warning_badge;
 use ms_backend_ipc as backend_ipc;
-use ms_local_ai::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand};
+use ms_config::torch_choice::TorchFlavour;
+use ms_local_ai::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand, TorchBuildInfo};
 use ms_widgets::{WheelComboBox, WheelSlider};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::onnx_caps::{OnnxCaps, device_id_offered, ep_device_ids, probe_onnx_caps};
@@ -443,6 +445,7 @@ pub fn draw_ai_backend_panel(
 
     ui.separator();
     ui.heading(t!("ai_backend.cuda_rocm_diagnostics_heading"));
+    draw_torch_build_lines(ui, &snapshot);
     if ui
         .add_enabled(
             ai_enabled && snapshot.connected,
@@ -476,6 +479,63 @@ pub fn draw_ai_backend_panel(
     // Drained last so a write that landed while this frame was drawn is reported now.
     outcome.changed_settings = state.append_landed_changes(outcome.changed_settings);
     outcome
+}
+
+/// Draws the backend's PyTorch build (`AiBackendHealthSnapshot::torch_build`) as one line and,
+/// below it, a warning when the main GPU's arch has no installed ROCm kernel wheel
+/// (`TorchBuildInfo::kernel_mismatch`). Draws nothing while the build is not reported
+/// (offline, warming up, no torch); an unreadable report is shown as such.
+fn draw_torch_build_lines(ui: &mut egui::Ui, snapshot: &AiBackendHealthSnapshot) {
+    match &snapshot.torch_build {
+        None => {}
+        Some(Err(err)) => {
+            ui.colored_label(ms_theme::status::WARNING, tf!("ai_backend.torch_build_unreadable_status", error = err));
+        }
+        Some(Ok(build)) => {
+            ui.label(tf!("ai_backend.torch_build_line_label", build = torch_build_summary(build)));
+            if let Some(mismatch) = build.kernel_mismatch() {
+                let warning = if mismatch.installed.is_empty() {
+                    tf!("ai_backend.torch_build_no_kernels_warning", device = mismatch.device)
+                } else {
+                    // Arch names are LLVM processor ids, never localized; ", " joins a list of them.
+                    let installed = mismatch.installed.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+                    tf!("ai_backend.torch_build_kernel_mismatch_warning", device = mismatch.device, installed = installed)
+                };
+                ui.colored_label(ms_theme::status::WARNING, warning);
+            }
+        }
+    }
+}
+
+/// One-line summary of a torch build: flavour and version, the HIP / CUDA runtime version,
+/// and the primary GPU (name and AMD arch), joined by " · " like the other pane summaries.
+fn torch_build_summary(build: &TorchBuildInfo) -> String {
+    let flavour = match build.flavour {
+        TorchFlavour::Cpu => t!("ai_backend.torch_build_flavour_cpu_label"),
+        TorchFlavour::Cuda => t!("ai_backend.torch_build_flavour_cuda_label"),
+        TorchFlavour::Rocm => t!("ai_backend.torch_build_flavour_rocm_label"),
+    };
+    let mut parts = vec![tf!("ai_backend.torch_build_flavour_version_part", flavour = flavour, version = build.version.as_str())];
+    // A ROCm wheel may also report a CUDA version; HIP is the runtime it actually uses.
+    if let Some(hip) = &build.hip_version {
+        parts.push(tf!("ai_backend.torch_build_hip_part", version = hip.as_str()));
+    } else if let Some(cuda) = &build.cuda_version {
+        parts.push(tf!("ai_backend.torch_build_cuda_part", version = cuda.as_str()));
+    }
+    match build.primary_device() {
+        Some(device) => {
+            let name = device.name.trim();
+            match (&device.gcn_arch, name.is_empty()) {
+                (Some(arch), false) => parts.push(tf!("ai_backend.torch_build_gpu_arch_part", name = name, arch = arch.as_str())),
+                (Some(arch), true) => parts.push(tf!("ai_backend.torch_build_gpu_part", name = arch.as_str())),
+                (None, false) => parts.push(tf!("ai_backend.torch_build_gpu_part", name = name)),
+                (None, true) => {}
+            }
+        }
+        None if build.flavour != TorchFlavour::Cpu => parts.push(t!("ai_backend.torch_build_no_gpu_part").to_string()),
+        None => {}
+    }
+    parts.join(" · ")
 }
 
 /// Renders the PyTorch device selector (backend-gated).

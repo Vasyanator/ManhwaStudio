@@ -91,7 +91,13 @@ use serde_json::{Map, Value, json};
 /// `mask_feather_px`, `color_match`, `color_match_local_pct`, `color_match_scale_px` by name;
 /// those four post fields are unknown keys of the `inpaint.flux3_klein` params (refused), whose
 /// mask is validated only; the FLUX.3 decode rounds to `u8` instead of truncating.
-pub const PROTOCOL_VERSION: u32 = 17;
+/// 18: the `health` payload gains `torch` (`null`, or `{flavour, version, hip_version,
+/// cuda_version, devices: [{index, name, gcn_arch, integrated}], rocm_device_archs,
+/// rocm_split_kernels}`: the backend's PyTorch build and visible GPUs; absent from the
+/// warming-up form); new
+/// `user_config` keys `General.torch_flavour` / `General.torch_rocm_gfx` (the installer's
+/// recorded torch choice, written by the installer, never read by the backend).
+pub const PROTOCOL_VERSION: u32 = 18;
 
 // ============================================================================
 // FRAME SIZE GUARDS

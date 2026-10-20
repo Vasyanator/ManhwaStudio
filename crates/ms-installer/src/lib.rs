@@ -59,11 +59,15 @@ pub mod prompt_window;
 pub mod window;
 // `utils` is the installer's backend half (layout probing, archive handling, pip and
 // release queries). It is `pub` rather than crate-private because the startup
-// `--check-venv` path (`src/venv_check.rs`) and the launcher's settings page read the
-// same package requirements and version helpers, and a second copy of those rules
-// would be free to drift from the installer's.
+// `--check-venv` path (`src/venv_check.rs`) reads the same package requirements, and a
+// second copy of those rules would be free to drift from the installer's.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod utils;
+// The PyTorch seam: pins, wheel options, preflight, install stage and the "installed PyTorch
+// is current" predicate. `pub` because the launcher's settings page runs the same preflight
+// and upgrade worker, and `venv_check` shares the readiness predicate.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod torch;
 // GitHub release metadata and asset downloads on the shared `ms-download` engine (retry,
 // resume, verification, cancel); crate-private, used by `utils` and `update`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -71,7 +75,7 @@ mod download;
 // The non-interactive, GUI-free readiness check behind the `--check-venv` startup flag.
 // It lives here rather than next to the other host probes (`ms-sysprobe`) because it reads
 // the installer's OWN package requirements and its two drift-prone predicates
-// (`installed_torch_is_current`, `missing_specs_for_readiness`) — and `ms-sysprobe` sits
-// BELOW this crate, so hosting it there would make the two circular.
+// (`torch::readiness`'s `installed_torch_is_current`, `utils::missing_specs_for_readiness`) —
+// and `ms-sysprobe` sits BELOW this crate, so hosting it there would make the two circular.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod venv_check;

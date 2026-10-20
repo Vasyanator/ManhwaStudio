@@ -8,6 +8,8 @@ desktop region capture, and which AI Python packages are installed. GUI-free and
 application-free: nothing here reads a config document, project data, or egui.
 
 Submodules:
+- `amd_adapters`: AMD display adapters and their gfx architecture (Linux sysfs + KFD topology,
+  Windows SetupAPI + driver key) over the one pinned PCI device-id -> gfx table.
 - `ai_backend_capabilities`: process-global slot mirroring whether the AI backend has Torch.
 - `ai_install_probe`: which AI Python packages are installed, classified into the persisted
   `ms_config::AiInstallType` level.
@@ -17,14 +19,14 @@ Submodules:
   PaddleOCR-VL) and their verified downloader.
 - `hf_token`: the process-wide Hugging Face access token, cached in memory and backed by the
   OS secret store (`keyring`).
-- `gpu_utils`: NVIDIA/AMD/DirectML/WebGPU adapter detection, CUDA/ROCm runtime versions,
-  Linux driver state.
+- `gpu_utils`: NVIDIA/AMD/DirectML/WebGPU adapter detection (AMD presence comes from
+  `amd_adapters`), CUDA/ROCm runtime versions, Linux driver state.
 - `python_manager`: discovery of the app-local Python interpreter and construction of the
   configured `Command` values that run it. Native-only (`#![cfg(not(wasm32))]` in the file).
 - `screen_capture`: virtual-desktop bounds and blocking region capture into an `RgbaImage`.
 
 Contract:
-- Every probe here performs blocking OS calls (subprocesses, GDI, filesystem) and must be
+- Every probe here performs blocking OS calls (subprocesses, GDI, SetupAPI, filesystem) and must be
   called from a worker thread, never from the GUI thread.
 - No dependency on the application crate. Diagnostics go to `ms_log::runtime_log`; the
   user-facing strings go through the `ms-i18n` macros mounted below.
@@ -42,6 +44,7 @@ Contract:
 extern crate ms_i18n;
 
 pub mod ai_backend_capabilities;
+pub mod amd_adapters;
 pub mod ai_install_probe;
 pub mod ai_models;
 pub mod hf_token;

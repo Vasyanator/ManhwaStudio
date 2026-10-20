@@ -50,6 +50,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from ..torch_flavour import is_rocm_build
 from ..torch_support import is_torch_available
 
 log = logging.getLogger(__name__)
@@ -88,7 +89,10 @@ def device_class_of(*, name: str | None, arch: str | None, is_hip: bool, cuda_ca
 
 
 def detect_device_class(device: str) -> str:
-    """`device_class_of` for a live torch device; `generic` without torch / GPU (never raises)."""
+    """`device_class_of` for a live torch device; `generic` without torch / GPU (never raises).
+
+    The ROCm-vs-CUDA branch is decided by `torch_flavour.is_rocm_build`.
+    """
     if not str(device).lower().startswith("cuda") or not is_torch_available():
         return GENERIC_DEVICE_CLASS
     import torch
@@ -103,7 +107,7 @@ def detect_device_class(device: str) -> str:
     except (RuntimeError, AssertionError, ValueError) as exc:
         log.debug("cost tables: device properties of %s unavailable (%s)", device, exc)
         return GENERIC_DEVICE_CLASS
-    is_hip = getattr(torch.version, "hip", None) is not None
+    is_hip = is_rocm_build(torch)
     return device_class_of(name=getattr(props, "name", None), arch=getattr(props, "gcnArchName", None), is_hip=is_hip, cuda_capability=None if is_hip else (int(props.major), int(props.minor)))
 
 

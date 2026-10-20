@@ -28,6 +28,10 @@ Main types:
   fixed snapshot of a process whose backend is off (`--no-ai` or platform).
 - `AiBackendHealthSnapshot::large_pool`: the large-model pool part of the pushed
   `model_manager` payload, parsed by `large_models::parse_pool_status` (no polling).
+- `TorchBuildInfo` / `TorchGpuInfo` / `KernelMismatch` / `TorchBuildError`: the snapshot's
+  `torch` object (protocol v18: PyTorch build flavour + versions, visible GPUs, installed AMD
+  per-arch kernel wheels) and the "main GPU's arch has no installed kernels" check
+  (`TorchBuildInfo::kernel_mismatch`). Diagnostic only: shown in the AI backend pane.
 - `AiBackendProbeCommand`: control messages for probe thread
   (`CheckNow`, `RefreshDeviceInfo`, `SetDevice`, `SetOnnxDevice`, `RefreshCudaDiagnostics`, `Stop`).
 
@@ -45,8 +49,10 @@ Main functions:
 use crate::large_models::{LargeModelsError, LargePoolStatus, parse_pool_status};
 use crate::local_ai::LocalAiOff;
 use ms_backend_ipc::{self as backend_ipc, CallError};
-use serde_json::{Value, json};
+use ms_config::torch_choice::{GfxArch, TorchFlavour};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use ms_thread::{self as thread, JoinHandle};
@@ -115,6 +121,11 @@ pub struct AiBackendHealthSnapshot {
     /// warming up, or when the snapshot carries no pool part; `Some(Err)` when the backend
     /// sent its `{"status":"error"}` placeholder or an unreadable shape.
     pub large_pool: Option<Result<LargePoolStatus, LargeModelsError>>,
+    /// The backend's PyTorch build as the last pushed snapshot reported it (`torch`, protocol
+    /// v18). `None` while not connected, warming up, or when the backend sent `null` (no torch,
+    /// or a build fact it could not read); `Some(Err)` when the object has an unreadable shape
+    /// or an unknown flavour token (shown in the pane, not logged per snapshot).
+    pub torch_build: Option<Result<TorchBuildInfo, TorchBuildError>>,
 }
 
 impl Default for AiBackendHealthSnapshot {
@@ -149,6 +160,7 @@ impl Default for AiBackendHealthSnapshot {
             cuda_diagnostics: t!("translation.backend_health.cuda_diagnostics_not_run_status").to_string(),
             cuda_checked_at: None,
             large_pool: None,
+            torch_build: None,
         }
     }
 }
@@ -190,6 +202,98 @@ impl AiBackendHealthSnapshot {
             cuda_diagnostics: t!("translation.backend_health.cuda_diagnostics_unavailable_status").to_string(),
             cuda_checked_at: None,
             large_pool: None,
+            torch_build: None,
+        }
+    }
+}
+
+/// One GPU the backend's torch sees (`torch.devices[]` of the health snapshot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorchGpuInfo {
+    /// torch device index (`cuda:<index>`; ROCm builds use the same namespace).
+    pub index: u32,
+    /// Device name as torch reports it (may be empty).
+    pub name: String,
+    /// Base AMD architecture (`gfx1201`); `None` on CUDA devices.
+    pub gcn_arch: Option<GfxArch>,
+    /// Whether torch reports it as an integrated GPU (APU).
+    pub integrated: bool,
+}
+
+/// The backend's PyTorch build and visible GPUs (`torch` object of the health snapshot,
+/// protocol v18). Diagnostic only: nothing gates on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorchBuildInfo {
+    pub flavour: TorchFlavour,
+    /// `torch.__version__` verbatim (e.g. `2.13.0+rocm10.1.0`).
+    pub version: String,
+    /// `torch.version.hip`, ROCm builds only.
+    pub hip_version: Option<String>,
+    /// `torch.version.cuda` (CUDA builds; a ROCm build may report one too).
+    pub cuda_version: Option<String>,
+    /// Visible devices in index order.
+    pub devices: Vec<TorchGpuInfo>,
+    /// gfx archs of the installed `amd-torch-device-gfxN` wheels, sorted. Empty for CPU/CUDA
+    /// builds AND for a pytorch.org ROCm build, which bundles its kernels instead.
+    pub rocm_device_archs: Vec<GfxArch>,
+    /// `rocm-sdk-core` is installed: the AMD whl-next layout, whose torch carries NO GPU kernels
+    /// and gets each arch's kernels from its `amd-torch-device-gfxN` wheel. False for a
+    /// pytorch.org ROCm build (kernels bundled) and for CPU/CUDA installs.
+    pub rocm_split_kernels: bool,
+}
+
+/// The main GPU's architecture has no installed per-arch ROCm kernel wheel: torch will fail
+/// (or fall back) on it. Produced by [`TorchBuildInfo::kernel_mismatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelMismatch {
+    /// Architecture of the main GPU.
+    pub device: GfxArch,
+    /// The archs whose kernel wheels ARE installed; empty when none is (bare whl-next torch,
+    /// no GPU kernels at all).
+    pub installed: Vec<GfxArch>,
+}
+
+impl TorchBuildInfo {
+    /// The GPU the user most likely runs on: the first discrete device, else the first device.
+    /// `None` when torch sees no GPU.
+    #[must_use]
+    pub fn primary_device(&self) -> Option<&TorchGpuInfo> {
+        self.devices.iter().find(|device| !device.integrated).or_else(|| self.devices.first())
+    }
+
+    /// `Some` when this is a split-kernel ROCm build ([`rocm_split_kernels`](Self::rocm_split_kernels))
+    /// whose primary device ([`primary_device`](Self::primary_device)) has an arch not among
+    /// [`rocm_device_archs`](Self::rocm_device_archs) — including an empty list (no kernels).
+    ///
+    /// `None` for CPU/CUDA builds, for a ROCm build with bundled kernels (pytorch.org: the
+    /// installed wheel set says nothing about coverage there), and without a primary device or
+    /// its arch.
+    #[must_use]
+    pub fn kernel_mismatch(&self) -> Option<KernelMismatch> {
+        if self.flavour != TorchFlavour::Rocm || !self.rocm_split_kernels {
+            return None;
+        }
+        let arch = self.primary_device()?.gcn_arch.as_ref()?;
+        (!self.rocm_device_archs.contains(arch))
+            .then(|| KernelMismatch { device: arch.clone(), installed: self.rocm_device_archs.clone() })
+    }
+}
+
+/// Why the snapshot's `torch` object could not be read. The UI shows the technical
+/// [`Display`](fmt::Display) form inside a localized line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TorchBuildError {
+    /// `flavour` is a string but not a known token (a newer backend); carries the token.
+    UnknownFlavour(String),
+    /// A required field is missing or has the wrong type / an unparsable value; names its path.
+    Malformed { field: &'static str },
+}
+
+impl fmt::Display for TorchBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownFlavour(token) => write!(f, "unknown torch flavour {token:?}"),
+            Self::Malformed { field } => write!(f, "malformed torch field `{field}`"),
         }
     }
 }
@@ -268,6 +372,7 @@ struct HealthFields {
     ocr_baberu_ready: Option<bool>,
     backend_version: Option<String>,
     large_pool: Option<Result<LargePoolStatus, LargeModelsError>>,
+    torch_build: Option<Result<TorchBuildInfo, TorchBuildError>>,
 }
 
 /// Maps a successful health payload (`ok`, `is_torch_available`, `ocr{...}`,
@@ -289,6 +394,86 @@ fn parse_health_payload(payload: &Value) -> HealthFields {
         ocr_baberu_ready: health_ocr_ready_flag(payload, "baberuocr"),
         backend_version: health_backend_version(payload),
         large_pool: health_large_pool(payload),
+        torch_build: health_torch_build(payload),
+    }
+}
+
+/// The `torch` part of a health payload: `None` when absent (warming up, pre-v18) or `null`
+/// (no torch / the backend could not read a fact), else the strict parse of the object.
+/// Not logged here: the snapshot arrives about once a second, the pane shows the error.
+fn health_torch_build(payload: &Value) -> Option<Result<TorchBuildInfo, TorchBuildError>> {
+    match payload.get("torch") {
+        None | Some(Value::Null) => None,
+        Some(torch) => Some(parse_torch_build(torch)),
+    }
+}
+
+/// Strict parse of a non-null `torch` object (shape: `PROTOCOL.md` §7 "`torch` payload").
+/// Every key is required; `hip_version` / `cuda_version` / `gcn_arch` may be `null`.
+fn parse_torch_build(torch: &Value) -> Result<TorchBuildInfo, TorchBuildError> {
+    let object = torch.as_object().ok_or(TorchBuildError::Malformed { field: "torch" })?;
+    let flavour_token = required_str(object, "flavour", "torch.flavour")?;
+    let flavour = TorchFlavour::from_token(flavour_token)
+        .ok_or_else(|| TorchBuildError::UnknownFlavour(flavour_token.to_string()))?;
+    let devices = object
+        .get("devices")
+        .and_then(Value::as_array)
+        .ok_or(TorchBuildError::Malformed { field: "torch.devices" })?
+        .iter()
+        .map(parse_torch_gpu)
+        .collect::<Result<Vec<_>, _>>()?;
+    let rocm_device_archs = object
+        .get("rocm_device_archs")
+        .and_then(Value::as_array)
+        .ok_or(TorchBuildError::Malformed { field: "torch.rocm_device_archs" })?
+        .iter()
+        .map(|arch| arch.as_str().and_then(GfxArch::parse).ok_or(TorchBuildError::Malformed { field: "torch.rocm_device_archs[]" }))
+        .collect::<Result<Vec<_>, _>>()?;
+    let rocm_split_kernels = object
+        .get("rocm_split_kernels")
+        .and_then(Value::as_bool)
+        .ok_or(TorchBuildError::Malformed { field: "torch.rocm_split_kernels" })?;
+    Ok(TorchBuildInfo {
+        flavour,
+        version: required_str(object, "version", "torch.version")?.to_string(),
+        hip_version: nullable_str(object, "hip_version", "torch.hip_version")?,
+        cuda_version: nullable_str(object, "cuda_version", "torch.cuda_version")?,
+        devices,
+        rocm_device_archs,
+        rocm_split_kernels,
+    })
+}
+
+/// One `torch.devices[]` entry.
+fn parse_torch_gpu(device: &Value) -> Result<TorchGpuInfo, TorchBuildError> {
+    let object = device.as_object().ok_or(TorchBuildError::Malformed { field: "torch.devices[]" })?;
+    let index = object
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|index| u32::try_from(index).ok())
+        .ok_or(TorchBuildError::Malformed { field: "torch.devices[].index" })?;
+    let gcn_arch = match nullable_str(object, "gcn_arch", "torch.devices[].gcn_arch")? {
+        None => None,
+        Some(text) => Some(GfxArch::parse(&text).ok_or(TorchBuildError::Malformed { field: "torch.devices[].gcn_arch" })?),
+    };
+    let integrated = object
+        .get("integrated")
+        .and_then(Value::as_bool)
+        .ok_or(TorchBuildError::Malformed { field: "torch.devices[].integrated" })?;
+    Ok(TorchGpuInfo { index, name: required_str(object, "name", "torch.devices[].name")?.to_string(), gcn_arch, integrated })
+}
+
+/// A required string key; `field` is the path reported on failure.
+fn required_str<'a>(object: &'a Map<String, Value>, key: &str, field: &'static str) -> Result<&'a str, TorchBuildError> {
+    object.get(key).and_then(Value::as_str).ok_or(TorchBuildError::Malformed { field })
+}
+
+/// A required key whose value is a string or `null`; a blank string reads as `None`.
+fn nullable_str(object: &Map<String, Value>, key: &str, field: &'static str) -> Result<Option<String>, TorchBuildError> {
+    match object.get(key) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.trim()).filter(|text| !text.is_empty()).map(str::to_string)),
+        _ => Err(TorchBuildError::Malformed { field }),
     }
 }
 
@@ -332,6 +517,7 @@ fn apply_health_fields(
     guard.ocr_surya_ready = fields.ocr_surya_ready;
     guard.ocr_baberu_ready = fields.ocr_baberu_ready;
     guard.large_pool = fields.large_pool;
+    guard.torch_build = fields.torch_build;
     // Backend onnxruntime reachability: available only while connected AND a
     // provider list has been enumerated. The retained list is not cleared on
     // disconnect, so on reconnect this restores immediately from the last-known
@@ -376,6 +562,7 @@ fn apply_health_offline(snapshot: &Arc<Mutex<AiBackendHealthSnapshot>>, details:
             ocr_baberu_ready: None,
             backend_version: None,
             large_pool: None,
+            torch_build: None,
         },
     );
 }
@@ -1474,6 +1661,7 @@ mod tests {
                 ocr_baberu_ready: None,
                 backend_version: None,
                 large_pool: None,
+                torch_build: None,
             },
         );
         let guard = snapshot.lock().unwrap();
@@ -1646,5 +1834,139 @@ mod tests {
         snapshot.ocr_paddle_vl_ready = Some(true);
         snapshot.ocr_paddle_vl_model = None;
         assert_eq!(super::paddle_vl_ready_for(&snapshot, "manga_ja"), Some(false));
+    }
+
+    fn gfx(name: &str) -> ms_config::torch_choice::GfxArch {
+        ms_config::torch_choice::GfxArch::parse(name).expect("test arch is valid")
+    }
+
+    /// A ROCm build report as `runtime/torch_flavour.torch_health_payload` emits it.
+    fn rocm_torch_payload() -> Value {
+        json!({
+            "flavour": "rocm",
+            "version": "2.13.0+rocm10.1.0",
+            "hip_version": "10.1.0",
+            "cuda_version": null,
+            "devices": [
+                { "index": 0, "name": "AMD Radeon Graphics", "gcn_arch": "gfx1036", "integrated": true },
+                { "index": 1, "name": "AMD Radeon RX 9070 XT", "gcn_arch": "gfx1201", "integrated": false }
+            ],
+            "rocm_device_archs": ["gfx1201"],
+            "rocm_split_kernels": true
+        })
+    }
+
+    /// The `torch` object round-trips into the snapshot field by field, and an offline state
+    /// clears it.
+    #[test]
+    fn torch_build_is_parsed_into_the_snapshot() {
+        use ms_config::torch_choice::TorchFlavour;
+        let snapshot = Arc::new(Mutex::new(AiBackendHealthSnapshot::default()));
+        let event = json!({ "ocr": {}, "torch": rocm_torch_payload() });
+        apply_health_fields(&snapshot, parse_health_payload(&event));
+        {
+            let guard = snapshot.lock().unwrap();
+            let build = guard.torch_build.clone().expect("present").expect("readable");
+            assert_eq!(
+                build,
+                super::TorchBuildInfo {
+                    flavour: TorchFlavour::Rocm,
+                    version: "2.13.0+rocm10.1.0".to_string(),
+                    hip_version: Some("10.1.0".to_string()),
+                    cuda_version: None,
+                    devices: vec![
+                        super::TorchGpuInfo { index: 0, name: "AMD Radeon Graphics".to_string(), gcn_arch: Some(gfx("gfx1036")), integrated: true },
+                        super::TorchGpuInfo { index: 1, name: "AMD Radeon RX 9070 XT".to_string(), gcn_arch: Some(gfx("gfx1201")), integrated: false },
+                    ],
+                    rocm_device_archs: vec![gfx("gfx1201")],
+                    rocm_split_kernels: true,
+                }
+            );
+            assert_eq!(build.primary_device().map(|device| device.index), Some(1));
+        }
+        super::apply_health_offline(&snapshot, "down".to_string());
+        assert!(snapshot.lock().unwrap().torch_build.is_none());
+    }
+
+    /// Absent (warming up, pre-v18) and `null` (no torch) both read as "not reported".
+    #[test]
+    fn absent_or_null_torch_is_none() {
+        assert!(parse_health_payload(&json!({ "snapshot_state": "warming_up" })).torch_build.is_none());
+        assert!(parse_health_payload(&json!({ "ocr": {}, "torch": null })).torch_build.is_none());
+    }
+
+    /// An unknown flavour token and every unreadable shape are typed errors, never a guess.
+    #[test]
+    fn unreadable_torch_objects_are_errors() {
+        use super::TorchBuildError;
+        let parse = |torch: Value| parse_health_payload(&json!({ "torch": torch })).torch_build.expect("reported");
+        let mut unknown = rocm_torch_payload();
+        unknown["flavour"] = json!("xpu");
+        assert_eq!(parse(unknown), Err(TorchBuildError::UnknownFlavour("xpu".to_string())));
+        assert_eq!(parse(json!("rocm")), Err(TorchBuildError::Malformed { field: "torch" }));
+        let cases: [(&str, Value, &str); 7] = [
+            ("rocm_split_kernels", json!("yes"), "torch.rocm_split_kernels"),
+            ("version", Value::Null, "torch.version"),
+            ("hip_version", json!(10), "torch.hip_version"),
+            ("devices", json!({}), "torch.devices"),
+            ("rocm_device_archs", json!(["gfx12-generic"]), "torch.rocm_device_archs[]"),
+            ("devices", json!([{ "index": -1, "name": "x", "gcn_arch": null, "integrated": false }]), "torch.devices[].index"),
+            ("devices", json!([{ "index": 0, "name": "x", "gcn_arch": "sm_90", "integrated": false }]), "torch.devices[].gcn_arch"),
+        ];
+        for (key, value, field) in cases {
+            let mut torch = rocm_torch_payload();
+            torch[key] = value;
+            assert_eq!(parse(torch), Err(TorchBuildError::Malformed { field }), "{key}");
+        }
+        let mut missing = rocm_torch_payload();
+        missing.as_object_mut().unwrap().remove("cuda_version");
+        assert_eq!(parse(missing), Err(TorchBuildError::Malformed { field: "torch.cuda_version" }));
+    }
+
+    /// `kernel_mismatch` looks at the primary (first discrete, else first) device of a ROCm
+    /// build and stays silent whenever the installed set cannot answer.
+    #[test]
+    fn kernel_mismatch_table() {
+        use ms_config::torch_choice::TorchFlavour;
+        let base = match super::parse_torch_build(&rocm_torch_payload()) {
+            Ok(build) => build,
+            Err(err) => panic!("fixture parses: {err}"),
+        };
+        // Discrete gfx1201 covered: the uncovered iGPU does not matter.
+        assert_eq!(base.kernel_mismatch(), None);
+
+        let mut other_kernels = base.clone();
+        other_kernels.rocm_device_archs = vec![gfx("gfx1100"), gfx("gfx1036")];
+        assert_eq!(
+            other_kernels.kernel_mismatch(),
+            Some(super::KernelMismatch { device: gfx("gfx1201"), installed: vec![gfx("gfx1100"), gfx("gfx1036")] })
+        );
+
+        // Only integrated devices: the first one is primary.
+        let mut igpu_only = base.clone();
+        igpu_only.devices.retain(|device| device.integrated);
+        igpu_only.rocm_device_archs = vec![gfx("gfx1201")];
+        assert_eq!(igpu_only.kernel_mismatch().map(|m| m.device), Some(gfx("gfx1036")));
+
+        // Bare whl-next torch: no per-arch wheel at all means no kernels for the GPU.
+        let mut bare = base.clone();
+        bare.rocm_device_archs.clear();
+        assert_eq!(bare.kernel_mismatch(), Some(super::KernelMismatch { device: gfx("gfx1201"), installed: Vec::new() }));
+
+        // Bundled kernels (pytorch.org ROCm build), no devices, no arch, not ROCm: silent.
+        let mut bundled = other_kernels.clone();
+        bundled.rocm_split_kernels = false;
+        assert_eq!(bundled.kernel_mismatch(), None);
+        bundled.rocm_device_archs.clear();
+        assert_eq!(bundled.kernel_mismatch(), None);
+        let mut no_devices = other_kernels.clone();
+        no_devices.devices.clear();
+        assert_eq!(no_devices.kernel_mismatch(), None);
+        let mut no_arch = other_kernels.clone();
+        no_arch.devices.iter_mut().for_each(|device| device.gcn_arch = None);
+        assert_eq!(no_arch.kernel_mismatch(), None);
+        let mut cuda = other_kernels;
+        cuda.flavour = TorchFlavour::Cuda;
+        assert_eq!(cuda.kernel_mismatch(), None);
     }
 }

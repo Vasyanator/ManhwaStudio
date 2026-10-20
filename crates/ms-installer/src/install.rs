@@ -15,7 +15,8 @@ Main responsibilities:
 - start background installer workers and consume their progress events; the install / repair
   worker shares `InstallerApp`'s cancel flag, set when the window closes (`Drop`);
 - persist the selected AI dependency level into the installed `user_config.json`
-  (one `ms_docstore::update` of the install target's document);
+  (one `ms_docstore::update` of the install target's document, through
+  `update_install_target_general`, which `torch::choice_store` shares for the torch record);
 - expose startup service entry points used by `lib.rs`.
 
 Every window's creator closure prepares its context through `window::prepare_window_context`
@@ -23,7 +24,8 @@ Every window's creator closure prepares its context through `window::prepare_win
 
 Notes:
 Non-UI installer work lives in `utils.rs` so the same worker helpers can be reused by future
-update flows.
+update flows; the PyTorch choice types, preflight and the choice widget (`torch::draw_torch_choice`)
+come from `torch/`.
 */
 
 use std::env;
@@ -45,7 +47,6 @@ use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, PendingDialo
 // The host version: displayed by the Windows "existing install found" window, and written as
 // the Uninstall entry's `DisplayVersion` by a full install.
 use crate::HostVersion;
-use ms_sysprobe::gpu_utils::RuntimeVersion;
 #[cfg(target_os = "windows")]
 use ms_sysprobe::python_manager;
 use eframe::egui;
@@ -53,6 +54,7 @@ use eframe::egui;
 use crate::window::prepare_window_context;
 
 use super::utils::*;
+use super::torch::{TorchChoiceState, TorchInstallSelection, TorchPreflightResult, detect_torch_preflight, draw_torch_choice};
 #[cfg(target_os = "windows")]
 pub use super::utils::{
     run_windows_create_start_menu_shortcut_for_install, run_windows_uninstall_from_current_exe,
@@ -555,41 +557,6 @@ pub fn resolve_installed_program_copy_path(install_dir: &Path) -> Result<PathBuf
     Err(tf!("installer.install.installed_copy_not_found_error", install_dir = install_dir.display(), listed = listed))
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum TorchBackend {
-    Cuda,
-    Rocm,
-}
-
-#[derive(Clone, Debug)]
-pub struct TorchWheelOption {
-    pub(crate) backend: TorchBackend,
-    pub(crate) wheel_tag: String,
-    /// Human-readable name of the wheel, shown verbatim in the Torch choice UI (the
-    /// launcher's settings page renders the same prompt as the installer window).
-    pub label: String,
-    pub(crate) version: RuntimeVersion,
-}
-
-#[derive(Clone, Debug)]
-pub struct TorchChoicePrompt {
-    pub options: Vec<TorchWheelOption>,
-    pub recommended_index: usize,
-    pub summary: String,
-}
-
-#[derive(Debug)]
-pub enum TorchPreflightResult {
-    Skip { reason: String },
-    Choose(TorchChoicePrompt),
-}
-
-#[derive(Clone, Debug)]
-pub enum TorchInstallSelection {
-    SkipCpu,
-    InstallGpu(TorchWheelOption),
-}
-
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub(super) enum InstallDependencyProfile {
     Fast,
@@ -940,7 +907,9 @@ struct InstallerApp {
     console_lines: Vec<String>,
     rx: Option<mpsc::Receiver<InstallEvent>>,
     result_sink: Arc<Mutex<Option<InstallerOutcome>>>,
-    torch_choice_prompt: Option<TorchChoicePrompt>,
+    /// The PyTorch choice shown in `UiState::TorchChoice`; kept across frames so the user's
+    /// pick survives repaints.
+    torch_choice: Option<TorchChoiceState>,
     pending_ai_install_type: config::AiInstallType,
     invite_telegram: bool,
     invite_discord: bool,
@@ -1022,7 +991,7 @@ impl InstallerApp {
             console_lines: Vec::new(),
             rx: None,
             result_sink,
-            torch_choice_prompt: None,
+            torch_choice: None,
             pending_ai_install_type: config::AiInstallType::None,
             invite_telegram: true,
             invite_discord: false,
@@ -1196,7 +1165,7 @@ impl InstallerApp {
         self.stage_label = t!("installer.install.stage_prepare_pytorch").to_string();
         self.overall_progress = 0.0;
         self.overall_label = tf!("installer.install.target_folder_label", install_target_dir = install_target_dir.display());
-        self.torch_choice_prompt = None;
+        self.torch_choice = None;
 
         let _ = ms_thread::Builder::new()
             .name("mini-launcher-torch-preflight".to_string())
@@ -1215,7 +1184,7 @@ impl InstallerApp {
         self.stage_label = t!("installer.install.choose_deps_set_hint").to_string();
         self.overall_progress = 0.0;
         self.overall_label = tf!("installer.install.target_folder_label", install_target_dir = install_target_dir.display());
-        self.torch_choice_prompt = None;
+        self.torch_choice = None;
     }
 
     fn start_install(
@@ -1245,7 +1214,7 @@ impl InstallerApp {
             ),
         };
         self.console_lines.clear();
-        self.torch_choice_prompt = None;
+        self.torch_choice = None;
         self.pending_ai_install_type = match dependency_profile {
             InstallDependencyProfile::Fast => config::AiInstallType::Base,
             InstallDependencyProfile::Full => config::AiInstallType::Full,
@@ -1347,7 +1316,7 @@ impl eframe::App for InstallerApp {
                         self.stage_label = t!("installer.install.choose_pytorch_wheel_hint").to_string();
                         self.overall_progress = 0.0;
                         self.overall_label = prompt.summary.clone();
-                        self.torch_choice_prompt = Some(prompt);
+                        self.torch_choice = Some(TorchChoiceState::new(prompt));
                     }
                 },
                 InstallEvent::Finished(Ok(())) => {
@@ -1518,40 +1487,15 @@ impl eframe::App for InstallerApp {
                         ui.small(t!("installer.install.full_install_desc"));
                     }
                     UiState::TorchChoice => {
-                        if let Some(prompt) = &self.torch_choice_prompt {
-                            ui.label(t!("installer.install.available_pytorch_wheels_label"));
-                            ui.small(&prompt.summary);
-                            if prompt.options.is_empty() {
-                                ui.add_space(8.0);
-                                ui.small(t!("installer.install.no_gpu_variants_hint"));
-                            } else {
-                                ui.add_space(8.0);
-                                ui.small(tf!("installer.install.recommended_label", prompt = prompt.options[prompt.recommended_index].label));
-                                ui.add_space(8.0);
-
-                                for (idx, option) in prompt.options.iter().enumerate() {
-                                    let title = if idx == prompt.recommended_index {
-                                        tf!("installer.install.option_recommended_marker", option = option.label)
-                                    } else {
-                                        option.label.clone()
-                                    };
-                                    if ui
-                                        .add_sized([260.0, 34.0], egui::Button::new(title))
-                                        .clicked()
-                                    {
-                                        selected_torch_install =
-                                            Some(TorchInstallSelection::InstallGpu(option.clone()));
-                                    }
-                                }
-                            }
-                        }
-
-                        ui.add_space(10.0);
-                        if ui
-                            .add_sized([260.0, 34.0], egui::Button::new(t!("installer.install.keep_cpu_button")))
-                            .clicked()
-                        {
-                            selected_torch_install = Some(TorchInstallSelection::SkipCpu);
+                        ui.label(t!("installer.install.available_pytorch_wheels_label"));
+                        ui.add_space(4.0);
+                        // The ROCm row's picker and notes can outgrow the fixed-height centre
+                        // area of a small window: scroll instead of clipping the confirm button.
+                        if let Some(choice) = self.torch_choice.as_mut() {
+                            egui::ScrollArea::vertical().id_salt("installer.torch.choice_scroll").show(ui, |ui| {
+                                selected_torch_install =
+                                    draw_torch_choice(ui, choice, t!("installer.install.install_pytorch_button"));
+                            });
                         }
                     }
                     UiState::Running => {
@@ -1823,24 +1767,26 @@ enum UiState {
     Failed,
 }
 
-/// Records `General.ai_install_type` in the install target's `user_config.json`.
+/// Edits `General` of the install target's `user_config` in ONE serialized read-modify-write
+/// through `ms_docstore::update` (atomic replace, the historical pretty layout without a
+/// trailing newline).
 ///
-/// One serialized read-modify-write through `ms_docstore::update` (atomic replace, the
-/// historical pretty layout without a trailing newline). Like the former `JsonConfig`
-/// path it also backfills missing `user_config_defaults()` keys and treats a non-object
-/// root as `{}`. A malformed existing document is left untouched and reported.
+/// Like the former `JsonConfig` path it also backfills missing `user_config_defaults()` keys
+/// and treats a non-object root (or `General`) as `{}`, then hands the `General` map to
+/// `mutate`. A malformed existing document is left untouched and reported. Shared by the
+/// install-type record and the torch-choice record (`torch::choice_store`). Blocking I/O.
 ///
 /// # Errors
-/// A localized message: `open_config_error` when the existing document cannot be read or
-/// parsed, `save_ai_type_error` when the replacement cannot be written.
-fn persist_ai_install_type_for_install_target(
+/// The docstore error: `Malformed` / `Storage` when the existing document cannot be read or
+/// parsed, an I/O error when the replacement cannot be written.
+pub(crate) fn update_install_target_general(
     install_target_dir: &Path,
-    install_type: config::AiInstallType,
-) -> Result<(), String> {
+    mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> Result<(), ms_docstore::DocStoreError> {
     let path = install_target_dir.join(config::USER_CONFIG_FILE);
     let doc = ms_docstore::DocRef::new(&path, ms_docstore::DocKind::UserConfig);
     let defaults = config::user_config_defaults();
-    let outcome = ms_docstore::update(&doc, ms_docstore::WriteOptions::default(), |root| {
+    ms_docstore::update(&doc, ms_docstore::WriteOptions::default(), |root| {
         if !root.is_object() {
             *root = serde_json::Value::Object(serde_json::Map::new());
         }
@@ -1853,14 +1799,31 @@ fn persist_ai_install_type_for_install_target(
         if !general.is_object() {
             *general = serde_json::Value::Object(serde_json::Map::new());
         }
-        general
-            .as_object_mut()
-            .ok_or_else(|| "user config `General` is not an object".to_string())?
-            .insert(
-                config::GENERAL_AI_INSTALL_TYPE_KEY.to_string(),
-                serde_json::Value::String(install_type.as_str().to_string()),
-            );
+        mutate(
+            general
+                .as_object_mut()
+                .ok_or_else(|| "user config `General` is not an object".to_string())?,
+        );
         Ok(())
+    })
+}
+
+/// Records `General.ai_install_type` in the install target's `user_config.json`
+/// (through [`update_install_target_general`]).
+///
+/// # Errors
+/// A localized message: `open_config_error` when the existing document cannot be read or
+/// parsed, `save_ai_type_error` when the replacement cannot be written.
+fn persist_ai_install_type_for_install_target(
+    install_target_dir: &Path,
+    install_type: config::AiInstallType,
+) -> Result<(), String> {
+    let path = install_target_dir.join(config::USER_CONFIG_FILE);
+    let outcome = update_install_target_general(install_target_dir, |general| {
+        general.insert(
+            config::GENERAL_AI_INSTALL_TYPE_KEY.to_string(),
+            serde_json::Value::String(install_type.as_str().to_string()),
+        );
     });
     outcome.map_err(|err| {
         ms_log::runtime_log::log_error(format!(

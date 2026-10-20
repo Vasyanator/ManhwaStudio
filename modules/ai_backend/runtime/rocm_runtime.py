@@ -9,7 +9,7 @@ auto-tuning/compilation cost and never run on an allocator mode that
 miscompiles on this hardware class.
 
 Main responsibilities:
-- detect a ROCm/HIP PyTorch build via `torch.version.hip`;
+- detect a ROCm/HIP PyTorch build (`torch_flavour.is_rocm_build`);
 - switch MIOpen into immediate mode (no exhaustive Find / no per-shape JIT
   tuning) by defaulting `MIOPEN_FIND_MODE=FAST` when the user has not set it;
 - force `expandable_segments:False` into the allocator-config variable Torch
@@ -27,7 +27,7 @@ Key functions:
 
 Notes:
 - A no-op on CPU-only, CUDA, MPS, or absent-Torch installs: it only acts when
-  `torch.version.hip` is a non-empty string.
+  `torch_flavour.is_rocm_build` says the imported Torch is a ROCm build.
 - Every environment default here uses `setdefault` semantics so an explicit
   user/env override wins - with ONE deliberate exception, `expandable_segments`,
   which is overridden even when the user set it because it is a correctness
@@ -52,6 +52,7 @@ from pathlib import Path
 
 from .error_text import configure_error_text
 from .paths import program_root
+from .torch_flavour import is_rocm_build
 
 log = logging.getLogger(__name__)
 
@@ -228,14 +229,15 @@ def configure_rocm_runtime() -> bool:
         configure_error_text(rocm_runtime=False)
         return False
 
-    hip_version = getattr(getattr(torch, "version", None), "hip", None)
-    if not isinstance(hip_version, str) or not hip_version.strip():
+    if not is_rocm_build(torch):
         # CUDA / CPU / MPS Torch build: MIOpen is not used, and Torch's own
         # `expandable_segments` advice is CORRECT there - do not rewrite it.
         configure_error_text(rocm_runtime=False)
         return False
 
     configure_error_text(rocm_runtime=True)
+    # Read for the log line only; `is_rocm_build` guarantees a non-blank string.
+    hip_version = torch.version.hip
 
     # Immediate mode: skip per-shape exhaustive Find/compile. setdefault keeps an
     # explicit user override intact.

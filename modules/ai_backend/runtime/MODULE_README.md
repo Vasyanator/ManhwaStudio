@@ -10,7 +10,9 @@ domains (`ocr/`, `detection/`, `inpaint/`, `reline/`, `translate/`) depend on th
 other way round.
 
 ## Architecture
-`paths.py` sits at the bottom and is stdlib-only. `torch_support.py` is likewise dependency-free;
+`paths.py` sits at the bottom and is stdlib-only. `torch_support.py` is likewise dependency-free, and
+`torch_flavour.py` builds only on it at import time (torch and `torch_device.py` lazily, inside its
+health-fact calls);
 `model_manager.py` builds only on `residency/` (which builds on `memory_budget.py` and `torch_support.py`). `device_service.py` reads/writes user config and probes runtimes.
 `rocm_runtime.py` and `rocm_mmap_transfer.py` are the two ROCm/HIP workarounds: the first is applied
 once at backend startup, the second is applied per weight transfer by the Torch services.
@@ -32,6 +34,14 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
 - `torch_support.py`: `is_torch_available()` cached import probe, a debug override that simulates a
   missing Torch (`configure_torch_support(simulate_disabled=...)`), and the stable user-facing
   message for Torch-gated endpoints.
+- `torch_flavour.py`: the one owner of "which torch build is this" — `TorchFlavour` (`CPU` / `CUDA` /
+  `ROCM`), `flavour_of(torch_module)` and `is_rocm_build(torch_module)` over an already imported
+  torch (the caller keeps its own import gate) — and of the torch facts of the health snapshot:
+  `TorchBuildFacts` / `torch_build_facts()`, `gpu_device_facts()` (index, name, base `gcn_arch`,
+  `integrated` via `torch_device`), `installed_rocm_device_archs()` (the `amd-torch-device-gfxN`
+  wheels from `importlib.metadata`) and `torch_health_payload()`, the snapshot's `torch` object.
+  Importing it never imports torch (a test enforces it). `test_torch_flavour.py` holds its table,
+  the fact tests and the site-agreement tests of every consumer (including `modules/ai_device.py`).
 - `model_manager.py`: `SmallModelManager` — the small-model pool over the residency arbiter:
   the service-facing lease API (`begin_model_use(key, unload_callback, *, owner=, hint=)` ->
   `ModelUsageLease`, `mark_unloaded`), its reclaim policy (drop whole idle models, LRU) and the
@@ -122,6 +132,30 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   reads root `config` (`SIDE_MODELS_DIR`, `FLUX_FILL_DIR`, `WATERMARK_DIR`, `MODELS_DIR`) or joins
   `ManhwaStudio_AI_Models/side_models` itself. Root `config.py` still lists the same directories for
   its folder-creation pass; `test_paths.py` asserts both spellings agree.
+- **`torch_flavour` is the single backend owner of "which torch build is this".** No backend module
+  reads `torch.version.hip` / `torch.version.cuda` to branch on the build; it calls
+  `is_rocm_build` / `flavour_of`. Only a non-blank string version counts, so `None`, `""`,
+  whitespace and a torch without `version` are never ROCm. A new consumer gets a row in
+  `test_torch_flavour.py`'s site-agreement section.
+- **The health snapshot's `torch` facts are computed once per process and never raise.** The health
+  worker builds a snapshot every second, so `torch_build_facts` (after the first success),
+  `gpu_device_facts` and `installed_rocm_device_archs` (also when empty) are cached; the only device
+  query, `torch.cuda.get_device_properties` per device, runs on the first snapshot. It initializes
+  torch's CUDA/HIP runtime state but allocates no VRAM (measured on gfx1201: 0 MiB, the first tensor
+  +202 MiB), and the app's first `device.get` after connect already does the same
+  (`device_service.py` `_detect_cuda_device_names_locked`, `torch.cuda.get_device_name`). Without torch
+  (including the simulate-missing override) `torch_health_payload()` is `None` and the device probe
+  is never called; any failing fact also yields `None` (logged WARNING once, then DEBUG). The key's
+  shape is an IPC contract (`PROTOCOL_VERSION`).
+- **No in-process WMI or COM call before `import torch` in the backend process (TheRock #9305).**
+  On Windows the ROCm runtime's `amd_comgr.dll` crashes in `DllMain` after any in-process COM/WMI
+  query, so `import torch` fails.
+  GPU listings go through `wmic` / `powershell` subprocesses only (`device_service.py`,
+  `modules/ai_device.py`); no backend module may import `wmi`, `comtypes`, `win32com` /
+  `pythoncom` or call `CoInitialize`. Python >= 3.12 implements `platform.win32_ver()` (and so
+  `platform.uname()` / `platform.system()` / `platform.platform()`) with the in-process `_wmi`
+  module: the backend runs on 3.11 today, and a Python bump must first move every pre-torch
+  `platform.*` call to `sys.platform` / `os.name`.
 - `__init__.py` re-exports nothing and imports no submodule. The package must stay import-cheap so
   the torch-free `ipc/` layer and its tests never drag in the AI stack — the same reason the parent
   `modules/ai_backend/__init__.py` resolves `run_server` lazily via PEP 562.
@@ -293,6 +327,8 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
 - To place a new on-demand side model, use `side_models_root() / "<dir>"` and add its consumer to
   `test_paths.py`.
 - To change device selection, sentinel handling, or device-name probing, edit `device_service.py`.
+- To change how a torch build is classified (CPU / CUDA / ROCm), edit `torch_flavour.py` and
+  `test_torch_flavour.py` — and only there.
 - To change how a Torch service turns `General.ai_device` into a device, or how it releases the
   allocator cache, edit `torch_device.py` and `test_torch_device.py`; a per-service difference is a
   keyword argument of the owner, never a local copy.

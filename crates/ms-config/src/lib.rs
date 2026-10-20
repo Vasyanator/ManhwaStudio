@@ -23,6 +23,8 @@ Main items:
   `update_user_config_file` (exit-only tab settings).
 - `user_config_defaults` / `project_config_defaults`: default trees for global and project settings.
 - `AiInstallType`: installed AI dependency level recorded in `user_config.json`.
+- `torch_choice` (module): `TorchFlavour`, `GfxArch` and the installer's `TorchChoiceRecord`
+  (`General.torch_flavour` / `General.torch_rocm_gfx`, never in the defaults tree).
 - `flux3_klein_dir` / `flux3_klein_settings_path`: the FLUX.3 klein model package root the
   download fills (mirrors the backend's `flux3_download.model_root`) and that engine's
   settings file.
@@ -110,6 +112,13 @@ pub use secondary_windows::{GENERAL_SECONDARY_WINDOWS_KEY, SecondaryWindows, Win
 pub mod touch_gestures;
 pub use touch_gestures::{GENERAL_TOUCH_GESTURES_KEY, touch_gestures_from_user_settings};
 
+// The torch-build vocabulary (`TorchFlavour`, `GfxArch`) and the installer's persisted choice
+// (`TorchChoiceRecord` under `General.torch_flavour` / `General.torch_rocm_gfx`). It lives here,
+// next to `AiInstallType`, because the installer (writer), the launcher, the AMD adapter probe
+// in `ms-sysprobe` and the backend-health reader all name it and all already depend on this
+// crate. The two keys are deliberately absent from `user_config_defaults()` (absent = legacy).
+pub mod torch_choice;
+
 // Single-image editing mode: the readable input-type table, the scratch-root resolver and
 // the `SingleImage` section of `user_config`. It lives here because the table is pure data
 // read by crates that do not know each other (launcher, installer, project, binary) and
@@ -184,6 +193,9 @@ pub const PROJECT_SETTINGS_FILE: &str = "settings.json";
 pub const USER_CONFIG_FILE: &str = "user_config.json";
 pub const GENERAL_PROJECTS_DIR_KEY: &str = "projects_dir";
 pub const GENERAL_AI_INSTALL_TYPE_KEY: &str = "ai_install_type";
+// The recorded torch choice keys; documented (and their "absent = legacy" contract) at their
+// definition in `torch_choice`.
+pub use torch_choice::{GENERAL_TORCH_FLAVOUR_KEY, GENERAL_TORCH_ROCM_GFX_KEY};
 /// `General` key selecting which AI runtime the app drives: the external Python
 /// backend process (`"backend"`) or the in-process native ONNX Runtime path
 /// (`"native"`). Parsed by [`AiRuntime::from_user_settings`], but only honored when

@@ -10,10 +10,26 @@ Main responsibilities:
 - persist explicit device selections in UserConfig;
 - provide CUDA/ROCm diagnostics for backend and Rust settings UI.
 
+Key functions:
+- AIDevice - the selected device (a `str` usable as `torch.device(...)`)
+- assert_cuda_or_rocm_available() - the CUDA/ROCm diagnosis report
+- _windows_listing_has_amd() / _lspci_gpu_line_is_amd() - AMD verdict over a GPU listing
+- _amd_problems() / _amd_driver_stack_present() - the AMD part of the verdict
+
 Notes:
 When PyTorch is not installed, CPU is reported as a temporary runtime fallback
 without writing it to config, so a later PyTorch installation can still promote
 the default device to CUDA when CUDA becomes available.
+The build flavour (CPU / CUDA / ROCm) comes from the backend owner
+`ai_backend.runtime.torch_flavour.flavour_of`, imported lazily under either
+import root. The AMD ROCm PyTorch wheels are self-contained (they carry their
+own ROCm runtime) on Windows and Linux, so a system ROCm install is reported
+only as information; on Linux the device node `/dev/kfd` (amdgpu driver,
+`render` / `video` groups) is what ROCm needs from the system.
+GPU listings are read through `wmic` / `powershell` SUBPROCESSES only: no WMI or
+COM call may run inside this process before `import torch` (TheRock #9305,
+see `ai_backend/runtime/MODULE_README.md`).
+User-facing diagnosis texts are Russian, like the rest of this report.
 """
 
 import os
@@ -74,6 +90,21 @@ def _which(exe: str) -> Optional[str]:
     return shutil.which(exe)
 
 
+#: AMD vendor / product markers in a lower-cased GPU listing value or lspci
+#: line. Word boundaries keep `ati` from matching inside other words ("compatible",
+#: "AdapterCompatibility"); on Windows the matcher sees field values only.
+_AMD_VALUE_MARKERS = re.compile(r"advanced micro devices|\bamd\b|radeon|\bati\b")
+
+
+def _lspci_gpu_line_is_amd(line: str) -> bool:
+    """Whether one `lspci -nn` GPU line names an AMD device, by word-bounded vendor markers.
+
+    The class text "VGA compatible controller" contains "ati", so plain substring
+    matching would make every GPU line AMD; `_AMD_VALUE_MARKERS` matches words only.
+    """
+    return _AMD_VALUE_MARKERS.search(line.lower()) is not None
+
+
 def _detect_gpu_linux() -> Tuple[bool, bool, str]:
     """
     Returns: (has_nvidia, has_amd_discrete, raw_summary)
@@ -92,8 +123,8 @@ def _detect_gpu_linux() -> Tuple[bool, bool, str]:
 
             has_nvidia = any("nvidia" in l.lower() for l in gpus)
             # AMD: "Advanced Micro Devices" or "AMD/ATI"; discrete vs iGPU is hard without extra parsing.
-            # We'll treat any AMD GPU listed here as "amd present"; still useful for ROCm check.
-            has_amd = any(re.search(r"(amd|advanced micro devices|ati)", l, re.I) for l in gpus)
+            # Any AMD GPU listed here counts as "amd present"; still useful for the ROCm check.
+            has_amd = any(_lspci_gpu_line_is_amd(l) for l in gpus)
             return has_nvidia, has_amd, "\n".join(summary_lines) if summary_lines else r.out
 
     # Fallback: /proc/driver/nvidia/gpus exists if nvidia driver is loaded
@@ -123,18 +154,50 @@ def _detect_gpu_linux() -> Tuple[bool, bool, str]:
     return has_nvidia, has_amd, "\n".join(summary_lines)
 
 
+def _windows_listing_values(text: str) -> list[str]:
+    """Field values of a wmic `/format:list` (`Key=Value`) or PowerShell `Format-List` (`Key : Value`) listing, lower-cased.
+
+    Each line is split at its first `=` or `:`; lines without either carry no
+    field and are skipped.
+    """
+    values = []
+    for line in text.splitlines():
+        match = re.match(r"\s*[^=:]*[=:](.*)$", line)
+        if match is None:
+            continue
+        value = match.group(1).strip().lower()
+        if value:
+            values.append(value)
+    return values
+
+
+def _windows_listing_has_amd(text: str) -> bool:
+    """Whether a wmic / PowerShell `Win32_VideoController` listing names an AMD GPU.
+
+    Only field values are matched (case-insensitive) against `advanced micro
+    devices`, `amd`, `radeon` and `ati` as words, so a listing of Intel or NVIDIA
+    adapters is never AMD because of its column names.
+    """
+    return any(_AMD_VALUE_MARKERS.search(value) for value in _windows_listing_values(text))
+
+
+def _windows_listing_has_nvidia(text: str) -> bool:
+    """Whether a wmic / PowerShell `Win32_VideoController` listing names an NVIDIA GPU (field values only)."""
+    return any("nvidia" in value for value in _windows_listing_values(text))
+
+
 def _detect_gpu_windows() -> Tuple[bool, bool, str]:
     """
-    Returns: (has_nvidia, has_amd_discrete, raw_summary)
+    Returns: (has_nvidia, has_amd, raw_summary)
+
+    The listing comes from a `wmic` or `powershell` subprocess, never from an
+    in-process WMI query (TheRock #9305, see the file header).
     """
     # Try wmic (legacy but often present)
     if _which("wmic"):
         r = _run(["wmic", "path", "win32_VideoController", "get", "Name,AdapterCompatibility", "/format:list"])
         if r.ok and r.out:
-            out = r.out.lower()
-            has_nvidia = "nvidia" in out
-            has_amd = ("advanced micro devices" in out) or ("amd" in out) or ("ati" in out) or ("radeon" in out)
-            return has_nvidia, has_amd, r.out
+            return _windows_listing_has_nvidia(r.out), _windows_listing_has_amd(r.out), r.out
 
     # Try PowerShell
     if _which("powershell"):
@@ -145,10 +208,7 @@ def _detect_gpu_windows() -> Tuple[bool, bool, str]:
         )
         r = _run(["powershell", "-NoProfile", "-Command", ps])
         if r.ok and r.out:
-            out = r.out.lower()
-            has_nvidia = "nvidia" in out
-            has_amd = ("advanced micro devices" in out) or ("amd" in out) or ("ati" in out) or ("radeon" in out)
-            return has_nvidia, has_amd, r.out
+            return _windows_listing_has_nvidia(r.out), _windows_listing_has_amd(r.out), r.out
 
     return False, False, "Не удалось получить список GPU (нет wmic/powershell или нет прав)."
 
@@ -217,6 +277,9 @@ def _detect_cuda_installation() -> Tuple[bool, str]:
 def _detect_rocm_installation() -> Tuple[bool, str]:
     """
     Returns: (rocm_present, details)
+
+    Information only: the AMD ROCm PyTorch wheels carry their own ROCm runtime,
+    so a missing system ROCm is not a problem for PyTorch.
     """
     details = []
 
@@ -433,6 +496,93 @@ def _torch_relevant_env_vars() -> str:
     return "\n".join(lines)
 
 
+def _torch_build_kind(torch_module: Any) -> Tuple[bool, bool]:
+    """(is CUDA build, is ROCm build) of `torch_module`, decided by `torch_flavour.flavour_of`.
+
+    A ROCm wheel may also report a CUDA version; it is a ROCm build only.
+    """
+    try:
+        from ai_backend.runtime.torch_flavour import TorchFlavour, flavour_of
+    except ImportError:  # pragma: no cover - one of the two import roots always works
+        from modules.ai_backend.runtime.torch_flavour import TorchFlavour, flavour_of
+    flavour = flavour_of(torch_module)
+    return flavour is TorchFlavour.CUDA, flavour is TorchFlavour.ROCM
+
+
+#: `_linux_kfd_state` answers.
+KFD_MISSING = "missing"
+KFD_NO_ACCESS = "no_access"
+KFD_OK = "ok"
+
+
+def _linux_kfd_state(path: str = "/dev/kfd") -> str:
+    """State of the ROCm compute device node: `KFD_MISSING`, `KFD_NO_ACCESS` (not readable+writable) or `KFD_OK`."""
+    if not os.path.exists(path):
+        return KFD_MISSING
+    if not (os.access(path, os.R_OK) and os.access(path, os.W_OK)):
+        return KFD_NO_ACCESS
+    return KFD_OK
+
+
+def _amd_driver_stack_present(*, is_linux: bool, is_windows: bool, kfd_state: str) -> bool:
+    """Whether the system part of the AMD ROCm stack is in place for an AMD GPU that was detected.
+
+    Windows: the AMD driver that lists the GPU is all a self-contained ROCm
+    wheel needs. Linux: `/dev/kfd` exists (amdgpu loaded); a system ROCm
+    install is not required. Other platforms: never.
+    """
+    if is_windows:
+        return True
+    if is_linux:
+        return kfd_state != KFD_MISSING
+    return False
+
+
+def _amd_problems(*, is_linux: bool, is_windows: bool, torch_is_rocm_build: bool, kfd_state: str, cuda_available: bool) -> list[str]:
+    """The AMD-specific "likely problems" of the diagnosis for a detected AMD GPU (Russian texts).
+
+    Covers: a non-ROCm torch build (install the ROCm PyTorch from the
+    launcher's PyTorch section), on Linux a missing or inaccessible `/dev/kfd`,
+    and a ROCm build whose device is still unavailable. A missing system ROCm is
+    never a problem: the wheels are self-contained.
+    """
+    problems = []
+    if not (is_linux or is_windows):
+        return problems
+    if not torch_is_rocm_build:
+        problems.append(
+            "Обнаружена AMD GPU, но Torch не является ROCm-сборкой (torch.version.hip пуст). "
+            "Установите PyTorch для AMD (ROCm) в разделе PyTorch лаунчера: "
+            "ROCm-сборка включает собственные библиотеки ROCm, отдельно ставить ROCm не нужно."
+        )
+    if is_linux and kfd_state == KFD_MISSING:
+        problems.append(
+            "На Linux отсутствует /dev/kfd при обнаруженной AMD GPU. "
+            "ROCm требует этот узел: проверьте, что загружен драйвер ядра amdgpu "
+            "(включая поддержку KFD) и что GPU поддерживается ядром."
+        )
+    elif is_linux and kfd_state == KFD_NO_ACCESS:
+        problems.append(
+            "На Linux у текущего пользователя нет доступа на чтение и запись к /dev/kfd. "
+            "Добавьте пользователя в группы render и video и перезайдите в систему."
+        )
+    if torch_is_rocm_build and not cuda_available:
+        if is_linux:
+            problems.append(
+                "Torch установлен с поддержкой ROCm (HIP), но устройство недоступно. "
+                "Частые причины: ROCm-сборка PyTorch не для архитектуры (gfx) вашей GPU, "
+                "неподдерживаемая модель GPU, неподдерживаемое ядро/драйвер amdgpu, "
+                "права на /dev/kfd, или запуск в контейнере без устройств."
+            )
+        else:
+            problems.append(
+                "Torch установлен с поддержкой ROCm (HIP), но устройство недоступно. "
+                "Частые причины: ROCm-сборка PyTorch не для архитектуры (gfx) вашей GPU, "
+                "неподдерживаемая модель GPU или устаревший драйвер AMD Adrenalin."
+            )
+    return problems
+
+
 def assert_cuda_or_rocm_available() -> bool:
     """
     If torch.cuda.is_available() is True -> returns True.
@@ -453,23 +603,21 @@ def assert_cuda_or_rocm_available() -> bool:
 
     # 2) CUDA/ROCm presence (system-level hints)
     cuda_present, cuda_details = _detect_cuda_installation() if has_nvidia else (False, "Пропущено: NVIDIA GPU не обнаружена.")
+    # System ROCm is information only (the ROCm PyTorch wheels are self-contained).
     rocm_present, rocm_details = _detect_rocm_installation() if has_amd and _is_linux() else (
         False,
-        "Пропущено: ROCm обычно поддерживается на Linux и требует AMD GPU.",
+        "Пропущено: проверяется только на Linux при обнаруженной AMD GPU (для PyTorch не требуется).",
     )
+    kfd_state = _linux_kfd_state() if _is_linux() else KFD_MISSING
     nvidia_query = _nvidia_smi_query() if has_nvidia else "Пропущено: NVIDIA GPU не обнаружена."
     linux_nodes = _linux_cuda_device_nodes_probe()
     env_vars = _torch_relevant_env_vars()
     cuda_init_ok, cuda_init_probe = _probe_torch_cuda_init_subprocess()
     torch_collect_env = _torch_collect_env_info()
 
-    # 3) Torch wheel / build suitability
-    # torch.version.cuda is None for CPU-only builds; torch.version.hip non-None for ROCm builds.
-    torch_cuda_ver = getattr(torch.version, "cuda", None)
-    torch_hip_ver = getattr(torch.version, "hip", None)
-
-    torch_is_cuda_build = torch_cuda_ver is not None
-    torch_is_rocm_build = torch_hip_ver is not None
+    # 3) Torch wheel / build suitability, decided by the one flavour owner.
+    torch_is_cuda_build, torch_is_rocm_build = _torch_build_kind(torch)
+    cuda_available = bool(torch.cuda.is_available())
 
     # Craft diagnosis
     parts = []
@@ -486,7 +634,7 @@ def assert_cuda_or_rocm_available() -> bool:
     parts.append(f"CUDA/driver/toolkit hints: {cuda_present}")
     parts.append(cuda_details or "n/a")
 
-    parts.append("\n== ROCm detection (system) ==")
+    parts.append("\n== ROCm detection (system, information only) ==")
     parts.append(f"ROCm hints: {rocm_present}")
     parts.append(rocm_details or "n/a")
 
@@ -528,30 +676,22 @@ def assert_cuda_or_rocm_available() -> bool:
                 "Установите CUDA wheel PyTorch (например, cu121/cu118) подходящий под вашу систему."
             )
 
-    # AMD / ROCm path (mostly Linux)
+    # AMD / ROCm path (Windows and Linux; the wheels are self-contained)
     if has_amd:
-        if _is_linux():
-            if not rocm_present:
-                problems.append(
-                    "Обнаружена AMD GPU, но ROCm не найден (rocm-smi/hipcc/ /opt/rocm). "
-                    "Для использования AMD с PyTorch на Linux требуется ROCm-стек и совместимая GPU."
-                )
-            if not torch_is_rocm_build:
-                # Many users install CPU or CUDA build by default.
-                problems.append(
-                    "Torch не выглядит как ROCm-сборка (torch.version.hip is None). "
-                    "Установите PyTorch ROCm wheel, соответствующий вашей версии ROCm."
-                )
-        else:
-            problems.append(
-                "AMD GPU обнаружена, но ROCm для PyTorch обычно поддерживается на Linux. "
-                "На Windows/macOS для AMD-ускорения через ROCm, как правило, не работает."
+        problems.extend(
+            _amd_problems(
+                is_linux=_is_linux(),
+                is_windows=_is_windows(),
+                torch_is_rocm_build=torch_is_rocm_build,
+                kfd_state=kfd_state,
+                cuda_available=cuda_available,
             )
-    
+        )
+
     # --- Баг драйверов / несовместимость ---
     driver_stack_present = (
         (has_nvidia and cuda_present) or
-        (has_amd and _is_linux() and rocm_present)
+        (has_amd and _amd_driver_stack_present(is_linux=_is_linux(), is_windows=_is_windows(), kfd_state=kfd_state))
     )
 
     torch_gpu_build_present = (
@@ -559,7 +699,7 @@ def assert_cuda_or_rocm_available() -> bool:
         (has_amd and torch_is_rocm_build)
     )
 
-    if driver_stack_present and torch_gpu_build_present and not torch.cuda.is_available():
+    if driver_stack_present and torch_gpu_build_present and not cuda_available:
         problems.append(
             "Баг драйверов или несовместимость низкоуровневых библиотек.\n"
             "GPU обнаружена, драйвер установлен, Torch собран с поддержкой GPU, "
@@ -572,20 +712,12 @@ def assert_cuda_or_rocm_available() -> bool:
             "- отсутствие прав доступа к устройствам (/dev/nvidia*, /dev/kfd)\n"
         )
     # If Torch *is* CUDA build but still unavailable, likely driver/runtime mismatch
-    if torch_is_cuda_build and has_nvidia and not torch.cuda.is_available():
+    if torch_is_cuda_build and has_nvidia and not cuda_available:
         problems.append(
             "Torch установлен с поддержкой CUDA, но CUDA не доступна. "
             "Частые причины: отсутствует/слишком старый драйвер NVIDIA, конфликт библиотек, "
             "запуск в контейнере без проброса GPU, или несовместимость версии драйвера с CUDA, "
             "ожидаемой сборкой PyTorch."
-        )
-
-    # If Torch is ROCm build but unavailable
-    if torch_is_rocm_build and has_amd and _is_linux() and not torch.cuda.is_available():
-        problems.append(
-            "Torch установлен с поддержкой ROCm (HIP), но устройство недоступно. "
-            "Частые причины: несовместимая модель GPU, неподходящая версия ROCm, "
-            "неподдерживаемое ядро/драйвер amdgpu, права на /dev/kfd, или запуск в контейнере без устройств."
         )
 
     if cuda_init_ok is False:
@@ -605,12 +737,6 @@ def assert_cuda_or_rocm_available() -> bool:
             "Проверьте, что драйвер NVIDIA корректно загружен."
         )
 
-    if _is_linux() and has_amd and "/dev/kfd: missing" in linux_nodes:
-        problems.append(
-            "На Linux отсутствует /dev/kfd при обнаруженной AMD GPU. "
-            "ROCm обычно требует доступный /dev/kfd."
-        )
-
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cuda_visible_devices is not None and cuda_visible_devices.strip() == "":
         problems.append(
@@ -628,9 +754,15 @@ def assert_cuda_or_rocm_available() -> bool:
         next_steps.append("Проверьте `nvidia-smi` (должен работать) и версию драйвера.")
         next_steps.append("Проверьте `nvidia-smi --query-gpu=driver_version,name,cuda_version --format=csv,noheader`.")
         next_steps.append("Проверьте, что установлен CUDA wheel PyTorch: `pip show torch` и `torch.version.cuda` не None.")
+    if has_amd and (_is_linux() or _is_windows()):
+        next_steps.append(
+            "Проверьте, что установлена ROCm-сборка PyTorch для архитектуры (gfx) вашей GPU "
+            "(раздел PyTorch лаунчера): `torch.version.hip` не пуст."
+        )
     if has_amd and _is_linux():
-        next_steps.append("Проверьте `rocm-smi` и наличие `/opt/rocm`.")
-        next_steps.append("Проверьте, что установлен ROCm wheel PyTorch: `torch.version.hip` не None.")
+        next_steps.append("Проверьте, что существует /dev/kfd (драйвер amdgpu) и пользователь входит в группы render и video.")
+    if has_amd and _is_windows():
+        next_steps.append("Проверьте, что установлен свежий драйвер AMD Adrenalin.")
     if _is_linux():
         next_steps.append("Проверьте права на /dev/nvidia* и /dev/kfd.")
     next_steps.append("Проверьте CUDA_VISIBLE_DEVICES/LD_LIBRARY_PATH на конфликтующие значения.")

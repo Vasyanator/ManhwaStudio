@@ -11,7 +11,8 @@ edition = "2024"
 # application's own layers.
 ms-log = { path = "../ms-log" }
 # `ai_install_probe` classifies a machine into the persisted `AiInstallType` level, which
-# is declared there. It reads no config document.
+# is declared there; `amd_adapters` / `gpu_utils` name the shared `torch_choice::GfxArch`
+# processor type. No module reads a config document.
 ms-config = { path = "../ms-config" }
 # `ai_install_probe` runs its shell probe on a background thread and must stay
 # target-neutral about how one is created.
@@ -49,11 +50,12 @@ ms-download = { path = "../ms-download" }
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
 keyring.workspace = true
 
-# Windows GDI screen capture and the Job Object that kills spawned Python children with
-# the parent process. Feature list is the subset of the binary's own windows-sys features
-# these two modules use.
+# Windows GDI screen capture, the Job Object that kills spawned Python children with the
+# parent process, and the AMD adapter probe (`amd_adapters`: SetupAPI display-class
+# enumeration -> `Win32_Devices_DeviceAndDriverInstallation`; the driver key's
+# `DriverVersion` -> `Win32_System_Registry`). Feature list is exactly what these modules use.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_Graphics_Gdi"] }
+windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Devices_DeviceAndDriverInstallation", "Win32_System_Registry"] }
 
 [dev-dependencies]
 # Unique, self-removing scratch directories for the `ai_models::external` download tests.

@@ -20,6 +20,8 @@ Notes:
 Updater work runs on background workers. The GUI thread only polls channels and draws progress or
 choice state. Every worker shares the window's cancel flag, which `Drop for UpdateApp` sets when the
 window closes; downloads, release requests and command retry waits stop on it.
+The PyTorch choice page draws the `torch::TorchChoicePrompt` the continuation worker asks for
+through the shared `torch::draw_torch_choice` widget.
 */
 
 use eframe::egui;
@@ -34,7 +36,7 @@ use ms_config::version_format::is_remote_newer;
 use crate::HostVersion;
 use crate::window::prepare_window_context;
 
-use super::install::TorchInstallSelection;
+use super::torch::{TorchChoiceState, TorchInstallSelection, draw_torch_choice};
 use super::release::fetch_latest_app_release;
 use super::utils::{
     ExternalUpdateTarget, UpdateWorkerEvent, load_embedded_icon_data,
@@ -151,8 +153,9 @@ struct UpdateApp {
     overall_label: String,
     current_operation: String,
     console_lines: Vec<String>,
-    torch_prompt: Option<super::install::TorchChoicePrompt>,
-    selected_torch_index: Option<usize>,
+    /// The PyTorch choice the continuation worker asked for; kept across frames so the
+    /// user's pick survives repaints.
+    torch_choice: Option<TorchChoiceState>,
     /// Cancel flag shared with every worker this window starts (release check, binary and
     /// continuation stages); set when the window is dropped, i.e. when it closes, so a
     /// download or a pip retry wait stops instead of running on behind a closed window.
@@ -180,8 +183,7 @@ impl UpdateApp {
             overall_label: t!("installer.update.waiting_stage").to_string(),
             current_operation: t!("installer.update.checking_updates_stage").to_string(),
             console_lines: Vec::new(),
-            torch_prompt: None,
-            selected_torch_index: None,
+            torch_choice: None,
             cancel: Arc::new(AtomicBool::new(false)),
         };
         match mode {
@@ -312,8 +314,7 @@ impl UpdateApp {
         self.stage_label = t!("installer.common.preparation").to_string();
         self.overall_progress = 0.0;
         self.overall_label = t!("installer.update.preparing_env_stage").to_string();
-        self.torch_prompt = None;
-        self.selected_torch_index = None;
+        self.torch_choice = None;
 
         let cancel = Arc::clone(&self.cancel);
         // The running (freshly installed) binary's version selects the release whose archive
@@ -360,8 +361,7 @@ impl UpdateApp {
                     self.current_operation = t!("installer.update.stage_choose_pytorch").to_string();
                     self.stage_label = t!("installer.update.choose_pytorch_backend_hint").to_string();
                     self.overall_label = prompt.summary.clone();
-                    self.selected_torch_index = Some(prompt.recommended_index);
-                    self.torch_prompt = Some(prompt);
+                    self.torch_choice = Some(TorchChoiceState::new(prompt));
                 }
                 UpdateWorkerEvent::NoUpdate {
                     local_version,
@@ -486,47 +486,22 @@ impl UpdateApp {
     }
 
     fn draw_torch_choice_page(&mut self, ui: &mut egui::Ui) {
-        let Some(prompt) = self.torch_prompt.clone() else {
+        let Some(choice) = self.torch_choice.as_mut() else {
             self.start_continuation_update(Some(TorchInstallSelection::SkipCpu));
             return;
         };
 
+        let mut confirmed = None;
         ui.vertical(|ui| {
             ui.heading(t!("installer.update.pytorch_update_label"));
             ui.add_space(8.0);
-            ui.label(prompt.summary);
-            ui.add_space(12.0);
-
-            let cpu_selected = self.selected_torch_index.is_none();
-            if ui
-                .selectable_label(cpu_selected, "CPU PyTorch")
-                .on_hover_text(t!("installer.update.install_cpu_pytorch_button"))
-                .clicked()
-            {
-                self.selected_torch_index = None;
-            }
-
-            for (idx, option) in prompt.options.iter().enumerate() {
-                let selected = self.selected_torch_index == Some(idx);
-                if ui
-                    .selectable_label(selected, &option.label)
-                    .on_hover_text(format!("PyTorch wheel tag: {}", option.wheel_tag))
-                    .clicked()
-                {
-                    self.selected_torch_index = Some(idx);
-                }
-            }
-
-            ui.add_space(14.0);
-            if ui.button(t!("installer.update.continue_update_button")).clicked() {
-                let selection = self
-                    .selected_torch_index
-                    .and_then(|idx| prompt.options.get(idx).cloned())
-                    .map(TorchInstallSelection::InstallGpu)
-                    .unwrap_or(TorchInstallSelection::SkipCpu);
-                self.start_continuation_update(Some(selection));
-            }
+            egui::ScrollArea::vertical().id_salt("installer.torch.choice_scroll").show(ui, |ui| {
+                confirmed = draw_torch_choice(ui, choice, t!("installer.update.continue_update_button"));
+            });
         });
+        if let Some(selection) = confirmed {
+            self.start_continuation_update(Some(selection));
+        }
     }
 
     fn draw_completed_page(&mut self, ui: &mut egui::Ui) {

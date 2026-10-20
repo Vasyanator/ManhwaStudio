@@ -5,14 +5,18 @@ Purpose:
 Shared GPU and accelerator detection helpers for installer and runtime code.
 
 Main responsibilities:
-- detect NVIDIA/AMD adapters through platform tools;
+- detect NVIDIA adapters through platform tools; AMD presence is derived from
+  `amd_adapters::detect_amd_adapters` (sysfs/KFD on Linux, SetupAPI on Windows), so AMD
+  chipset/USB functions never count as a GPU;
 - detect CUDA, ROCm, and NVIDIA Compute Capability versions;
 - inspect Linux driver/ROCm installation state;
-- resolve AMD GPU architecture / LLVM target and validate ROCm 7.2 support;
-- detect likely DirectML-capable accelerators on Windows;
+- resolve AMD GPU architecture / LLVM target (ROCm tools, else `amd_adapters`) and validate
+  ROCm 7.2 support;
+- detect likely DirectML-capable accelerators on Windows (WMI `Win32_VideoController` names);
 - probe for the system CUDA 12.x / cuDNN 9.x runtime the onnxruntime GPU build needs;
 - probe for a WebGPU-capable GPU (Dawn D3D12/Vulkan/Metal) for the WebGPU provider;
-- enumerate the WebGPU GPU adapters (per-OS, index = Dawn `device_id`) for adapter picking.
+- enumerate the WebGPU GPU adapters (per-OS, index assumed to be Dawn's `device_id`) for
+  adapter picking.
 
 Key structures:
 - RuntimeVersion
@@ -29,7 +33,7 @@ Key functions:
 - detect_amd_gpu()
 - detect_cuda_runtime_version()
 - detect_nvidia_compute_capability()
-- detect_rocm_runtime_version()
+- detect_rocm_runtime_version() (`/opt/rocm/.info/version`, else `hipcc --version`)
 - validate_rocm_7_2_support_linux()
 - detect_directml_accelerators_windows()
 - probe_cuda_runtime() / native_cuda_runtime_available()
@@ -42,6 +46,8 @@ Key functions:
 Notes:
 Detection intentionally uses short-lived system commands and filesystem probes.
 Callers must run these helpers outside the GUI thread.
+Every gfx token parsed from tool output goes through `ms_config::torch_choice::GfxArch::parse`,
+so the CPU agent `gfx000` and generic ISA names (`gfx11-generic`) never leak out as targets.
 
 Web (wasm) build:
 GPU/accelerator detection relies on system commands (`nvidia-smi`, `lspci`, ...) that do
@@ -52,6 +58,10 @@ system-information tab is cross-platform), but the single command primitive
 */
 
 use std::fmt::Display;
+
+use ms_config::torch_choice::GfxArch;
+
+use crate::amd_adapters::detect_amd_adapters;
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -123,10 +133,10 @@ pub struct DirectMlAccelerator {
 
 /// A GPU adapter selectable by the native WebGPU execution provider.
 ///
-/// The Vec position of an adapter in [`detect_webgpu_adapters`]'s result IS the WebGPU
-/// `device_id`: WebGPU runs through Dawn, and Dawn enumerates adapters with the same
-/// per-OS backend this module uses (DXGI/D3D12 on Windows, Vulkan on Linux), so the
-/// index aligns with `ort::ep::WebGPU::with_device_id`.
+/// The Vec position of an adapter in [`detect_webgpu_adapters`]'s result is USED as the WebGPU
+/// `device_id` (`ort::ep::WebGPU::with_device_id`). On Linux the list comes from Vulkan, the
+/// backend Dawn uses there. On Windows it comes from WMI `Win32_VideoController` names, while
+/// Dawn enumerates DXGI adapters: that the two orders agree is an unproven assumption.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WebGpuAdapter {
     /// Human-readable adapter name (e.g. `"AMD Radeon RX 7900 XT"`).
@@ -193,32 +203,20 @@ pub fn detect_nvidia_gpu() -> bool {
     false
 }
 
+/// Whether an AMD display adapter is present (Linux and Windows; `false` elsewhere).
+///
+/// Derived from [`detect_amd_adapters`]: a display-class PCI function of vendor 0x1002 (Linux:
+/// driven by amdgpu). AMD chipset, USB or audio functions do not count. Blocking.
 #[must_use]
 pub fn detect_amd_gpu() -> bool {
-    if cfg!(target_os = "linux") {
-        return detect_amd_gpu_linux();
-    }
-
-    if cfg!(target_os = "windows") {
-        return windows_video_controller_output()
-            .as_deref()
-            .is_some_and(text_has_amd_gpu);
-    }
-
-    false
+    (cfg!(target_os = "linux") || cfg!(target_os = "windows")) && !detect_amd_adapters().is_empty()
 }
 
+/// Linux-only form of [`detect_amd_gpu`]: an amdgpu-driven AMD display adapter exists
+/// ([`detect_amd_adapters`]). Always `false` off Linux. Blocking.
 #[must_use]
 pub fn detect_amd_gpu_linux() -> bool {
-    if !cfg!(target_os = "linux") {
-        return false;
-    }
-
-    if let Some(output) = command_output("lspci", &[]) {
-        return text_has_amd_gpu(&output);
-    }
-
-    false
+    cfg!(target_os = "linux") && !detect_amd_adapters().is_empty()
 }
 
 #[must_use]
@@ -238,31 +236,43 @@ pub fn detect_cuda_runtime_version() -> Option<RuntimeVersion> {
     None
 }
 
+/// Version of the SYSTEM ROCm installation (major.minor), or `None` when none is found.
+///
+/// Reads `/opt/rocm/.info/version` (Linux), else the `HIP version:` line of
+/// `hipcc --version`. Deliberately NOT rocminfo — its `Runtime Version: 1.18` is the HSA
+/// runtime, not ROCm — and NOT `rocm-smi --showdriverversion`, which is the kernel driver's
+/// version. The pip ROCm torch wheels are self-contained and do not need this. Blocking.
 #[must_use]
 pub fn detect_rocm_runtime_version() -> Option<RuntimeVersion> {
-    if let Some(output) =
-        command_output_from_candidates(&["rocminfo", "/opt/rocm/bin/rocminfo"], &[])
-        && let Some(v) = parse_version_after_keywords(&output, &["rocm version", "runtime version"])
+    if cfg!(target_os = "linux")
+        && let Ok(text) = std::fs::read_to_string(ROCM_INFO_VERSION_FILE)
+        && let Some(v) = parse_rocm_info_version(&text)
     {
         return Some(v);
     }
 
     if let Some(output) =
         command_output_from_candidates(&["hipcc", "/opt/rocm/bin/hipcc"], &["--version"])
-        && let Some(v) = parse_version_after_keywords(&output, &["rocm version", "hip version"])
-    {
-        return Some(v);
-    }
-
-    if let Some(output) = command_output_from_candidates(
-        &["rocm-smi", "/opt/rocm/bin/rocm-smi"],
-        &["--showdriverversion"],
-    ) && let Some(v) = parse_first_major_minor(&output)
+        && let Some(v) = parse_hipcc_rocm_version(&output)
     {
         return Some(v);
     }
 
     None
+}
+
+/// The version file a system ROCm install writes (`7.2.4`, or `6.4.0-47` on older ones).
+const ROCM_INFO_VERSION_FILE: &str = "/opt/rocm/.info/version";
+
+/// Parses the first line of [`ROCM_INFO_VERSION_FILE`] into major.minor.
+fn parse_rocm_info_version(text: &str) -> Option<RuntimeVersion> {
+    text.lines().next().and_then(parse_first_major_minor)
+}
+
+/// Parses the `HIP version: 7.1.52801-…` line of `hipcc --version` into major.minor. Text
+/// without that line (for example rocminfo output) yields `None`.
+fn parse_hipcc_rocm_version(text: &str) -> Option<RuntimeVersion> {
+    parse_version_after_keywords(text, &["hip version"])
 }
 
 #[must_use]
@@ -356,15 +366,17 @@ pub fn detect_amd_gpu_architectures_linux() -> Vec<GpuArchitecture> {
         });
     }
 
+    // Without ROCm tools: the adapter probe (KFD topology, else the pinned device-id table).
     if architectures.is_empty() {
-        architectures.extend(detect_amd_gfx_targets_from_lspci().into_iter().map(
-            |(name, target)| GpuArchitecture {
+        architectures.extend(detect_amd_adapters().into_iter().filter_map(|adapter| {
+            let target = adapter.gfx?.as_str().to_string();
+            Some(GpuArchitecture {
                 vendor: GpuVendor::Amd,
-                name: Some(name),
+                name: Some(adapter.name),
                 architecture: rocm_architecture_family(&target).map(str::to_string),
                 llvm_target: Some(target),
-            },
-        ));
+            })
+        }));
     }
 
     dedupe_architectures(architectures)
@@ -433,6 +445,9 @@ pub fn validate_rocm_7_2_support_linux() -> RocmSupportValidation {
     }
 }
 
+/// Likely DirectML-capable accelerators on Windows, from the WMI `Win32_VideoController`
+/// adapter NAMES (`wmic`, else PowerShell CIM), minus the Microsoft Basic Display Adapter;
+/// vendor is classified by name. Empty off Windows. Blocking.
 #[must_use]
 pub fn detect_directml_accelerators_windows() -> Vec<DirectMlAccelerator> {
     if !cfg!(target_os = "windows") {
@@ -541,13 +556,14 @@ pub fn native_webgpu_runtime_available() -> bool {
 }
 
 /// Enumerates the GPU adapters selectable by the native WebGPU execution provider, in
-/// the order that matches Dawn's `device_id` indexing.
+/// the order assumed to match Dawn's `device_id` indexing.
 ///
-/// The returned Vec's position IS the WebGPU `device_id`: the enumeration uses the same
-/// native backend Dawn uses per-OS, so the indices line up with
-/// `ort::ep::WebGPU::with_device_id`:
-/// - Windows: DXGI adapters via [`detect_directml_accelerators_windows`] — DXGI adapter
-///   order matches Dawn's D3D12 adapter order.
+/// The returned Vec's position is used as the WebGPU `device_id`
+/// (`ort::ep::WebGPU::with_device_id`):
+/// - Windows: WMI `Win32_VideoController` names via
+///   [`detect_directml_accelerators_windows`]. Dawn's D3D12 backend enumerates DXGI
+///   adapters; that WMI order equals DXGI order is UNPROVEN, so on a multi-GPU machine an
+///   index may name a different adapter than its label.
 /// - Linux (and other unix): Vulkan physical devices via `vulkaninfo --summary`; the
 ///   Vulkan enumeration order is the order Dawn's Vulkan backend sees. If `vulkaninfo`
 ///   is absent or its output is unparseable, returns an EMPTY Vec (the caller then
@@ -562,8 +578,7 @@ pub fn native_webgpu_runtime_available() -> bool {
 #[must_use]
 pub fn detect_webgpu_adapters() -> Vec<WebGpuAdapter> {
     if cfg!(target_os = "windows") {
-        // Dawn's D3D12 backend enumerates DXGI adapters in the same order DXGI reports
-        // them, which is exactly what `detect_directml_accelerators_windows` returns.
+        // WMI order, assumed (not proven) to match the DXGI order Dawn's D3D12 backend uses.
         return detect_directml_accelerators_windows()
             .into_iter()
             .map(|adapter| WebGpuAdapter { name: adapter.name })
@@ -952,46 +967,8 @@ fn detect_amd_gfx_targets_from_rocm_tools() -> Vec<String> {
     dedupe_strings(targets)
 }
 
-fn detect_amd_gfx_targets_from_lspci() -> Vec<(String, String)> {
-    command_output("lspci", &[])
-        .map(|output| {
-            output
-                .lines()
-                .filter(|line| text_has_amd_gpu(line))
-                .filter_map(|line| {
-                    amd_lspci_line_to_gfx_target(line).map(|target| (line.to_string(), target))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
-fn amd_lspci_line_to_gfx_target(line: &str) -> Option<String> {
-    let lower = line.to_ascii_lowercase();
-    let target = if lower.contains("mi355") || lower.contains("mi350") {
-        "gfx950"
-    } else if lower.contains("mi325") || lower.contains("mi300") {
-        "gfx942"
-    } else if lower.contains("mi250") || lower.contains("mi210") {
-        "gfx90a"
-    } else if lower.contains("mi100") {
-        "gfx908"
-    } else if lower.contains("r9700") || lower.contains("r9600d") || lower.contains("9070") {
-        "gfx1201"
-    } else if lower.contains("9060") {
-        "gfx1200"
-    } else if lower.contains("7900") || lower.contains("w7900") || lower.contains("w7800") {
-        "gfx1100"
-    } else if lower.contains("7800") || lower.contains("7700") || lower.contains("w7700") {
-        "gfx1101"
-    } else if lower.contains("w6800") || lower.contains("v620") {
-        "gfx1030"
-    } else {
-        return None;
-    };
-    Some(target.to_string())
-}
-
+/// Marketing architecture family of a ROCm 7.2 LLVM target (`"RDNA4"`, `"CDNA3"`, …) for the
+/// System tab; `None` for targets outside that list.
 fn rocm_architecture_family(target: &str) -> Option<&'static str> {
     match target {
         "gfx950" => Some("CDNA4"),
@@ -1058,25 +1035,24 @@ fn parse_min_runtime_version_from_lines(text: &str) -> Option<RuntimeVersion> {
     min_value
 }
 
+/// Extracts processor names from ROCm tool output (`rocm_agent_enumerator`, `rocminfo`) in
+/// order of appearance; tokens that are not processors (`gfx000`, `gfx11-generic`) are dropped.
 fn parse_gfx_targets(text: &str) -> Vec<String> {
     text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
         .filter_map(normalize_gfx_token)
         .collect()
 }
 
+/// The processor name inside one alphanumeric token (`"gfx1201"`, `"AMDgfx90a"`), validated by
+/// `GfxArch::parse`; `None` for anything that is not a processor.
 fn normalize_gfx_token(token: &str) -> Option<String> {
     let lower = token.trim().to_ascii_lowercase();
     let start = lower.find("gfx")?;
-    let tail = &lower[start..];
-    let normalized = tail
+    let candidate = lower[start..]
         .chars()
         .take_while(|ch| ch.is_ascii_alphanumeric())
         .collect::<String>();
-    if normalized.len() > 3 {
-        Some(normalized)
-    } else {
-        None
-    }
+    GfxArch::parse(&candidate).map(|gfx| gfx.as_str().to_string())
 }
 
 fn text_has_amd_gpu(text: &str) -> bool {
@@ -1368,6 +1344,38 @@ GPU1:
         } else {
             assert!(!available, "OpenVINO builds are x86_64 Windows/Linux only");
         }
+    }
+
+    #[test]
+    fn rocm_version_ignores_the_hsa_runtime_line() {
+        // rocminfo's header (S-074): "Runtime Version: 1.18" is HSA, never a ROCm version.
+        let rocminfo = "ROCk module version 6.14.14 is loaded\n=====================\nHSA System Attributes\n=====================\nRuntime Version:         1.18\nRuntime Ext Version:     1.15\n";
+        assert_eq!(parse_hipcc_rocm_version(rocminfo), None);
+        let hipcc = "HIP version: 7.1.52801-9999\nUbuntu clang version 21.1.8 (6ubuntu1)\nTarget: x86_64-pc-linux-gnu\n";
+        assert_eq!(parse_hipcc_rocm_version(hipcc), Some(RuntimeVersion::new(7, 1)));
+        assert_eq!(parse_rocm_info_version("7.2.4\n"), Some(RuntimeVersion::new(7, 2)));
+        assert_eq!(parse_rocm_info_version("6.4.0-47\n"), Some(RuntimeVersion::new(6, 4)));
+        assert_eq!(parse_rocm_info_version(""), None);
+    }
+
+    #[test]
+    fn gfx_targets_drop_the_cpu_agent_and_generic_isas() {
+        // Classic `rocm_agent_enumerator` output lists the CPU agent as gfx000 (S-074).
+        assert_eq!(parse_gfx_targets("gfx000\ngfx1201\n"), vec!["gfx1201".to_string()]);
+        assert_eq!(
+            parse_gfx_targets("  Name:                    gfx1201\n  Name:                    amdgcn-amd-amdhsa--gfx1201\n  Name:                    amdgcn-amd-amdhsa--gfx12-generic\n  Name:   gfx90a:sramecc+:xnack-\n"),
+            vec!["gfx1201".to_string(), "gfx1201".to_string(), "gfx90a".to_string()]
+        );
+        assert_eq!(normalize_gfx_token("gfx11"), None);
+        assert_eq!(normalize_gfx_token("GFX1100"), Some("gfx1100".to_string()));
+    }
+
+    #[test]
+    fn amd_presence_follows_the_adapter_probe() {
+        let adapters = detect_amd_adapters();
+        let expected = (cfg!(target_os = "linux") || cfg!(target_os = "windows")) && !adapters.is_empty();
+        assert_eq!(detect_amd_gpu(), expected);
+        assert_eq!(detect_amd_gpu_linux(), cfg!(target_os = "linux") && !adapters.is_empty());
     }
 
     #[test]

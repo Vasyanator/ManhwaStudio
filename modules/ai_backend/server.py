@@ -26,7 +26,8 @@ Main responsibilities:
   `flux3_klein` (`large_model_adapters`);
 - apply the Linux OOM backstop (`General.large_models_oom_score_adj`) at start;
 - maintain a non-blocking health snapshot and publish it as a `health` event on
-  the IPC event bus;
+  the IPC event bus (including the `torch` build facts of
+  `runtime/torch_flavour.torch_health_payload`);
 - expose the backend version metadata for Rust-side compatibility checks.
 
 Transport:
@@ -63,6 +64,7 @@ from .runtime.large_models.cost_tables import CostTables, detect_device_class, l
 from .runtime.large_models.manager import JsonLimitsStore, LargeModelManager, apply_oom_score_backstop, limits_store_path
 from .runtime.memory_budget import TorchDeviceProbe
 from .runtime.residency.arbiter import MemoryBudgetProbes, ResidencyArbiter
+from .runtime.torch_flavour import torch_health_payload
 from .runtime.torch_support import is_torch_available
 from .engines.paddle_onnx import RuntimeFactory, resolve_compiled_cache_root
 from .detection.ctd import CtdTextDetectorService
@@ -169,6 +171,14 @@ def _safe_service_health(service: Any) -> dict[str, Any]:
 
 
 def _build_health_snapshot(state: AppState) -> dict[str, Any]:
+    """One full health snapshot, built by the health worker every `HEALTH_SNAPSHOT_REFRESH_SECS`.
+
+    Never raises for a single failing part: each service entry goes through
+    `_safe_service_health`, and `torch` (`torch_health_payload`: build flavour,
+    versions, visible devices, installed AMD per-arch wheels; `None` without
+    torch or on a failed fact) never raises and is cached after the first call.
+    The warm-up snapshots (published before the first build) carry no `torch` key.
+    """
     now_s = time.time()
     return {
         "ok": True,
@@ -176,6 +186,7 @@ def _build_health_snapshot(state: AppState) -> dict[str, Any]:
         "backend_version": state.app_version,
         "snapshot_unix_s": now_s,
         "is_torch_available": is_torch_available(),
+        "torch": torch_health_payload(),
         "ocr": {
             "easyocr": _safe_service_health(state.easy_ocr),
             "mangaocr": _safe_service_health(state.manga_ocr),

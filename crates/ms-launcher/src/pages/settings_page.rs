@@ -11,7 +11,9 @@ Main responsibilities:
 - show system CPU/RAM/core and accelerator information from a background probe;
 - probe AI Python packages through the shared startup/settings probe path;
 - reconcile `General.ai_install_type` to `Full` when PyTorch is actually importable;
-- run the launcher-side PyTorch/full-dependency upgrade flow through installer backend helpers;
+- run the launcher-side PyTorch/full-dependency upgrade flow through installer backend helpers
+  (the choice itself is the shared `ms_installer::torch::draw_torch_choice` widget; this page
+  keeps the Idle/Preparing/Choice/Running state machine around it);
 - host a background-driven shell console for the detected Python environment;
 - keep `pip` console commands usable via the active env or `uv pip` fallback;
 - notify the launcher runtime when the projects root changes so dependent pages refresh;
@@ -64,11 +66,12 @@ use ms_sysprobe::gpu_utils::{
 // flow. The installer subsystem is desktop-only, so these are gated to native;
 // on web the whole Torch-upgrade tab is a stub.
 #[cfg(not(target_arch = "wasm32"))]
-use ms_installer::install::{
-    InstallEvent, TorchChoicePrompt, TorchInstallSelection, TorchPreflightResult,
-};
+use ms_installer::install::InstallEvent;
 #[cfg(not(target_arch = "wasm32"))]
-use ms_installer::utils;
+use ms_installer::torch::{
+    TorchChoicePrompt, TorchChoiceState, TorchInstallSelection, TorchPreflightResult, detect_torch_preflight,
+    draw_torch_choice, run_torch_upgrade_worker,
+};
 use crate::pages::base::{self, PageNavAction};
 use crate::state::LauncherHost;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -312,7 +315,8 @@ enum TorchUpgradeStatus {
     #[default]
     Idle,
     Preparing,
-    Choice(TorchChoicePrompt),
+    /// The PyTorch choice on screen; the state carries the user's pick across frames.
+    Choice(TorchChoiceState),
     Running,
     Completed,
     Error(String),
@@ -1391,42 +1395,16 @@ impl SettingsPageState {
                     ));
                 });
             }
-            TorchUpgradeStatus::Choice(prompt) => {
-                ui.label(theme::status(&prompt.summary, theme::TEXT_MAIN));
-                ui.add_space(8.0);
-                if !prompt.options.is_empty() {
-                    ui.label(theme::status(
-                        &tf!("launcher.settings.recommended_label", prompt = prompt.options[prompt.recommended_index].label),
-                        theme::TEXT_MUTED,
-                    ));
-                    ui.add_space(8.0);
-                    let options = prompt.options.clone();
-                    for (idx, option) in options.into_iter().enumerate() {
-                        let title = if idx == prompt.recommended_index {
-                            tf!("launcher.settings.option_recommended_marker", option = option.label)
-                        } else {
-                            option.label.clone()
-                        };
-                        if theme::launcher_button(ui, &title, Vec2::new(320.0, 34.0), true)
-                            .clicked()
-                        {
-                            self.start_torch_upgrade_install(
-                                ui,
-                                TorchInstallSelection::InstallGpu(option),
-                                installing_full_dependencies,
-                            );
-                        }
-                        ui.add_space(6.0);
-                    }
-                }
-                if theme::launcher_button(ui, t!("launcher.settings.keep_cpu_button"), Vec2::new(220.0, 34.0), true)
-                    .clicked()
-                {
-                    self.start_torch_upgrade_install(
-                        ui,
-                        TorchInstallSelection::SkipCpu,
-                        installing_full_dependencies,
-                    );
+            TorchUpgradeStatus::Choice(_) => {
+                // The surrounding match reads a per-frame clone of the status; draw the live
+                // state so the user's pick persists across frames.
+                let confirmed = if let TorchUpgradeStatus::Choice(choice) = &mut self.torch_upgrade.status {
+                    draw_torch_choice(ui, choice, t!("launcher.settings.install_pytorch_button"))
+                } else {
+                    None
+                };
+                if let Some(selection) = confirmed {
+                    self.start_torch_upgrade_install(ui, selection, installing_full_dependencies);
                 }
             }
             TorchUpgradeStatus::Running => {
@@ -1514,7 +1492,7 @@ impl SettingsPageState {
         let _ = thread::Builder::new()
             .name("launcher-torch-upgrade-preflight".to_string())
             .spawn(move || {
-                let result = utils::detect_torch_preflight();
+                let result = detect_torch_preflight();
                 let _ = tx.send(InstallEvent::TorchPreflightReady(result));
             });
         ui.ctx().request_repaint();
@@ -1541,7 +1519,7 @@ impl SettingsPageState {
         let _ = thread::Builder::new()
             .name("launcher-torch-upgrade-install".to_string())
             .spawn(move || {
-                let result = utils::run_torch_upgrade_worker(
+                let result = run_torch_upgrade_worker(
                     root_dir,
                     selection,
                     install_full_dependencies,
@@ -1586,16 +1564,16 @@ impl SettingsPageState {
                         self.torch_upgrade
                             .console_lines
                             .push(format!("[PyTorch] {reason}"));
-                        self.torch_upgrade.status = TorchUpgradeStatus::Choice(TorchChoicePrompt {
+                        self.torch_upgrade.status = TorchUpgradeStatus::Choice(TorchChoiceState::new(TorchChoicePrompt {
                             options: Vec::new(),
                             recommended_index: 0,
                             summary: reason,
-                        });
+                        }));
                         keep_rx = false;
                     }
                     TorchPreflightResult::Choose(prompt) => {
                         self.torch_upgrade.overall_label = prompt.summary.clone();
-                        self.torch_upgrade.status = TorchUpgradeStatus::Choice(prompt);
+                        self.torch_upgrade.status = TorchUpgradeStatus::Choice(TorchChoiceState::new(prompt));
                         keep_rx = false;
                     }
                 },
