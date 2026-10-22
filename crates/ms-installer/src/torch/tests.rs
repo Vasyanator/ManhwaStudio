@@ -17,7 +17,7 @@ use ms_sysprobe::gpu_utils::RuntimeVersion;
 
 use super::catalog::{
     build_cuda_torch_options, build_rocm_torch_option, choose_recommended_torch_option, driver_note, rocm_device_extras,
-    rocm_download_estimate,
+    rocm_download_estimate, rocm_gfx_is_experimental,
 };
 use super::choice_store::persist_torch_choice_record;
 use super::command::{TorchCommandError, amd_packages_to_remove, torch_install_pip_args};
@@ -532,4 +532,19 @@ fn constraints_pin_the_installed_torch() {
         std::fs::read_to_string(&path).expect("constraints readable"),
         "torch==2.13.0+rocm10.1.0\ntorchvision==0.28.0+rocm10.1.0\n"
     );
+}
+
+#[test]
+fn rocm_experimental_is_exactly_gfx10() {
+    assert!(rocm_gfx_is_experimental(&gfx("gfx1030")));
+    assert!(rocm_gfx_is_experimental(&gfx("gfx1012")));
+    assert!(!rocm_gfx_is_experimental(&gfx("gfx1100")));
+    assert!(!rocm_gfx_is_experimental(&gfx("gfx90a")));
+}
+
+#[test]
+fn option_flavour_accessor_reports_the_built_flavour() {
+    let rocm = build_rocm_torch_option(TorchOs::Linux, gfx("gfx1100"), Vec::new(), None);
+    assert_eq!(rocm.flavour(), TorchFlavour::Rocm);
+    assert!(build_cuda_torch_options(RuntimeVersion::new(12, 6), None).iter().all(|option| option.flavour() == TorchFlavour::Cuda));
 }

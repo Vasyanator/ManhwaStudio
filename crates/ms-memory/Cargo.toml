@@ -14,3 +14,14 @@ ms-log = { path = "../ms-log" }
 ms-i18n = { path = "../ms-i18n" }
 # `MemoryProfile` is persisted in `user_config.json`, so it derives Serialize/Deserialize.
 serde.workspace = true
+
+# The Windows half of the OS memory probe (`current_memory_availability`):
+# `GlobalMemoryStatusEx` lives in `Win32_System_SystemInformation`, its `BOOL` result in
+# `Win32_Foundation`. Feature list is exactly what the probe uses.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
+
+# The macOS half of the same probe, without a process: `sysctlbyname("hw.memsize")` and mach
+# `host_statistics64` / `mach_host_self` / `vm_page_size`.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true

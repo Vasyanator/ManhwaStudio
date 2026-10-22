@@ -13,7 +13,7 @@ Key items:
 - Re-exported entry points: `TorchChoiceState` + `draw_torch_choice` (the one choice widget
   of the three screens), `detect_torch_preflight`, `run_torch_upgrade_worker`,
   `TorchReadiness`, `torch_readiness`, `required_torch_version`, `installed_torch_version`,
-  `installed_torch_is_current`, `read_torch_choice_record`.
+  `installed_torch_is_current`, `read_torch_choice_record`, `rocm_gfx_is_experimental`.
 
 Submodules:
 - `catalog`: the single pin set and the option builders.
@@ -45,6 +45,7 @@ mod stage;
 #[cfg(test)]
 mod tests;
 
+pub use catalog::rocm_gfx_is_experimental;
 pub use choice_store::read_torch_choice_record;
 pub use choice_ui::{TorchChoiceState, draw_torch_choice};
 pub(crate) use constraints::write_torch_constraints;
@@ -135,6 +136,13 @@ pub struct TorchWheelOption {
 }
 
 impl TorchWheelOption {
+    /// The PyTorch flavour this option installs (CUDA or ROCm; never CPU, which is the prompt's
+    /// separate row). Read-only view of the field the catalog filled.
+    #[must_use]
+    pub fn flavour(&self) -> TorchFlavour {
+        self.flavour
+    }
+
     /// The localized download-size text of this option: the estimate, "size unknown" for a
     /// ROCm option without one, and `None` for an option whose size was never measured
     /// (CUDA), which shows no size at all.

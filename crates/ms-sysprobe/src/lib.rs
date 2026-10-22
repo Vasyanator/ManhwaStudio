@@ -24,6 +24,10 @@ Submodules:
 - `python_manager`: discovery of the app-local Python interpreter and construction of the
   configured `Command` values that run it. Native-only (`#![cfg(not(wasm32))]` in the file).
 - `screen_capture`: virtual-desktop bounds and blocking region capture into an `RgbaImage`.
+- `system_facts`: the machine's OS / device / CPU / RAM / GPU-adapter fact sheet (raw data) for
+  the launcher's system-information view.
+- `win_registry` (Windows, crate-private): RAII registry key + bounded value reads shared by
+  `amd_adapters` and `system_facts`.
 
 Contract:
 - Every probe here performs blocking OS calls (subprocesses, GDI, SetupAPI, filesystem) and must be
@@ -52,3 +56,6 @@ pub mod gpu_utils;
 pub mod python_manager;
 pub mod paste_image;
 pub mod screen_capture;
+pub mod system_facts;
+#[cfg(windows)]
+mod win_registry;

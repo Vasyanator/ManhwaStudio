@@ -5,13 +5,8 @@ Purpose:
 Shared GPU and accelerator detection helpers for installer and runtime code.
 
 Main responsibilities:
-- detect NVIDIA adapters through platform tools; AMD presence is derived from
-  `amd_adapters::detect_amd_adapters` (sysfs/KFD on Linux, SetupAPI on Windows), so AMD
-  chipset/USB functions never count as a GPU;
-- detect CUDA, ROCm, and NVIDIA Compute Capability versions;
-- inspect Linux driver/ROCm installation state;
-- resolve AMD GPU architecture / LLVM target (ROCm tools, else `amd_adapters`) and validate
-  ROCm 7.2 support;
+- detect NVIDIA adapters through platform tools (installer preflight, native CUDA gate);
+- detect the CUDA runtime and NVIDIA Compute Capability versions;
 - detect likely DirectML-capable accelerators on Windows (WMI `Win32_VideoController` names);
 - probe for the system CUDA 12.x / cuDNN 9.x runtime the onnxruntime GPU build needs;
 - probe for a WebGPU-capable GPU (Dawn D3D12/Vulkan/Metal) for the WebGPU provider;
@@ -20,21 +15,14 @@ Main responsibilities:
 
 Key structures:
 - RuntimeVersion
-- GpuArchitecture
-- LinuxDriverStatus
-- RocmInstallationStatus
-- RocmSupportValidation
 - DirectMlAccelerator
 - WebGpuAdapter
 - CudaRuntimeStatus
 
 Key functions:
 - detect_nvidia_gpu()
-- detect_amd_gpu()
 - detect_cuda_runtime_version()
 - detect_nvidia_compute_capability()
-- detect_rocm_runtime_version() (`/opt/rocm/.info/version`, else `hipcc --version`)
-- validate_rocm_7_2_support_linux()
 - detect_directml_accelerators_windows()
 - probe_cuda_runtime() / native_cuda_runtime_available()
 - native_cuda_build_available() (per-build CUDA-major gate: cuda12 vs cuda13)
@@ -43,30 +31,35 @@ Key functions:
 - native_webgpu_runtime_available()
 - detect_webgpu_adapters()
 
+- run_command_bounded() (crate-private): the crate's one bounded process runner (stdin closed,
+  both pipes drained on reader threads, killed and reaped past the timeout); `command_output`
+  and `system_facts` go through it.
+
 Notes:
-Detection intentionally uses short-lived system commands and filesystem probes.
-Callers must run these helpers outside the GUI thread.
-Every gfx token parsed from tool output goes through `ms_config::torch_choice::GfxArch::parse`,
-so the CPU agent `gfx000` and generic ISA names (`gfx11-generic`) never leak out as targets.
+Detection intentionally uses short-lived system commands and filesystem probes, each bounded
+(`command_output`: 30 s hang guard). Callers must run these helpers outside the GUI thread.
+AMD adapters and their gfx architectures are not detected here: `amd_adapters` owns them, and
+the machine's full adapter list (all vendors) is `system_facts`.
 
 Web (wasm) build:
 GPU/accelerator detection relies on system commands (`nvidia-smi`, `lspci`, ...) that do
-not exist in the browser. The module still COMPILES on `wasm32` (the launcher
-system-information tab is cross-platform), but the single command primitive
-(`command_output`) is stubbed to return `None`, so every `detect_*` helper reports
+not exist in the browser. The module still COMPILES on `wasm32`, but the single command
+primitive (`command_output`) is stubbed to return `None`, so every `detect_*` helper reports
 "nothing detected" on web. The public types are plain data and compile everywhere.
 */
 
 use std::fmt::Display;
 
-use ms_config::torch_choice::GfxArch;
-
-use crate::amd_adapters::detect_amd_adapters;
-#[cfg(target_os = "linux")]
-use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::process::{Command, Stdio};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Duration, Instant};
+
+#[cfg(not(target_arch = "wasm32"))]
+use ms_log::runtime_log;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct RuntimeVersion {
@@ -90,39 +83,6 @@ impl Display for RuntimeVersion {
 pub enum GpuVendor {
     Amd,
     Nvidia,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GpuArchitecture {
-    pub vendor: GpuVendor,
-    pub name: Option<String>,
-    pub architecture: Option<String>,
-    pub llvm_target: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LinuxDriverStatus {
-    pub amdgpu_loaded: bool,
-    pub kfd_available: bool,
-    pub dri_available: bool,
-    pub nvidia_driver_available: bool,
-    pub nvidia_device_nodes_available: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RocmInstallationStatus {
-    pub present: bool,
-    pub version: Option<RuntimeVersion>,
-    pub details: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RocmSupportValidation {
-    pub supported: bool,
-    pub reason: String,
-    pub driver_status: LinuxDriverStatus,
-    pub rocm_status: RocmInstallationStatus,
-    pub architectures: Vec<GpuArchitecture>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,15 +127,6 @@ pub struct CudaRuntimeStatus {
     pub details: String,
 }
 
-pub const ROCM_7_2_SUPPORTED_LLVM_TARGETS: &[&str] = &[
-    "gfx950", "gfx942", "gfx90a", "gfx908", "gfx1201", "gfx1200", "gfx1101", "gfx1100", "gfx1030",
-];
-
-#[must_use]
-pub fn rocm_7_2_supported_llvm_targets() -> &'static [&'static str] {
-    ROCM_7_2_SUPPORTED_LLVM_TARGETS
-}
-
 #[must_use]
 pub fn detect_nvidia_gpu() -> bool {
     if let Some(output) = command_output("nvidia-smi", &["-L"]) {
@@ -203,22 +154,6 @@ pub fn detect_nvidia_gpu() -> bool {
     false
 }
 
-/// Whether an AMD display adapter is present (Linux and Windows; `false` elsewhere).
-///
-/// Derived from [`detect_amd_adapters`]: a display-class PCI function of vendor 0x1002 (Linux:
-/// driven by amdgpu). AMD chipset, USB or audio functions do not count. Blocking.
-#[must_use]
-pub fn detect_amd_gpu() -> bool {
-    (cfg!(target_os = "linux") || cfg!(target_os = "windows")) && !detect_amd_adapters().is_empty()
-}
-
-/// Linux-only form of [`detect_amd_gpu`]: an amdgpu-driven AMD display adapter exists
-/// ([`detect_amd_adapters`]). Always `false` off Linux. Blocking.
-#[must_use]
-pub fn detect_amd_gpu_linux() -> bool {
-    cfg!(target_os = "linux") && !detect_amd_adapters().is_empty()
-}
-
 #[must_use]
 pub fn detect_cuda_runtime_version() -> Option<RuntimeVersion> {
     if let Some(output) = command_output("nvidia-smi", &[])
@@ -234,45 +169,6 @@ pub fn detect_cuda_runtime_version() -> Option<RuntimeVersion> {
     }
 
     None
-}
-
-/// Version of the SYSTEM ROCm installation (major.minor), or `None` when none is found.
-///
-/// Reads `/opt/rocm/.info/version` (Linux), else the `HIP version:` line of
-/// `hipcc --version`. Deliberately NOT rocminfo — its `Runtime Version: 1.18` is the HSA
-/// runtime, not ROCm — and NOT `rocm-smi --showdriverversion`, which is the kernel driver's
-/// version. The pip ROCm torch wheels are self-contained and do not need this. Blocking.
-#[must_use]
-pub fn detect_rocm_runtime_version() -> Option<RuntimeVersion> {
-    if cfg!(target_os = "linux")
-        && let Ok(text) = std::fs::read_to_string(ROCM_INFO_VERSION_FILE)
-        && let Some(v) = parse_rocm_info_version(&text)
-    {
-        return Some(v);
-    }
-
-    if let Some(output) =
-        command_output_from_candidates(&["hipcc", "/opt/rocm/bin/hipcc"], &["--version"])
-        && let Some(v) = parse_hipcc_rocm_version(&output)
-    {
-        return Some(v);
-    }
-
-    None
-}
-
-/// The version file a system ROCm install writes (`7.2.4`, or `6.4.0-47` on older ones).
-const ROCM_INFO_VERSION_FILE: &str = "/opt/rocm/.info/version";
-
-/// Parses the first line of [`ROCM_INFO_VERSION_FILE`] into major.minor.
-fn parse_rocm_info_version(text: &str) -> Option<RuntimeVersion> {
-    text.lines().next().and_then(parse_first_major_minor)
-}
-
-/// Parses the `HIP version: 7.1.52801-…` line of `hipcc --version` into major.minor. Text
-/// without that line (for example rocminfo output) yields `None`.
-fn parse_hipcc_rocm_version(text: &str) -> Option<RuntimeVersion> {
-    parse_version_after_keywords(text, &["hip version"])
 }
 
 #[must_use]
@@ -292,157 +188,6 @@ pub fn detect_nvidia_compute_capability() -> Option<RuntimeVersion> {
     }
 
     None
-}
-
-#[must_use]
-pub fn detect_nvidia_gpu_architecture() -> Option<GpuArchitecture> {
-    detect_nvidia_compute_capability().map(|capability| GpuArchitecture {
-        vendor: GpuVendor::Nvidia,
-        name: Some(format!("NVIDIA SM {capability}")),
-        architecture: Some(format!("sm_{}{}", capability.major, capability.minor)),
-        llvm_target: None,
-    })
-}
-
-#[must_use]
-pub fn linux_driver_status() -> LinuxDriverStatus {
-    LinuxDriverStatus {
-        amdgpu_loaded: Path::new("/sys/module/amdgpu").is_dir(),
-        kfd_available: Path::new("/dev/kfd").exists(),
-        dri_available: Path::new("/dev/dri").is_dir(),
-        nvidia_driver_available: Path::new("/proc/driver/nvidia/version").is_file()
-            || command_output("nvidia-smi", &["-L"]).is_some(),
-        nvidia_device_nodes_available: linux_nvidia_device_nodes_available(),
-    }
-}
-
-#[must_use]
-pub fn detect_rocm_installation_linux() -> RocmInstallationStatus {
-    if !cfg!(target_os = "linux") {
-        return RocmInstallationStatus {
-            present: false,
-            version: None,
-            details: "ROCm Linux probe skipped on this target.".to_string(),
-        };
-    }
-
-    let mut details = Vec::new();
-    let version = detect_rocm_runtime_version();
-
-    for command in ["rocminfo", "hipcc", "rocm-smi"] {
-        if let Some(path) = command_path(command) {
-            details.push(format!("{command}: {}", path.display()));
-        }
-    }
-    if Path::new("/opt/rocm").is_dir() {
-        details.push("/opt/rocm exists".to_string());
-    }
-
-    let present = version.is_some() || !details.is_empty();
-    if details.is_empty() {
-        details.push("ROCm not detected through rocminfo/hipcc/rocm-smi or /opt/rocm.".to_string());
-    }
-
-    RocmInstallationStatus {
-        present,
-        version,
-        details: details.join("\n"),
-    }
-}
-
-#[must_use]
-pub fn detect_amd_gpu_architectures_linux() -> Vec<GpuArchitecture> {
-    if !cfg!(target_os = "linux") {
-        return Vec::new();
-    }
-
-    let mut architectures = Vec::new();
-    for target in detect_amd_gfx_targets_from_rocm_tools() {
-        architectures.push(GpuArchitecture {
-            vendor: GpuVendor::Amd,
-            name: None,
-            architecture: rocm_architecture_family(&target).map(str::to_string),
-            llvm_target: Some(target),
-        });
-    }
-
-    // Without ROCm tools: the adapter probe (KFD topology, else the pinned device-id table).
-    if architectures.is_empty() {
-        architectures.extend(detect_amd_adapters().into_iter().filter_map(|adapter| {
-            let target = adapter.gfx?.as_str().to_string();
-            Some(GpuArchitecture {
-                vendor: GpuVendor::Amd,
-                name: Some(adapter.name),
-                architecture: rocm_architecture_family(&target).map(str::to_string),
-                llvm_target: Some(target),
-            })
-        }));
-    }
-
-    dedupe_architectures(architectures)
-}
-
-#[must_use]
-pub fn validate_rocm_7_2_support_linux() -> RocmSupportValidation {
-    let driver_status = linux_driver_status();
-    let rocm_status = detect_rocm_installation_linux();
-    let architectures = detect_amd_gpu_architectures_linux();
-
-    if !detect_amd_gpu_linux() {
-        return RocmSupportValidation {
-            supported: false,
-            reason: "AMD GPU was not detected on Linux.".to_string(),
-            driver_status,
-            rocm_status,
-            architectures,
-        };
-    }
-
-    if !driver_status.amdgpu_loaded || !driver_status.kfd_available {
-        return RocmSupportValidation {
-            supported: false,
-            reason: "AMD GPU detected, but amdgpu driver or /dev/kfd is unavailable.".to_string(),
-            driver_status,
-            rocm_status,
-            architectures,
-        };
-    }
-
-    if !rocm_status.present {
-        return RocmSupportValidation {
-            supported: false,
-            reason: "AMD GPU detected, but ROCm installation was not found.".to_string(),
-            driver_status,
-            rocm_status,
-            architectures,
-        };
-    }
-
-    let has_supported_architecture = architectures.iter().any(|arch| {
-        arch.llvm_target
-            .as_deref()
-            .is_some_and(is_rocm_7_2_supported_llvm_target)
-    });
-
-    if has_supported_architecture {
-        RocmSupportValidation {
-            supported: true,
-            reason: "Detected AMD GPU architecture is supported by ROCm 7.2.".to_string(),
-            driver_status,
-            rocm_status,
-            architectures,
-        }
-    } else {
-        RocmSupportValidation {
-            supported: false,
-            reason:
-                "AMD GPU architecture was not detected or is not officially supported by ROCm 7.2."
-                    .to_string(),
-            driver_status,
-            rocm_status,
-            architectures,
-        }
-    }
 }
 
 /// Likely DirectML-capable accelerators on Windows, from the WMI `Win32_VideoController`
@@ -882,58 +627,6 @@ fn scan_dir_for_library<F: Fn(&str) -> bool>(dir: &Path, matches: F) -> bool {
         .any(|entry| entry.file_name().to_str().is_some_and(&matches))
 }
 
-/// Detect the Apple Silicon / Mac GPU description (macOS only).
-#[must_use]
-pub fn detect_apple_gpu() -> Option<String> {
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
-
-    if let Some(output) = command_output("system_profiler", &["SPDisplaysDataType"]) {
-        let mut chipset: Option<String> = None;
-        let mut cores: Option<String> = None;
-        let mut metal: Option<String> = None;
-        for line in output.lines() {
-            let trimmed = line.trim();
-            if let Some(value) = trimmed.strip_prefix("Chipset Model:") {
-                chipset = Some(value.trim().to_string());
-            } else if let Some(value) = trimmed.strip_prefix("Total Number of Cores:") {
-                cores = Some(value.trim().to_string());
-            } else if let Some(value) = trimmed.strip_prefix("Metal Support:") {
-                metal = Some(value.trim().to_string());
-            } else if let Some(value) = trimmed.strip_prefix("Metal Family:") {
-                metal = metal.or_else(|| Some(value.trim().to_string()));
-            }
-        }
-
-        if let Some(name) = chipset.filter(|value| !value.is_empty()) {
-            let mut extra = Vec::new();
-            if let Some(cores) = cores.filter(|value| !value.is_empty()) {
-                extra.push(tf!("gpu_utils.gpu_cores", cores = cores));
-            }
-            if let Some(metal) = metal.filter(|value| !value.is_empty()) {
-                extra.push(metal);
-            }
-            if extra.is_empty() {
-                return Some(name);
-            }
-            return Some(format!("{name} ({})", extra.join(", ")));
-        }
-    }
-
-    command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty())
-}
-
-#[must_use]
-pub fn is_rocm_7_2_supported_llvm_target(target: &str) -> bool {
-    let normalized = target.trim().to_ascii_lowercase();
-    ROCM_7_2_SUPPORTED_LLVM_TARGETS
-        .iter()
-        .any(|supported| *supported == normalized)
-}
-
 fn directml_accelerator_from_name(name: &str) -> Option<DirectMlAccelerator> {
     let lower = name.to_ascii_lowercase();
     let vendor = if lower.contains("nvidia") {
@@ -952,37 +645,9 @@ fn directml_accelerator_from_name(name: &str) -> Option<DirectMlAccelerator> {
     })
 }
 
-fn detect_amd_gfx_targets_from_rocm_tools() -> Vec<String> {
-    let mut targets = Vec::new();
-    for (command, args) in [
-        ("rocm_agent_enumerator", &[] as &[&str]),
-        ("/opt/rocm/bin/rocm_agent_enumerator", &[] as &[&str]),
-        ("rocminfo", &[] as &[&str]),
-        ("/opt/rocm/bin/rocminfo", &[] as &[&str]),
-    ] {
-        if let Some(output) = command_output(command, args) {
-            targets.extend(parse_gfx_targets(&output));
-        }
-    }
-    dedupe_strings(targets)
-}
-
-/// Marketing architecture family of a ROCm 7.2 LLVM target (`"RDNA4"`, `"CDNA3"`, …) for the
-/// System tab; `None` for targets outside that list.
-fn rocm_architecture_family(target: &str) -> Option<&'static str> {
-    match target {
-        "gfx950" => Some("CDNA4"),
-        "gfx942" => Some("CDNA3"),
-        "gfx90a" => Some("CDNA2"),
-        "gfx908" => Some("CDNA"),
-        "gfx1201" | "gfx1200" => Some("RDNA4"),
-        "gfx1101" | "gfx1100" => Some("RDNA3"),
-        "gfx1030" => Some("RDNA2"),
-        _ => None,
-    }
-}
-
-fn parse_version_after_keywords(text: &str, keywords: &[&str]) -> Option<RuntimeVersion> {
+/// Parses the first `major.minor` that follows any of `keywords` (case-insensitive, tried in
+/// order) in `text`, e.g. the `CUDA Version: 12.4` of plain `nvidia-smi` output. Pure.
+pub(crate) fn parse_version_after_keywords(text: &str, keywords: &[&str]) -> Option<RuntimeVersion> {
     let lower = text.to_ascii_lowercase();
     for keyword in keywords {
         let needle = keyword.to_ascii_lowercase();
@@ -1035,26 +700,6 @@ fn parse_min_runtime_version_from_lines(text: &str) -> Option<RuntimeVersion> {
     min_value
 }
 
-/// Extracts processor names from ROCm tool output (`rocm_agent_enumerator`, `rocminfo`) in
-/// order of appearance; tokens that are not processors (`gfx000`, `gfx11-generic`) are dropped.
-fn parse_gfx_targets(text: &str) -> Vec<String> {
-    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .filter_map(normalize_gfx_token)
-        .collect()
-}
-
-/// The processor name inside one alphanumeric token (`"gfx1201"`, `"AMDgfx90a"`), validated by
-/// `GfxArch::parse`; `None` for anything that is not a processor.
-fn normalize_gfx_token(token: &str) -> Option<String> {
-    let lower = token.trim().to_ascii_lowercase();
-    let start = lower.find("gfx")?;
-    let candidate = lower[start..]
-        .chars()
-        .take_while(|ch| ch.is_ascii_alphanumeric())
-        .collect::<String>();
-    GfxArch::parse(&candidate).map(|gfx| gfx.as_str().to_string())
-}
-
 fn text_has_amd_gpu(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.starts_with("amd ")
@@ -1080,12 +725,6 @@ fn windows_video_controller_output() -> Option<String> {
     )
 }
 
-fn command_output_from_candidates(commands: &[&str], args: &[&str]) -> Option<String> {
-    commands
-        .iter()
-        .find_map(|command| command_output(command, args))
-}
-
 // The single process-spawning primitive. On wasm there is no subprocess, so it
 // returns `None` and every `detect_*` helper degrades to "nothing detected".
 #[cfg(target_arch = "wasm32")]
@@ -1093,22 +732,27 @@ fn command_output(_command: &str, _args: &[&str]) -> Option<String> {
     None
 }
 
+//
+// Every detection command runs through `run_command_bounded` with
+// [`COMMAND_OUTPUT_TIMEOUT`], so a hung tool (a wedged driver under `nvidia-smi`, a stuck
+// PowerShell) can never keep a probe worker alive forever. A tool that is not installed
+// (spawn `NotFound`) is the normal "unknown" answer and is not logged.
 #[cfg(not(target_arch = "wasm32"))]
 fn command_output(command: &str, args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new(command);
-    apply_windows_no_window(&mut cmd);
-    let output = cmd
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
+    let output = match run_command_bounded(command, args, COMMAND_OUTPUT_TIMEOUT) {
+        Ok(output) => output,
+        Err(CommandRunError::Spawn(err)) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            runtime_log::log_warn(format!("[gpu-utils] `{command} {}` failed: {err}", args.join(" ")));
+            return None;
+        }
+    };
     if !output.status.success() {
         return None;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = output.stdout.as_str();
+    let stderr = output.stderr.as_str();
     let text = if stdout.trim().is_empty() {
         stderr.to_string()
     } else if stderr.trim().is_empty() {
@@ -1124,64 +768,156 @@ fn command_output(command: &str, args: &[&str]) -> Option<String> {
     }
 }
 
-fn command_path(command: &str) -> Option<std::path::PathBuf> {
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(command))
-            .find(|candidate| candidate.is_file())
-    })
+/// Hang guard of [`command_output`]: generous, because a cold PowerShell or `rocminfo` with a
+/// GPU can legitimately take several seconds; it only has to end a tool that never returns.
+#[cfg(not(target_arch = "wasm32"))]
+const COMMAND_OUTPUT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often [`run_command_bounded`] checks whether the child has exited.
+#[cfg(not(target_arch = "wasm32"))]
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How long [`run_command_bounded`] waits for a pipe to reach end-of-file after the child
+/// exited. A grandchild that inherited the pipe can keep it open; past this the output is
+/// abandoned instead of blocking the worker.
+#[cfg(not(target_arch = "wasm32"))]
+const COMMAND_PIPE_GRACE: Duration = Duration::from_secs(1);
+
+/// What a finished command printed. Both streams are decoded lossily (tool output is
+/// diagnostic text; an invalid byte must not lose the rest).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+pub(crate) struct CommandCapture {
+    /// The child's exit status; callers decide whether a failure status is an error.
+    pub(crate) status: std::process::ExitStatus,
+    /// Everything written to stdout.
+    pub(crate) stdout: String,
+    /// Everything written to stderr.
+    pub(crate) stderr: String,
 }
 
-fn linux_nvidia_device_nodes_available() -> bool {
-    if !cfg!(target_os = "linux") {
-        return false;
-    }
-    if Path::new("/dev/nvidiactl").exists() {
-        return true;
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        fs::read_dir("/dev")
-            .ok()
-            .into_iter()
-            .flat_map(|entries| entries.filter_map(Result::ok))
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .any(|name| {
-                name.strip_prefix("nvidia")
-                    .is_some_and(|suffix| suffix.chars().all(|ch| ch.is_ascii_digit()))
-            })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
+/// Why [`run_command_bounded`] produced no [`CommandCapture`].
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+pub(crate) enum CommandRunError {
+    /// The process could not be started (`NotFound` = the tool is not installed).
+    Spawn(std::io::Error),
+    /// A pipe-reader thread could not be created; the child was killed.
+    ReaderThread(std::io::Error),
+    /// Polling the child's state failed; the child was killed.
+    Wait(std::io::Error),
+    /// The child did not exit within the timeout; it was killed and reaped.
+    TimedOut(Duration),
+    /// The child exited but one of its pipes failed to read, or stayed open past
+    /// [`COMMAND_PIPE_GRACE`] (held by a grandchild).
+    Pipe(String),
 }
 
-fn dedupe_architectures(items: Vec<GpuArchitecture>) -> Vec<GpuArchitecture> {
-    let mut deduped = Vec::with_capacity(items.len());
-    for item in items {
-        if deduped.iter().any(|existing: &GpuArchitecture| {
-            existing.vendor == item.vendor
-                && existing.llvm_target == item.llvm_target
-                && existing.name == item.name
-        }) {
-            continue;
+#[cfg(not(target_arch = "wasm32"))]
+impl Display for CommandRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(err) => write!(f, "cannot start the process: {err}"),
+            Self::ReaderThread(err) => write!(f, "cannot start an output reader thread: {err}"),
+            Self::Wait(err) => write!(f, "cannot poll the process state: {err}"),
+            Self::TimedOut(after) => write!(f, "no exit within {} ms; killed", after.as_millis()),
+            Self::Pipe(detail) => write!(f, "output unreadable: {detail}"),
         }
-        deduped.push(item);
     }
-    deduped
 }
 
-fn dedupe_strings(items: Vec<String>) -> Vec<String> {
-    let mut deduped = Vec::with_capacity(items.len());
-    for item in items {
-        if deduped.iter().any(|existing| existing == &item) {
-            continue;
+/// Runs `command args` with stdin closed and both output streams captured, killing it when it
+/// has not exited within `timeout`. Blocking (polls every [`COMMAND_POLL_INTERVAL`]): workers
+/// only. On Windows the child gets no console window. Never panics.
+///
+/// # Errors
+/// [`CommandRunError`]: the spawn failed, the child timed out (killed and reaped), its state
+/// could not be polled, or its output could not be collected. A non-zero exit is NOT an error:
+/// it is reported in [`CommandCapture::status`].
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn run_command_bounded(command: &str, args: &[&str], timeout: Duration) -> Result<CommandCapture, CommandRunError> {
+    let mut cmd = Command::new(command);
+    apply_windows_no_window(&mut cmd);
+    let mut child = cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(CommandRunError::Spawn)?;
+    // Both pipes are drained on their own threads while the child runs: a tool that fills one
+    // pipe buffer would otherwise block forever and look like a hang.
+    let stdout_rx = match spawn_pipe_reader(child.stdout.take(), command, "stdout") {
+        Ok(rx) => rx,
+        Err(err) => {
+            kill_and_reap(&mut child, command);
+            return Err(CommandRunError::ReaderThread(err));
         }
-        deduped.push(item);
+    };
+    let stderr_rx = match spawn_pipe_reader(child.stderr.take(), command, "stderr") {
+        Ok(rx) => rx,
+        Err(err) => {
+            kill_and_reap(&mut child, command);
+            return Err(CommandRunError::ReaderThread(err));
+        }
+    };
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(err) => {
+                kill_and_reap(&mut child, command);
+                return Err(CommandRunError::Wait(err));
+            }
+        }
+        if started.elapsed() >= timeout {
+            kill_and_reap(&mut child, command);
+            return Err(CommandRunError::TimedOut(timeout));
+        }
+        std::thread::sleep(COMMAND_POLL_INTERVAL);
+    };
+    let stdout = collect_pipe(&stdout_rx, "stdout")?;
+    let stderr = collect_pipe(&stderr_rx, "stderr")?;
+    Ok(CommandCapture { status, stdout, stderr })
+}
+
+/// Reads `pipe` to end-of-file on a named thread and sends the bytes (or the read error) once.
+/// A missing pipe (never the case for a `Stdio::piped` stream) sends an empty buffer.
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(pipe: Option<R>, command: &str, stream: &'static str) -> std::io::Result<mpsc::Receiver<std::io::Result<Vec<u8>>>> {
+    let (tx, rx) = mpsc::channel();
+    let command = command.to_string();
+    std::thread::Builder::new().name(format!("sysprobe-{stream}")).spawn(move || {
+        let mut buffer = Vec::new();
+        let result = match pipe {
+            Some(mut pipe) => pipe.read_to_end(&mut buffer).map(|_| buffer),
+            None => Ok(buffer),
+        };
+        if let Err(unsent) = tx.send(result) {
+            // The receiver is dropped only once the caller stopped waiting (timeout or pipe
+            // grace): the output is no longer wanted, which is worth a trace in the log.
+            let bytes = unsent.0.map_or(0, |bytes| bytes.len());
+            runtime_log::log_info(format!("[gpu-utils] `{command}` {stream} ({bytes} bytes) arrived after the caller gave up"));
+        }
+    })?;
+    Ok(rx)
+}
+
+/// Waits up to [`COMMAND_PIPE_GRACE`] for one pipe reader's result and decodes it lossily.
+#[cfg(not(target_arch = "wasm32"))]
+fn collect_pipe(rx: &mpsc::Receiver<std::io::Result<Vec<u8>>>, stream: &str) -> Result<String, CommandRunError> {
+    match rx.recv_timeout(COMMAND_PIPE_GRACE) {
+        Ok(Ok(bytes)) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Ok(Err(err)) => Err(CommandRunError::Pipe(format!("{stream}: {err}"))),
+        Err(err) => Err(CommandRunError::Pipe(format!("{stream}: {err}"))),
     }
-    deduped
+}
+
+/// Kills `child` and reaps it so no zombie is left; both failures are logged (the child may
+/// have exited on its own between the last poll and the kill).
+#[cfg(not(target_arch = "wasm32"))]
+fn kill_and_reap(child: &mut std::process::Child, command: &str) {
+    if let Err(err) = child.kill() {
+        runtime_log::log_info(format!("[gpu-utils] cannot kill `{command}`: {err}"));
+    }
+    if let Err(err) = child.wait() {
+        runtime_log::log_warn(format!("[gpu-utils] cannot reap `{command}`: {err}"));
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1344,38 +1080,6 @@ GPU1:
         } else {
             assert!(!available, "OpenVINO builds are x86_64 Windows/Linux only");
         }
-    }
-
-    #[test]
-    fn rocm_version_ignores_the_hsa_runtime_line() {
-        // rocminfo's header (S-074): "Runtime Version: 1.18" is HSA, never a ROCm version.
-        let rocminfo = "ROCk module version 6.14.14 is loaded\n=====================\nHSA System Attributes\n=====================\nRuntime Version:         1.18\nRuntime Ext Version:     1.15\n";
-        assert_eq!(parse_hipcc_rocm_version(rocminfo), None);
-        let hipcc = "HIP version: 7.1.52801-9999\nUbuntu clang version 21.1.8 (6ubuntu1)\nTarget: x86_64-pc-linux-gnu\n";
-        assert_eq!(parse_hipcc_rocm_version(hipcc), Some(RuntimeVersion::new(7, 1)));
-        assert_eq!(parse_rocm_info_version("7.2.4\n"), Some(RuntimeVersion::new(7, 2)));
-        assert_eq!(parse_rocm_info_version("6.4.0-47\n"), Some(RuntimeVersion::new(6, 4)));
-        assert_eq!(parse_rocm_info_version(""), None);
-    }
-
-    #[test]
-    fn gfx_targets_drop_the_cpu_agent_and_generic_isas() {
-        // Classic `rocm_agent_enumerator` output lists the CPU agent as gfx000 (S-074).
-        assert_eq!(parse_gfx_targets("gfx000\ngfx1201\n"), vec!["gfx1201".to_string()]);
-        assert_eq!(
-            parse_gfx_targets("  Name:                    gfx1201\n  Name:                    amdgcn-amd-amdhsa--gfx1201\n  Name:                    amdgcn-amd-amdhsa--gfx12-generic\n  Name:   gfx90a:sramecc+:xnack-\n"),
-            vec!["gfx1201".to_string(), "gfx1201".to_string(), "gfx90a".to_string()]
-        );
-        assert_eq!(normalize_gfx_token("gfx11"), None);
-        assert_eq!(normalize_gfx_token("GFX1100"), Some("gfx1100".to_string()));
-    }
-
-    #[test]
-    fn amd_presence_follows_the_adapter_probe() {
-        let adapters = detect_amd_adapters();
-        let expected = (cfg!(target_os = "linux") || cfg!(target_os = "windows")) && !adapters.is_empty();
-        assert_eq!(detect_amd_gpu(), expected);
-        assert_eq!(detect_amd_gpu_linux(), cfg!(target_os = "linux") && !adapters.is_empty());
     }
 
     #[test]

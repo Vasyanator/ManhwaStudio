@@ -39,16 +39,15 @@ state arrives.
   extraction into the projects root, safe path validation, and optional open-after-import action.
 - `export_page.rs`: title/chapter selection, project refresh, compression preset selection, and
   `tar + zstd` archive creation for `.mschapter` export.
-- `settings_page.rs`: launcher settings tabs, system CPU/RAM/GPU probes,
-  AI package probes, `General.ai_install_type` reconciliation, PyTorch/full-dependency upgrade
+- `settings_page.rs`: launcher settings tabs, AI package probes, `General.ai_install_type` reconciliation, PyTorch/full-dependency upgrade
   flow (its choice step draws the installer's shared `ms_installer::torch::draw_torch_choice`), and a background-driven Python environment console. The tab set, ordering, tab labels, and
   the shared General/AiBackend/Tutorials sections come from the shared section registry
   (`crate::settings_shared`): `active_tab` is a `SettingsSectionId`, the vertical tab sidebar (`show_sidebar`, left of the
   section content, below the title; tabs in their own `ScrollArea`, "Save log" pinned under it)
   iterates `sections_for(SettingsSurface::Launcher)`, and the three shared "double-interface"
   panels are owned as one `SharedSettingsPanels`. The dynamic TorchUpgrade hide/relabel logic is
-  applied inline in the sidebar. Overlong tab labels scroll as `ms_widgets` marquees. The launcher-exclusive sections (SystemInfo/AiComputations/TorchUpgrade/PythonEnvironment)
-  keep their local renderers here. Section content scrolls in one content-column `ScrollArea`,
+  applied inline in the sidebar. Overlong tab labels scroll as `ms_widgets` marquees. The launcher-exclusive sections (AiComputations/TorchUpgrade/PythonEnvironment)
+  keep their local renderers here; SystemInfo is `system_info/` (state owned by the page). Section content scrolls in one content-column `ScrollArea`,
   except the PythonEnvironment console: it fills the column itself (command row + hint pinned
   bottom-up, output frame with its own stick-to-bottom scroll taking the rest) and drops back
   into the column scroll as a fixed-height block only when the column is shorter than
@@ -59,6 +58,9 @@ state arrives.
   panes (item badges), paints each tab's worst level as a corner badge in
   `show_tab_button_impl` (`highlighted` there is the unrelated amber upgrade-tab look), and
   rechecks the units named by every `SettingChange` the panes report.
+- `system_info/` (native only): the System info tab — hardware facts, graphics adapters and
+  the AI acceleration this machine gets, plus a "Copy report" plain-text export. One
+  `launcher-system-info-probe` worker per (re)fresh; see `system_info/MODULE_README.md`.
 - `system_registration.rs` (Windows and Linux only): the System registration tab
   (`SystemRegistrationState`, owned by the settings page). Lists the OS records of this copy as
   `ms_os_integration::report::probe` judged them (worker `system-registration-probe`, on first
@@ -109,8 +111,9 @@ state arrives.
   validation.
 - Import must reject unsafe archive paths and preserve explicit user-facing errors plus diagnostic
   log messages.
-- Settings probes and consoles must use shared runtime helpers such as `python_manager` and
-  `gpu_utils`; do not duplicate Python or GPU discovery in page UI code.
+- Settings probes and consoles must use shared runtime helpers such as `python_manager`,
+  `ms_sysprobe::system_facts` and the installer / native-runtime owners; do not duplicate
+  Python, hardware or GPU discovery in page UI code.
 
 ## Editing map
 - To add a launcher-level navigation action, edit `base.rs`, update affected page states, and handle
@@ -119,6 +122,8 @@ state arrives.
 - To change archive import/export, edit `import_page.rs` or `export_page.rs`.
 - To change global launcher settings, environment probes, AI install-type reconciliation, Torch
   upgrade UI, or the Python console, edit `settings_page.rs`.
+- To change what the System info tab shows or how it words it, edit `system_info/report.rs`;
+  a new hardware fact belongs in `ms_sysprobe::system_facts`, never in the page.
 - To change the System registration tab's layout, texts or worker flow, edit
   `system_registration.rs`; what is broken, which actions exist and how they run belong to
   `crates/ms-os-integration` (`report.rs`, `actions.rs`).

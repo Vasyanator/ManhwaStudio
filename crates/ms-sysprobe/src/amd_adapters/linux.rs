@@ -2,19 +2,22 @@
 File: crates/ms-sysprobe/src/amd_adapters/linux.rs
 
 Purpose:
-Linux half of `amd_adapters`: enumerates AMD display adapters from sysfs and takes each one's
-gfx from KFD topology, with the pinned device-id table as the fallback. Reads files only — no
-rocminfo, no lspci, no system ROCm needed.
+Linux half of the display-device walk: enumerates every display-class PCI function from sysfs
+(any vendor) and, for AMD functions, takes the gfx from KFD topology. Reads files only — no
+rocminfo, no lspci, no system ROCm needed. The AMD filter (`amdgpu` driver) and the table
+fallback live in `mod.rs`.
 
 Key functions:
-- enumerate(): `/sys/class/drm/card<N>` -> `AmdAdapter`s (unordered; the caller orders them).
+- enumerate(): `/sys/class/drm/card<N>` -> `PciDisplayDevice`s in `cardN` order.
 
 Notes:
-- A card is kept when its PCI vendor is 0x1002, its class is display (`0x03xxxx`) and its
-  driver is `amdgpu` (a `radeon`-driven or driverless card cannot run ROCm and is logged and
-  skipped). `cardN-<connector>` entries are not cards; cards are deduplicated by the canonical
-  path of their `device` link.
-- KFD matching is by PCI device id; KFD nodes with `simd_count 0` are CPU agents.
+- A card is kept when it has readable PCI vendor / device ids and a display class
+  (`0x03xxxx`). `cardN-<connector>` entries are not cards; cards are deduplicated by the
+  canonical path of their `device` link. Non-PCI DRM devices (SoC display engines without a
+  `vendor` attribute) are skipped.
+- `mem_info_vram_total` (amdgpu) is read for every card that has it; KFD is read only when an
+  AMD function was found. KFD matching is by PCI device id; KFD nodes with `simd_count 0` are
+  CPU agents.
 */
 
 use std::collections::HashMap;
@@ -24,25 +27,24 @@ use std::path::{Path, PathBuf};
 use ms_config::torch_choice::GfxArch;
 use ms_log::runtime_log;
 
-use super::{AMD_PCI_VENDOR_ID, AmdAdapter, GfxSource, device_id_info, parse_kfd_node_properties, parse_sysfs_hex_u16};
+use super::{AMD_PCI_VENDOR_ID, PciDisplayDevice, parse_kfd_node_properties, parse_sysfs_hex_u16};
 
 const DRM_CLASS_DIR: &str = "/sys/class/drm";
 const KFD_NODES_DIR: &str = "/sys/class/kfd/kfd/topology/nodes";
 
-/// Enumerates the amdgpu-driven AMD display adapters in `cardN` order. Never panics; an
-/// unreadable directory or attribute is logged and the card (or the whole probe) skipped.
-pub(super) fn enumerate() -> Vec<AmdAdapter> {
+/// Enumerates the display-class PCI functions in `cardN` order. Never panics; an unreadable
+/// directory or attribute is logged and the card (or the whole probe) skipped.
+pub(super) fn enumerate() -> Vec<PciDisplayDevice> {
     let cards = match drm_cards() {
         Ok(cards) => cards,
         Err(err) => {
-            // No DRM class at all (container, no GPU driver): nothing to enumerate.
+            // No DRM class at all (container, WSL, no GPU driver): nothing to enumerate.
             runtime_log::log_info(format!("[amd-adapters] cannot list {DRM_CLASS_DIR}: {err}"));
             return Vec::new();
         }
     };
-    let kfd = kfd_gfx_by_device_id();
     let mut seen_devices: Vec<PathBuf> = Vec::new();
-    let mut adapters = Vec::new();
+    let mut devices = Vec::new();
     for card in cards {
         let device_dir = card.join("device");
         let canonical = match fs::canonicalize(&device_dir) {
@@ -56,11 +58,17 @@ pub(super) fn enumerate() -> Vec<AmdAdapter> {
             continue;
         }
         seen_devices.push(canonical);
-        if let Some(adapter) = adapter_from_device_dir(&device_dir, &kfd) {
-            adapters.push(adapter);
+        if let Some(device) = device_from_dir(&device_dir) {
+            devices.push(device);
         }
     }
-    adapters
+    if devices.iter().any(|device| device.vendor_id == AMD_PCI_VENDOR_ID) {
+        let kfd = kfd_gfx_by_device_id();
+        for device in devices.iter_mut().filter(|device| device.vendor_id == AMD_PCI_VENDOR_ID) {
+            device.kfd_gfx = kfd.get(&device.device_id).cloned();
+        }
+    }
+    devices
 }
 
 /// `cardN` entries of the DRM class, sorted by N.
@@ -92,63 +100,34 @@ fn card_index(name: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// Builds the adapter of one PCI device directory, or `None` when it is not an
-/// amdgpu-driven AMD display device.
-fn adapter_from_device_dir(device_dir: &Path, kfd: &HashMap<u16, GfxArch>) -> Option<AmdAdapter> {
+/// Builds the display device of one PCI device directory, or `None` when it is not a PCI
+/// display-class function with readable ids.
+fn device_from_dir(device_dir: &Path) -> Option<PciDisplayDevice> {
+    // No `vendor` attribute: not a PCI function (an SoC display engine); nothing to report.
     let vendor_id = read_attr(device_dir, "vendor").as_deref().and_then(parse_sysfs_hex_u16)?;
-    if vendor_id != AMD_PCI_VENDOR_ID {
-        return None;
-    }
     let class = read_attr(device_dir, "class").and_then(|text| parse_sysfs_hex_u32(&text))?;
     // PCI base class 0x03 = display controller (VGA 0x0300, 3D 0x0302, other 0x0380).
     if class >> 16 != 0x03 {
         return None;
     }
     let Some(device_id) = read_attr(device_dir, "device").as_deref().and_then(parse_sysfs_hex_u16) else {
-        runtime_log::log_warn(format!("[amd-adapters] AMD display device without a readable device id: {}", device_dir.display()));
+        runtime_log::log_warn(format!("[amd-adapters] display device of vendor {vendor_id:#06x} without a readable device id: {}", device_dir.display()));
         return None;
     };
-    let driver = fs::read_link(device_dir.join("driver"))
+    let kernel_driver = fs::read_link(device_dir.join("driver"))
         .ok()
         .and_then(|link| link.file_name().map(|name| name.to_string_lossy().into_owned()));
-    if driver.as_deref() != Some("amdgpu") {
-        runtime_log::log_info(format!(
-            "[amd-adapters] skipping AMD display device {device_id:#06x} at {}: driver {} is not amdgpu",
-            device_dir.display(),
-            driver.as_deref().unwrap_or("<none>")
-        ));
-        return None;
-    }
-    let revision = read_attr(device_dir, "revision").and_then(|text| parse_sysfs_hex_u8(&text));
-    let table = device_id_info(device_id);
-    let kfd_gfx = kfd.get(&device_id).cloned();
-    if let (Some(kfd_gfx), Some(table)) = (&kfd_gfx, &table)
-        && *kfd_gfx != table.gfx
-    {
-        runtime_log::log_warn(format!(
-            "[amd-adapters] device {device_id:#06x}: KFD reports {kfd_gfx}, the device-id table says {}; using KFD",
-            table.gfx
-        ));
-    }
-    let (gfx, gfx_source) = match (kfd_gfx, &table) {
-        (Some(gfx), _) => (Some(gfx), Some(GfxSource::Kfd)),
-        (None, Some(info)) => (Some(info.gfx.clone()), Some(GfxSource::DeviceIdTable)),
-        (None, None) => (None, None),
-    };
-    let name = read_attr(device_dir, "product_name")
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-        .or_else(|| table.as_ref().map(|info| info.product.to_string()))
-        .unwrap_or_else(|| format!("AMD [{AMD_PCI_VENDOR_ID:04x}:{device_id:04x}]"));
-    Some(AmdAdapter {
+    let os_name = read_attr(device_dir, "product_name").map(|text| text.trim().to_string()).filter(|text| !text.is_empty());
+    let reported_memory_bytes = read_attr(device_dir, "mem_info_vram_total").and_then(|text| text.trim().parse::<u64>().ok()).filter(|bytes| *bytes > 0);
+    Some(PciDisplayDevice {
         vendor_id,
         device_id,
-        revision,
-        name,
-        gfx,
-        gfx_source,
-        integrated: table.as_ref().map(|info| info.integrated),
+        revision: read_attr(device_dir, "revision").and_then(|text| parse_sysfs_hex_u8(&text)),
+        os_name,
+        kernel_driver,
         driver_version: None,
+        reported_memory_bytes,
+        kfd_gfx: None,
     })
 }
 

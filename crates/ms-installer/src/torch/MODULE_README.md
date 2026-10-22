@@ -29,16 +29,18 @@ helpers and the torch-dependent extras list stay in `utils.rs`; this directory c
 AMD adapter and gfx detection is `ms_sysprobe::amd_adapters`.
 
 ## Files and submodules
-- `mod.rs`: the choice data model (`TorchOs`, `TorchWheelOption`, `RocmOptionInfo`,
-  `DriverNote`, `TorchChoicePrompt`, `TorchPreflightResult`, `TorchInstallSelection` with
-  `for_option` / `record`) and the public re-exports.
+- `mod.rs`: the choice data model (`TorchOs`, `TorchWheelOption` with the read-only
+  `flavour()`, `RocmOptionInfo`, `DriverNote`, `TorchChoicePrompt`, `TorchPreflightResult`,
+  `TorchInstallSelection` with `for_option` / `record`) and the public re-exports.
 - `choice_ui.rs`: the one PyTorch choice widget (`TorchChoiceState`, `draw_torch_choice`) drawn
   by the installer window, the update window and the launcher settings page: summary, one radio
   row per option (recommended marker, size, ROCm architecture picker with detected
   architectures first, the gfx10 "experimental" note, the driver note), the CPU row and one
   confirm button.
-- `catalog.rs`: every pin and index URL, the per-OS ROCm device-extra list, the ROCm download
-  estimate table, the minimum Windows driver, the option builders and the recommendation rule.
+- `catalog.rs`: every pin and index URL, the per-OS ROCm device-extra list, the gfx10
+  "experimental" rule (`rocm_gfx_is_experimental`, public: the launcher's system-information
+  tab reports it too), the ROCm download estimate table, the minimum Windows driver, the option
+  builders and the recommendation rule.
 - `preflight.rs`: `build_torch_options` (pure) and `detect_torch_preflight` (blocking probes;
   worker thread only).
 - `command.rs`: selection -> exact `pip install` arguments (validated, `TorchCommandError`) and
@@ -91,8 +93,8 @@ AMD adapter and gfx detection is `ms_sysprobe::amd_adapters`.
   not met here (manager-tracked known gap).
 
 ## Editing map
-- To change a pin, a wheel index, the ROCm architecture list, the size table or the driver
-  minimum, edit `catalog.rs` (and the golden vectors in `tests.rs`).
+- To change a pin, a wheel index, the ROCm architecture list, the experimental-architecture
+  rule, the size table or the driver minimum, edit `catalog.rs` (and the golden vectors in `tests.rs`).
 - To change which GPUs lead to which offer, edit `preflight.rs` (`build_torch_options`).
 - To change the install flags or the uninstall set, edit `command.rs`; the stage's steps,
   progress and retry budget, `stage.rs`.

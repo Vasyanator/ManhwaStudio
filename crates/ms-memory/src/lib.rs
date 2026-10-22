@@ -5,6 +5,9 @@ Project-wide image cache memory policy.
 Main items:
 - `MemoryProfile`: user-selected memory usage profile persisted in `user_config.json`.
 - `MemoryManager`: small shared runtime handle for querying and hot-applying the profile.
+- `current_memory_availability`: the OS physical-memory probe (total + available) — the
+  workspace's RAM owner: `/proc/meminfo` on Linux and Android, `GlobalMemoryStatusEx` on
+  Windows, `sysctlbyname` + mach `host_statistics64` on macOS (no process), `None` elsewhere.
 - `MemoryPressure` / `MemoryBudget`: pressure classification and profile-derived budgets.
 - `CacheResourceInfo` and eviction request/report types: typed policy boundary for cache owners;
   `CacheEvictionReport::append` is the one owner of summing per-owner reports.
@@ -26,10 +29,6 @@ extern crate ms_i18n;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-#[cfg(target_os = "linux")]
-use std::fs::File;
-#[cfg(target_os = "linux")]
-use std::io::{BufRead, BufReader};
 use std::sync::RwLock;
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -242,36 +241,66 @@ pub struct MemoryAvailability {
 /// Reports physical memory availability for pressure/eviction decisions.
 ///
 /// Returns both currently available (reclaimable) memory and total physical
-/// memory. On Linux the values come from `/proc/meminfo` (`MemAvailable` /
-/// `MemTotal`); on macOS from `vm_stat` (free+inactive+speculative pages, an
-/// approximation of reclaimable memory) plus `sysctl -n hw.memsize` (total).
-/// Returns `None` when the underlying source cannot be read or parsed, which the
-/// caller treats as "memory pressure unknown".
+/// memory. On Linux and Android the values come from `/proc/meminfo`
+/// (`MemAvailable` / `MemTotal`); on Windows from `GlobalMemoryStatusEx`
+/// (`ullAvailPhys` / `ullTotalPhys`); on macOS from mach `host_statistics64`
+/// (free+inactive+speculative pages, an approximation of reclaimable memory) plus
+/// `sysctlbyname("hw.memsize")` (total). Returns `None` when the underlying source
+/// cannot be read or parsed (logged), and on every other target, which the caller
+/// treats as "memory pressure unknown". Never spawns a process: a file read, one
+/// Win32 call or a few syscalls.
 #[must_use]
 pub fn current_memory_availability() -> Option<MemoryAvailability> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        read_linux_meminfo_availability()
+        read_proc_meminfo_availability()
+    }
+    #[cfg(windows)]
+    {
+        read_windows_availability()
     }
     #[cfg(target_os = "macos")]
     {
         read_macos_availability()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", windows, target_os = "macos")))]
     {
         None
     }
 }
 
-#[cfg(target_os = "linux")]
-fn read_linux_meminfo_availability() -> Option<MemoryAvailability> {
-    let file = File::open("/proc/meminfo").ok()?;
+/// Path of the kernel memory report on Linux and Android.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const PROC_MEMINFO: &str = "/proc/meminfo";
+
+/// Reads and parses [`PROC_MEMINFO`]. `None` (logged) when the file cannot be read
+/// or lacks `MemTotal` / `MemAvailable` (kernels before 3.14 have no `MemAvailable`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_proc_meminfo_availability() -> Option<MemoryAvailability> {
+    let text = match std::fs::read_to_string(PROC_MEMINFO) {
+        Ok(text) => text,
+        Err(err) => {
+            ms_log::runtime_log::log_warn(format!("[memory] cannot read {PROC_MEMINFO}: {err}"));
+            return None;
+        }
+    };
+    let parsed = parse_meminfo_availability(&text);
+    if parsed.is_none() {
+        ms_log::runtime_log::log_warn(format!("[memory] {PROC_MEMINFO} has no parseable MemTotal / MemAvailable line"));
+    }
+    parsed
+}
+
+/// Parses a `/proc/meminfo` text into total and available bytes. `None` unless both
+/// `MemTotal:` and `MemAvailable:` are present with a numeric kB value. Pure.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn parse_meminfo_availability(text: &str) -> Option<MemoryAvailability> {
     let mut total_kib = None;
     let mut available_kib = None;
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        if let Some(value) = parse_meminfo_kib(&line, "MemTotal:") {
+    for line in text.lines() {
+        if let Some(value) = parse_meminfo_kib(line, "MemTotal:") {
             total_kib = Some(value);
-        } else if let Some(value) = parse_meminfo_kib(&line, "MemAvailable:") {
+        } else if let Some(value) = parse_meminfo_kib(line, "MemAvailable:") {
             available_kib = Some(value);
         }
         if total_kib.is_some() && available_kib.is_some() {
@@ -284,7 +313,8 @@ fn read_linux_meminfo_availability() -> Option<MemoryAvailability> {
     })
 }
 
-#[cfg(target_os = "linux")]
+/// Parses the kB value of one `/proc/meminfo` line that starts with `key`. Pure.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn parse_meminfo_kib(line: &str, key: &str) -> Option<u64> {
     line.strip_prefix(key)?
         .split_whitespace()
@@ -293,156 +323,122 @@ fn parse_meminfo_kib(line: &str, key: &str) -> Option<u64> {
         .ok()
 }
 
-/// TTL for the macOS memory-probe cache. Unlike Linux `/proc/meminfo` (a
-/// microsecond read), each macOS probe fork+execs `sysctl` and `vm_stat` (several
-/// ms each). 750ms is short enough to keep the 1s pressure poll and eviction
-/// decisions responsive, yet long enough to collapse bursts (e.g. per-page cache
-/// promotion) into a single probe per window.
-#[cfg(target_os = "macos")]
-const MACOS_MEM_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(750);
+/// Reads total and available physical memory through `GlobalMemoryStatusEx`.
+/// `None` (logged with the Win32 error) when the call fails.
+#[cfg(windows)]
+fn read_windows_availability() -> Option<MemoryAvailability> {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
-/// Cached macOS physical-memory availability.
-///
-/// Wraps [`probe_macos_availability`] in a short-TTL in-process cache (see
-/// [`MACOS_MEM_CACHE_TTL`]) so rapid successive callers reuse a recent value
-/// instead of each spawning `sysctl`/`vm_stat`. Same return contract as the raw
-/// probe: `None` means "availability unknown". Cache lives ONLY on macOS; the
-/// Linux/Windows paths call their probes directly and are unaffected.
+    let mut status = MEMORYSTATUSEX {
+        // `dwLength` must be the struct size; a fixed-size Win32 struct always fits in u32.
+        dwLength: u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).unwrap_or(u32::MAX),
+        dwMemoryLoad: 0,
+        ullTotalPhys: 0,
+        ullAvailPhys: 0,
+        ullTotalPageFile: 0,
+        ullAvailPageFile: 0,
+        ullTotalVirtual: 0,
+        ullAvailVirtual: 0,
+        ullAvailExtendedVirtual: 0,
+    };
+    // SAFETY: `status` is a writable, properly sized `MEMORYSTATUSEX` with `dwLength` set as
+    // the API requires; the call only writes into it.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok == 0 {
+        // SAFETY: reads the calling thread's last-error value; no preconditions.
+        let error = unsafe { GetLastError() };
+        ms_log::runtime_log::log_warn(format!("[memory] GlobalMemoryStatusEx failed (Win32 error {error})"));
+        return None;
+    }
+    Some(MemoryAvailability { available_bytes: status.ullAvailPhys, total_bytes: status.ullTotalPhys })
+}
+
+/// Reads macOS physical memory without spawning a process: total from
+/// `sysctlbyname("hw.memsize")`, available from mach `host_statistics64(HOST_VM_INFO64)`
+/// page counts times the kernel VM page size (`vm_page_size`), combined by
+/// [`macos_available_bytes`]. `None` (logged) when either call fails, so the caller keeps
+/// treating pressure as unknown instead of acting on a wrong number. A few syscalls: cheap
+/// enough for the 1 s pressure poll without a cache.
 #[cfg(target_os = "macos")]
 fn read_macos_availability() -> Option<MemoryAvailability> {
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Instant;
-
-    // Module-local TTL cache: a justified, bounded exception to the "no global
-    // mutable state" rule (a pure timed cache, not shared logic state). A poisoned
-    // lock falls back to a fresh probe rather than panicking.
-    static CACHE: OnceLock<Mutex<Option<(Instant, Option<MemoryAvailability>)>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Ok(guard) = cache.lock()
-        && let Some((stamped_at, value)) = guard.as_ref()
-        && stamped_at.elapsed() < MACOS_MEM_CACHE_TTL
-    {
-        return *value;
+    let total_bytes = macos_memsize()?;
+    let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: `stats` is writable storage for one `vm_statistics64`, and `count` holds its size in
+    // `integer_t` units as the API requires; the kernel writes at most `count` units.
+    let status = unsafe { libc::host_statistics64(macos_host_port(), libc::HOST_VM_INFO64, stats.as_mut_ptr().cast::<libc::integer_t>(), &mut count) };
+    if status != libc::KERN_SUCCESS {
+        ms_log::runtime_log::log_warn(format!("[memory] host_statistics64(HOST_VM_INFO64) failed (kern_return {status})"));
+        return None;
     }
-    // Probe WITHOUT holding the lock: never fork+exec under a Mutex.
-    let value = probe_macos_availability();
-    if let Ok(mut guard) = cache.lock() {
-        *guard = Some((Instant::now(), value));
-    }
-    value
+    // SAFETY: the call succeeded, so the kernel filled the struct (it was zero-initialized
+    // beforehand, so even a shorter answer leaves only zero fields, all valid integers).
+    let stats = unsafe { stats.assume_init() };
+    // SAFETY: `vm_page_size` is a libsystem global initialized before `main`; reading it has no
+    // side effects.
+    let page_size = u64::try_from(unsafe { libc::vm_page_size }).ok()?;
+    let available_bytes = macos_available_bytes(
+        u64::from(stats.free_count),
+        u64::from(stats.inactive_count),
+        u64::from(stats.speculative_count),
+        page_size,
+    )?;
+    Some(MemoryAvailability { available_bytes, total_bytes })
 }
 
-/// Reads macOS physical memory availability via `vm_stat` (available) and
-/// `sysctl -n hw.memsize` (total). Returns `None` if either short command fails
-/// or its output cannot be parsed, so the caller keeps treating pressure as
-/// unknown instead of acting on a wrong number.
-///
-/// This is the raw (uncached) probe; callers go through
-/// [`read_macos_availability`], which caches the result for a short TTL.
+/// The host port for `host_statistics64`, obtained once per process: every
+/// `mach_host_self()` call adds a user reference to the send right, so calling it on each
+/// 1 s poll would grow the reference count without bound (libc has no
+/// `mach_port_deallocate` to drop it).
 #[cfg(target_os = "macos")]
-fn probe_macos_availability() -> Option<MemoryAvailability> {
-    use std::process::Command;
+fn macos_host_port() -> libc::mach_port_t {
+    static HOST_PORT: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+    // libc deprecates its mach bindings in favour of the `mach2` crate; the workspace adds no
+    // crate for one call, and the symbol itself is a stable part of libsystem.
+    #[expect(deprecated, reason = "libc points to the mach2 crate; one stable libsystem call does not justify a new dependency")]
+    // SAFETY: `mach_host_self` has no preconditions and returns a send right to the host port.
+    let fetch = || unsafe { libc::mach_host_self() };
+    *HOST_PORT.get_or_init(fetch)
+}
 
-    // Total physical memory: `hw.memsize` is the authoritative byte count.
-    let memsize_out = Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok()?;
-    if !memsize_out.status.success() {
-        ms_log::runtime_log::log_warn("[memory] `sysctl -n hw.memsize` exited with failure status");
+/// Total physical memory from `sysctlbyname("hw.memsize")` (a 64-bit byte count); `None`
+/// (logged) when the call fails.
+#[cfg(target_os = "macos")]
+fn macos_memsize() -> Option<u64> {
+    let mut value: u64 = 0;
+    let mut len: libc::size_t = std::mem::size_of::<u64>();
+    // SAFETY: the name is a NUL-terminated literal; `value` is writable for `len` bytes and
+    // `len` holds that size; no new value is written (null `newp`, length 0).
+    let rc = unsafe { libc::sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut value).cast(), &mut len, std::ptr::null_mut(), 0) };
+    if rc != 0 || len != std::mem::size_of::<u64>() || value == 0 {
+        ms_log::runtime_log::log_warn(format!("[memory] sysctl hw.memsize failed ({}; len {len})", std::io::Error::last_os_error()));
         return None;
     }
-    let total_bytes = parse_macos_sysctl_u64(&String::from_utf8_lossy(&memsize_out.stdout))?;
-
-    // Available (reclaimable) memory: approximated from `vm_stat` page counts.
-    let vm_out = Command::new("vm_stat").output().ok()?;
-    if !vm_out.status.success() {
-        ms_log::runtime_log::log_warn("[memory] `vm_stat` exited with failure status");
-        return None;
-    }
-    let available_bytes = parse_vm_stat_available_bytes(&String::from_utf8_lossy(&vm_out.stdout))?;
-
-    Some(MemoryAvailability {
-        available_bytes,
-        total_bytes,
-    })
+    Some(value)
 }
 
-/// Parses the single-number output of `sysctl -n <key>` into `u64`.
-/// Returns `None` on empty/garbled output.
-#[cfg(any(target_os = "macos", test))]
-fn parse_macos_sysctl_u64(text: &str) -> Option<u64> {
-    text.trim().parse::<u64>().ok()
-}
-
-/// Extracts the page size in bytes from the `vm_stat` header line, which ends
-/// with "(page size of N bytes)". Returns `None` if the marker is absent or the
-/// number cannot be parsed.
-#[cfg(any(target_os = "macos", test))]
-fn parse_vm_stat_page_size(line: &str) -> Option<u64> {
-    line.split("page size of")
-        .nth(1)?
-        .split_whitespace()
-        .next()?
-        .parse::<u64>()
-        .ok()
-}
-
-/// Parses a `vm_stat` "Pages <name>:" row into its page count, stripping the
-/// trailing '.' that `vm_stat` appends to every count. Returns `None` when the
-/// prefix does not match or the number cannot be parsed.
-#[cfg(any(target_os = "macos", test))]
-fn parse_vm_stat_pages(line: &str, key: &str) -> Option<u64> {
-    line.strip_prefix(key)?
-        .trim()
-        .trim_end_matches('.')
-        .parse::<u64>()
-        .ok()
-}
-
-/// Approximates macOS available memory from `vm_stat` output.
+/// Approximates macOS available memory from mach VM page counts.
 ///
 /// macOS exposes no single "available memory" counter, so this mirrors the
 /// meaning of Linux `MemAvailable` (reclaimable memory) by summing the pages that
 /// can be reclaimed under pressure: free + inactive + speculative, multiplied by
-/// the page size from the `vm_stat` header. Wired/active/compressed pages are
-/// excluded because they are not readily reclaimable.
+/// the VM page size (what `vm_stat` reports as free / inactive / speculative). Wired /
+/// active / compressed pages are excluded because they are not readily reclaimable.
 ///
 /// Uses checked arithmetic; on the (physically unreachable) overflow it logs a
-/// warning and returns `None`. Returns `None` if the page size or any required
-/// page count is missing or unparseable, so the caller keeps pressure "unknown".
+/// warning and returns `None`, as it does for a zero page size. Pure otherwise.
 #[cfg(any(target_os = "macos", test))]
-fn parse_vm_stat_available_bytes(text: &str) -> Option<u64> {
-    let mut page_size: Option<u64> = None;
-    let mut free: Option<u64> = None;
-    let mut inactive: Option<u64> = None;
-    let mut speculative: Option<u64> = None;
-
-    for raw in text.lines() {
-        let line = raw.trim();
-        if page_size.is_none()
-            && let Some(size) = parse_vm_stat_page_size(line)
-        {
-            page_size = Some(size);
-        }
-        if let Some(v) = parse_vm_stat_pages(line, "Pages free:") {
-            free = Some(v);
-        } else if let Some(v) = parse_vm_stat_pages(line, "Pages inactive:") {
-            inactive = Some(v);
-        } else if let Some(v) = parse_vm_stat_pages(line, "Pages speculative:") {
-            speculative = Some(v);
-        }
+fn macos_available_bytes(free: u64, inactive: u64, speculative: u64, page_size: u64) -> Option<u64> {
+    if page_size == 0 {
+        ms_log::runtime_log::log_warn("[memory] macOS VM page size is 0; reporting unknown");
+        return None;
     }
-
-    let page_size = page_size?;
-    // free + inactive + speculative ≈ pages reclaimable under memory pressure.
-    let pages = free?.checked_add(inactive?)?.checked_add(speculative?)?;
-    match pages.checked_mul(page_size) {
-        Some(bytes) => Some(bytes),
-        None => {
-            ms_log::runtime_log::log_warn(
-                "[memory] vm_stat page count * page size overflowed u64; reporting unknown",
-            );
-            None
-        }
+    let bytes = free.checked_add(inactive).and_then(|pages| pages.checked_add(speculative)).and_then(|pages| pages.checked_mul(page_size));
+    if bytes.is_none() {
+        ms_log::runtime_log::log_warn("[memory] macOS page count * page size overflowed u64; reporting unknown");
     }
+    bytes
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -879,7 +875,6 @@ mod tests {
         assert_eq!(ids, vec!["outside"]);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn parses_linux_meminfo_kib_values() {
         assert_eq!(
@@ -889,53 +884,39 @@ mod tests {
         assert_eq!(parse_meminfo_kib("SwapFree: 1 kB", "MemAvailable:"), None);
     }
 
-    /// Realistic `vm_stat` capture (16 KiB pages). The parser must strip the
-    /// trailing '.', read the page size from the header, and sum
-    /// free+inactive+speculative pages.
-    const VM_STAT_SAMPLE: &str = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
-Pages free:                               10000.\n\
-Pages active:                            234567.\n\
-Pages inactive:                            5000.\n\
-Pages speculative:                         2000.\n\
-Pages throttled:                              0.\n\
-Pages wired down:                        333333.\n\
-Pages purgeable:                          44444.\n\
-\"Translation faults\":                1234567890.\n\
-Pages copy-on-write:                   12345678.\n";
+    /// Head of a real `/proc/meminfo` (Linux and Android share the format).
+    const MEMINFO_SAMPLE: &str = "MemTotal:       65536000 kB\n\
+MemFree:         1000000 kB\n\
+MemAvailable:   32768000 kB\n\
+Buffers:          123456 kB\n";
 
     #[test]
-    fn parses_macos_vm_stat_available_bytes() {
-        // (10000 free + 5000 inactive + 2000 speculative) * 16384 = 278_528_000.
+    fn parses_proc_meminfo_total_and_available() {
         assert_eq!(
-            parse_vm_stat_available_bytes(VM_STAT_SAMPLE),
-            Some(17_000 * 16_384)
+            parse_meminfo_availability(MEMINFO_SAMPLE),
+            Some(MemoryAvailability { available_bytes: 32_768_000 * 1024, total_bytes: 65_536_000 * 1024 })
         );
     }
 
     #[test]
-    fn macos_vm_stat_page_size_parsed_from_header() {
-        assert_eq!(
-            parse_vm_stat_page_size("Mach Virtual Memory Statistics: (page size of 4096 bytes)"),
-            Some(4096)
-        );
-        assert_eq!(parse_vm_stat_page_size("Pages free: 1."), None);
+    fn proc_meminfo_without_mem_available_is_unknown() {
+        // Kernels before 3.14 report no MemAvailable: unknown, never "0 free".
+        assert_eq!(parse_meminfo_availability("MemTotal: 1024 kB\nMemFree: 512 kB\n"), None);
+        assert_eq!(parse_meminfo_availability(""), None);
+        assert_eq!(parse_meminfo_availability("MemTotal: abc kB\nMemAvailable: 1 kB\n"), None);
     }
 
     #[test]
-    fn macos_vm_stat_bad_input_returns_none() {
-        // Missing header/page size and missing required rows must not panic.
-        assert_eq!(parse_vm_stat_available_bytes(""), None);
-        assert_eq!(
-            parse_vm_stat_available_bytes("Pages free: 10.\nPages inactive: 5.\n"),
-            None,
-            "no page-size header => unknown"
-        );
+    fn macos_available_is_free_inactive_speculative_pages() {
+        // (10000 free + 5000 inactive + 2000 speculative) * 16 KiB pages.
+        assert_eq!(macos_available_bytes(10_000, 5_000, 2_000, 16_384), Some(17_000 * 16_384));
+        assert_eq!(macos_available_bytes(0, 0, 0, 4_096), Some(0));
     }
 
     #[test]
-    fn parses_macos_sysctl_memsize() {
-        assert_eq!(parse_macos_sysctl_u64("  17179869184\n"), Some(17_179_869_184));
-        assert_eq!(parse_macos_sysctl_u64("garbage"), None);
-        assert_eq!(parse_macos_sysctl_u64(""), None);
+    fn macos_available_rejects_zero_page_size_and_overflow() {
+        assert_eq!(macos_available_bytes(1, 1, 1, 0), None);
+        assert_eq!(macos_available_bytes(u64::MAX, 1, 0, 4_096), None);
+        assert_eq!(macos_available_bytes(u64::MAX / 2, 0, 0, 4_096), None);
     }
 }

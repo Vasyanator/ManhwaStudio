@@ -22,7 +22,7 @@ use eframe::egui;
 use ms_config::torch_choice::{GfxArch, TorchFlavour};
 use ms_widgets::WheelComboBox;
 
-use super::catalog::{rocm_download_estimate, rocm_option_label};
+use super::catalog::{rocm_download_estimate, rocm_gfx_is_experimental, rocm_option_label};
 use super::{TorchChoicePrompt, TorchInstallSelection, TorchOs, TorchWheelOption, download_size_text};
 
 /// Which row of the choice is selected.
@@ -189,12 +189,6 @@ impl TorchChoiceState {
     }
 }
 
-/// Whether `gfx` belongs to the RDNA1 / RDNA2 generation (`gfx10*`), whose ROCm PyTorch
-/// support AMD ships as experimental.
-fn is_experimental_gfx(gfx: &GfxArch) -> bool {
-    gfx.as_str().starts_with("gfx10")
-}
-
 /// Draws the PyTorch choice of `state` and returns the selection on the frame the confirm
 /// button (captioned `confirm_label`) is clicked, `None` otherwise.
 ///
@@ -264,7 +258,7 @@ fn draw_option_row(ui: &mut egui::Ui, state: &mut TorchChoiceState, index: usize
             })
             .collect();
         let mut picked = pick.selected;
-        let experimental = is_experimental_gfx(pick.gfx());
+        let experimental = rocm_gfx_is_experimental(pick.gfx());
         ui.horizontal(|ui| {
             ui.label(t!("installer.torch.gfx_picker_label"));
             let response = WheelComboBox::from_id_salt("installer.torch.gfx_picker_label").show_index(
@@ -387,13 +381,5 @@ mod tests {
         state.set_rocm_choice(7, 0);
         state.select_option(7);
         assert_eq!(rocm_gfx(&state.selection()), Some("gfx1201"));
-    }
-
-    #[test]
-    fn experimental_is_exactly_gfx10() {
-        assert!(is_experimental_gfx(&gfx("gfx1030")));
-        assert!(is_experimental_gfx(&gfx("gfx1012")));
-        assert!(!is_experimental_gfx(&gfx("gfx1100")));
-        assert!(!is_experimental_gfx(&gfx("gfx90a")));
     }
 }

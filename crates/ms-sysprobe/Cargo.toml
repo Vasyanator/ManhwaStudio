@@ -31,6 +31,9 @@ serde_json.workspace = true
 sha2.workspace = true
 # Typed public error of `ai_models::external` (`ExternalModelError`).
 thiserror.workspace = true
+# `system_facts` reports physical memory through the workspace's one RAM probe
+# (`current_memory_availability`) instead of probing it a second time.
+ms-memory = { path = "../ms-memory" }
 # Platform seams: the system clipboard behind `paste_image`, the capability table
 # (`PlatformFeature`) that decides which host probes and stores exist on this target, and
 # the Android credential store of the Hugging Face token (`credentials`).
@@ -50,12 +53,19 @@ ms-download = { path = "../ms-download" }
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
 keyring.workspace = true
 
+# `system_facts` reads macOS facts through `sysctlbyname` and Android system properties through
+# `__system_property_get`, both without a process.
+[target.'cfg(any(target_os = "macos", target_os = "android"))'.dependencies]
+libc.workspace = true
+
 # Windows GDI screen capture, the Job Object that kills spawned Python children with the
 # parent process, and the AMD adapter probe (`amd_adapters`: SetupAPI display-class
 # enumeration -> `Win32_Devices_DeviceAndDriverInstallation`; the driver key's
-# `DriverVersion` -> `Win32_System_Registry`). Feature list is exactly what these modules use.
+# `DriverVersion` / memory size and `system_facts`' OS and CPU keys -> `Win32_System_Registry`),
+# and `system_facts`' physical core count (`GetLogicalProcessorInformationEx` ->
+# `Win32_System_SystemInformation`). Feature list is exactly what these modules use.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Devices_DeviceAndDriverInstallation", "Win32_System_Registry"] }
+windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Devices_DeviceAndDriverInstallation", "Win32_System_Registry", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 # Unique, self-removing scratch directories for the `ai_models::external` download tests.

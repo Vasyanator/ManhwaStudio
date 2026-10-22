@@ -11,6 +11,7 @@ Key items:
   (one index for Windows and Linux; the GPU kernels come from the `[device-gfxN]` extra).
 - `rocm_device_extras()`: the architectures AMD publishes device wheels for, per OS
   (`TorchOs::current()` selects this machine's list).
+- `rocm_gfx_is_experimental()`: the gfx10 (RDNA1 / RDNA2) "experimental support" rule (public).
 - `rocm_download_estimate()`: measured compressed download size of the ROCm set per arch.
 - `MIN_WINDOWS_DRIVER` / `MIN_WINDOWS_DRIVER_ADRENALIN`: the AMD Windows driver ROCm needs.
 - `cpu_torch_specs()`, `rocm_torch_specs()`: the exact requirement specs.
@@ -92,6 +93,14 @@ pub(crate) fn rocm_device_extras(os: TorchOs) -> &'static [&'static str] {
         TorchOs::Windows => ROCM_DEVICE_EXTRAS_WINDOWS,
         TorchOs::Linux => ROCM_DEVICE_EXTRAS_LINUX,
     }
+}
+
+/// Whether AMD ships ROCm PyTorch support for `gfx` as experimental: exactly the RDNA1 / RDNA2
+/// generation (`gfx10*`). The one owner of this rule; the choice widget warns with it and the
+/// launcher's system-information tab reports it.
+#[must_use]
+pub fn rocm_gfx_is_experimental(gfx: &GfxArch) -> bool {
+    gfx.as_str().starts_with("gfx10")
 }
 
 /// Approximate compressed download of the ROCm set for `gfx` on `os`, in bytes.

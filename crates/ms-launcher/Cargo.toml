@@ -44,8 +44,9 @@ ms-theme = { path = "../ms-theme" }
 # `SharedSettingsPanels`, the first-run modal reuses the locale helpers of the General
 # pane, and the launcher drives the same `AiBackendHandle` supervisor.
 ms-settings-ui = { path = "../ms-settings-ui" }
-# Host probes: GPU list, app-local Python discovery (settings page console), desktop
-# region capture (new-project screenshot source), clipboard paste and the AI install probe.
+# Host probes: the System info tab's hardware fact sheet (`system_facts`), app-local Python
+# discovery (settings page console), desktop region capture (new-project screenshot source),
+# clipboard paste and the AI install probe.
 ms-sysprobe = { path = "../ms-sysprobe" }
 # Framed IPC with the Python AI backend: reline and the advanced download / batch nodes
 # call backend methods directly.
@@ -117,6 +118,11 @@ libloading.workspace = true
 ms-download = { path = "../ms-download" }
 # The system UI-locale probe that preselects a language in the first-run modal.
 sys-locale.workspace = true
+# The System info tab (`pages/system_info/`): the native ONNX runtime's hardware facts and
+# effective build selection (`ms-native-runtime`) and the build catalog's display labels
+# (`ms-onnx-runtime`). Both sit below `ms-settings-ui`; native only, like the runtime itself.
+ms-native-runtime = { path = "../ms-native-runtime" }
+ms-onnx-runtime = { path = "../ms-onnx-runtime" }
 
 [dev-dependencies]
 # Isolated on-disk fixtures for the catalogue/import tests.

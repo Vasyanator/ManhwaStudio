@@ -26,6 +26,11 @@ Main modules:
   preconditions (`check_backend_spawnable`).
 - `onnx_caps` (native-only): the probed ONNX capabilities (`OnnxCaps`, `probe_onnx_caps`) and
   the EP device-id rule (`ep_device_ids`) the AI pane and inspection callers share.
+- `native_builds` (native-only): every native ONNX build's verdict on this machine
+  (`NativeBuildAvailability` over `ms_native_runtime::native_build_fallback_reason`), the build
+  picker's groups and labels, and `native_fallback_reason_text`.
+- `torch_build_text`: the localized texts of the backend's PyTorch build report
+  (`torch_build_summary`, `torch_build_line`, `torch_build_kernel_warning`, …).
 - `settings_warnings`: the per-setting warnings of the shared panes — keys, reasons and
   aggregation (`WarningSet`), the checks worker (`SettingsWarnings`) and the "!" badge.
 - `tutorial` (feature-gated): the onboarding overlay engine, the per-surface controller,
@@ -50,6 +55,10 @@ pub mod large_models_panel;
 pub mod general_settings_panel;
 // Process-wide count of background `user_config` writes, waited for at process exit.
 pub mod pending_config_writes;
+// Native ONNX build catalog verdicts on this machine (availability, picker groups, labels,
+// fallback-reason wording), over the native runtime's rule (native-only).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod native_builds;
 // Probed ONNX capabilities and the device-id rule over them (native-only probes).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod onnx_caps;
@@ -61,6 +70,8 @@ pub mod settings_warnings;
 // General pane's switch share it) and the pane row that drives it.
 pub mod storage_mode_job;
 pub mod storage_mode_setting;
+// Localized texts of the backend's PyTorch build report (AI pane + launcher system info).
+pub mod torch_build_text;
 
 // The onboarding tutorial subsystem, behind the `tutorial` feature exactly as in the
 // binary (off by default: the controller and its `mark` sites stay compiled but inert,

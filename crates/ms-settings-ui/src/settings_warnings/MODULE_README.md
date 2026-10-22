@@ -65,7 +65,10 @@ GUI frame: poll() -> WarningSet -> item_warning_badge / section_level / overall_
   `ms_os_integration::report::badge_worthy` / `Defect::severity`; actionable record:
   `ms_os_integration::actions::allowed_actions`;
   spawnability: `check_backend_spawnable`; catalog loading: `locale_store::probe_disk_catalog`;
-  severity: `WarningReason::level`. Never add a second copy of any of them here.
+  severity: `WarningReason::level`; native reason -> `FallbackCause`: `From<NativeFallbackReason>`
+  in `../native_builds.rs`. Never add a second copy of any of them here. `FallbackCause::label`
+  is the one owner of the fallback-reason wording (`native_builds::native_fallback_reason_text`
+  exposes it to the launcher).
 - **Never pin the native selection.** The worker must not call `native_load_scope_key()` or
   anything that initializes the process selection cache; it uses the uncached
   `evaluate_native_selection` and the side-effect-free `next_load_scope_key()`.

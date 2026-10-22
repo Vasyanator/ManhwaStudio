@@ -8,7 +8,7 @@ Main responsibilities:
 - render the Rust launcher settings card in the same shell/theme as other pages;
 - split launcher settings into tabs (a vertical sidebar) without blocking the fullscreen page shell;
 - edit and persist the projects root stored in `user_config.json`;
-- show system CPU/RAM/core and accelerator information from a background probe;
+- host the System info tab (`system_info/`, native only: hardware facts and AI acceleration);
 - probe AI Python packages through the shared startup/settings probe path;
 - reconcile `General.ai_install_type` to `Full` when PyTorch is actually importable;
 - run the launcher-side PyTorch/full-dependency upgrade flow through installer backend helpers
@@ -27,9 +27,10 @@ background worker threads so the launcher UI never blocks on shell I/O.
 The tab set, ordering, tab labels, and the shared General/AiBackend/Tutorials sections come from the
 shared section registry (`ms_settings_ui::settings_shared`): `active_tab` is a `SettingsSectionId`, the tab
 sidebar iterates `sections_for(SettingsSurface::Launcher)`, and the shared panels are owned as one
-`SharedSettingsPanels`. The launcher-exclusive sections (SystemInfo/AiComputations/TorchUpgrade/
-PythonEnvironment) keep their local renderers here; the dynamic TorchUpgrade hide/relabel logic is
-applied inline in the sidebar.
+`SharedSettingsPanels`. The launcher-exclusive sections (AiComputations/TorchUpgrade/
+PythonEnvironment) keep their local renderers here; SystemInfo is drawn by `system_info/`
+(`SystemInfoState`, owned here); the dynamic TorchUpgrade hide/relabel logic is applied inline
+in the sidebar.
 
 Layout: under the title the card is split into two explicit child rects — the vertical tab
 sidebar on the left (`show_sidebar`, width `sidebar_width`: a clamped sixth of the card) and the
@@ -51,17 +52,6 @@ use ms_sysprobe::ai_install_probe::{
     spawn_ai_computations_probe,
 };
 use ms_config as config;
-// GPU/system diagnostics types + probes. `gpu_utils` compiles on wasm with the
-// command primitive stubbed, so on web the system-information tab renders and
-// simply reports "nothing detected"; the import is target-neutral.
-use ms_sysprobe::gpu_utils::{
-    DirectMlAccelerator, GpuArchitecture, LinuxDriverStatus, RocmInstallationStatus,
-    RocmSupportValidation, RuntimeVersion, detect_amd_gpu, detect_amd_gpu_architectures_linux,
-    detect_apple_gpu, detect_cuda_runtime_version, detect_directml_accelerators_windows,
-    detect_nvidia_compute_capability, detect_nvidia_gpu, detect_nvidia_gpu_architecture,
-    detect_rocm_installation_linux, detect_rocm_runtime_version, linux_driver_status,
-    rocm_7_2_supported_llvm_targets, validate_rocm_7_2_support_linux,
-};
 // Installer types/helpers drive the native PyTorch/full-dependency upgrade
 // flow. The installer subsystem is desktop-only, so these are gated to native;
 // on web the whole Torch-upgrade tab is a stub.
@@ -76,6 +66,8 @@ use crate::pages::base::{self, PageNavAction};
 use crate::state::LauncherHost;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 use crate::pages::system_registration::SystemRegistrationState;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::pages::system_info::SystemInfoState;
 use crate::theme;
 use ms_settings_ui::settings_shared::{
     SettingsSectionId, SettingsSurface, SharedSettingsPanels, sections_for, title_key,
@@ -106,10 +98,6 @@ use ms_platform::file_dialog::PendingDialog;
 #[cfg(not(target_arch = "wasm32"))]
 use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, SaveTarget};
 use serde_json::Value;
-#[cfg(target_os = "linux")]
-use std::collections::HashSet;
-#[cfg(target_os = "linux")]
-use std::fs;
 // I/O traits used only by the native Python-environment console threads.
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -210,7 +198,9 @@ pub struct SettingsPageState {
     #[cfg(not(target_arch = "wasm32"))]
     python_console: PythonConsoleState,
     ai_probe: AiComputationsProbeState,
-    system_info_probe: SystemInfoProbeState,
+    /// The System info tab (native only: its probes and runtimes do not exist on web).
+    #[cfg(not(target_arch = "wasm32"))]
+    system_info: SystemInfoState,
     ai_install_type: config::AiInstallType,
     // Native PyTorch upgrade flow driven by the desktop installer.
     #[cfg(not(target_arch = "wasm32"))]
@@ -270,12 +260,6 @@ struct AiComputationsProbeState {
     rx: Option<Receiver<Result<AiComputationsReport, String>>>,
 }
 
-#[derive(Debug, Default)]
-struct SystemInfoProbeState {
-    status: SystemInfoStatus,
-    rx: Option<Receiver<Result<SystemInfoReport, String>>>,
-}
-
 // Torch-upgrade state carries installer events; the installer subsystem is
 // desktop-only, so this and its status enum are compiled out on wasm.
 #[cfg(not(target_arch = "wasm32"))]
@@ -300,15 +284,6 @@ enum AiProbeStatus {
     Error(String),
 }
 
-#[derive(Debug, Default)]
-enum SystemInfoStatus {
-    #[default]
-    Idle,
-    Running,
-    Ready(Box<SystemInfoReport>),
-    Error(String),
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Default, Clone)]
 enum TorchUpgradeStatus {
@@ -320,41 +295,6 @@ enum TorchUpgradeStatus {
     Running,
     Completed,
     Error(String),
-}
-
-#[derive(Debug, Clone)]
-struct SystemInfoReport {
-    cpu: CpuInfoReport,
-    memory: MemoryInfoReport,
-    gpu: GpuInfoReport,
-}
-
-#[derive(Debug, Clone)]
-struct CpuInfoReport {
-    name: String,
-    physical_cores: Option<usize>,
-    logical_cores: usize,
-}
-
-#[derive(Debug, Clone)]
-struct MemoryInfoReport {
-    total_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone)]
-struct GpuInfoReport {
-    nvidia_detected: bool,
-    amd_detected: bool,
-    cuda_version: Option<RuntimeVersion>,
-    nvidia_compute_capability: Option<RuntimeVersion>,
-    nvidia_architecture: Option<GpuArchitecture>,
-    rocm_version: Option<RuntimeVersion>,
-    linux_driver_status: Option<LinuxDriverStatus>,
-    rocm_installation: Option<RocmInstallationStatus>,
-    amd_architectures: Vec<GpuArchitecture>,
-    rocm_validation: Option<RocmSupportValidation>,
-    directml_accelerators: Vec<DirectMlAccelerator>,
-    apple_gpu: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -385,7 +325,8 @@ impl SettingsPageState {
             #[cfg(not(target_arch = "wasm32"))]
             python_console: PythonConsoleState::default(),
             ai_probe: AiComputationsProbeState::default(),
-            system_info_probe: SystemInfoProbeState::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            system_info: SystemInfoState::default(),
             ai_install_type,
             #[cfg(not(target_arch = "wasm32"))]
             torch_upgrade: TorchUpgradeState::default(),
@@ -586,7 +527,12 @@ impl SettingsPageState {
                                 // already persisted by the shared widget, so
                                 // `outcome.memory_profile_changed` is intentionally ignored.
                             }
-                            SettingsSectionId::SystemInfo => self.show_system_info_tab(ui),
+                            #[cfg(not(target_arch = "wasm32"))]
+                            SettingsSectionId::SystemInfo => self.system_info.show(ui, &self.ai_backend),
+                            #[cfg(target_arch = "wasm32")]
+                            SettingsSectionId::SystemInfo => {
+                                ui.label(theme::status(t!("launcher.settings.system_info.web_unsupported_status"), theme::TEXT_MUTED));
+                            }
                             SettingsSectionId::AiComputations => {
                                 if let Some(tab_action) = self.show_ai_computations_tab(ui) {
                                     action = Some(tab_action);
@@ -963,231 +909,6 @@ impl SettingsPageState {
     #[cfg(target_arch = "wasm32")]
     fn save_log_file(&mut self, _kind: LogKind, _ctx: &egui::Context) {
         runtime_log::log_error("Сохранение лога недоступно в веб-версии.".to_string());
-    }
-
-    fn show_system_info_tab(&mut self, ui: &mut Ui) {
-        self.ensure_system_info_probe_started(ui);
-        self.poll_system_info_probe(ui);
-
-        ui.horizontal(|ui| {
-            ui.label(theme::status(
-                t!("launcher.settings.system_info_collecting"),
-                theme::TEXT_MUTED,
-            ));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let enabled = !matches!(self.system_info_probe.status, SystemInfoStatus::Running);
-                if theme::launcher_button(ui, t!("launcher.common.refresh_button"), Vec2::new(112.0, 34.0), enabled).clicked()
-                {
-                    self.start_system_info_probe(ui);
-                }
-            });
-        });
-
-        ui.add_space(12.0);
-        match &self.system_info_probe.status {
-            SystemInfoStatus::Idle | SystemInfoStatus::Running => {
-                self.show_system_info_placeholder(ui);
-            }
-            SystemInfoStatus::Ready(report) => self.show_system_info_report(ui, report),
-            SystemInfoStatus::Error(message) => {
-                ui.label(theme::status(message, STATUS_ERROR));
-            }
-        }
-    }
-
-    fn ensure_system_info_probe_started(&mut self, ui: &Ui) {
-        if matches!(self.system_info_probe.status, SystemInfoStatus::Idle) {
-            self.start_system_info_probe(ui);
-        }
-    }
-
-    fn start_system_info_probe(&mut self, ui: &Ui) {
-        self.system_info_probe.status = SystemInfoStatus::Running;
-        self.system_info_probe.rx = Some(spawn_system_info_probe());
-        ui.ctx().request_repaint();
-    }
-
-    fn poll_system_info_probe(&mut self, ui: &Ui) {
-        let Some(rx) = self.system_info_probe.rx.take() else {
-            return;
-        };
-
-        match rx.try_recv() {
-            Ok(Ok(report)) => {
-                self.system_info_probe.status = SystemInfoStatus::Ready(Box::new(report));
-                ui.ctx().request_repaint();
-            }
-            Ok(Err(err)) => {
-                runtime_log::log_error(format!(
-                    "[launcher-settings] system info probe failed: {err}"
-                ));
-                self.system_info_probe.status = SystemInfoStatus::Error(err);
-                ui.ctx().request_repaint();
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                self.system_info_probe.rx = Some(rx);
-                ui.ctx().request_repaint();
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.system_info_probe.status = SystemInfoStatus::Error(
-                    t!("launcher.settings.system_info_no_response").to_string(),
-                );
-                ui.ctx().request_repaint();
-            }
-        }
-    }
-
-    fn show_system_info_placeholder(&self, ui: &mut Ui) {
-        self.show_info_card(ui, t!("launcher.settings.cpu_memory_label"), |ui| {
-            self.show_info_row(ui, t!("launcher.settings.status_label"), t!("launcher.settings.checking_status"));
-        });
-        ui.add_space(10.0);
-        self.show_info_card(ui, t!("launcher.settings.video_accelerators_label"), |ui| {
-            self.show_info_row(ui, t!("launcher.settings.status_label"), t!("launcher.settings.checking_status"));
-        });
-    }
-
-    fn show_system_info_report(&self, ui: &mut Ui, report: &SystemInfoReport) {
-        self.show_info_card(ui, t!("launcher.settings.cpu_memory_label"), |ui| {
-            self.show_info_row(ui, "CPU", &report.cpu.name);
-            self.show_info_row(
-                ui,
-                t!("launcher.settings.cores_label"),
-                &format_core_count(report.cpu.physical_cores, report.cpu.logical_cores),
-            );
-            self.show_info_row(ui, "RAM", &format_memory_total(report.memory.total_bytes));
-        });
-
-        ui.add_space(10.0);
-        self.show_info_card(ui, t!("launcher.settings.video_accelerators_label"), |ui| {
-            if let Some(apple) = &report.gpu.apple_gpu {
-                self.show_info_row(ui, "Apple GPU (Metal)", apple);
-                ui.add_space(8.0);
-            }
-            self.show_info_row(
-                ui,
-                "NVIDIA",
-                if report.gpu.nvidia_detected {
-                    t!("launcher.settings.detected_female")
-                } else {
-                    t!("launcher.settings.not_detected_female")
-                },
-            );
-            self.show_info_row(
-                ui,
-                "CUDA",
-                &report
-                    .gpu
-                    .cuda_version
-                    .map(|version| version.to_string())
-                    .unwrap_or_else(|| t!("launcher.settings.not_detected_female").to_string()),
-            );
-            self.show_info_row(
-                ui,
-                "NVIDIA SM",
-                &report
-                    .gpu
-                    .nvidia_compute_capability
-                    .map(|version| version.to_string())
-                    .unwrap_or_else(|| t!("launcher.settings.not_determined_male").to_string()),
-            );
-            if let Some(architecture) = &report.gpu.nvidia_architecture {
-                self.show_info_row(
-                    ui,
-                    t!("launcher.settings.nvidia_arch_label"),
-                    &format_gpu_architecture(architecture),
-                );
-            }
-
-            ui.add_space(8.0);
-            self.show_info_row(
-                ui,
-                "AMD",
-                if report.gpu.amd_detected {
-                    t!("launcher.settings.detected_female")
-                } else {
-                    t!("launcher.settings.not_detected_female")
-                },
-            );
-            self.show_info_row(
-                ui,
-                "ROCm",
-                &report
-                    .gpu
-                    .rocm_version
-                    .map(|version| version.to_string())
-                    .unwrap_or_else(|| t!("launcher.settings.not_detected_masc").to_string()),
-            );
-            if let Some(installation) = &report.gpu.rocm_installation {
-                self.show_info_row(
-                    ui,
-                    t!("launcher.settings.rocm_in_system_label"),
-                    if installation.present {
-                        t!("launcher.settings.found_masc")
-                    } else {
-                        t!("launcher.settings.not_found_masc")
-                    },
-                );
-            }
-            if let Some(driver) = &report.gpu.linux_driver_status {
-                self.show_info_row(ui, "amdgpu", bool_status(driver.amdgpu_loaded));
-                self.show_info_row(ui, "/dev/kfd", bool_status(driver.kfd_available));
-            }
-            self.show_info_row(
-                ui,
-                t!("launcher.settings.amd_arch_label"),
-                &format_architecture_list(&report.gpu.amd_architectures),
-            );
-            self.show_info_row(
-                ui,
-                "ROCm 7.2 targets",
-                &rocm_7_2_supported_llvm_targets().join(", "),
-            );
-            if let Some(validation) = &report.gpu.rocm_validation {
-                let text = if validation.supported {
-                    tf!("launcher.settings.supported_status", validation = validation.reason)
-                } else {
-                    tf!("launcher.settings.not_confirmed_status", validation = validation.reason)
-                };
-                self.show_info_row(ui, "ROCm 7.2", &text);
-            }
-
-            ui.add_space(8.0);
-            self.show_info_row(
-                ui,
-                "DirectML",
-                &format_directml_accelerators(&report.gpu.directml_accelerators),
-            );
-        });
-    }
-
-    fn show_info_card(&self, ui: &mut Ui, title: &str, body: impl FnOnce(&mut Ui)) {
-        Frame::new()
-            .fill(Color32::from_rgba_premultiplied(12, 12, 16, 168))
-            .stroke(Stroke::new(1.0, theme::BUTTON_STROKE))
-            .corner_radius(CornerRadius::same(12))
-            .inner_margin(egui::Margin::same(14))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new(title)
-                        .size(18.0)
-                        .strong()
-                        .color(theme::TEXT_MAIN),
-                );
-                ui.add_space(8.0);
-                body(ui);
-            });
-    }
-
-    fn show_info_row(&self, ui: &mut Ui, label: &str, value: &str) {
-        ui.horizontal_wrapped(|ui| {
-            ui.set_min_height(24.0);
-            ui.add_sized(
-                [170.0, 20.0],
-                egui::Label::new(theme::status(label, theme::TEXT_MUTED)),
-            );
-            ui.label(theme::status(value, theme::TEXT_MAIN));
-        });
     }
 
     fn show_ai_computations_tab(&mut self, ui: &mut Ui) -> Option<PageNavAction> {
@@ -2090,344 +1811,6 @@ fn update_ai_install_type_from_probe(
         return None;
     }
     Some(config::AiInstallType::Full)
-}
-
-fn spawn_system_info_probe() -> Receiver<Result<SystemInfoReport, String>> {
-    let (tx, rx) = mpsc::channel();
-    let spawn_result = thread::Builder::new()
-        .name("launcher-system-info-probe".to_string())
-        .spawn(move || {
-            let result = collect_system_info_report();
-            if tx.send(result).is_err() {
-                runtime_log::log_warn(
-                    "[launcher-settings] system info probe result receiver was dropped",
-                );
-            }
-        });
-
-    if let Err(err) = spawn_result {
-        let (fallback_tx, fallback_rx) = mpsc::channel();
-        let message = tf!("launcher.settings.start_system_check_error", err = err);
-        if fallback_tx.send(Err(message)).is_err() {
-            runtime_log::log_warn(
-                "[launcher-settings] failed to send system info probe spawn error to UI",
-            );
-        }
-        return fallback_rx;
-    }
-
-    rx
-}
-
-fn collect_system_info_report() -> Result<SystemInfoReport, String> {
-    runtime_log::log_info("[launcher-settings] collecting system information");
-    Ok(SystemInfoReport {
-        cpu: collect_cpu_info(),
-        memory: collect_memory_info(),
-        gpu: collect_gpu_info(),
-    })
-}
-
-fn collect_cpu_info() -> CpuInfoReport {
-    let logical_cores = thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1);
-    CpuInfoReport {
-        name: detect_cpu_name().unwrap_or_else(|| t!("launcher.settings.cpu_not_determined").to_string()),
-        physical_cores: detect_physical_core_count(),
-        logical_cores,
-    }
-}
-
-fn collect_memory_info() -> MemoryInfoReport {
-    MemoryInfoReport {
-        total_bytes: detect_total_memory_bytes(),
-    }
-}
-
-fn collect_gpu_info() -> GpuInfoReport {
-    GpuInfoReport {
-        nvidia_detected: detect_nvidia_gpu(),
-        amd_detected: detect_amd_gpu(),
-        cuda_version: detect_cuda_runtime_version(),
-        nvidia_compute_capability: detect_nvidia_compute_capability(),
-        nvidia_architecture: detect_nvidia_gpu_architecture(),
-        rocm_version: detect_rocm_runtime_version(),
-        linux_driver_status: cfg!(target_os = "linux").then(linux_driver_status),
-        rocm_installation: cfg!(target_os = "linux").then(detect_rocm_installation_linux),
-        amd_architectures: if cfg!(target_os = "linux") {
-            detect_amd_gpu_architectures_linux()
-        } else {
-            Vec::new()
-        },
-        rocm_validation: cfg!(target_os = "linux").then(validate_rocm_7_2_support_linux),
-        directml_accelerators: detect_directml_accelerators_windows(),
-        apple_gpu: detect_apple_gpu(),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn detect_cpu_name() -> Option<String> {
-    let content = fs::read_to_string("/proc/cpuinfo").ok()?;
-    content
-        .lines()
-        .find_map(|line| line.strip_prefix("model name"))
-        .and_then(|tail| {
-            tail.split_once(':')
-                .map(|(_, value)| value.trim().to_string())
-        })
-        .filter(|name| !name.is_empty())
-}
-
-#[cfg(target_os = "windows")]
-fn detect_cpu_name() -> Option<String> {
-    command_output(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-Command",
-            "(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)",
-        ],
-    )
-    .map(|name| name.trim().to_string())
-    .filter(|name| !name.is_empty())
-}
-
-#[cfg(target_os = "macos")]
-fn detect_cpu_name() -> Option<String> {
-    command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty())
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-fn detect_cpu_name() -> Option<String> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn detect_physical_core_count() -> Option<usize> {
-    let content = fs::read_to_string("/proc/cpuinfo").ok()?;
-    let mut pairs = HashSet::new();
-    let mut current_physical: Option<String> = None;
-    let mut current_core: Option<String> = None;
-
-    for line in content.lines().chain(std::iter::once("")) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            if let (Some(physical), Some(core)) = (current_physical.take(), current_core.take()) {
-                pairs.insert((physical, core));
-            }
-            current_physical = None;
-            current_core = None;
-            continue;
-        }
-        if let Some((key, value)) = trimmed.split_once(':') {
-            match key.trim() {
-                "physical id" => current_physical = Some(value.trim().to_string()),
-                "core id" => current_core = Some(value.trim().to_string()),
-                _ => {}
-            }
-        }
-    }
-
-    if pairs.is_empty() {
-        None
-    } else {
-        Some(pairs.len())
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn detect_physical_core_count() -> Option<usize> {
-    let output = command_output(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-Command",
-            "(Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum",
-        ],
-    )?;
-    output.trim().parse::<usize>().ok()
-}
-
-#[cfg(target_os = "macos")]
-fn detect_physical_core_count() -> Option<usize> {
-    command_output("sysctl", &["-n", "hw.physicalcpu"])
-        .and_then(|output| output.trim().parse::<usize>().ok())
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-fn detect_physical_core_count() -> Option<usize> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn detect_total_memory_bytes() -> Option<u64> {
-    let content = fs::read_to_string("/proc/meminfo").ok()?;
-    content.lines().find_map(|line| {
-        let rest = line.strip_prefix("MemTotal:")?.trim();
-        let kb_text = rest.split_whitespace().next()?;
-        let kb = kb_text.parse::<u64>().ok()?;
-        kb.checked_mul(1024)
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn detect_total_memory_bytes() -> Option<u64> {
-    let output = command_output(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-Command",
-            "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
-        ],
-    )?;
-    output.trim().parse::<u64>().ok()
-}
-
-#[cfg(target_os = "macos")]
-fn detect_total_memory_bytes() -> Option<u64> {
-    command_output("sysctl", &["-n", "hw.memsize"])
-        .and_then(|output| output.trim().parse::<u64>().ok())
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-fn detect_total_memory_bytes() -> Option<u64> {
-    None
-}
-
-fn format_core_count(physical: Option<usize>, logical: usize) -> String {
-    match physical {
-        Some(value) => tf!("launcher.settings.cores_phys_logical", value = value, logical = logical),
-        None => tf!("launcher.settings.cores_logical", logical = logical),
-    }
-}
-
-fn format_memory_total(total_bytes: Option<u64>) -> String {
-    let Some(bytes) = total_bytes else {
-        return t!("launcher.settings.not_determined_neuter").to_string();
-    };
-    const GIB: u64 = 1024 * 1024 * 1024;
-    const MIB: u64 = 1024 * 1024;
-    if bytes >= GIB {
-        let tenths = u128::from(bytes) * 10 / u128::from(GIB);
-        let whole = tenths / 10;
-        let fraction = tenths % 10;
-        format!("{whole}.{fraction} GiB")
-    } else {
-        let mib = u128::from(bytes) / u128::from(MIB);
-        format!("{mib} MiB")
-    }
-}
-
-fn format_gpu_architecture(architecture: &GpuArchitecture) -> String {
-    let mut parts = Vec::new();
-    if let Some(name) = architecture
-        .name
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        parts.push(name.to_string());
-    }
-    if let Some(family) = architecture
-        .architecture
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        parts.push(family.to_string());
-    }
-    if let Some(target) = architecture
-        .llvm_target
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        parts.push(target.to_string());
-    }
-    if parts.is_empty() {
-        t!("launcher.settings.not_determined_fem").to_string()
-    } else {
-        parts.join(" / ")
-    }
-}
-
-fn format_architecture_list(architectures: &[GpuArchitecture]) -> String {
-    if architectures.is_empty() {
-        return t!("launcher.settings.not_determined_plural").to_string();
-    }
-    architectures
-        .iter()
-        .map(format_gpu_architecture)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn format_directml_accelerators(accelerators: &[DirectMlAccelerator]) -> String {
-    if !cfg!(target_os = "windows") {
-        return t!("launcher.settings.windows_only").to_string();
-    }
-    if accelerators.is_empty() {
-        return t!("launcher.settings.no_compatible_accelerators").to_string();
-    }
-    accelerators
-        .iter()
-        .map(|accelerator| accelerator.name.clone())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn bool_status(value: bool) -> &'static str {
-    if value { t!("launcher.settings.yes") } else { t!("launcher.settings.no") }
-}
-
-#[cfg(target_os = "macos")]
-fn command_output(command: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(command)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).to_string();
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn command_output(command: &str, args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new(command);
-    apply_hidden_process_flags(&mut cmd);
-    let output = cmd
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let text = if stdout.trim().is_empty() {
-        stderr.to_string()
-    } else if stderr.trim().is_empty() {
-        stdout.to_string()
-    } else {
-        format!("{stdout}\n{stderr}")
-    };
-
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text.trim().to_string())
-    }
 }
 
 // The following console/shell helpers exist only for the native Python console

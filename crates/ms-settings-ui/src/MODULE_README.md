@@ -89,15 +89,15 @@ not the dependency list.
   sent by the section's own poll, or on a worker when the pane state is dropped.
 - `ai_backend_panel.rs`: AI runtime selection, ONNX provider/device/build, model limit,
   backend health readout (incl. the PyTorch build line and its kernel-mismatch warning, read
-  from `AiBackendHealthSnapshot::torch_build`), ORT crash-guard reset. The provider list is the UNION of the offline
+  from `AiBackendHealthSnapshot::torch_build`, texts from `torch_build_text.rs`), ORT crash-guard reset. The provider list is the UNION of the offline
   native set and the providers the backend reports; backend-only providers (e.g. MIGraphX,
   ROCm) stay selectable for backend ONNX. Without `PlatformFeature::PythonBackend` (Android,
   web) it offers no "Backend" runtime and draws only the native ONNX selection (backend status,
   process control, log, PyTorch device and diagnostics hidden); the runtime it shows is the
   EFFECTIVE one (`ms_local_ai::local_ai::effective_ai_runtime`). Native build availability (picker groups,
   "(unavailable)" label, auto-download gate) is NOT decided here: it is
-  `ms_native_runtime::native_build_fallback_reason` over the caps probe's
-  `NativeHardwareFacts`, so the panel shows what the runtime will do. Where nothing is
+  `native_builds::NativeBuildAvailability` (over `ms_native_runtime::native_build_fallback_reason`
+  and the caps probe's `NativeHardwareFacts`), so the panel shows what the runtime will do. Where nothing is
   downloadable (`ms_onnx_runtime::ort_downloads_offered_here() == false`, Android: every build
   is bundled in the APK) the picker lists only the runnable builds, and a bundled build never
   starts or offers a download (`build_source_kind_here`). The ORT auto-download runs on an
@@ -121,6 +121,16 @@ not the dependency list.
   device — judged on the runtime's own parse (`ms_native_runtime::device_selection_for`), so
   an id the native load accepts (OpenVINO `"GPU.0"`) is never treated as missing. The pane's
   device reconcile and the settings device check both ask it. No UI here.
+- `native_builds.rs` (native-only, GUI-free): `NativeBuildAvailability::evaluate(&facts)` —
+  every catalog build's verdict (`NativeBuildStatus { slug, category, fallback }`) from the
+  native runtime's rule —, `groups()` (Базовые / Специфичные / Недоступные, the picker's
+  grouping incl. the bundled-only rule), `display_label()`, and `native_fallback_reason_text`,
+  the localized wording of a `NativeFallbackReason` (via `From<NativeFallbackReason> for
+  FallbackCause`, whose `label()` owns the text). Shared by the AI pane, the settings warnings
+  and the launcher's system-information tab; it never decides availability itself.
+- `torch_build_text.rs` (GUI-free): the localized texts of the backend's PyTorch build report —
+  `torch_build_summary`, `torch_build_line`, `torch_build_unreadable_text`,
+  `torch_build_kernel_warning` — shared by the AI pane and the launcher's system-information tab.
 - `ai_backend_supervisor.rs`: `AiBackendHandle` — the app-global handle both shells drive
   the Python backend process through, plus its health probe and (on Windows) the loopback
   WebSocket handshake. `AiBackendSupervisor` is built once at startup
@@ -205,6 +215,9 @@ not the dependency list.
   `title_key`) and add both halves of the double interface in the new pane.
 - To change what the large-model section shows or does, see `large_models_panel.rs` (the wire
   client and its types are `ms_local_ai::large_models`).
+- To change how native builds are grouped or labelled, or the wording of a fallback reason, see
+  `native_builds.rs` (and `settings_warnings/model.rs` `FallbackCause::label`); how a PyTorch
+  build report is worded, `torch_build_text.rs`.
 - To change what the AI pane offers or reports, see `ai_backend_panel.rs`; which device ids
   an EP offers or what the capability probe gathers, `onnx_caps.rs`; how the backend process
   is started, watched or stopped (and what blocks a spawn), `ai_backend_supervisor.rs`.

@@ -21,7 +21,8 @@ Key items:
   `overall_level`, all through one `worst_where`).
 
 Notes:
-`FallbackCause` mirrors `ms_native_runtime::NativeFallbackReason`, and `RegistrationRecord` /
+`FallbackCause` mirrors `ms_native_runtime::NativeFallbackReason` (the 1:1 mapping is
+`From<NativeFallbackReason>` in `native_builds.rs`) and owns its localized wording, and `RegistrationRecord` /
 `RegistrationProblem` mirror `ms_os_integration::report::{RecordKind, Defect}`; both owners
 are native-only. `SettingKey::ALL` and `REGISTRATION_FAMILY` are platform-filtered: the
 registration keys exist on Windows (three) and Linux (two, no installed-programs entry), and
@@ -187,8 +188,10 @@ pub enum FallbackCause {
 }
 
 impl FallbackCause {
-    /// The localized reason fragment substituted into the fallback tooltip.
-    fn label(self) -> &'static str {
+    /// The localized reason fragment substituted into the fallback tooltip. The one owner of
+    /// this wording: `crate::native_builds::native_fallback_reason_text` exposes it for a
+    /// `NativeFallbackReason` (mapping in `native_builds.rs`).
+    pub(crate) fn label(self) -> &'static str {
         match self {
             FallbackCause::NoRunnableProvider => t!("settings.warnings.fallback_reason.no_provider_label"),
             FallbackCause::CudaRuntimeMissing => t!("settings.warnings.fallback_reason.cuda_missing_label"),

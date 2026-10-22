@@ -99,7 +99,8 @@ shared wiki view). The studio never references
   `RetryPolicy`, `ResumableFetch::fetch_part` into a `.part`, process-wide `BusyGuard`); GUI-free, no
   i18n; consumers own threads, URLs, verification, publishing and UI text.
 - `ms-fonts` — the bundled `fonts/ui` stack, shared by egui UI fonts and the text renderer.
-- `ms-memory` — image-memory profiles and eviction policy; owns no pixels.
+- `ms-memory` — image-memory profiles and eviction policy, host RAM total / available on every
+  platform (`current_memory_availability`); owns no pixels.
 - `ms-onnx` — onnxruntime (`ort`, load-dynamic) inference: MangaOCR, PaddleOCR.
 - `ms-backend-ipc` — framed IPC client for the Python backend.
 - `ms-platform` — GUI-free platform seams: the capability table
@@ -115,8 +116,9 @@ shared wiki view). The studio never references
 - `ms-text-render` — the production text renderer (cosmic-text shaping, vector-first glyph
   raster, effects); re-exported to the typing crate as `render_next`.
 - `ms-page-ops` — journalled structural page operations; owns `Page` and `ProjectPaths`.
-- `ms-sysprobe` — system probes, app-managed AI model catalogue, Hugging Face token, AMD
-  adapter enumeration with the one PCI device id -> gfx table (`amd_adapters`);
+- `ms-sysprobe` — system probes, app-managed AI model catalogue, Hugging Face token, the one
+  PCI display-device walk and AMD PCI device id -> gfx table (`amd_adapters`), the OS / CPU /
+  GPU fact sheet behind the launcher's system-information view (`system_facts`);
   `python_manager` is the only way to find or spawn Python.
 - `ms-onnx-runtime` — locates, downloads and loads the native onnxruntime library per build.
 - `ms-window-geometry` — startup monitor and window geometry; the only direct `winit` user.

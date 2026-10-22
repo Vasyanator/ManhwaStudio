@@ -3704,6 +3704,8 @@ dependencies = [
  "ms-installer",
  "ms-local-ai",
  "ms-log",
+ "ms-native-runtime",
+ "ms-onnx-runtime",
  "ms-os-integration",
  "ms-page-ops",
  "ms-platform",
@@ -3756,9 +3758,11 @@ dependencies = [
 name = "ms-memory"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "ms-i18n",
  "ms-log",
  "serde",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3983,10 +3987,12 @@ version = "0.1.0"
 dependencies = [
  "image 0.25.10",
  "keyring",
+ "libc",
  "ms-config",
  "ms-download",
  "ms-i18n",
  "ms-log",
+ "ms-memory",
  "ms-platform",
  "ms-thread",
  "serde",

@@ -21,7 +21,8 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   the open blocker is `STATE.md` S-004). Keep existing wasm gating and `ms_thread` use intact; do
   not delete web code.
 - macOS (`x86_64-apple-darwin`) is supported but NOT a mandatory check target: `cargo check-mac`
-  / `cargo bmac` (zigbuild), `run-dev.MacOS.command`, `build-macos.sh`.
+  / `cargo bmac` (zigbuild; a plain `cargo check --target x86_64-apple-darwin` fails in ring's C
+  build, per crate use `cargo zigbuild --target x86_64-apple-darwin -p <crate>`), `run-dev.MacOS.command`, `build-macos.sh`.
 - For Windows-target builds (including `cargo check-all`) set `MS_DISABLE_BUILD_CODESIGN=1`, or
   `build.rs` re-spawns the codesign worker on every source change. Under `flock` that detached
   worker inherits the lock fd and holds the lock for up to ~25 min (it waits for `.exe` files a
@@ -117,7 +118,8 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   canvas or tool reads raw `Event::Touch` or decides pan/pinch/long-press itself), input
   bindings, their display labels and conflicts (`ms-input`: `InputRegistry`, `InputRouter`),
   AMD PCI device id -> gfx (`ms_sysprobe::amd_adapters`: one pinned table; KFD topology wins on
-  Linux), torch pins and ROCm device extras (`ms_installer::torch::catalog`), the backend's
+  Linux), the PCI display-device walk (`amd_adapters::enumerate_display_devices`), time-bounded
+  probe subprocesses (`ms_sysprobe::gpu_utils::run_command_bounded`), torch pins and ROCm device extras (`ms_installer::torch::catalog`), the backend's
   "which torch build is this" (`modules/ai_backend/runtime/torch_flavour.py`).
 - ROCm PyTorch comes only from AMD's whl-next index in its OWN uv call (`--index-url` alone):
   PyPI squats AMD's package names, so the two are never resolved together; every later PyPI

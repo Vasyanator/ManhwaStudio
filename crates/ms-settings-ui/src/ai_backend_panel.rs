@@ -14,9 +14,11 @@ call sites stay in sync without duplicating the UI.
 Build availability:
 The native build picker does not decide which builds can run here: it asks the native
 runtime's rule (`ms_native_runtime::native_build_fallback_reason` over the probed
-`NativeHardwareFacts`), so the picker shows what the runtime's selection will do. The probed
-capabilities and the EP device-id rule live in `crate::onnx_caps`; this file adds only the
-labels and pickers.
+`NativeHardwareFacts`), so the picker shows what the runtime's selection will do. The
+per-build verdicts, the picker groups and the build labels are `crate::native_builds`
+(`NativeBuildAvailability`); the probed capabilities and the EP device-id rule live in
+`crate::onnx_caps`; this file draws the pickers. The PyTorch build texts are
+`crate::torch_build_text`.
 
 Change reporting and warning badges:
 `draw_ai_backend_panel` returns an `AiBackendPanelOutcome` whose `changed_settings` lists
@@ -54,9 +56,11 @@ use crate::settings_warnings::{SettingChange, SettingKey, WarningSet};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::settings_warnings::item_warning_badge;
 use ms_backend_ipc as backend_ipc;
-use ms_config::torch_choice::TorchFlavour;
-use ms_local_ai::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand, TorchBuildInfo};
+use crate::torch_build_text;
+use ms_local_ai::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand};
 use ms_widgets::{WheelComboBox, WheelSlider};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::native_builds::NativeBuildAvailability;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::onnx_caps::{OnnxCaps, device_id_offered, ep_device_ids, probe_onnx_caps};
 #[cfg(not(target_arch = "wasm32"))]
@@ -484,58 +488,21 @@ pub fn draw_ai_backend_panel(
 /// Draws the backend's PyTorch build (`AiBackendHealthSnapshot::torch_build`) as one line and,
 /// below it, a warning when the main GPU's arch has no installed ROCm kernel wheel
 /// (`TorchBuildInfo::kernel_mismatch`). Draws nothing while the build is not reported
-/// (offline, warming up, no torch); an unreadable report is shown as such.
+/// (offline, warming up, no torch); an unreadable report is shown as such. The texts are
+/// owned by `crate::torch_build_text` (shared with the launcher's system-information tab).
 fn draw_torch_build_lines(ui: &mut egui::Ui, snapshot: &AiBackendHealthSnapshot) {
     match &snapshot.torch_build {
         None => {}
         Some(Err(err)) => {
-            ui.colored_label(ms_theme::status::WARNING, tf!("ai_backend.torch_build_unreadable_status", error = err));
+            ui.colored_label(ms_theme::status::WARNING, torch_build_text::torch_build_unreadable_text(err));
         }
         Some(Ok(build)) => {
-            ui.label(tf!("ai_backend.torch_build_line_label", build = torch_build_summary(build)));
-            if let Some(mismatch) = build.kernel_mismatch() {
-                let warning = if mismatch.installed.is_empty() {
-                    tf!("ai_backend.torch_build_no_kernels_warning", device = mismatch.device)
-                } else {
-                    // Arch names are LLVM processor ids, never localized; ", " joins a list of them.
-                    let installed = mismatch.installed.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
-                    tf!("ai_backend.torch_build_kernel_mismatch_warning", device = mismatch.device, installed = installed)
-                };
+            ui.label(torch_build_text::torch_build_line(build));
+            if let Some(warning) = torch_build_text::torch_build_kernel_warning(build) {
                 ui.colored_label(ms_theme::status::WARNING, warning);
             }
         }
     }
-}
-
-/// One-line summary of a torch build: flavour and version, the HIP / CUDA runtime version,
-/// and the primary GPU (name and AMD arch), joined by " · " like the other pane summaries.
-fn torch_build_summary(build: &TorchBuildInfo) -> String {
-    let flavour = match build.flavour {
-        TorchFlavour::Cpu => t!("ai_backend.torch_build_flavour_cpu_label"),
-        TorchFlavour::Cuda => t!("ai_backend.torch_build_flavour_cuda_label"),
-        TorchFlavour::Rocm => t!("ai_backend.torch_build_flavour_rocm_label"),
-    };
-    let mut parts = vec![tf!("ai_backend.torch_build_flavour_version_part", flavour = flavour, version = build.version.as_str())];
-    // A ROCm wheel may also report a CUDA version; HIP is the runtime it actually uses.
-    if let Some(hip) = &build.hip_version {
-        parts.push(tf!("ai_backend.torch_build_hip_part", version = hip.as_str()));
-    } else if let Some(cuda) = &build.cuda_version {
-        parts.push(tf!("ai_backend.torch_build_cuda_part", version = cuda.as_str()));
-    }
-    match build.primary_device() {
-        Some(device) => {
-            let name = device.name.trim();
-            match (&device.gcn_arch, name.is_empty()) {
-                (Some(arch), false) => parts.push(tf!("ai_backend.torch_build_gpu_arch_part", name = name, arch = arch.as_str())),
-                (Some(arch), true) => parts.push(tf!("ai_backend.torch_build_gpu_part", name = arch.as_str())),
-                (None, false) => parts.push(tf!("ai_backend.torch_build_gpu_part", name = name)),
-                (None, true) => {}
-            }
-        }
-        None if build.flavour != TorchFlavour::Cpu => parts.push(t!("ai_backend.torch_build_no_gpu_part").to_string()),
-        None => {}
-    }
-    parts.join(" · ")
 }
 
 /// Renders the PyTorch device selector (backend-gated).
@@ -876,7 +843,7 @@ fn draw_native_build_selection(
 ) {
     use ms_onnx_runtime::builds;
 
-    let availability = build_availability(caps);
+    let availability = NativeBuildAvailability::evaluate(&caps.native_facts());
 
     // Seed the build + EP + device ONCE from config (each validated against the catalog /
     // the build's EP set), independent of any value the Backend branch may have left in
@@ -913,11 +880,11 @@ fn draw_native_build_selection(
         state.selected_onnx_build = build;
     }
 
-    let groups = partition_builds(&availability, ms_onnx_runtime::ort_downloads_offered_here());
+    let groups = availability.groups(ms_onnx_runtime::ort_downloads_offered_here());
     let prev_build = state.selected_onnx_build.clone();
 
     ui.horizontal_wrapped(|ui| {
-        let selected_label = build_display_label(&state.selected_onnx_build, &availability);
+        let selected_label = availability.display_label(&state.selected_onnx_build);
         WheelComboBox::from_label(t!("ai_backend.build_combo_label")).id_salt("ai_backend.build_combo_label")
             .selected_text(selected_label)
             .show_ui(ui, |ui| {
@@ -1066,7 +1033,7 @@ fn draw_native_build_selection(
     // Unavailable builds are only fetched via the explicit "Загрузить другую сборку"
     // button (forced download). A bundled build (Android) is never downloaded: its
     // library ships in the app package.
-    let selected_available = build_slug_available(&build_slug, &availability);
+    let selected_available = availability.is_available(&build_slug);
     let bundled = ms_onnx_runtime::build_source_kind_here(&build_slug) == Some(ms_onnx_runtime::OrtBuildSourceKind::Bundled);
     if selected_available && !bundled && dylib_present == Some(false) {
         maybe_start_ort_download(state, &build_slug);
@@ -1647,135 +1614,6 @@ fn reconcile_onnx_selection(
     }
 }
 
-/// Per-build availability on this machine: each flag is the native runtime's own
-/// verdict ([`ms_native_runtime::native_build_fallback_reason`] is `None`) for that
-/// build with its headline EP — the EP a build pick resets to — so the picker shows
-/// what the runtime's selection will do. Computed once per frame from [`OnnxCaps`];
-/// the partition/label helpers stay pure over it and testable without probing.
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BuildAvailability {
-    /// CPU build.
-    cpu: bool,
-    /// DirectML build (Windows; no adapter fact is consulted, DXGI always has one).
-    directml: bool,
-    /// WebGPU build (headline EP WebGPU: a WebGPU-capable GPU is present).
-    webgpu: bool,
-    /// CoreML build (macOS).
-    coreml: bool,
-    /// CUDA 13 build: CUDA 13.x + cuDNN 9.x runtime present.
-    cuda13: bool,
-    /// CUDA 12 build: CUDA 12.x + cuDNN 9.x runtime present.
-    cuda12: bool,
-    /// OpenVINO build: Intel device + OpenVINO runtime present.
-    openvino: bool,
-    /// XNNPACK build (Android: shipped in the APK).
-    xnnpack: bool,
-}
-
-/// Computes per-build availability by asking the native runtime's availability rule
-/// about every catalog build over the probed [`OnnxCaps`] facts. Pure (no probe).
-#[cfg(not(target_arch = "wasm32"))]
-fn build_availability(caps: &OnnxCaps) -> BuildAvailability {
-    let facts = caps.native_facts();
-    let runnable =
-        |slug: &str| ms_native_runtime::native_build_fallback_reason(slug, &facts).is_none();
-    BuildAvailability {
-        cpu: runnable("cpu"),
-        directml: runnable("directml"),
-        webgpu: runnable("webgpu"),
-        coreml: runnable("coreml"),
-        cuda13: runnable("cuda13"),
-        cuda12: runnable("cuda12"),
-        openvino: runnable("openvino"),
-        xnnpack: runnable("xnnpack"),
-    }
-}
-
-/// Whether the catalog build `slug` is runnable on this machine. QNN (informational) and
-/// any unknown slug are never available.
-#[cfg(not(target_arch = "wasm32"))]
-fn build_slug_available(slug: &str, availability: &BuildAvailability) -> bool {
-    match slug {
-        "cpu" => availability.cpu,
-        "directml" => availability.directml,
-        "webgpu" => availability.webgpu,
-        "coreml" => availability.coreml,
-        "cuda13" => availability.cuda13,
-        "cuda12" => availability.cuda12,
-        "openvino" => availability.openvino,
-        "xnnpack" => availability.xnnpack,
-        // qnn (informational) and any unknown slug: not runnable here.
-        _ => false,
-    }
-}
-
-/// The three "Билд" combo groups (slugs in catalog order).
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct BuildGroups {
-    /// Available `Basic`-category builds.
-    basic: Vec<&'static str>,
-    /// Available `Specific`-category builds.
-    specific: Vec<&'static str>,
-    /// Every unavailable build plus the informational QNN entry (bottom group).
-    unavailable: Vec<&'static str>,
-}
-
-/// Partitions the build catalog into Базовые / Специфичные / Недоступные for the panel.
-///
-/// An AVAILABLE `Basic` build lands in `basic`, an available `Specific` build in
-/// `specific`; every build unavailable on this machine — plus the informational QNN
-/// entry — lands in `unavailable`. With `downloads_offered == false`
-/// (`ms_onnx_runtime::ort_downloads_offered_here`: every build here is bundled, Android)
-/// an unavailable build can never be obtained, so it and QNN are not listed at all: the
-/// picker offers exactly the builds shipped here. Pure over its inputs, so the grouping is
-/// unit-testable.
-#[cfg(not(target_arch = "wasm32"))]
-fn partition_builds(availability: &BuildAvailability, downloads_offered: bool) -> BuildGroups {
-    use ms_onnx_runtime::builds::{self, BuildCategory};
-    let mut groups = BuildGroups::default();
-    for build in builds::all_builds() {
-        let available = build_slug_available(build.slug, availability);
-        if !available && !downloads_offered {
-            continue;
-        }
-        match build.category {
-            BuildCategory::Basic => {
-                if available {
-                    groups.basic.push(build.slug);
-                } else {
-                    groups.unavailable.push(build.slug);
-                }
-            }
-            BuildCategory::Specific => {
-                if available {
-                    groups.specific.push(build.slug);
-                } else {
-                    groups.unavailable.push(build.slug);
-                }
-            }
-            // Informational (QNN): never runnable here — always in the bottom group.
-            BuildCategory::Informational => groups.unavailable.push(build.slug),
-        }
-    }
-    groups
-}
-
-/// The "Билд" label: the catalog display name, suffixed " (недоступно)" when the build is
-/// not runnable on this machine.
-#[cfg(not(target_arch = "wasm32"))]
-fn build_display_label(slug: &str, availability: &BuildAvailability) -> String {
-    let name = ms_onnx_runtime::builds::build_by_slug(slug)
-        .map(|build| build.display_label())
-        .unwrap_or(slug);
-    if build_slug_available(slug, availability) {
-        name.to_string()
-    } else {
-        tf!("ai_backend.device_unavailable_suffix", name = name)
-    }
-}
-
 /// Renders one "Билд" combo group (separator + header + entries), if non-empty.
 ///
 /// Real builds use `selectable_value` (an unavailable one stays selectable for a forced
@@ -1787,7 +1625,7 @@ fn render_build_group(
     state: &mut AiBackendPanelState,
     header: &str,
     slugs: &[&'static str],
-    availability: &BuildAvailability,
+    availability: &NativeBuildAvailability,
 ) {
     use ms_onnx_runtime::builds::{self, BuildCategory};
     if slugs.is_empty() {
@@ -1796,7 +1634,7 @@ fn render_build_group(
     ui.separator();
     ui.label(egui::RichText::new(header).small().strong());
     for slug in slugs {
-        let label = build_display_label(slug, availability);
+        let label = availability.display_label(slug);
         match builds::build_by_slug(slug).map(|build| build.category) {
             Some(BuildCategory::Informational) => {
                 // Display-only: no binary to download, not selectable.
@@ -2585,10 +2423,10 @@ fn spawn_reset_ort_guard(landed: Sender<SettingChange>) {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{
-        AiBackendPanelState, BackendOnnxProviders, BuildAvailability, OnnxCaps, OnnxProviderOption, OrtBuildAction,
-        PendingChanges, SettingChange, build_availability, build_onnx_provider_options, build_slug_available,
+        AiBackendPanelState, BackendOnnxProviders, OnnxCaps, OnnxProviderOption, OrtBuildAction,
+        PendingChanges, SettingChange, build_onnx_provider_options,
         default_onnx_provider, device_pick_needs_save, ep_device_options, ep_display_label, ort_provider_token,
-        native_device_ep, ort_build_action, partition_builds, provider_runtime_state, report_landed,
+        native_device_ep, ort_build_action, provider_runtime_state, report_landed,
     };
     use ms_config::AiRuntime;
     use ms_local_ai::backend_health::AiBackendDeviceOption;
@@ -3049,101 +2887,6 @@ mod tests {
         assert_eq!(webgpu.devices[0].label, t!("ai_backend.device_default"));
     }
 
-    /// Characterization of the per-build availability the panel derives from the probed
-    /// caps, for an empty probe (no adapters, no runtimes) and a full one (two DirectML
-    /// adapters, every runtime present). Platform-gated builds follow the target OS.
-    #[test]
-    fn build_availability_per_caps_shape() {
-        // Every expectation is tied to the embedded manifest (does the build ship for this
-        // OS/arch?), so the test holds on every target, including ones with no archive.
-        let ships = ms_onnx_runtime::build_shipped_here;
-        let empty = build_availability(&OnnxCaps::default());
-        assert_eq!(empty.cpu, ships("cpu"));
-        // The panel follows the runtime's rule: DirectML needs no probed adapter, so it is
-        // available on Windows even with zero probed adapters (D1). A build without an
-        // archive for this OS/arch is unavailable (D3b). The manifest ships DirectML only
-        // for Windows and CoreML only for macOS, where their headline EPs run.
-        assert_eq!(empty.directml, ships("directml"), "DirectML with zero adapters");
-        assert!(!empty.webgpu);
-        assert_eq!(empty.coreml, ships("coreml"));
-        assert!(!empty.cuda13 && !empty.cuda12 && !empty.openvino);
-
-        let full = build_availability(&OnnxCaps {
-            cuda_available: true,
-            webgpu_available: true,
-            directml_accelerators: vec!["A".to_string(), "B".to_string()],
-            webgpu_adapters: Vec::new(),
-            cuda13_available: true,
-            cuda12_available: true,
-            openvino_available: true,
-        });
-        assert_eq!(full.cpu, ships("cpu"));
-        assert_eq!(full.directml, ships("directml"));
-        assert_eq!(full.webgpu, ships("webgpu"));
-        assert_eq!(full.coreml, ships("coreml"));
-        assert_eq!(full.cuda13, ships("cuda13"));
-        assert_eq!(full.cuda12, ships("cuda12"));
-        assert_eq!(full.openvino, ships("openvino"));
-        assert_eq!(full.xnnpack, ships("xnnpack"));
-
-        // The informational QNN entry and an unknown slug are never available.
-        assert!(!build_slug_available("qnn", &full));
-        assert!(!build_slug_available("no-such-build", &full));
-    }
-
-    /// Availability flags partition builds into Базовые / Специфичные / Недоступные:
-    /// available Basic → basic, available Specific → specific, everything else + QNN →
-    /// unavailable, with no slug in two groups.
-    #[test]
-    fn partition_groups_by_category_and_availability() {
-        let availability = BuildAvailability {
-            cpu: true,
-            directml: true,
-            webgpu: true,
-            coreml: true,
-            cuda13: true,
-            cuda12: false,
-            openvino: false,
-            xnnpack: false,
-        };
-        let groups = partition_builds(&availability, true);
-        for slug in ["cpu", "directml", "webgpu", "coreml"] {
-            assert!(groups.basic.contains(&slug), "{slug} should be Базовые");
-        }
-        assert!(groups.specific.contains(&"cuda13"));
-        // Unavailable Specific builds and the informational QNN land at the bottom.
-        for slug in ["cuda12", "openvino", "qnn"] {
-            assert!(groups.unavailable.contains(&slug), "{slug} should be Недоступные");
-        }
-        // A slug never appears in more than one group.
-        for slug in &groups.basic {
-            assert!(!groups.specific.contains(slug) && !groups.unavailable.contains(slug));
-        }
-    }
-
-    /// An unavailable Basic build (e.g. DirectML off Windows) drops from Базовые to
-    /// Недоступные instead of vanishing; CPU is the only Basic build available on every
-    /// shipped platform.
-    #[test]
-    fn partition_unavailable_basic_falls_to_bottom() {
-        let availability = BuildAvailability {
-            cpu: true,
-            directml: false,
-            webgpu: false,
-            coreml: false,
-            cuda13: false,
-            cuda12: false,
-            openvino: false,
-            xnnpack: false,
-        };
-        let groups = partition_builds(&availability, true);
-        assert_eq!(groups.basic, vec!["cpu"]);
-        assert!(groups.specific.is_empty());
-        for slug in ["directml", "webgpu", "coreml", "cuda13", "cuda12", "openvino", "qnn"] {
-            assert!(groups.unavailable.contains(&slug), "{slug} should be Недоступные");
-        }
-    }
-
     /// Each EP's ORT token round-trips back to the same EP through the native runtime's
     /// parser, so a persisted token resolves correctly (the device combo's EP included).
     #[test]
@@ -3164,26 +2907,6 @@ mod tests {
         }
         // No EP named (informational build): the device combo shows CPU's default entry.
         assert_eq!(native_device_ep(""), ExecutionProvider::Cpu);
-    }
-
-    /// Where nothing can be downloaded (every build bundled, Android) the picker lists only
-    /// the builds that run here; QNN and unavailable builds are not offered at all.
-    #[test]
-    fn partition_without_downloads_lists_only_runnable_builds() {
-        let availability = BuildAvailability {
-            cpu: true,
-            directml: false,
-            webgpu: false,
-            coreml: false,
-            cuda13: false,
-            cuda12: false,
-            openvino: false,
-            xnnpack: true,
-        };
-        let groups = partition_builds(&availability, false);
-        assert_eq!(groups.basic, vec!["cpu", "xnnpack"]);
-        assert!(groups.specific.is_empty());
-        assert!(groups.unavailable.is_empty(), "{:?}", groups.unavailable);
     }
 
     /// The EP labels for a build follow the build's ordered EP set.

@@ -17,9 +17,13 @@ Three layers, all pure except the middle one:
 1. Profile — `MemoryProfile` (persisted in `user_config.json`) and `MemoryManager`, a small
    `RwLock`-backed handle so the profile can be hot-applied from the settings UI while
    workers read it.
-2. Probe — `current_memory_availability()` reads what the OS reports free
-   (`/proc/meminfo` on Linux, `vm_stat` on macOS, `None` elsewhere). This is the crate's
-   only side effect and its only failure mode.
+2. Probe — `current_memory_availability()` reads what the OS reports as total and free
+   physical memory (`/proc/meminfo` on Linux and Android, `GlobalMemoryStatusEx` on
+   Windows, `sysctlbyname` + mach `host_statistics64` on macOS, `None` elsewhere). It never
+   spawns a process, so it is safe for the 1 s pressure poll and probe workers alike. This is the crate's only side
+   effect and its only failure mode (logged). It is the workspace's one RAM-total/available
+   owner: a new consumer (e.g. the launcher's system report) calls it rather than probing
+   memory itself.
 3. Policy — `classify_memory_pressure()` turns availability + profile into a
    `MemoryPressure`, `MemoryBudget` derives per-profile limits, and
    `select_eviction_candidates()` orders `CacheResourceInfo` entries into a
@@ -41,8 +45,8 @@ Three layers, all pure except the middle one:
   ignore the report, but must not evict something the report did not name.
 - `MemoryProfile` is serialized into `user_config.json`, so its serde representation is a
   persisted format: renaming a variant breaks existing user configs.
-- Crate boundary: dependencies are `ms-log`, `ms-i18n` and `serde`. No egui, no image
-  crate, no application layers — that is what keeps it a leaf that type-checks in parallel
+- Crate boundary: dependencies are `ms-log`, `ms-i18n`, `serde`, `windows-sys` on Windows
+  (the probe's two features) and `libc` on macOS (the probe's sysctl / mach calls). No egui, no image crate, no application layers — that is what keeps it a leaf that type-checks in parallel
   with the binary.
 
 ## Editing map

@@ -37,7 +37,6 @@ use std::path::Path;
 use ms_config::locale_store;
 use ms_config::{AiInstallType, AiRuntime, OrtLoadDecision};
 use ms_log::runtime_log;
-use ms_native_runtime::NativeFallbackReason;
 use ms_onnx::NativeDeviceSelection;
 use ms_local_ai::local_ai::effective_ai_runtime;
 use serde_json::Value;
@@ -262,7 +261,8 @@ fn gather_native(cfg: &Value, ctx: CheckContext) -> [(SettingKey, Vec<WarningRea
     let scope = ms_native_runtime::next_load_scope_key(&report);
     let guard_suspect =
         ms_config::ort_load_decision(ms_config::read_ort_load_guard(cfg, &scope)) == OrtLoadDecision::Suspect;
-    let fallback = report.fallback.map(fallback_cause);
+    // The native -> mirror mapping has one owner: `From<NativeFallbackReason>` in `native_builds.rs`.
+    let fallback = report.fallback.map(FallbackCause::from);
     let device_id = ms_config::ai_onnx_device_id_from_user_settings(cfg);
     let device_consumed = report.device != NativeDeviceSelection::Default;
     // The capability probe spawns system commands: only when the device rule can fire.
@@ -294,18 +294,6 @@ pub(crate) fn native_checks_apply(ctx: CheckContext, runtime: AiRuntime) -> bool
     match runtime {
         AiRuntime::Native => ctx.native_onnx_enabled,
         AiRuntime::Backend => false,
-    }
-}
-
-/// Maps the native-only reason onto its wasm-clean mirror.
-fn fallback_cause(reason: NativeFallbackReason) -> FallbackCause {
-    match reason {
-        NativeFallbackReason::NoRunnableProvider => FallbackCause::NoRunnableProvider,
-        NativeFallbackReason::CudaRuntimeMissing => FallbackCause::CudaRuntimeMissing,
-        NativeFallbackReason::OpenVinoRuntimeMissing => FallbackCause::OpenVinoRuntimeMissing,
-        NativeFallbackReason::WebGpuUnavailable => FallbackCause::WebGpuUnavailable,
-        NativeFallbackReason::UnsupportedOnPlatform => FallbackCause::UnsupportedOnPlatform,
-        NativeFallbackReason::BuildNotShippedForPlatform => FallbackCause::BuildNotShipped,
     }
 }
 
