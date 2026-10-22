@@ -1,11 +1,12 @@
 /*
 FILE OVERVIEW: crates/ms-tab-translation/src/tab.rs
-Translation tab state and orchestration for side panels, OCR, machine translation,
+Translation tab state and orchestration for the tools, OCR, machine translation,
 text detector, and footer metadata synchronization with CanvasView/BubblesModel.
 
 Main types:
-- `TranslationPanel`: active floating panel (`None`, `Bubbles`, `Ocr`, `Composition`,
-  `MachineTranslation`, `TextDetector`).
+- `TranslationTool` / `ToolToggles` (child module `tab/tool_panels.rs`, imported here): the five
+  tools (`Bubbles`, `Ocr`, `Composition`, `MachineTranslation`, `TextDetector`) and which of them
+  are switched on — independent flags, each tool a dock tab.
 - `canvas_input::CanvasSelection` (child module `tab/canvas_input.rs`): the running canvas-wide
   rect selection (quick OCR, advanced recognition, image-bubble page crop) driven from the input
   router's claim; the crop writes crop metadata instead of dispatching OCR.
@@ -42,11 +43,6 @@ Key constants:
 - `footer_additional_character_names()`: built-in extra names for footer character picker.
 - `TEXT_DETECTOR_OCR_RETRY_DELAY_SECS`: retry delay for failed detector-ocr block.
 
-TranslationPanel helpers:
-- `panel_title`: localized panel caption with its toggle's binding text (`[P]`, ...).
-- `open_button_label`: compact canvas button caption with that binding text (`(P)`, ...).
-- `Default::default`: defaults to `TranslationPanel::None`.
-
 TranslationTabState lifecycle:
 - `new`: initializes state and starts async settings saver worker.
 - `Default::default`: wraps `new(true)`.
@@ -56,33 +52,33 @@ TranslationTabState public API:
 - `begin_input_frame` / `end_input_frame`: the host hands the frame's input (and binding labels)
   to the state for its draw; `input_contexts`, `lines_edit_active`, `input_labels` feed the host.
 - `sync_with_project_settings`: lazy-loads OCR/MT/composition/text-detector settings.
-- `draw_side_panel`: draws floating panel window and active panel body (takes the app's
-  `page_infos` for the detector panel's per-page plan notice).
-- `toggle_bubbles_panel_hotkey`, `toggle_ocr_panel_hotkey`,
-  `toggle_composition_panel_hotkey`, `toggle_machine_translation_panel_hotkey`,
-  `toggle_text_detector_panel_hotkey`: hotkey actions to toggle translation panels.
+
+Tools (child module `tab/tool_panels.rs`):
+- `restore_tool_toggles` (host, first frame: the on-set persisted in the dock),
+  `prepare_tool_frame` (host, before the canvas draw: current page size, health / route caches),
+  `toggle_tool` / `set_tool_on` and the `toggle_*_panel_hotkey` entry points,
+  `apply_tool_dock_requests` (focus + persistence, before `PanelDock::begin`),
+  `draw_tools_bar_body` / `tools_tab_sizes` (the «Инструменты» toolbar tab) and
+  `draw_tool_body` + one `draw_*_tool_body` per tool.
 
 Panel/UI flow:
-- `draw_active_panel`: routes rendering and actions for current active panel.
-- `toggle_panel`: toggles panel visibility and handles first-show expand/rebuild flags.
-- `toggle_bubbles_panel_hotkey`, `toggle_ocr_panel_hotkey`,
-  `toggle_composition_panel_hotkey`, `toggle_machine_translation_panel_hotkey`,
-  `toggle_text_detector_panel_hotkey`: hotkey entry points for panel toggles.
 - `draw_startup_page_load_toast`: renders startup image-loading progress toast on canvas.
 - `draw_toast`: renders toast popup.
 - `draw_text_detector_mask_layer_on_page`: draws detector mask and mask-edit interaction on canvas mask layer.
 - `draw_text_detector_additional_overlay_on_page`: draws detector boxes/line-edit overlay on additional-elements layer.
-  Both draw while `detector_overlay_visible()` (`tab/detector_region.rs`): Detector panel open,
+  Both draw while `detector_overlay_visible()` (`tab/detector_region.rs`): Detector tool on,
   or the selected OCR engine's "create mask" parameter on.
-- `draw_canvas_overlay_top_left` (CanvasHooks): frame orchestrator, buttons, polling, flushes.
+- `draw_canvas_overlay_top_left` (CanvasHooks): frame orchestrator — polling (including the MT
+  request preview), flushes, the pending Composition rebuild, then the panel dock.
 
-Panel dock:
+Panel dock (child module `tab/dock.rs`):
 - `draw_panel_dock`: runs this tab's `PanelDock` frame — the canvas' «Лента» plus this tab's own
-  «Последние персонажи» (`TRANSLATION_RECENT_CHARACTERS_TAB`) — at the end of
+  «Последние персонажи» (`TRANSLATION_RECENT_CHARACTERS_TAB`), the «Инструменты» toolbar and the
+  five tool tabs — at the end of
   `draw_canvas_overlay_top_left`. It must run on every frame the tab is active —
   `PanelDock::end` is what keeps the dock's detached sub-window viewports alive.
-- `TranslationDockCx`: the per-frame dock context; `draw_recent_characters_tab_body` is the one
-  tab body this tab owns.
+- `TranslationDockCx`: the per-frame dock context (the whole tab state, the canvas, the project);
+  `draw_recent_characters_tab_body` plus the toolbar and tool bodies are this tab's own bodies.
 - `ribbon_panel_rect`: last frame's MAIN-WINDOW rect of the panel holding «Лента», `None` when the
   tab is hidden or detached; `text_detector_edit_panel_pos` places the two detector edit boxes
   under it and falls back to a fixed canvas offset.
@@ -201,7 +197,8 @@ Module-level utility functions:
   `build_ocr_request`, `build_bubble_original_text`.
 
 Key TranslationTabState field groups:
-- Panel/controllers/options: `active_panel`, `local_ai` (which local AI runtimes the process
+- Tools/controllers/options: `tools` (+ `tools_restored`, `pending_tool_focus`,
+  `tools_persist_pending`, `current_page_size`), `local_ai` (which local AI runtimes the process
   may use; OCR/detector routes are gated per route through it, MT and AI API never are),
   `ocr_controller`, `ocr_panel_options`,
   `ocr_engine_states` + `ocr_loading_engine` (runtime per-engine OCR statuses),
@@ -243,7 +240,7 @@ Key TranslationTabState field groups:
 
 use ms_widgets::bubble_status::{BubbleBorderStyle, BubbleStatusContext, evaluate_bubble_status_rules};
 use ms_canvas::{
-    BubbleAction, BubbleClass, CANVAS_RIBBON_TAB, CanvasHooks, CanvasScrollbarContext,
+    BubbleAction, BubbleClass, CanvasHooks, CanvasScrollbarContext,
     CanvasUiStatus, CanvasView, TranslationStatusDisplay,
 };
 use ms_input::{InputFrame, InputRegistry};
@@ -256,7 +253,6 @@ use ms_models::SessionCapabilities;
 use ms_models::text_mask_model::{TextMaskModel, TextMaskPage};
 use ms_sysprobe::paste_image;
 use ms_project::{Bubble, ComicType, Page, ProjectData};
-use ms_config::app_tab::AppTab;
 use ms_tabs_simple::characters::load_character_names;
 use crate::adv_rec::{
     AdvancedRecognitionAction, AdvancedRecognitionSelection, AdvancedRecognitionWindow,
@@ -280,24 +276,24 @@ use ms_sysprobe::ai_models::external::ExternalModelSpec;
 use ms_sysprobe::ai_models::external_catalog::PaddleVlVariant;
 use ms_ai_api::{AiApiService, AiApiTaskRunner, GenerationSnapshot, ImageInputSupport, image_input_support, is_probable_quota_or_limit_error};
 use crate::panels::bubbles::{
-    BubbleFooterState, BubblesPanelContext, BubblesPanelState, ImageBubbleFilePick, bubble_extra_bool,
-    bubble_extra_string, bubble_footer_state_from_record, draw_bubbles_panel, footer_no_character,
+    BubbleFooterState, BubblesPanelState, ImageBubbleFilePick, bubble_extra_bool,
+    bubble_extra_string, bubble_footer_state_from_record, footer_no_character,
     footer_no_characters,
     footer_state_for_bubble,
 };
 use crate::panels::composition::{
     CompositionPanelOptions, CompositionPanelState, CompositionSortMethod, CompositionSourceMode,
-    compose_translation_text, draw_composition_panel, normalize_wrap_with,
+    compose_translation_text, normalize_wrap_with,
 };
 use crate::panels::machine_translation::{
-    MtPanelOptions, MtPanelProgress, MtPanelRun, MtPanelTab, MtStopNotice, draw_machine_translation_panel,
+    MtPanelOptions, MtPanelProgress, MtPanelTab, MtStopNotice,
 };
 use crate::panels::ocr::{
-    CharReplacementRuleUi, OcrPanelModelView, OcrPanelNeurolate, OcrPanelOptions, OcrSelectionHints, draw_ocr_panel, selected_mode_requirement,
+    CharReplacementRuleUi, OcrPanelOptions, selected_mode_requirement,
 };
 use crate::panels::text_detector::{
-    DetectorUnavailable, TextDetectorAlgorithm, TextDetectorNeurolate, TextDetectorPanelOptions, TextDetectorPanelView,
-    TextDetectorPlanNoticeCache, detector_page_size, draw_text_detector_panel,
+    DetectorUnavailable, TextDetectorAlgorithm, TextDetectorPanelOptions,
+    TextDetectorPlanNoticeCache,
 };
 use crate::neurolate::NeurolateSettings;
 use ms_ai_api::neurolate::NeurolateKeyPanel;
@@ -305,18 +301,14 @@ use crate::text_detector::{
     RegionDetection, SURYA_DETECTOR_SPECS, TextDetectorControllerEvent, TextDetectorPageResult, TextDetectorRect, TextDetectorRunMode,
     TranslationTextDetectorController,
 };
-use ms_models::page_view::PageImageInfo;
 use ms_tools::MaskBrush;
-use ms_widgets::panel_dock::{
-    DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
-    PanelNode, TabId,
-};
+use ms_widgets::panel_dock::PanelDockState;
 use ms_widgets::{
     AiRequirement, AutocompleteLine, MarkFill, ScrollMark, ScrollSpan, WheelComboBox, WheelSlider,
     WheelSpinBox,
 };
 use eframe::egui;
-use egui::{Color32, Pos2, Rect, Stroke, Vec2};
+use egui::{Color32, Pos2, Rect, Stroke};
 use ms_theme::Severity;
 use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -339,8 +331,14 @@ mod block_bubbles;
 // Off-GUI-thread refresh of the OCR / detector routing inputs (desktop-only).
 #[cfg(not(target_arch = "wasm32"))]
 mod route_inputs;
+// The panel dock: default arrangement, the per-frame dock run, «Последние персонажи».
+mod dock;
+// The five tools: their vocabulary, the canvas tools bar, the tool window and one body per tool.
+mod tool_panels;
 
 use canvas_input::CanvasSelection;
+pub use dock::translation_default_dock_layout;
+use tool_panels::{ToolToggles, TranslationTool};
 
 /// (detected results per page, total loaded, total failed)
 type DetectionLoadResult = Result<(Vec<(usize, TextDetectorPageResult)>, usize, usize), String>;
@@ -386,162 +384,6 @@ const OCR_ROUTE_INPUTS_CACHE_TTL: web_time::Duration = web_time::Duration::from_
 const FOOTER_CHARACTER_AUTOCOMPLETE_MAX: usize = 7;
 const CHARACTER_NAMES_WATCH_CHECK_SECS: f64 = 1.0;
 const RECENT_CHARACTER_HISTORY_LIMIT: usize = 6;
-
-// Dock tabs of the «Перевод» program tab. The id is a stable, non-localised
-// literal: it is the identity the persisted layout and every egui id of the
-// owning panel derive from (`dev-docs/i18n_exclusions.md` §A9).
-/// «Последние персонажи» — the row of cards naming the last
-/// [`RECENT_CHARACTER_HISTORY_LIMIT`] characters, one per recent-character parameter mode
-/// (`crate::input::RECENT_CHARS`).
-const TRANSLATION_RECENT_CHARACTERS_TAB: TabId = TabId::new("translation.recent_characters");
-
-/// Gap, in points, between two recent-character cards on both axes.
-const RECENT_CHARACTER_CARD_SPACING_PX: f32 = 8.0;
-/// Points between a recent-character card's border and its caption, horizontally.
-const RECENT_CHARACTER_CARD_MARGIN_X_PX: f32 = 10.0;
-/// Points between a recent-character card's border and its caption, vertically.
-const RECENT_CHARACTER_CARD_MARGIN_Y_PX: f32 = 6.0;
-/// Width, in points, of a recent-character card's border.
-const RECENT_CHARACTER_CARD_STROKE_WIDTH_PX: f32 = 1.0;
-/// Corner radius, in points, of a recent-character card.
-const RECENT_CHARACTER_CARD_CORNER_RADIUS_PX: u8 = 8;
-
-/// Smallest outer size, in points, the dock may shrink the «Последние персонажи»
-/// panel to.
-///
-/// A `min_size` is a shrink FLOOR, not a request (`panel_dock/MODULE_README.md`),
-/// so it only has to keep ONE card and the panel's grip reachable — the body
-/// scrolls below that, and the floor is deliberately far under
-/// [`TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX`] so a user who narrows the
-/// panel is not fought by the solver. Roughly one card (~120 pt of caption plus its
-/// margins) plus the panel's own ~16 pt of chrome, and a header strip plus
-/// `PANEL_MIN_BODY_HEIGHT`.
-const TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(150.0, 70.0);
-/// Outer size, in points, the «Последние персонажи» panel starts at.
-///
-/// The WIDTH is the number that matters and it is a COMPROMISE. The dock never
-/// re-measures a tab's width — it reports back the width it was GIVEN
-/// (`panel.rs::measured_size`) — so 560 pt stays the panel's width until the user
-/// drags the resize grip, whereas the height converges to the content on the second
-/// frame and only decides what the FIRST frame looks like. Before the migration the
-/// row of cards ran across almost the whole canvas in a single line; a narrow panel
-/// would change that look far more than the migration was meant to. 560 pt is the
-/// balance: ~544 pt of content once the panel's ~16 pt of chrome is taken off,
-/// against a card of ~110–160 pt plus [`RECENT_CHARACTER_CARD_SPACING_PX`], so the
-/// six-card history reads in 2–3 rows while the panel still leaves most of the
-/// canvas free. The height covers three such rows, the worst case at that width.
-const TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(560.0, 154.0);
-
-/// Builds the default dock arrangement of the «Перевод» program tab.
-///
-/// Two panels: the canvas' own «Лента» flush with the LEFT edge of the dock area —
-/// the same anchor, panel id and content sizing every canvas program tab gives it,
-/// so a user who already arranged the ribbon keeps it where they left it — and
-/// «Последние персонажи» docked to its RIGHT, top-aligned. That is exactly where
-/// the row of cards floated before it became a dock tab: it hung at a fixed
-/// 340 pt offset from the canvas' left edge, a constant picked to clear the width
-/// of the canvas controls panel the ribbon replaced.
-///
-/// The two panels carry different `target` + `edge` + `align` triples, which is
-/// what keeps the solver — a total function of whatever layout it is given — from
-/// laying one exactly on top of the other.
-///
-/// This tab needs a builder of ITS own because the default layout doubles as the
-/// DICTIONARY the persistence layer resolves stored tab keys against: a `TabId`
-/// missing from it is dropped from the user's arrangement on every load
-/// (`panel_dock/persist.rs::known_tabs`).
-///
-/// Used only when no layout exists yet for this program tab; a restored one always
-/// wins. Handed to the app-owned dock state as a plain `fn` pointer, both when the
-/// persisted layouts are restored before the first frame (`studio.rs`) and by
-/// `ensure_default_layout` on every frame this tab draws — the two must name the
-/// same item, since the header's «сбросить раскладку» rebuilds from the one the
-/// state kept. A model refusal is logged and skipped, never panicked on: the dock
-/// then creates a panel for the orphaned tab on its own, which is a degraded
-/// arrangement rather than a lost tab.
-#[must_use]
-pub fn translation_default_dock_layout() -> DockLayout {
-    let mut layout = DockLayout::new();
-    let ribbon = PanelId::new(0);
-    let panels = [
-        // The ribbon is inserted FIRST because the cards anchor to it, and
-        // `insert_panel` rejects an anchor whose target does not exist yet.
-        (
-            ribbon,
-            vec![CANVAS_RIBBON_TAB],
-            PanelAnchor::ViewportEdge {
-                edge: DockEdge::Left,
-                along: 0.0,
-            },
-        ),
-        (
-            PanelId::new(1),
-            vec![TRANSLATION_RECENT_CHARACTERS_TAB],
-            PanelAnchor::Panel {
-                target: ribbon,
-                edge: DockEdge::Right,
-                align: 0.0,
-            },
-        ),
-    ];
-    for (id, tabs, anchor) in panels {
-        let node = match PanelNode::new(id, HostId::MainWindow, tabs) {
-            Ok(mut node) => {
-                node.anchor = anchor;
-                node
-            }
-            Err(error) => {
-                ms_log::runtime_log::log_warn(format!(
-                    "[translation] default dock layout: could not build panel {id} ({error}); \
-                     the dock will create one per orphaned tab on its own"
-                ));
-                continue;
-            }
-        };
-        if let Err(error) = layout.insert_panel(node) {
-            ms_log::runtime_log::log_warn(format!(
-                "[translation] default dock layout: could not insert panel {id} ({error}); \
-                 the dock will create one per orphaned tab on its own"
-            ));
-        }
-    }
-    layout
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-pub enum TranslationPanel {
-    #[default]
-    None,
-    Bubbles,
-    Ocr,
-    Composition,
-    MachineTranslation,
-    TextDetector,
-}
-
-impl TranslationPanel {
-    fn title(self) -> &'static str {
-        match self {
-            TranslationPanel::None => "",
-            TranslationPanel::Bubbles => t!("translation.tab.bubbles_title"),
-            TranslationPanel::Ocr => t!("translation.tab.panel_ocr_title"),
-            TranslationPanel::Composition => t!("translation.tab.panel_composition_title"),
-            TranslationPanel::MachineTranslation => t!("translation.tab.panel_mt_title"),
-            TranslationPanel::TextDetector => t!("translation.text_detector.title"),
-        }
-    }
-
-    fn short_button_title(self) -> &'static str {
-        match self {
-            TranslationPanel::None => "",
-            TranslationPanel::Bubbles => t!("translation.tab.bubbles_title"),
-            TranslationPanel::Ocr => t!("translation.tab.panel_ocr_title"),
-            TranslationPanel::Composition => t!("translation.tab.panel_composition_title"),
-            TranslationPanel::MachineTranslation => t!("translation.tab.panel_mt_short_title"),
-            TranslationPanel::TextDetector => t!("translation.text_detector.title"),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 struct OcrToast {
@@ -680,7 +522,21 @@ struct RecentCharacterEntry {
 }
 
 pub struct TranslationTabState {
-    active_panel: TranslationPanel,
+    /// Which of the five tools are switched on (`tab/tool_panels.rs`): the ONE source of truth
+    /// for whether a tool is open. Read during the canvas draw (detector overlay), so it is never
+    /// derived from the dock's output.
+    tools: ToolToggles,
+    /// Whether `tools` was adopted from the dock's persisted toolbar extras (once per state,
+    /// `restore_tool_toggles`).
+    tools_restored: bool,
+    /// Tools switched on since the last dock frame; their tabs are focused before the next
+    /// `PanelDock::begin` (`apply_tool_dock_requests`).
+    pending_tool_focus: Vec<TranslationTool>,
+    /// `tools` changed since it was last written into the toolbar's dock extras.
+    tools_persist_pending: bool,
+    /// Size of the current page, cached by the host before the canvas draw for the detector
+    /// tool body (the overlay hook receives no `page_infos`); `None` while unknown.
+    current_page_size: Option<[u32; 2]>,
     /// Which local AI runtimes (Python backend, native ONNX) this process may use (`--no-ai`
     /// and platform). Only routes needing an off runtime are refused (`ocr_route_availability`,
     /// `TextDetectorAlgorithm::availability`); cloud AI API and machine translation never are.
@@ -841,7 +697,6 @@ pub struct TranslationTabState {
     composition_panel_options: CompositionPanelOptions,
     composition_panel_state: CompositionPanelState,
     composition_rebuild_requested: bool,
-    expand_panel_on_show: bool,
     /// This frame's binding texts (`TranslationInputLabels::from_registry`), set by the host.
     input_labels: TranslationInputLabels,
     /// This frame's input, set by the host for its draw (`begin_input_frame`) and cleared after
@@ -881,7 +736,11 @@ impl TranslationTabState {
     ) -> Self {
         let (settings_save_tx, settings_save_thread) = spawn_translation_settings_saver_thread();
         Self {
-            active_panel: TranslationPanel::None,
+            tools: ToolToggles::default(),
+            tools_restored: false,
+            pending_tool_focus: Vec::new(),
+            tools_persist_pending: false,
+            current_page_size: None,
             local_ai,
             ai_backend_health: Arc::clone(&ai_backend_health),
             ai_backend_health_cached: match ai_backend_health.lock() {
@@ -985,7 +844,6 @@ impl TranslationTabState {
             composition_panel_options: CompositionPanelOptions::default(),
             composition_panel_state: CompositionPanelState::default(),
             composition_rebuild_requested: true,
-            expand_panel_on_show: false,
             input_labels: TranslationInputLabels::default(),
             input_frame: None,
             last_is_known_character: true,
@@ -1281,115 +1139,12 @@ impl TranslationTabState {
         self.session_caps = caps;
     }
 
-    fn panel_shortcut_hint(&self, panel: TranslationPanel) -> Option<&str> {
-        let labels = &self.input_labels;
-        match panel {
-            TranslationPanel::None => None,
-            TranslationPanel::Bubbles => labels.bubbles_panel.as_deref(),
-            TranslationPanel::Ocr => labels.ocr_panel.as_deref(),
-            TranslationPanel::Composition => labels.composition_panel.as_deref(),
-            TranslationPanel::MachineTranslation => labels.machine_translation_panel.as_deref(),
-            TranslationPanel::TextDetector => labels.text_detector_panel.as_deref(),
-        }
-    }
-
-    fn active_panel_title(&self) -> String {
-        self.panel_title(self.active_panel)
-    }
-
     fn ocr_quick_selection_mode_active(&self) -> bool {
         self.input_mode_active(crate::input::OCR_QUICK_MODE)
     }
 
     fn ocr_advanced_selection_mode_active(&self) -> bool {
         self.input_mode_active(crate::input::OCR_ADVANCED_MODE)
-    }
-
-    fn panel_title(&self, panel: TranslationPanel) -> String {
-        match self.panel_shortcut_hint(panel) {
-            Some(shortcut) if !shortcut.is_empty() => format!("{} [{}]", panel.title(), shortcut),
-            _ => panel.title().to_string(),
-        }
-    }
-
-    fn open_button_label(&self, panel: TranslationPanel) -> String {
-        match self.panel_shortcut_hint(panel) {
-            Some(shortcut) if !shortcut.is_empty() => {
-                format!("{} ({shortcut})", panel.short_button_title())
-            }
-            _ => panel.short_button_title().to_string(),
-        }
-    }
-
-    pub fn draw_side_panel(
-        &mut self,
-        ctx: &egui::Context,
-        canvas: &mut CanvasView,
-        project: &ProjectData,
-        page_infos: &HashMap<usize, PageImageInfo>,
-    ) {
-        if self.active_panel == TranslationPanel::None {
-            return;
-        }
-        if self.active_panel == TranslationPanel::Bubbles {
-            self.ensure_character_names_loaded(project);
-        }
-        self.refresh_ai_backend_health_snapshot_cache();
-
-        let viewport = ctx.content_rect();
-        let default_pos = egui::pos2(
-            (viewport.right() - 372.0).max(0.0),
-            (viewport.center().y - 230.0).max(0.0),
-        );
-        let panel_window_id = egui::Id::new("translation_overlay_panel");
-        if self.expand_panel_on_show {
-            let mut collapsing = egui::collapsing_header::CollapsingState::load_with_default_open(
-                ctx,
-                panel_window_id.with("collapsing"),
-                true,
-            );
-            collapsing.set_open(true);
-            collapsing.store(ctx);
-            self.expand_panel_on_show = false;
-        }
-
-        let mut panel_open = true;
-        egui::Window::new(self.active_panel_title())
-            .id(panel_window_id)
-            .open(&mut panel_open)
-            .default_pos(default_pos)
-            .default_size(egui::vec2(360.0, 460.0))
-            .resizable(true)
-            .show(ctx, |ui| {
-                self.draw_active_panel(ui, ctx, canvas, project, page_infos);
-            });
-        if !panel_open {
-            if self.active_panel == TranslationPanel::TextDetector {
-                self.set_text_detector_edit_lines_mode(false);
-                self.set_text_detector_edit_mask_mode(false);
-            }
-            self.active_panel = TranslationPanel::None;
-        }
-    }
-
-    pub fn toggle_ocr_panel_hotkey(&mut self) {
-        self.toggle_panel(TranslationPanel::Ocr);
-    }
-
-    pub fn toggle_bubbles_panel_hotkey(&mut self) {
-        self.toggle_panel(TranslationPanel::Bubbles);
-    }
-
-    pub fn toggle_composition_panel_hotkey(&mut self) {
-        self.toggle_panel(TranslationPanel::Composition);
-    }
-
-    pub fn toggle_machine_translation_panel_hotkey(&mut self) {
-        self.toggle_panel(TranslationPanel::MachineTranslation);
-    }
-
-    pub fn toggle_text_detector_panel_hotkey(&mut self) {
-        self.toggle_panel(TranslationPanel::TextDetector);
     }
 
     fn refresh_ai_backend_health_snapshot_cache(&mut self) {
@@ -1545,340 +1300,6 @@ impl TranslationTabState {
         }
         matches!(self.ai_backend_torch_available(), Some(false))
             .then(|| t!("translation.common.pytorch_not_installed_status").to_string())
-    }
-
-    /// Draws the body of the active panel. `page_infos` (the app's decoded page sizes) feeds
-    /// the detector panel's per-page plan notice.
-    fn draw_active_panel(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        canvas: &mut CanvasView,
-        project: &ProjectData,
-        page_infos: &HashMap<usize, PageImageInfo>,
-    ) {
-        // Keep the native-ORT capability fresh for EVERY panel (not just OCR): the
-        // detector panel also gates algorithm buttons on onnx availability, so the
-        // native-armed signal must be published regardless of which panel is active.
-        // Throttled internally, so this is a cheap no-op most frames.
-        #[cfg(not(target_arch = "wasm32"))]
-        self.refresh_ocr_route_inputs_cache();
-        match self.active_panel {
-            TranslationPanel::Bubbles => {
-                let mut panel_ctx = BubblesPanelContext {
-                    character_names: &self.character_names,
-                    footer_overrides: &mut self.footer_overrides,
-                    pending_footer_patches: &mut self.pending_footer_patches,
-                    pending_footer_patch_changed_at: &mut self.pending_footer_patch_changed_at,
-                    pending_characters_refresh: &mut self.pending_characters_refresh,
-                    last_is_known_character: &mut self.last_is_known_character,
-                    last_character_name: &mut self.last_character_name,
-                    last_clarification: &mut self.last_clarification,
-                    last_page_idx: &mut self.last_page_idx,
-                    last_bubble_order: &mut self.last_bubble_order,
-                    image_bubble_pick: &mut self.image_bubble_pick,
-                    input: self.input_frame.as_ref(),
-                };
-                draw_bubbles_panel(
-                    &mut self.bubbles_panel,
-                    ui,
-                    ctx,
-                    canvas,
-                    project,
-                    &mut panel_ctx,
-                );
-            }
-            TranslationPanel::Ocr => {
-                let selected_engine_before = self.ocr_panel_options.engine;
-                let selected_variant_before = self.ocr_panel_options.paddle_vl_model;
-                let model_specs = self.selected_ocr_model_specs();
-                // Opening the panel on (or switching to) a model never probed this session.
-                self.ocr_model_downloads.probe_unknown(&model_specs);
-                let model_snapshot =
-                    (!model_specs.is_empty()).then(|| self.ocr_model_downloads.panel_snapshot(&model_specs));
-                // The MT source language is the input language of OCR; `TextTab.text_language` is the
-                // typesetting (output) language and the wrong signal here.
-                let korean_source = self.mt_panel_options.source_lang.trim().eq_ignore_ascii_case("ko");
-                let force_health_check = self.ocr_last_panel_engine != Some(selected_engine_before);
-                // Route-aware: a native ONNX or cloud selection needs no backend, so we do
-                // NOT probe backend health or mark it unavailable for it. The panel itself is
-                // never disabled as a whole: AI API OCR runs with every local runtime off
-                // (`--no-ai`, Android), and local engines self-gate on their capabilities.
-                let route = self.current_ocr_route_availability();
-                let requires_backend = matches!(route, Ok(AiRouteKind::Backend));
-                if requires_backend {
-                    self.request_ai_backend_health_check(ctx, force_health_check);
-                    self.sync_ocr_states_from_backend_health_snapshot();
-                }
-                let backend_unavailable = requires_backend && self.ai_backend_unavailable();
-                let quick_selection_active = self.ocr_quick_selection_mode_active();
-                let advanced_selection_active = self.ocr_advanced_selection_mode_active();
-                let actions = draw_ocr_panel(
-                    ui,
-                    self.ocr_state_for_engine(self.ocr_panel_options.engine),
-                    &mut self.ocr_panel_options,
-                    self.ocr_controller.last_error(),
-                    self.ocr_controller.last_result(),
-                    OcrSelectionHints {
-                        quick_binding: &self.input_labels.quick_rect,
-                        quick_active: quick_selection_active,
-                        advanced_binding: &self.input_labels.advanced_rect,
-                        advanced_active: advanced_selection_active,
-                    },
-                    &self.ocr_controller.generation_snapshot(),
-                    OcrPanelModelView {
-                        korean_source,
-                        source_lang: &self.mt_panel_options.source_lang,
-                        download: model_snapshot.as_ref(),
-                        // Only the engine whose command downloads shows its progress.
-                        engine_download: self
-                            .ocr_model_download
-                            .current()
-                            .filter(|_| self.ocr_loading_engine == Some(selected_engine_before)),
-                    },
-                    OcrPanelNeurolate { settings: &mut self.neurolate_settings, key: &mut self.neurolate_key, project_type: project.comic_type },
-                );
-                // Pumped only while its UI is drawn (see `tab/neurolate.rs`).
-                if self.ocr_panel_options.engine == OcrEngine::NeuroLate {
-                    self.pump_neurolate_key(ctx, actions.neurolate_key);
-                }
-                if actions.options_changed {
-                    self.ocr_settings_dirty = true;
-                    if selected_engine_before != self.ocr_panel_options.engine
-                        && self.ocr_requires_backend_runtime()
-                    {
-                        self.request_ai_backend_health_check(ctx, true);
-                        self.sync_ocr_states_from_backend_health_snapshot();
-                    }
-                }
-                self.ocr_ai_api_tasks.submit_actions(&mut self.ocr_panel_options.ai_api, actions.ai_api);
-                self.apply_ocr_model_panel_changes(&model_specs, selected_variant_before, actions.model_download);
-                if let Some(shown) = actions.stop_generation {
-                    self.stop_ocr_generation(ctx, shown);
-                }
-                if actions.cancel_model_download {
-                    self.ocr_controller.cancel_model_download();
-                }
-                if actions.request_load && !backend_unavailable {
-                    if let Err(off) = route {
-                        self.push_toast(ctx, off.user_message(), Severity::Error, 2.8);
-                    } else if let Some(error) = self.current_ocr_torch_requirement_error() {
-                        self.push_toast(ctx, error, Severity::Error, 2.8);
-                    } else {
-                        self.mark_ocr_load_requested_for_engine(self.ocr_panel_options.engine);
-                        self.ocr_controller.request_load(
-                            self.ocr_panel_options.engine,
-                            build_ocr_runtime_options(&self.ocr_panel_options, &self.mt_panel_options.source_lang, &self.neurolate_settings, project.comic_type),
-                        );
-                    }
-                }
-                // The selected local engine cannot run in this process: name the runtime and
-                // the real reason (`--no-ai`, or not on this platform). Read after the panel
-                // ran, so an engine switch this frame shows its own reason.
-                if let Err(off) = self.selected_ocr_route_availability() {
-                    ui.separator();
-                    ui.colored_label(ms_theme::status::WARNING, off.user_message());
-                }
-                self.ocr_last_panel_engine = Some(self.ocr_panel_options.engine);
-            }
-            TranslationPanel::MachineTranslation => {
-                let mt_busy = self.mt_controller.is_busy();
-                let mt_can_cancel = self.mt_has_active_or_pending();
-                // Machine translation (plain translators and AI API) is network code: no local
-                // AI runtime is involved, so neither `--no-ai` nor the platform gates it.
-                let actions = draw_machine_translation_panel(
-                    ui,
-                    MtPanelRun {
-                        busy: mt_busy,
-                        can_cancel: mt_can_cancel,
-                        progress: self.mt_progress,
-                        generation: self.mt_controller.generation_snapshot(),
-                        issues: self.mt_controller.run_issues(),
-                    },
-                    &mut self.mt_stop_notice,
-                    &mut self.mt_panel_options,
-                    self.session_caps.title_documents,
-                );
-                if actions.options_changed {
-                    self.mt_settings_dirty = true;
-                }
-                self.mt_ai_api_tasks.submit_actions(&mut self.mt_panel_options.ai_api, actions.ai_api);
-                if actions.start_all {
-                    self.pending_mt_start_all = true;
-                }
-                if actions.start_page {
-                    self.pending_mt_start_page = true;
-                }
-                if actions.preview_request_page {
-                    self.start_ai_mt_request_preview(ctx, canvas, project, true);
-                }
-                if actions.preview_request_all {
-                    self.start_ai_mt_request_preview(ctx, canvas, project, false);
-                }
-                if actions.cancel {
-                    self.cancel_active_mt(ctx);
-                }
-                self.poll_ai_mt_request_preview(ctx);
-                self.draw_ai_mt_request_preview_window(ctx);
-            }
-            TranslationPanel::Composition => {
-                if self.composition_rebuild_requested {
-                    self.rebuild_composition_text(project);
-                }
-                let actions = draw_composition_panel(
-                    ui,
-                    project,
-                    &mut self.composition_panel_state,
-                    &mut self.composition_panel_options,
-                );
-                if actions.options_changed {
-                    self.composition_settings_dirty = true;
-                }
-                if actions.request_rebuild {
-                    self.rebuild_composition_text(project);
-                }
-            }
-            TranslationPanel::TextDetector => {
-                self.ensure_text_detection_storage_loaded(project);
-                let has_pages = !project.pages.is_empty();
-                let availability = self.text_detector_availability();
-                // OCR over detected blocks runs the selected OCR engine: its route decides.
-                let block_ocr_route = self.current_ocr_route_availability();
-                let can_ocr_current = block_ocr_route.is_ok()
-                    && self.ocr_controller.state() == OcrLoadState::Ready
-                    && self.has_detected_blocks_on_page(canvas.current_page_idx());
-                let can_ocr_all = block_ocr_route.is_ok()
-                    && self.ocr_controller.state() == OcrLoadState::Ready
-                    && self.has_detected_blocks_any();
-                // The same pages `detector_region::detection_pages_for_save` writes: detected
-                // ones, or hand-painted ones (an all-erased painted page is refused on click).
-                let can_save = !self.text_detection_storage_busy
-                    && (!self.text_detector_results.is_empty() || self.has_hand_painted_only_pages());
-                let ocr_busy = self.textdetector_ocr_is_running();
-                let page_size = detector_page_size(page_infos.get(&canvas.current_page_idx()));
-                // The Surya checkpoint's install state, probed once per session on selection.
-                let surya_model = (self.text_detector_options.algorithm == TextDetectorAlgorithm::Surya).then(|| {
-                    self.ocr_model_downloads.probe_unknown(&SURYA_DETECTOR_SPECS);
-                    self.ocr_model_downloads.panel_snapshot(&SURYA_DETECTOR_SPECS)
-                });
-                let view = TextDetectorPanelView {
-                    status_text: &self.text_detector_status,
-                    status_color: self.text_detector_status_severity.color(),
-                    progress: self.text_detector_progress,
-                    model_download: self.text_detector_model_download.current(),
-                    surya_model: surya_model.as_ref(),
-                    detect_busy: self.detector_busy_for_batches(),
-                    batch_running: self.text_detector_controller.is_batch_running(),
-                    ocr_busy,
-                    has_pages,
-                    availability,
-                    can_ocr_current,
-                    can_ocr_all,
-                    can_save,
-                    storage_available: self.session_caps.chapter_storage,
-                    edit_lines_mode: self.text_detector_edit_lines_mode,
-                    edit_mask_mode: self.text_detector_edit_mask_mode,
-                    page_size,
-                };
-                let neurolate = TextDetectorNeurolate {
-                    settings: &mut self.neurolate_settings,
-                    key: &mut self.neurolate_key,
-                    mt_source_lang: &self.mt_panel_options.source_lang,
-                    project_type: project.comic_type,
-                };
-                let actions = draw_text_detector_panel(
-                    ui,
-                    &mut self.text_detector_options,
-                    &mut self.text_detector_plan_notice,
-                    &view,
-                    neurolate,
-                );
-                if actions.options_changed {
-                    self.text_detector_settings_dirty = true;
-                }
-                // NeuroLate settings persist with the OCR section (shared with the OCR panel).
-                self.ocr_settings_dirty |= actions.neurolate_changed;
-                if self.text_detector_options.algorithm == TextDetectorAlgorithm::NeuroLate {
-                    self.pump_neurolate_key(ctx, actions.neurolate_key);
-                }
-                if actions.cancel_detection {
-                    self.text_detector_controller.cancel_detection();
-                }
-                if actions.stop_detection {
-                    self.text_detector_controller.request_stop();
-                }
-                self.apply_detector_model_panel_action(actions.surya_model_download);
-                if actions.toggle_edit_lines_mode {
-                    self.set_text_detector_edit_lines_mode(!self.text_detector_edit_lines_mode);
-                }
-                if actions.toggle_edit_mask_mode {
-                    self.set_text_detector_edit_mask_mode(!self.text_detector_edit_mask_mode);
-                }
-                if actions.save_results {
-                    self.start_text_detection_storage_save(project);
-                }
-                if actions.clear_results {
-                    self.clear_detector_result_stores();
-                    self.text_detector_progress = None;
-                    self.clear_text_detector_line_edit_state();
-                    self.set_text_detector_status(t!("translation.tab.results_cleared_status"), Severity::Success);
-                }
-                if actions.detect_current {
-                    self.start_text_detection_for_current_page(project, canvas);
-                }
-                if actions.detect_all {
-                    self.start_text_detection_for_all_pages(project);
-                }
-                if actions.ocr_current {
-                    self.start_text_detector_ocr_for_indices(
-                        ctx,
-                        project,
-                        vec![canvas.current_page_idx()],
-                    );
-                }
-                if actions.ocr_all {
-                    self.start_text_detector_ocr_for_indices(
-                        ctx,
-                        project,
-                        self.detected_page_indices(),
-                    );
-                }
-
-                if let Err(off) = block_ocr_route {
-                    ui.separator();
-                    ui.colored_label(
-                        ms_theme::status::WARNING,
-                        tf!("translation.tab.block_ocr_unavailable_status", reason = off.user_message()),
-                    );
-                } else if self.ocr_controller.state() != OcrLoadState::Ready {
-                    ui.separator();
-                    ui.small(t!("translation.tab.block_ocr_load_engine_hint"));
-                }
-            }
-            _ => {
-                ui.label(t!("translation.tab.section_porting_notice"));
-            }
-        }
-    }
-
-    fn toggle_panel(&mut self, panel: TranslationPanel) {
-        let prev = self.active_panel;
-        let next = if self.active_panel == panel {
-            TranslationPanel::None
-        } else {
-            panel
-        };
-        if next == TranslationPanel::Composition {
-            self.composition_rebuild_requested = true;
-        }
-        if next != TranslationPanel::None && next != prev {
-            self.expand_panel_on_show = true;
-        }
-        if prev == TranslationPanel::TextDetector && next != TranslationPanel::TextDetector {
-            self.set_text_detector_edit_lines_mode(false);
-            self.set_text_detector_edit_mask_mode(false);
-        }
-        self.active_panel = next;
     }
 
     fn ensure_character_names_loaded(&mut self, project: &ProjectData) {
@@ -4866,235 +4287,6 @@ impl TranslationTabState {
     }
 }
 
-/// Per-frame context the panel dock hands to one «Перевод» tab body at a time.
-///
-/// The bodies capture nothing of their own: «Лента» needs the shared `CanvasView`
-/// (the hook's own parameter, borrow-independent of the tab state the hook was
-/// called on) while «Последние персонажи» needs the tab's own history. Closures
-/// capturing those borrows directly could not coexist in the dock's queue;
-/// exclusive, sequential access through this context lets every body reach exactly
-/// what it needs.
-///
-/// Every field is a borrow of a DISJOINT field of [`TranslationTabState`] or a
-/// plain copy, and none of them is the `PanelDockState` the dock itself borrows for
-/// the frame. There is no deferred-output field: this tab's own body only READS.
-struct TranslationDockCx<'a> {
-    /// Owner of the «Лента» body.
-    canvas: &'a mut CanvasView,
-    /// Project page count, shown by the «Лента» tab's page counter.
-    total_pages: usize,
-    /// Most recently used characters, newest first — one card per entry.
-    recent_characters: &'a VecDeque<RecentCharacterEntry>,
-    /// The binding text of each recent-character rank (`TranslationInputLabels::recent_char_keys`).
-    recent_char_keys: &'a [String],
-}
-
-impl TranslationDockCx<'_> {
-    /// The accessor `canvas::declare_ribbon_tab` asks for, as a plain `fn` item the
-    /// caller can hand over instead of spelling the closure out.
-    fn ribbon_body(&mut self) -> (&mut CanvasView, usize) {
-        (&mut *self.canvas, self.total_pages)
-    }
-}
-
-/// Caption of a recent-character card: the binding text of the rank's parameter mode
-/// (`crate::input::RECENT_CHARS`, "1" by default for the first card), then the name.
-#[must_use]
-fn recent_character_card_caption(key_label: &str, character_name: &str) -> String {
-    format!("[ {key_label} ] {character_name}")
-}
-
-/// Outer size, in points, of a recent-character card whose caption laid out to
-/// `caption_size`.
-///
-/// The caption plus the inner margin plus the border on all four sides, which is
-/// exactly what `egui::Frame` allocated for the same card before: its
-/// `outer_rect` is `content_rect + inner_margin + Margin::from(stroke.width) +
-/// outer_margin`, and the outer margin is zero here
-/// (`egui-0.35.0/src/containers/frame.rs:349-352`, `:456-462`).
-#[must_use]
-fn recent_character_card_size(caption_size: Vec2) -> Vec2 {
-    caption_size
-        + Vec2::new(
-            2.0 * (RECENT_CHARACTER_CARD_MARGIN_X_PX + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX),
-            2.0 * (RECENT_CHARACTER_CARD_MARGIN_Y_PX + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX),
-        )
-}
-
-/// Top-left corner the caption is painted at inside a card laid out at `card_rect`.
-///
-/// The inverse of [`recent_character_card_size`]: `Frame` places the content rect
-/// one inner margin and one border in from the card's own corner.
-#[must_use]
-fn recent_character_card_caption_pos(card_rect: Rect) -> Pos2 {
-    card_rect.min
-        + Vec2::new(
-            RECENT_CHARACTER_CARD_MARGIN_X_PX + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX,
-            RECENT_CHARACTER_CARD_MARGIN_Y_PX + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX,
-        )
-}
-
-/// Draws the «Последние персонажи» tab body: one card per remembered character,
-/// captioned with the digit that activates it, wrapping onto further rows at the
-/// panel's own width.
-///
-/// The cards are not interactive and this is deliberate — a character is picked by
-/// holding its recent-character binding together with the bubble-create command or the quick OCR
-/// gesture, never by clicking the card. The body only reads
-/// [`TranslationDockCx::recent_characters`]; the allocation senses `hover` and
-/// nothing else, exactly as `Frame::allocate_space` did
-/// (`egui-0.35.0/src/containers/frame.rs:466-468`), and nothing is painted from
-/// the response, so there is no hover highlight and no click target.
-///
-/// **A card may NOT be an `egui::Frame`, and that is the whole reason this function
-/// paints by hand.** `Frame::begin` takes its bounds from
-/// `Ui::available_rect_before_wrap` and reserves the space only afterwards, through
-/// `Prepared::allocate_space` → `Ui::allocate_rect` → `advance_cursor_after_rect`
-/// (`frame.rs:378-397`, `:466-468`, `egui-0.35.0/src/ui.rs:1256-1270`). That path
-/// calls `Placer::advance_after_rects` DIRECTLY and never reaches
-/// `Placer::next_space`, which is where `Layout::next_frame` starts a new row
-/// (`egui-0.35.0/src/placer.rs:113-125`, `src/layout.rs:506-528`). A framed card
-/// therefore cannot wrap: the whole history ran off the right edge of the panel
-/// and the body grew a horizontal scrollbar. `egui::Button` wraps in
-/// `cleaning::tab::draw_tool_button_rows` for the opposite reason — it measures
-/// itself first and allocates through `Ui::allocate_exact_size`.
-///
-/// So the caption is laid out FIRST (never wrapped, so a character name can never
-/// break across two lines), its card size is derived from the galley, that exact
-/// size goes through `allocate_exact_size` → `allocate_space` → `next_space`, and
-/// only then are the background, the border and the text painted into the rect the
-/// layout handed back. `Layout::next_frame` breaks a row only while
-/// `max_rect.left() < cursor.left()`, so a card wider than the whole panel still
-/// gets a row of its own rather than an empty one above it (`layout.rs:517`).
-///
-/// The look is unchanged: `StrokeKind::Inside` on the allocated rect reproduces
-/// `Frame::paint`, which draws its `RectShape` with the same `StrokeKind::Inside`
-/// on `widget_rect = content_rect + inner_margin + stroke.width`
-/// (`frame.rs:423-445`), and the galley comes from the same `FontSelection::Default`
-/// the removed `ui.label` resolved through (`egui-0.35.0/src/widgets/label.rs:173`).
-fn draw_recent_characters_tab_body(ui: &mut egui::Ui, cx: &mut TranslationDockCx<'_>) {
-    let fill = Color32::from_rgba_unmultiplied(110, 110, 110, 170);
-    let stroke = Stroke::new(
-        RECENT_CHARACTER_CARD_STROKE_WIDTH_PX,
-        Color32::from_rgba_unmultiplied(255, 255, 255, 44),
-    );
-    let caption_color = Color32::from_rgb(235, 235, 235);
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = Vec2::splat(RECENT_CHARACTER_CARD_SPACING_PX);
-        for (rank, entry) in cx.recent_characters.iter().enumerate() {
-            // `Extend` with an infinite width: the card is sized from this galley, so
-            // the name must be measured as the single line it will be drawn as.
-            let caption = egui::WidgetText::from(
-                egui::RichText::new(recent_character_card_caption(cx.recent_char_keys.get(rank).map_or("", String::as_str), &entry.character_name))
-                    .color(caption_color),
-            )
-            .into_galley(
-                ui,
-                Some(egui::TextWrapMode::Extend),
-                f32::INFINITY,
-                egui::FontSelection::Default,
-            );
-            let (card_rect, _) = ui.allocate_exact_size(
-                recent_character_card_size(caption.size()),
-                egui::Sense::hover(),
-            );
-            let painter = ui.painter();
-            painter.rect(
-                card_rect,
-                egui::CornerRadius::same(RECENT_CHARACTER_CARD_CORNER_RADIUS_PX),
-                fill,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-            // The colour is already baked into the galley by `RichText::color`, so the
-            // fallback only ever applies to a `Color32::PLACEHOLDER` section there is none of.
-            painter.galley(
-                recent_character_card_caption_pos(card_rect),
-                caption,
-                caption_color,
-            );
-        }
-    });
-}
-
-impl TranslationTabState {
-    /// Top-left corner of the text-detector edit boxes: just under the dock panel
-    /// holding the «Лента» tab, as they sat under the canvas controls panel before
-    /// that panel became a dock tab.
-    ///
-    /// Uses the PREVIOUS frame's rect ([`TranslationTabState::ribbon_panel_rect`]) —
-    /// these boxes are drawn before the dock runs — and falls back to a fixed offset
-    /// inside `canvas_rect` whenever the panel is not on screen in this window
-    /// (hidden, or detached into a sub-window), which is the same fallback the
-    /// `Memory::area_rect` read had.
-    #[must_use]
-    fn text_detector_edit_panel_pos(&self, canvas_rect: Rect) -> Pos2 {
-        self.ribbon_panel_rect
-            .map(|rect| rect.left_bottom() + egui::vec2(0.0, 8.0))
-            .unwrap_or_else(|| canvas_rect.left_top() + egui::vec2(12.0, 112.0))
-    }
-
-    /// Runs the «Перевод» tab's panel dock — the canvas' own «Лента» tab and this
-    /// tab's «Последние персонажи» — and records the ribbon panel's rect for the
-    /// next frame.
-    ///
-    /// Called at the very END of `draw_canvas_overlay_top_left`; see the call site
-    /// for why that position is load-bearing.
-    fn draw_panel_dock(
-        &mut self,
-        ctx: &egui::Context,
-        canvas_rect: Rect,
-        canvas: &mut CanvasView,
-        total_pages: usize,
-        panel_dock: &mut PanelDockState,
-    ) {
-        // The SAME `fn` item `studio.rs::restore_panel_dock` registers: the dock state
-        // keeps it to rebuild the arrangement for the header's reset item, so two
-        // different builders here would reset to something the user never saw.
-        panel_dock.ensure_default_layout(
-            AppTab::Translation.key(),
-            translation_default_dock_layout,
-        );
-        let recent_characters_visible = !self.recent_characters.is_empty();
-        let mut cx = TranslationDockCx {
-            canvas,
-            total_pages,
-            recent_characters: &self.recent_characters,
-            recent_char_keys: &self.input_labels.recent_char_keys,
-        };
-        let mut dock = PanelDock::begin(
-            ctx,
-            panel_dock,
-            DockArea {
-                rect: ms_canvas::dock_area_rect(canvas_rect),
-                layout_key: AppTab::Translation.key(),
-            },
-        );
-        ms_canvas::declare_ribbon_tab(&mut dock, TranslationDockCx::ribbon_body);
-        // Declared on EVERY frame, visible only while the history has entries: a
-        // hidden tab keeps its slot in the layout and only its panel is skipped, so
-        // the first character of a fresh chapter brings the cards back to wherever
-        // the user put them. Skipping the declaration instead would make the dock
-        // treat the tab as another program tab's and seed it a fresh panel next time.
-        //
-        // Transparent until hovered: without the pointer on it the panel paints no
-        // frame, border, arrow or grip, so the cards float on the canvas exactly as
-        // they did as a bare `Area`. Hovering fades the chrome in and makes the panel
-        // draggable and resizable like any other.
-        dock.tab(TRANSLATION_RECENT_CHARACTERS_TAB)
-            .title(|| t!("translation.tab.recent_characters_tab"))
-            .visible(recent_characters_visible)
-            .transparent_until_hover(true)
-            .min_size(TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX)
-            .initial_size(TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX)
-            .show(draw_recent_characters_tab_body);
-        // `tab_rect` answers for the MAIN window alone: it is `None` while the tab is
-        // hidden AND while the user keeps it in a detached sub-window, whose rect lives
-        // in that window's own coordinate frame. Both are "unknown" to the edit boxes.
-        self.ribbon_panel_rect = dock.end(&mut cx).tab_rect(CANVAS_RIBBON_TAB);
-    }
-}
-
 impl CanvasHooks for TranslationTabState {
     /// The create-bubble command's binding (`crate::input::CREATE_BUBBLE`), from this frame's
     /// labels; `None` while it is unbound.
@@ -5255,51 +4447,16 @@ impl CanvasHooks for TranslationTabState {
         self.poll_image_bubble_pick(ctx, project, now_s);
         self.flush_footer_patches(canvas, project, now_s);
         self.bubbles_panel.flush_text_updates(canvas, now_s);
-
-        egui::Area::new("translation_canvas_open_buttons".into())
-            .fixed_pos(canvas_rect.right_bottom() + egui::vec2(0.0, -40.0))
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    // Заголовок по центру
-                    ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new(t!("translation.tab.tools_heading")).strong());
-                    });
-
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(self.open_button_label(TranslationPanel::Bubbles))
-                            .clicked()
-                        {
-                            self.toggle_panel(TranslationPanel::Bubbles);
-                        }
-                        if ui
-                            .button(self.open_button_label(TranslationPanel::Ocr))
-                            .clicked()
-                        {
-                            self.toggle_panel(TranslationPanel::Ocr);
-                        }
-                        if ui
-                            .button(self.open_button_label(TranslationPanel::Composition))
-                            .clicked()
-                        {
-                            self.toggle_panel(TranslationPanel::Composition);
-                        }
-                        if ui
-                            .button(self.open_button_label(TranslationPanel::MachineTranslation))
-                            .clicked()
-                        {
-                            self.toggle_panel(TranslationPanel::MachineTranslation);
-                        }
-                        if ui
-                            .button(self.open_button_label(TranslationPanel::TextDetector))
-                            .clicked()
-                        {
-                            self.toggle_panel(TranslationPanel::TextDetector);
-                        }
-                    });
-                });
-            });
+        // The MT request preview outlives its tool body: polled and drawn on every frame, so it
+        // keeps working while the MT tab is behind a sibling or switched off.
+        self.poll_ai_mt_request_preview(ctx);
+        self.draw_ai_mt_request_preview_window(ctx);
+        // A pending rebuild (tool just switched on, settings just loaded) is done here rather
+        // than in the body: the body runs only while its tab is in front, and the dock below
+        // must see the fresh text on this very frame.
+        if self.tools.is_on(TranslationTool::Composition) && self.composition_rebuild_requested {
+            self.rebuild_composition_text(project);
+        }
 
         let show_startup_load_toast =
             status.total_pages > 0 && status.loaded_pages < status.total_pages;
@@ -5355,9 +4512,6 @@ impl CanvasHooks for TranslationTabState {
                         });
                 });
         }
-        if self.active_panel == TranslationPanel::Ocr {
-            ctx.request_repaint_after(Duration::from_millis(350));
-        }
         if self.ocr_quick_selection_mode_active()
             || self.ocr_advanced_selection_mode_active()
             || self.canvas_selection.is_some()
@@ -5380,8 +4534,6 @@ impl CanvasHooks for TranslationTabState {
             || self.text_detector_line_drag_state.is_some()
             || !self.pending_footer_patches.is_empty()
             || self.bubbles_panel.has_pending_text_updates()
-            || (self.active_panel == TranslationPanel::Composition
-                && self.composition_rebuild_requested)
         {
             ctx.request_repaint();
         }
@@ -5399,7 +4551,7 @@ impl CanvasHooks for TranslationTabState {
         // It must run on EVERY frame this tab is active — the dock's detached sub-windows are
         // immediate viewports that only exist while `PanelDock::end` shows them
         // (`studio.rs::PanelDockPass`), so this hook has no early return before this point.
-        self.draw_panel_dock(ctx, canvas_rect, canvas, status.total_pages, panel_dock);
+        self.draw_panel_dock(ctx, canvas_rect, canvas, project, status.total_pages, panel_dock);
     }
 
     fn build_bubble_header(&mut self, _ui: &mut egui::Ui, _bubble: &Bubble, _editable: bool) {}
@@ -7894,289 +7046,12 @@ fn build_bubble_original_text(
 #[cfg(test)]
 mod tests {
     use super::{
-        Bubble, Map, Pos2, RECENT_CHARACTER_CARD_MARGIN_X_PX, RECENT_CHARACTER_CARD_MARGIN_Y_PX,
-        RECENT_CHARACTER_CARD_SPACING_PX, RECENT_CHARACTER_CARD_STROKE_WIDTH_PX, Rect,
-        TRANSLATION_RECENT_CHARACTERS_TAB,
-        TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX,
-        TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX, TranslationTabState, Value, Vec2, egui,
+        Bubble, Map, TranslationTabState, Value,
         build_translation_character_names, collect_chapter_character_names,
         footer_additional_character_names, footer_autocomplete_candidates, footer_no_character,
         footer_no_characters,
-        footer_tracking_should_recompute, recent_character_card_caption,
-        recent_character_card_caption_pos, recent_character_card_size,
-        translation_default_dock_layout,
+        footer_tracking_should_recompute,
     };
-    use ms_canvas::{
-        CANVAS_RIBBON_TAB, CANVAS_RIBBON_TAB_INITIAL_SIZE_PX, CANVAS_RIBBON_TAB_MIN_SIZE_PX,
-    };
-    use ms_widgets::panel_dock::{
-        DockEdge, HostId, PanelAnchor, PanelChrome, PanelId, PanelSizes, solve,
-    };
-
-    /// A card shows the binding of its rank's parameter mode, then the name.
-    #[test]
-    fn a_recent_character_card_is_captioned_with_its_own_binding() {
-        assert_eq!(recent_character_card_caption("1", "Аня"), "[ 1 ] Аня");
-        assert_eq!(recent_character_card_caption("F6", "Bob"), "[ F6 ] Bob");
-        // A missing name still leaves the binding legible — the card is the only
-        // place that says which key is bound to what.
-        assert_eq!(recent_character_card_caption("3", ""), "[ 3 ] ");
-    }
-
-    /// The two card helpers are each other's inverse, and nothing but their
-    /// agreement keeps the caption centred: the size is what the layout allocates
-    /// and the position is where the text is painted inside it, so a margin changed
-    /// in one and not the other slides the text off the card.
-    ///
-    /// The inset reproduces `egui::Frame` exactly — one inner margin plus one border
-    /// on every side (`egui-0.35.0/src/containers/frame.rs:349-352`), which is what
-    /// makes the hand-painted card look identical to the framed one it replaced.
-    #[test]
-    fn a_recent_character_card_insets_its_caption_equally_on_every_side() {
-        let caption = Vec2::new(97.0, 18.0);
-        let size = recent_character_card_size(caption);
-        assert_eq!(
-            size,
-            caption
-                + Vec2::new(
-                    2.0 * (RECENT_CHARACTER_CARD_MARGIN_X_PX
-                        + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX),
-                    2.0 * (RECENT_CHARACTER_CARD_MARGIN_Y_PX
-                        + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX),
-                )
-        );
-
-        let card = Rect::from_min_size(Pos2::new(30.0, 40.0), size);
-        let drawn = Rect::from_min_size(recent_character_card_caption_pos(card), caption);
-        assert!(
-            card.contains_rect(drawn),
-            "the caption {drawn:?} sticks out of its card {card:?}"
-        );
-        assert_eq!(
-            drawn.left() - card.left(),
-            card.right() - drawn.right(),
-            "the caption is not horizontally centred in the card"
-        );
-        assert_eq!(
-            drawn.top() - card.top(),
-            card.bottom() - drawn.bottom(),
-            "the caption is not vertically centred in the card"
-        );
-        assert_eq!(
-            drawn.left() - card.left(),
-            RECENT_CHARACTER_CARD_MARGIN_X_PX + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX
-        );
-        assert_eq!(
-            drawn.top() - card.top(),
-            RECENT_CHARACTER_CARD_MARGIN_Y_PX + RECENT_CHARACTER_CARD_STROKE_WIDTH_PX
-        );
-    }
-
-    /// A card has to fit the panel the tab STARTS at, or the very first frame the
-    /// user sees is a single card with a horizontal scrollbar under it. The floor
-    /// must not fight it either: `min_size` only stops the shrink, so it has to stay
-    /// well under the start size, and it has to hold at least one card.
-    #[test]
-    fn the_start_size_fits_several_cards_and_the_floor_fits_one() {
-        // A caption of ~13 characters at the body font — «[ 1 ] Персонаж».
-        let card = recent_character_card_size(Vec2::new(100.0, 18.0));
-        // The panel spends this much on its own frame margins and border before the
-        // body gets any width (`Frame::popup`, 6 pt per side plus a 1 pt stroke).
-        const PANEL_CHROME_WIDTH_PX: f32 = 16.0;
-
-        let start_body = TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX.x - PANEL_CHROME_WIDTH_PX;
-        let per_row = ((start_body + RECENT_CHARACTER_CARD_SPACING_PX)
-            / (card.x + RECENT_CHARACTER_CARD_SPACING_PX))
-            .floor();
-        // A band, not a number: the real card width is a font galley, so this only
-        // pins that the start width is neither one-card-narrow (which is what the
-        // pre-fix bug looked like) nor so wide the panel eats the canvas. Four fit at
-        // this caption length; a name half again as long still leaves three.
-        assert!(
-            (2.0..=5.0).contains(&per_row),
-            "the start width fits {per_row} cards per row, outside the 2-5 band the size targets"
-        );
-
-        let floor_body = TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX.x - PANEL_CHROME_WIDTH_PX;
-        assert!(
-            floor_body >= card.x,
-            "the shrink floor cannot hold one card: {floor_body} pt of body for a {} pt card",
-            card.x
-        );
-        // Both operands are constants, so this is a compile-time check.
-        const {
-            assert!(
-                TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX.x
-                    < TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX.x
-                    && TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX.y
-                        < TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX.y,
-                "the floor must stay under the start size or the solver fights a user who narrows \
-                 the panel"
-            );
-        }
-    }
-
-    /// The default arrangement is what the dock is handed on a first run AND the
-    /// dictionary `panel_dock::persist` resolves stored tab keys against, so it has
-    /// to be well-formed and to name every tab this program tab can declare.
-    #[test]
-    fn the_default_dock_layout_places_the_two_translation_panels() {
-        let layout = translation_default_dock_layout();
-        assert_eq!(layout.validate(), Ok(()));
-        assert_eq!(layout.panels().len(), 2);
-
-        // «Лента» keeps the anchor and the id every canvas program tab gives it, so a
-        // user who already arranged the ribbon finds their panel where they left it.
-        let ribbon = layout
-            .panel(PanelId::new(0))
-            .expect("the ribbon panel exists");
-        assert_eq!(ribbon.tabs, vec![CANVAS_RIBBON_TAB]);
-        assert_eq!(
-            ribbon.anchor,
-            PanelAnchor::ViewportEdge {
-                edge: DockEdge::Left,
-                along: 0.0,
-            }
-        );
-
-        // The cards reproduce where the floating row sat: to the RIGHT of the ribbon,
-        // aligned with its top edge.
-        let recent = layout
-            .panel(PanelId::new(1))
-            .expect("the recent-characters panel exists");
-        assert_eq!(recent.tabs, vec![TRANSLATION_RECENT_CHARACTERS_TAB]);
-        assert_eq!(
-            recent.anchor,
-            PanelAnchor::Panel {
-                target: PanelId::new(0),
-                edge: DockEdge::Right,
-                align: 0.0,
-            }
-        );
-        assert_ne!(
-            recent.anchor, ribbon.anchor,
-            "two panels sharing a target+edge+align would be laid out on the same rect"
-        );
-
-        // Both panels are content-sized: their size comes from their tabs' own
-        // declarations, and pinning one here would only make the first solve fight it.
-        for id in (0..2).map(PanelId::new) {
-            let panel = layout.panel(id).expect("a default panel exists");
-            assert_eq!(panel.size_override, None, "{id} must stay content-sized");
-        }
-
-        // A `TabId` missing here is dropped from the user's stored arrangement on
-        // every load (`panel_dock::persist::known_tabs`), so this list is the whole
-        // set this program tab can declare.
-        for tab in [CANVAS_RIBBON_TAB, TRANSLATION_RECENT_CHARACTERS_TAB] {
-            assert!(layout.panel_of_tab(tab).is_some(), "{tab} has no panel");
-        }
-    }
-
-    /// Solving matters as much as being well-formed: the default arrangement is what
-    /// the user SEES on a first run, and a panel laid out on top of another one is
-    /// unreachable — the buried one cannot even be dragged out.
-    ///
-    /// Two frames are checked, because «Последние персонажи» is conditional: the one
-    /// where the history has entries (both panels) and the ordinary empty-history one
-    /// where `panel_dock::frame_layout` — built on `DockLayout::remove_panel` — drops
-    /// its panel for the frame.
-    #[test]
-    fn the_default_dock_layout_solves_into_disjoint_panels() {
-        // A maximised 1080p studio window: the canvas area of a 1920-wide window
-        // less the page-manager column and the scrollbar reserve. Deliberately not
-        // the largest possible area — the arrangement has to fit an ordinary window,
-        // not only a wide one.
-        let area = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1600.0, 1000.0));
-        let with_cards = translation_default_dock_layout();
-        let mut without_cards = translation_default_dock_layout();
-        without_cards
-            .remove_panel(PanelId::new(1))
-            .expect("the recent-characters panel can be dropped for a frame");
-        for (frame, layout, expected_panels) in [
-            ("history non-empty", &with_cards, 2),
-            ("history empty", &without_cards, 1),
-        ] {
-            let solved = solve_default_layout(layout, area);
-            assert_eq!(solved.len(), expected_panels, "{frame}: every panel is placed");
-            for (id, rect) in &solved {
-                assert!(
-                    area.contains_rect(*rect),
-                    "{frame}: panel {id} is laid out outside the dock area: {rect:?}"
-                );
-            }
-            for (i, (id_a, rect_a)) in solved.iter().enumerate() {
-                for (id_b, rect_b) in &solved[i + 1..] {
-                    assert!(
-                        !rect_a.intersects(*rect_b),
-                        "{frame}: panels {id_a} and {id_b} overlap: {rect_a:?} vs {rect_b:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Solves `layout` inside `area` with the sizes the two tabs declare, and returns
-    /// the drawn rects in panel order.
-    fn solve_default_layout(
-        layout: &ms_widgets::panel_dock::DockLayout,
-        area: Rect,
-    ) -> Vec<(PanelId, Rect)> {
-        // What the first frame feeds the solver: each panel's tab's `initial_size`,
-        // and its `min_size` as the floor.
-        let sizes: PanelSizes = [
-            (PanelId::new(0), CANVAS_RIBBON_TAB_INITIAL_SIZE_PX),
-            (
-                PanelId::new(1),
-                TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX,
-            ),
-        ]
-        .into_iter()
-        .collect();
-        let mins: PanelSizes = [
-            (PanelId::new(0), CANVAS_RIBBON_TAB_MIN_SIZE_PX),
-            (
-                PanelId::new(1),
-                TRANSLATION_RECENT_CHARACTERS_TAB_MIN_SIZE_PX,
-            ),
-        ]
-        .into_iter()
-        .collect();
-        let solved = solve(
-            layout,
-            HostId::MainWindow,
-            area,
-            &sizes,
-            &mins,
-            PanelChrome::default(),
-        );
-        let mut placed: Vec<(PanelId, Rect)> =
-            solved.iter().map(|(id, panel)| (id, panel.rect)).collect();
-        placed.sort_by_key(|(id, _)| *id);
-        placed
-    }
-
-    /// The two text-detector edit boxes are drawn BEFORE the dock runs, so they position
-    /// themselves from the previous frame's ribbon-panel rect and must degrade to a fixed
-    /// offset inside the canvas whenever that panel was not on screen in this window.
-    #[test]
-    fn the_detector_edit_boxes_follow_the_ribbon_panel_and_have_a_fallback() {
-        let canvas = Rect::from_min_max(Pos2::new(100.0, 50.0), Pos2::new(1100.0, 850.0));
-        let mut tab = TranslationTabState::default();
-        assert_eq!(
-            tab.text_detector_edit_panel_pos(canvas),
-            canvas.left_top() + egui::vec2(12.0, 112.0),
-            "an unknown panel rect falls back inside the canvas"
-        );
-
-        let panel = Rect::from_min_size(Pos2::new(120.0, 60.0), egui::vec2(330.0, 160.0));
-        tab.ribbon_panel_rect = Some(panel);
-        assert_eq!(
-            tab.text_detector_edit_panel_pos(canvas),
-            panel.left_bottom() + egui::vec2(0.0, 8.0),
-            "a known panel rect places the box one small gap under it"
-        );
-    }
 
     #[test]
     fn footer_tracking_not_bootstrapped_always_recomputes() {

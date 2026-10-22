@@ -23,6 +23,8 @@ Key structures:
 Key functions:
 - `PanelDock::begin` / `PanelDock::tab` / `PanelDock::end`.
 - `PanelDockState::ensure_default_layout`.
+- `PanelDockState::set_tab_extras_flag` / `PanelDockState::focus_tab`: host-side
+  (outside any body) extras write and "bring this tab to the front".
 - the pure frame helpers `ensure_declared_tabs`, `plan_frame`, `tab_request`,
   `frame_layout`, `apply_mutations` and `write_back_positions`, all unit-tested
   without a GPU.
@@ -751,6 +753,69 @@ impl PanelDockState {
         }
         extras.clear_changed();
         self.put_tab_extras(layout_key, tab, extras);
+    }
+
+    /// Writes one flag of `tab`'s extras in the program tab `layout_key` from
+    /// OUTSIDE a tab body, with the same footprint and dirty rules a body write has
+    /// ([`TabExtras::set_flag`]): `dirty` rises only when the stored content really
+    /// moved.
+    ///
+    /// For state a host owns and merely stores in the dock — e.g. which of its
+    /// tool tabs are switched on — that must persist even on frames the owning
+    /// tab's body does not run (its panel collapsed, hidden or showing a sibling).
+    /// Call it before [`PanelDock::begin`] or after [`PanelDock::end`]: `begin`
+    /// holds the state borrow for the frame.
+    pub fn set_tab_extras_flag(
+        &mut self,
+        layout_key: &str,
+        tab: TabId,
+        key: &str,
+        value: bool,
+        default: bool,
+    ) {
+        let mut extras = self.take_tab_extras(layout_key, tab);
+        extras.set_flag(key, value, default);
+        self.finish_tab_extras(layout_key, tab, extras);
+    }
+
+    /// Brings `tab` to the front of the panel that owns it in the program tab
+    /// `layout_key` and expands that panel if it was collapsed — what a host does
+    /// when the user switches a tool on and expects to see it.
+    ///
+    /// Returns `false`, changing nothing, when the program tab has no layout yet or
+    /// no panel owns `tab` (a tab is seeded into a panel at the end of the first
+    /// frame that declares it, so the caller may retry on the next frame). Raises
+    /// `dirty` only when the active tab or the collapsed state really changed, so a
+    /// tab already in front costs no config write. Works for a panel in any window.
+    /// Call it before [`PanelDock::begin`], like
+    /// [`PanelDockState::set_tab_extras_flag`].
+    pub fn focus_tab(&mut self, layout_key: &str, tab: TabId) -> bool {
+        let Some(layout) = self.layouts.get_mut(layout_key) else {
+            return false;
+        };
+        let Some(panel_id) = layout.panel_of_tab(tab) else {
+            return false;
+        };
+        let Some(panel) = layout.panel(panel_id) else {
+            return false;
+        };
+        if panel.active_tab == tab && !panel.collapsed {
+            return true;
+        }
+        // Neither setter can fail here — `panel_of_tab` just found `panel_id` and it
+        // owns `tab` — but a refusal is still logged rather than unwrapped.
+        if let Err(error) = layout
+            .set_active_tab(panel_id, tab)
+            .and_then(|()| layout.set_collapsed(panel_id, false))
+        {
+            runtime_log::log_warn(format!(
+                "[panel_dock] could not focus tab `{tab}` in panel {panel_id} of `{layout_key}`: \
+                 {error}"
+            ));
+            return false;
+        }
+        self.dirty = true;
+        true
     }
 
     /// Header/frame overhead measured on the last drawn frame, or the nominal
@@ -3112,6 +3177,12 @@ struct DefaultPlacement {
     size_override: Option<Vec2>,
 }
 
+/// The panel of the DEFAULT layout that holds `tab`, or `None` when the default
+/// does not know the tab.
+fn default_panel_of(default: &DockLayout, tab: TabId) -> Option<&PanelNode> {
+    default.panel_of_tab(tab).and_then(|id| default.panel(id))
+}
+
 /// Tab naming the panel the DEFAULT hangs `tab`'s own panel off, or `None` when
 /// the default gives it no `Panel` anchor — or does not know the tab at all.
 ///
@@ -3121,7 +3192,7 @@ struct DefaultPlacement {
 /// [`seeding_order`] decides what has to exist first with it, and the two would
 /// disagree the moment they read the default differently.
 fn default_anchor_tab(default: &DockLayout, tab: TabId) -> Option<TabId> {
-    let source = default.panel_of_tab(tab).and_then(|id| default.panel(id))?;
+    let source = default_panel_of(default, tab)?;
     match source.anchor {
         PanelAnchor::Free | PanelAnchor::ViewportEdge { .. } => None,
         PanelAnchor::Panel { target, .. } => default
@@ -3181,10 +3252,11 @@ fn same_slot(left: PanelAnchor, right: PanelAnchor) -> bool {
 /// the gestures: the solver is a total function and lays two panels sharing an
 /// anchor on exactly the same rect, the later one burying the earlier one — and a
 /// buried panel can no longer be reached, not even to drag it out again. The
-/// seeding path reaches that state by the most ordinary route there is: a new
-/// build adds its tab to an EXISTING default panel, the tab is new to the user's
-/// restored layout while the panel's older tabs are not, and the panel seeded for
-/// it inherits that panel's whole anchor and pinned size.
+/// seeding path reaches that state whenever the slot the default names for a new
+/// panel is already taken in the user's restored layout — by a panel the user
+/// docked there, or by one the default never put there. (A tab whose default
+/// panel-mates are already live does not get here: it joins their panel, see
+/// [`ensure_declared_tabs`].)
 ///
 /// So the newcomer QUEUES, exactly as a dropped panel does: while a live panel of
 /// `host` already holds this anchor, the newcomer is re-anchored to THAT panel,
@@ -3289,10 +3361,7 @@ fn default_placement(
     host: HostId,
     tab: TabId,
 ) -> Option<DefaultPlacement> {
-    let source = default
-        .panel_of_tab(tab)
-        .and_then(|id| default.panel(id))
-        .filter(|panel| panel.host == host)?;
+    let source = default_panel_of(default, tab).filter(|panel| panel.host == host)?;
     let anchor = match source.anchor {
         PanelAnchor::Free => PanelAnchor::Free,
         PanelAnchor::ViewportEdge { edge, along } => PanelAnchor::ViewportEdge { edge, along },
@@ -3320,34 +3389,114 @@ fn default_placement(
     })
 }
 
-/// Adds a panel for every declared tab the layout does not own yet.
+/// Where a missing tab joins an EXISTING panel: the panel and the index in its
+/// tab strip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SiblingSlot {
+    panel: PanelId,
+    index: usize,
+}
+
+/// The live panel a missing `tab` joins because a SIBLING of it — a tab sharing
+/// its panel in the DEFAULT layout — is already in `layout`, or `None` when no
+/// sibling is (or the default does not know the tab).
 ///
-/// **Rule:** a tab declared for the first time gets its OWN new free-floating
-/// panel. It is deliberately never appended to an existing panel: merging
-/// unrelated tabs into one panel behind the caller's back is not recoverable by
-/// the user without dragging, while a panel that stands alone can always be
-/// docked onto another one.
+/// The nearest sibling in the default's tab order decides: the closest one
+/// BEFORE `tab`, and `tab` goes right after it in that sibling's panel; failing
+/// that, the closest one AFTER it, and `tab` goes right before it. Joining tab by
+/// tab in default order therefore rebuilds the default's relative order inside
+/// the joined panel. The sibling's panel is taken wherever the user put it — any
+/// host, any position — because that is where the user keeps the group now.
+fn sibling_slot(default: &DockLayout, layout: &DockLayout, tab: TabId) -> Option<SiblingSlot> {
+    let siblings = &default_panel_of(default, tab)?.tabs;
+    let position = siblings.iter().position(|sibling| *sibling == tab)?;
+    let slot_of = |sibling: TabId, after: bool| {
+        let panel = layout.panel_of_tab(sibling)?;
+        let index = layout
+            .panel(panel)?
+            .tabs
+            .iter()
+            .position(|held| *held == sibling)?;
+        Some(SiblingSlot {
+            panel,
+            index: if after { index.saturating_add(1) } else { index },
+        })
+    };
+    let (before, after) = siblings.split_at(position);
+    before
+        .iter()
+        .rev()
+        .find_map(|sibling| slot_of(*sibling, true))
+        .or_else(|| after.iter().skip(1).find_map(|sibling| slot_of(*sibling, false)))
+}
+
+/// The tabs that get ONE new panel together with `tab`, and the one of them that
+/// panel shows: every DECLARED tab of `tab`'s default panel that `layout` does
+/// not own yet, in the default's tab order, active as in the default when the
+/// default's active tab is among them (else the first). Without a default that
+/// knows `tab`, the group is `tab` alone.
 ///
-/// **Where that panel goes** is asked of the program tab's DEFAULT arrangement
-/// first (`default`, the layout [`PanelDockState::ensure_default_layout`] was
-/// given — pass `None` when the key has no builder). A user with a stored layout
-/// keeps it, so the default builder never runs for them, and a tab added by a new
-/// build reaches this function for every existing user at once: cascading it into
-/// the middle of the canvas puts a brand-new panel on top of the user's own
-/// arrangement, while the default builder already says where that tab belongs.
-/// The default's anchor, position and pinned size are reused when they can be
-/// expressed in this layout (see [`default_placement`]); otherwise — the default
-/// does not know the tab, or its anchor targets a panel that is not here — the
-/// panel falls back to a free position cascaded by [`AUTO_PANEL_CASCADE_STEP`]
+/// Only called once [`sibling_slot`] found no sibling in `layout`, so no member
+/// of the default panel is live and the group is that panel's declared part.
+fn seeding_group(
+    default: Option<&DockLayout>,
+    layout: &DockLayout,
+    order: &[TabId],
+    tab: TabId,
+) -> (Vec<TabId>, TabId) {
+    let Some(source) = default.and_then(|default| default_panel_of(default, tab)) else {
+        return (vec![tab], tab);
+    };
+    let members: Vec<TabId> = source
+        .tabs
+        .iter()
+        .copied()
+        .filter(|member| {
+            *member == tab || (order.contains(member) && layout.panel_of_tab(*member).is_none())
+        })
+        .collect();
+    let active = if members.contains(&source.active_tab) {
+        source.active_tab
+    } else {
+        members.first().copied().unwrap_or(tab)
+    };
+    (members, active)
+}
+
+/// Gives every declared tab the layout does not own yet a panel.
+///
+/// **Rule:** a missing tab is placed by its DEFAULT panel (`default`, the layout
+/// [`PanelDockState::ensure_default_layout`] was given — pass `None` when the key
+/// has no builder). A user with a stored layout keeps it, so the default builder
+/// never runs for them, and a tab added by a new build reaches this function for
+/// every existing user at once; the default already says which tabs belong
+/// together and where.
+/// - **A sibling is live** — some tab sharing the missing tab's default panel is
+///   already in `layout`: the missing tab JOINS that sibling's panel, next to the
+///   nearest sibling in default order ([`sibling_slot`]). That panel's active tab,
+///   size, anchor and host stay as the user left them.
+/// - **No sibling is live:** the missing DECLARED members of the default panel
+///   get ONE new panel together, in the default's tab order, showing the
+///   default's active tab when it is among them ([`seeding_group`]) — a group a
+///   new build adds arrives as one tabbed panel, not a column of single-tab ones.
+/// - **No default, or the default does not know the tab:** the tab gets its OWN
+///   new panel. Unrelated tabs are never merged behind the caller's back: that is
+///   not recoverable without dragging, while a panel that stands alone can always
+///   be docked onto another one.
+///
+/// Tabs already in `layout` are never moved; only their panel's tab strip may
+/// grow.
+///
+/// **Where a new panel goes:** the default panel's anchor, position and pinned
+/// size when they can be expressed in this layout (see [`default_placement`]);
+/// otherwise — the default does not know the tab, or its anchor targets a panel
+/// that is not here — a free position cascaded by [`AUTO_PANEL_CASCADE_STEP`]
 /// from the layout's origin, so it does not land exactly on an existing one.
 ///
-/// **A seeded panel never buries a live one.** The default answers for the whole
-/// default panel while the seeded panel holds the new tab ALONE, so a tab added
-/// to an existing default panel would otherwise arrive on exactly the rect the
-/// live panel holding that panel's older tabs occupies. An anchored placement is
-/// therefore queued behind whoever already holds that slot
-/// ([`free_anchor_slot`]) and a free one steps off whatever stands at its
-/// position ([`step_off_occupied`]).
+/// **A seeded panel never buries a live one.** A slot the user filled with
+/// another panel may be the one the default names, so an anchored placement is
+/// queued behind whoever already holds that slot ([`free_anchor_slot`]) and a
+/// free one steps off whatever stands at its position ([`step_off_occupied`]).
 ///
 /// The tabs are seeded in [`seeding_order`], not in declaration order: a default
 /// anchor is resolved against the LIVE layout, so a tab it hangs off another
@@ -3361,8 +3510,30 @@ fn ensure_declared_tabs(
     default: Option<&DockLayout>,
 ) -> bool {
     let mut changed = false;
-    // Every entry is a tab this layout does not own, listed once.
+    // Every entry is a tab this layout did not own when the pass began, listed
+    // once; a group seeded earlier in the pass may have taken it since.
     for tab in seeding_order(layout, order, default) {
+        if layout.panel_of_tab(tab).is_some() {
+            continue;
+        }
+        if let Some(slot) = default.and_then(|default| sibling_slot(default, layout, tab)) {
+            let joined = layout.edit(slot.panel, |node| {
+                // `slot.index` is at most the strip's length (one past a held
+                // tab's index); the clamp keeps `insert` total regardless.
+                let index = slot.index.min(node.tabs.len());
+                node.tabs.insert(index, tab);
+            });
+            match joined {
+                Ok(()) => changed = true,
+                Err(error) => runtime_log::log_warn(format!(
+                    "[panel_dock] cannot add the newly declared tab `{}` to panel {} of its default siblings: {error}",
+                    tab.as_str(),
+                    slot.panel
+                )),
+            }
+            continue;
+        }
+        let (members, active) = seeding_group(default, layout, order, tab);
         let id = match layout.next_panel_id() {
             Ok(id) => id,
             Err(error) => {
@@ -3373,7 +3544,7 @@ fn ensure_declared_tabs(
                 continue;
             }
         };
-        let mut node = match PanelNode::new(id, host, vec![tab]) {
+        let mut node = match PanelNode::new(id, host, members) {
             Ok(node) => node,
             Err(error) => {
                 runtime_log::log_warn(format!(
@@ -3383,6 +3554,8 @@ fn ensure_declared_tabs(
                 continue;
             }
         };
+        // `seeding_group` picks the active tab among the members it returns.
+        node.active_tab = active;
         match default.and_then(|default| default_placement(default, layout, host, tab)) {
             Some(placement) => {
                 match placement.anchor {
@@ -3831,12 +4004,12 @@ mod tests {
         solved
     }
 
-    /// The natural way a new build adds a tab is to put it into an EXISTING
-    /// default panel. The seeded panel then inherits that panel's whole anchor and
-    /// pinned size while holding the new tab ALONE, and the solver lays two panels
-    /// sharing target + edge + align on exactly the same rect: the newcomer has the
-    /// highest id, is drawn last, and buries the live panel completely — which
-    /// cannot even be dragged out again. So the seeded panel queues behind it.
+    /// The slot the default names for a new panel may already be taken in the
+    /// user's layout — here by a panel the user docked there, holding a tab the
+    /// default keeps elsewhere. The solver lays two panels sharing target + edge +
+    /// align on exactly the same rect: the newcomer has the highest id, is drawn
+    /// last, and buries the live panel completely — which cannot even be dragged
+    /// out again. So the seeded panel queues behind it.
     #[test]
     fn a_seeded_panel_queues_behind_the_live_panel_already_in_its_slot() {
         let pinned = Some(Vec2::new(300.0, 200.0));
@@ -3850,19 +4023,21 @@ mod tests {
             align: 0.0,
         };
 
-        // The new build's default: the added TAB_C shares a panel with TAB_B,
-        // docked under the panel holding TAB_A.
+        // The new build's default: the added TAB_C docked under the panel
+        // holding TAB_A, and TAB_B on a free panel of its own.
         let mut default = DockLayout::new();
         let mut root = panel_with(0, &[TAB_A]);
         root.anchor = edge_anchor;
         root.size_override = pinned;
         default.insert_panel(root).expect("default 0");
-        let mut hanging = panel_with(1, &[TAB_B, TAB_C]);
+        let mut hanging = panel_with(1, &[TAB_C]);
         hanging.anchor = under_root;
         hanging.size_override = pinned;
         default.insert_panel(hanging).expect("default 1");
+        default.insert_panel(panel_with(2, &[TAB_B])).expect("default 2");
 
-        // The user's restored layout, written by the build that had no TAB_C.
+        // The user's restored layout, written by the build that had no TAB_C:
+        // the user docked TAB_B's panel into the slot TAB_C's default names.
         let mut layout = DockLayout::new();
         let mut live_root = panel_with(4, &[TAB_A]);
         live_root.anchor = edge_anchor;
@@ -4007,6 +4182,172 @@ mod tests {
         // Seeded root-first, whatever the declaration order says.
         assert!(root.id < dependant.id);
         assert_panels_stand_clear(&layout);
+    }
+
+    const GROUP_D: TabId = TabId::new("test.group.d");
+    const GROUP_E: TabId = TabId::new("test.group.e");
+    const GROUP_F: TabId = TabId::new("test.group.f");
+
+    /// The default the grouping tests share: TAB_A pinned to the left edge, and
+    /// one panel holding the group GROUP_D, GROUP_E, GROUP_F (showing GROUP_E) docked
+    /// under it with a pinned size.
+    fn group_default() -> DockLayout {
+        let mut default = DockLayout::new();
+        let mut root = panel_with(0, &[TAB_A]);
+        root.anchor = PanelAnchor::ViewportEdge {
+            edge: DockEdge::Left,
+            along: 0.0,
+        };
+        default.insert_panel(root).expect("default 0");
+        let mut group = panel_with(1, &[GROUP_D, GROUP_E, GROUP_F]);
+        group.anchor = PanelAnchor::Panel {
+            target: PanelId::new(0),
+            edge: DockEdge::Bottom,
+            align: 0.0,
+        };
+        group.size_override = Some(Vec2::new(280.0, 190.0));
+        group.active_tab = GROUP_E;
+        default.insert_panel(group).expect("default 1");
+        default
+    }
+
+    /// A build that adds a whole group of tabs sharing one default panel must
+    /// give an existing user ONE tabbed panel, in the default's order and with
+    /// the default's active tab and placement — not a column of single-tab panels.
+    #[test]
+    fn missing_tabs_of_one_default_panel_are_seeded_together() {
+        let mut layout = DockLayout::new();
+        let mut live_root = panel_with(3, &[TAB_A]);
+        live_root.anchor = PanelAnchor::ViewportEdge {
+            edge: DockEdge::Left,
+            along: 0.0,
+        };
+        layout.insert_panel(live_root).expect("restored root");
+        let before = layout.panel(PanelId::new(3)).cloned();
+
+        // Declared in an order that differs from the default's tab order.
+        assert!(ensure_declared_tabs(
+            &mut layout,
+            HostId::MainWindow,
+            &[GROUP_F, TAB_A, GROUP_D, GROUP_E],
+            Some(&group_default())
+        ));
+        assert_eq!(layout.validate(), Ok(()));
+        assert_eq!(layout.panels().len(), 2, "one new panel for the whole group");
+        let group = layout
+            .panel_of_tab(GROUP_D)
+            .and_then(|id| layout.panel(id))
+            .expect("a panel was created for the group");
+        assert_eq!(group.tabs, vec![GROUP_D, GROUP_E, GROUP_F]);
+        assert_eq!(group.active_tab, GROUP_E);
+        assert_eq!(
+            group.anchor,
+            PanelAnchor::Panel {
+                target: PanelId::new(3),
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            }
+        );
+        assert_eq!(group.size_override, Some(Vec2::new(280.0, 190.0)));
+        // The tab that was already there is untouched.
+        assert_eq!(layout.panel(PanelId::new(3)).cloned(), before);
+    }
+
+    /// Only DECLARED members join the new panel; the default's active tab falls
+    /// back to the first member when it is not among them.
+    #[test]
+    fn an_undeclared_member_is_left_out_of_the_seeded_group() {
+        let mut layout = DockLayout::new();
+        layout.insert_panel(panel_with(0, &[TAB_A])).expect("restored");
+        assert!(ensure_declared_tabs(
+            &mut layout,
+            HostId::MainWindow,
+            &[TAB_A, GROUP_F, GROUP_D],
+            Some(&group_default())
+        ));
+        let group = layout
+            .panel_of_tab(GROUP_D)
+            .and_then(|id| layout.panel(id))
+            .expect("a panel was created for the group");
+        assert_eq!(group.tabs, vec![GROUP_D, GROUP_F]);
+        assert_eq!(group.active_tab, GROUP_D);
+        assert_eq!(layout.panel_of_tab(GROUP_E), None);
+    }
+
+    /// A partial group: the missing members join the live panel that already
+    /// holds a sibling, next to it in the default's order — wherever the user
+    /// keeps that panel, and without touching its active tab or its other tabs.
+    #[test]
+    fn missing_members_join_the_panel_of_a_live_sibling() {
+        // The user keeps GROUP_E in a free panel together with an unrelated TAB_B,
+        // TAB_B showing; GROUP_D and GROUP_F are new.
+        let mut layout = DockLayout::new();
+        layout.insert_panel(panel_with(0, &[TAB_A])).expect("restored root");
+        let mut kept = panel_with(5, &[TAB_B, GROUP_E]);
+        kept.pos = Pos2::new(400.0, 300.0);
+        layout.insert_panel(kept).expect("restored group");
+        let root_before = layout.panel(PanelId::new(0)).cloned();
+
+        assert!(ensure_declared_tabs(
+            &mut layout,
+            HostId::MainWindow,
+            &[TAB_A, TAB_B, GROUP_F, GROUP_D, GROUP_E],
+            Some(&group_default())
+        ));
+        assert_eq!(layout.validate(), Ok(()));
+        assert_eq!(layout.panels().len(), 2, "no new panel for a partial group");
+        let joined = layout.panel(PanelId::new(5)).expect("the kept panel");
+        // GROUP_D precedes GROUP_E in the default, GROUP_F follows it.
+        assert_eq!(joined.tabs, vec![TAB_B, GROUP_D, GROUP_E, GROUP_F]);
+        assert_eq!(joined.active_tab, TAB_B);
+        assert_eq!(joined.anchor, PanelAnchor::Free);
+        assert_eq!(joined.pos, Pos2::new(400.0, 300.0));
+        assert_eq!(layout.panel(PanelId::new(0)).cloned(), root_before);
+    }
+
+    /// "Any host" holds literally: a sibling the user keeps in a DETACHED window
+    /// pulls the missing members into that window's panel — not into a fresh panel
+    /// of the main window the frame is declaring for.
+    #[test]
+    fn missing_members_join_a_live_sibling_in_a_detached_window() {
+        let mut layout = DockLayout::new();
+        layout.insert_panel(panel_with(0, &[TAB_A])).expect("restored root");
+        let detached = PanelNode::new(PanelId::new(7), HostId::SubWindow(0), vec![GROUP_E])
+            .expect("detached panel");
+        layout.insert_panel(detached).expect("restored detached group");
+
+        assert!(ensure_declared_tabs(
+            &mut layout,
+            HostId::MainWindow,
+            &[TAB_A, GROUP_D, GROUP_E, GROUP_F],
+            Some(&group_default())
+        ));
+        assert_eq!(layout.validate(), Ok(()));
+        assert_eq!(layout.panels().len(), 2, "no new panel in the main window");
+        let joined = layout.panel(PanelId::new(7)).expect("the detached panel");
+        assert_eq!(joined.host, HostId::SubWindow(0));
+        assert_eq!(joined.tabs, vec![GROUP_D, GROUP_E, GROUP_F]);
+        assert_eq!(joined.active_tab, GROUP_E);
+    }
+
+    /// When the only live sibling FOLLOWS the missing tab in the default's order,
+    /// the missing tab goes right before it.
+    #[test]
+    fn a_missing_member_goes_before_a_following_live_sibling() {
+        let mut layout = DockLayout::new();
+        layout.insert_panel(panel_with(0, &[TAB_A])).expect("restored root");
+        layout
+            .insert_panel(panel_with(1, &[GROUP_F, TAB_B]))
+            .expect("restored group");
+        assert!(ensure_declared_tabs(
+            &mut layout,
+            HostId::MainWindow,
+            &[TAB_A, TAB_B, GROUP_D, GROUP_F],
+            Some(&group_default())
+        ));
+        let joined = layout.panel(PanelId::new(1)).expect("the kept panel");
+        assert_eq!(joined.tabs, vec![GROUP_D, GROUP_F, TAB_B]);
+        assert_eq!(joined.active_tab, GROUP_F);
     }
 
     #[test]
@@ -5018,6 +5359,64 @@ mod tests {
             state.tab_extras("typing", TAB_A).map(|bag| bag.flag("params.font", true)),
             Some(false)
         );
+    }
+
+    /// A host-side flag write follows the body-write rules: it stores the value,
+    /// dirties the dock only when the content moved, and leaves no trace once the
+    /// flag is back at its default.
+    #[test]
+    fn a_host_side_extras_flag_write_dirties_only_on_a_real_change() {
+        let mut state = PanelDockState::new();
+        state.ensure_default_layout("typing", single_panel_default_layout);
+        state.clear_dirty();
+
+        state.set_tab_extras_flag("typing", TAB_A, "tool.ocr", true, false);
+        assert!(state.is_dirty());
+        assert_eq!(
+            state.tab_extras("typing", TAB_A).map(|bag| bag.flag("tool.ocr", false)),
+            Some(true)
+        );
+        state.clear_dirty();
+
+        state.set_tab_extras_flag("typing", TAB_A, "tool.ocr", true, false);
+        assert!(!state.is_dirty(), "re-writing the stored value is not a change");
+
+        state.set_tab_extras_flag("typing", TAB_A, "tool.ocr", false, false);
+        assert!(state.is_dirty());
+        assert!(
+            state.tab_extras("typing", TAB_A).is_none(),
+            "a flag back at its default stores nothing"
+        );
+    }
+
+    /// Focusing a tab makes it the drawn tab of its panel and expands the panel;
+    /// a tab already in front dirties nothing, and an unknown layout or a tab no
+    /// panel owns yet is refused without touching the state.
+    #[test]
+    fn focusing_a_tab_brings_it_to_the_front_of_an_expanded_panel() {
+        let mut state = PanelDockState::new();
+        assert!(!state.focus_tab("typing", TAB_B), "no layout yet");
+        state.ensure_default_layout("typing", two_tab_default_layout);
+        let panel = PanelId::new(0);
+        state
+            .layout_mut("typing")
+            .expect("layout")
+            .set_collapsed(panel, true)
+            .expect("collapse");
+        state.clear_dirty();
+
+        assert!(state.focus_tab("typing", TAB_B));
+        let node = state.layout("typing").and_then(|layout| layout.panel(panel)).expect("panel");
+        assert_eq!(node.active_tab, TAB_B);
+        assert!(!node.collapsed);
+        assert!(state.is_dirty());
+        state.clear_dirty();
+
+        assert!(state.focus_tab("typing", TAB_B));
+        assert!(!state.is_dirty(), "a tab already in front is not a change");
+
+        assert!(!state.focus_tab("typing", TAB_C), "no panel owns the tab");
+        assert!(!state.is_dirty());
     }
 
     /// A `PanelDockOutput` is filled by EVERY window of the dock, and a

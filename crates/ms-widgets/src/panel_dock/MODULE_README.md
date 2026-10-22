@@ -696,9 +696,12 @@ back to the main window, and a window no restored layout puts a panel in is not 
 merges layouts per key but REPLACES the global `sub_windows` list, while `layouts_from_user_settings`
 decodes only the keys present in the caller's defaults slice. A stored program-tab key the running
 build does not pass in that slice therefore keeps its layout in the file but loses its sub-window
-association on the next write. Unreachable today — all three canvas keys are in the slice, and a
-build that starts hosting the dock in another program tab has to add it there anyway. Phase 8 must
-either keep undecoded keys addressable or move the window list under the per-key merge.
+association on the next write. Unreachable today: the studio builds the slice from every program
+tab's `StudioTab::default_dock_layout` (`Tabs::dock_layout_defaults` in `src/studio/tabs.rs`), so all
+four dock hosts (Translation, Cleaning, Typing, PS editor) are in it, and a program tab that starts
+hosting the dock enters it by implementing that hook. It becomes reachable only when a build stops
+hosting the dock in a program tab whose layout is stored. Phase 8 must either keep undecoded keys
+addressable or move the window list under the per-key merge.
 
 **Reset.** The header's context menu — below the «Переместить в окно →» submenu — restores the
 program tab's default layout. `PanelDockState`
@@ -748,6 +751,13 @@ content.
   that flag alone. The expected caller writes what it currently shows on every frame, so any weaker
   rule would make the persistence writer fire once per session start — and `dirty` means the USER
   changed something.
+- **A host may write a flag, or focus a tab, from outside any body** — before `PanelDock::begin`,
+  which holds the state borrow. `PanelDockState::set_tab_extras_flag` applies the body-write rules
+  (minimal footprint, `dirty` only on a real change) for state a host owns but stores in the dock
+  and must persist even while the owning tab's body does not run (the Translation tools' on-set).
+  `PanelDockState::focus_tab` makes a tab its panel's drawn tab and expands that panel (a host
+  switching a tool on); it refuses a tab no panel owns yet (seeded at the end of its first declared
+  frame) and dirties only on a real change, unlike `layout_mut`, which dirties unconditionally.
 - **The solver is a pure function.** `solve()` holds no egui state, performs no I/O and no logging,
   and has no interior mutability. Same inputs => same output, always.
 - **No egui runtime types below `mod.rs`.** `Pos2` / `Vec2` / `Rect` are used as plain geometry;
@@ -860,10 +870,23 @@ content.
   step. The drawn rect now matches the solved rect exactly (the frame's border is charged to the
   content width and to the body's height budget), and the gesture is authoritative regardless.
 - **Declaration rules.**
-  - A tab declared for the first time (owned by no panel of the layout) gets its OWN new panel. It
-    is never appended to an existing panel: merging unrelated tabs behind the caller's back is not
-    undoable without a drag, while a lone panel can always be docked onto another one.
-  - **Where that panel goes is asked of the program tab's DEFAULT layout first**
+  - A tab declared for the first time (owned by no panel of the layout) is placed by its DEFAULT
+    panel — the panel of the program tab's default layout holding it (`ensure_declared_tabs`):
+    - **a default panel-mate is already live** (the user's stored layout holds a sibling): the tab
+      JOINS that sibling's panel, next to the nearest sibling in the default's tab order (after the
+      closest preceding one, else before the closest following one; `sibling_slot`). The panel is
+      taken wherever the user keeps it (any position, any window); its active tab, size and anchor
+      are left as they are.
+    - **no panel-mate is live:** all missing DECLARED tabs of that default panel get ONE new panel
+      together, in the default's tab order, showing the default's active tab when it is among them
+      (else the first; `seeding_group`). A group a new build adds therefore reaches an existing
+      user as one tabbed panel, not as a column of single-tab panels queued in one slot. A member
+      that is not declared yet is left out and joins later by the rule above.
+    - **no default, or the default does not know the tab:** the tab gets its OWN new panel.
+      Unrelated tabs are never merged behind the caller's back: that is not undoable without a
+      drag, while a lone panel can always be docked onto another one.
+    - Tabs already in the layout are never moved; only a joined panel's tab strip grows.
+  - **Where a new panel goes is asked of the program tab's DEFAULT layout first**
     (`PanelDockState::ensure_default_layout` keeps the builder). A user with a stored arrangement
     never runs that builder — restore beats default — so a tab a new build adds reaches
     `ensure_declared_tabs` for every existing user on the first launch after the update, and a
@@ -874,12 +897,11 @@ content.
     default does not know the tab, or its anchor cannot be resolved here (the target tab is absent,
     or lives in another window), does the panel fall back to the free cascade by
     `AUTO_PANEL_CASCADE_STEP` from the area origin.
-  - **A seeded panel never buries a live one.** The default answers for the whole default PANEL
-    while the seeded panel holds the new tab ALONE, so the natural way to add a tab — putting it
-    into an existing default panel — hands the newcomer that panel's anchor and pinned size, i.e.
-    exactly the rect the live panel holding the older tabs occupies. It has the highest id, is drawn
-    last, and covers it completely (the cascade this replaced always left a corner visible). So an
-    anchored placement QUEUES behind whoever already holds the slot (`free_anchor_slot`, on
+  - **A seeded panel never buries a live one.** The slot the default names for a new panel may
+    already be taken in the user's layout — by a panel the user docked there, or one the default
+    keeps elsewhere — and a newcomer given that anchor and pinned size lands on exactly the rect the
+    live panel occupies. It has the highest id, is drawn last, and covers it completely (the cascade
+    this replaced always left a corner visible). So an anchored placement QUEUES behind whoever already holds the slot (`free_anchor_slot`, on
     `drag::queue_edge` so a queue grown here reads like one grown by a drag) and a free one steps off
     what stands at its position (`step_off_occupied`). Occupancy is decided by comparing ANCHORS,
     not rects: `drag::resolve_slot`'s geometric test needs the frame's solved rects and this runs
@@ -1003,7 +1025,9 @@ content.
   `install_persisted_tab_extras` in `mod.rs` (when it is handed out, when it dirties the dock, how it
   is restored) and `StoredTabExtras` / `StoredTabExtrasMap` / `decode_tab_extras` /
   `encode_tab_extras` in `persist.rs` (how it is written, and how a malformed stored value
-  degrades). To let a tab READ it, declare that tab's body with `PanelTab::show_with_extras`.
+  degrades). To let a tab READ it, declare that tab's body with `PanelTab::show_with_extras`; a
+  host writes it outside a body with `PanelDockState::set_tab_extras_flag`.
+- To bring a tab to the front of its panel from host code, use `PanelDockState::focus_tab`.
 - To change where a drop that crossed a window border goes — how a monitor coordinate is built,
   which window claims an overlapped point, what a tab or a panel lands on inside the receiving
   window — edit `cross_window.rs`; every rule there is a pure function with a test. To change how
@@ -1032,7 +1056,8 @@ content.
 - To change where a NEWLY DECLARED tab's panel lands — what the default is asked, how a slot that
   is already taken is answered, in which order the new panels are created — edit
   `default_placement` / `default_anchor_tab` / `free_anchor_slot` / `seeding_order` /
-  `ensure_declared_tabs` in `mod.rs`; all five are pure and unit-tested.
+  `sibling_slot` / `seeding_group` / `ensure_declared_tabs` in `mod.rs`; all are pure and
+  unit-tested.
 - The solver still lays two panels with an identical `target` + `edge` + `align` on top of each
   other — it is a total function of whatever layout it is given. Three things guarantee the user
   never sees that, one per writer of anchors: the sibling rule in `drag.rs` for a gesture,

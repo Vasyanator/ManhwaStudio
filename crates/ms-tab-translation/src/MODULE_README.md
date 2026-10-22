@@ -19,8 +19,9 @@ for that reason and carry a note saying so.
 `TranslationTab` in `host.rs` is the program tab as the studio root holds it: it owns the tab's
 `CanvasView` and its `TranslationTabState` (so the split borrow `(&mut canvas, &mut state)` the
 canvas draw needs stays inside this crate), draws them (`draw`: this frame's input handed to the
-state, fired commands, bottom-hint rows, lazy settings load, side panel, per-frame canvas flags,
-then the canvas inside the root's `CentralPanel`), and implements `ms_studio_tab::StudioTab` —
+state, the tools' on-set restored from the dock (first frame), fired commands, bottom-hint rows,
+lazy settings load, the tools' per-frame preparation, per-frame canvas flags, then the canvas
+inside the root's `CentralPanel`), and implements `ms_studio_tab::StudioTab` —
 the tab's input declarations and contexts, the dock builder, GPU eviction (canvas clean overlay, then detector masks), the source-page window, NEAREST
 sampling and the exit-only `Canvas.translation_hint_collapsed` key.
 
@@ -53,7 +54,8 @@ Long work is delegated to focused controllers:
   `detect_*_mask_for_image` helpers are the same pipeline reused by Cleaning's mask generation.
   The detector panel announces the current page's plan (resize, tile count) by planning with the
   same `TextDetectorRunMode::plan_inputs` the worker uses; the page sizes the root lends
-  (`page_infos`, `TranslationDrawParams`) reach it through `draw_side_panel`.
+  (`page_infos`, `TranslationDrawParams`) reach it as the size the host caches each frame
+  (`prepare_tool_frame` -> `current_page_size`).
   Dilation and Otsu come from `ms-raster` (see `text_detector/MODULE_README.md`).
   PaddleOCR, Surya and NeuroLate, which are also detectors, each have a "create mask and text
   blocks" parameter (`OcrPanelOptions::{paddle,surya}_detect_mask`, per title in
@@ -113,14 +115,21 @@ UI panels under `panels/` expose typed options/actions and avoid owning worker l
 converts panel actions into controller requests, canvas changes, persistent settings, or storage
 jobs.
 
-This tab also HOSTS the shared panel dock (`crates/ms-widgets/src/panel_dock`). It declares two tabs — the
+This tab also HOSTS the shared panel dock (`crates/ms-widgets/src/panel_dock`). It declares eight tabs — the
 canvas' own «Лента» (`canvas::CANVAS_RIBBON_TAB`, body `CanvasView::draw_ribbon_tab_body`, declared
-through `canvas::declare_ribbon_tab`, the canvas' one declaration of it) and its own «Последние
-персонажи» (`TRANSLATION_RECENT_CHARACTERS_TAB`, body `draw_recent_characters_tab_body`) — through
-the per-frame context `TranslationDockCx`. Its default arrangement is its OWN
-`translation_default_dock_layout`: the ribbon panel at the dock area's left edge and the cards
-docked to its right, top-aligned, which is where the row of cards floated before the migration. The
-same `fn` item is handed to the dock both through `StudioTab::default_dock_layout` (which the
+through `canvas::declare_ribbon_tab`, the canvas' one declaration of it), its own «Последние
+персонажи» (`TRANSLATION_RECENT_CHARACTERS_TAB`, body `draw_recent_characters_tab_body`), the
+«Инструменты» toolbar (`TRANSLATION_TOOLS_TAB`) and one tab per tool
+(`TranslationTool::tab_id`: Bubbles, OCR, Composition, MT, Text detector) — through the per-frame
+context `TranslationDockCx`, which carries the whole `&mut TranslationTabState` (the tool bodies act
+on it), the canvas and the project; it is built only after every tab is declared, so declarations
+borrow nothing of the state. Its default arrangement is its OWN `translation_default_dock_layout`:
+the ribbon panel at the dock area's left edge, the cards docked to its right, top-aligned (where the
+row of cards floated before the migration), the toolbar flush with the bottom edge at its right end
+(where the floating tools bar sat) and ONE panel of the five tool tabs docked on top of the toolbar,
+right-aligned — one chain, so the solver shrinks them together and never lays the tools over the
+bar. Sharing that default panel is also what makes the dock seed the five tools as one tabbed panel
+into a stored layout that predates them. The same `fn` item is handed to the dock both through `StudioTab::default_dock_layout` (which the
 studio's `restore_panel_dock` restores against) and by `ensure_default_layout`, since the dock state keeps it to rebuild the arrangement for the header's
 reset item.
 
@@ -133,6 +142,32 @@ the panel paints no frame, border, arrow or grip until the pointer is over it, a
 identical in both states. The cards are display-only in both states too: a character is activated by
 its recent-character binding (shown on the card) together with the bubble-create command or the
 quick OCR gesture, never by a click.
+
+**Tools.** Each tool is switched on and off independently by its latching toolbar button
+(`egui::Button::selected`, caption plus the binding text from the input registry) or its hotkey
+(P S K M D); several may be on at once. Whether a tool is on is a STATE flag (`tools:
+ToolToggles`), never read back from the dock: the detector overlay is decided inside the canvas draw
+(`detector_overlay_visible`), before the dock runs. Each tool tab is declared EVERY frame with
+`.visible(on)`, so switching it off keeps its panel, position, detached window and size. Switching
+a tool ON queues a focus request that `apply_tool_dock_requests` applies before the next
+`PanelDock::begin` (`PanelDockState::focus_tab`: front tab of its panel, panel expanded; a tab not
+yet seeded keeps its request for the next frame) — only on that switch, never on later frames,
+and never for a tool the user docked into the toolbar's own panel (that would bury the toolbar).
+Switching the detector OFF turns its lines / mask edit modes off; switching Composition on requests
+a rebuild. The on-set PERSISTS as the toolbar tab's `TabExtras` flags (`tool.<name>`, default off):
+read once per state by the host before the first hotkey (`restore_tool_toggles`, the PS editor's
+read-before-declare pattern) and written host-side before `begin` on change
+(`PanelDockState::set_tab_extras_flag`), so it persists even while the toolbar is collapsed. The
+toolbar's `initial_size` width is measured from its captions every frame (`tools_tab_sizes`): a dock
+panel never re-measures its own width, so a bar started narrower would stay wrapped. Per-frame tool
+work that used to assume one visible tool runs outside the bodies: the host's `prepare_tool_frame`
+caches the current page size for the detector body (the hook gets no `page_infos`) and, while any
+tool is on, refreshes the backend health snapshot and the OCR route inputs; the hook polls and draws
+the MT request preview every frame, rebuilds Composition while it is on and a rebuild is pending,
+and loads the stored detection while the detector is on. The OCR body asks for a frame every
+350 ms only while it is actually drawn (its status lines change without an egui event), so an OCR
+tool left on behind a sibling, collapsed or detached-and-hidden costs no idle frames.
+Only the front tab of a panel runs its body.
 
 A card is PAINTED, not built from an `egui::Frame`, and that is a contract of the body rather than a
 style choice. `Frame` reserves its space through `Ui::allocate_rect`, which advances the cursor past
@@ -237,7 +272,7 @@ Cancel (`TranslationOcrController::cancel_model_download`, active only in `Downl
 filled bar when the size is known, the retry wait as progress — has ONE owner,
 `model_download_status.rs`, which the Cleaning tools draw too. PaddleOCR-VL (IPC method `ocr.paddle_vl`) is a PyTorch/Transformers OCR
 engine that needs no text detection and no language selection; it is shown on a second engine row in
-the OCR panel so the side panel stays narrow, next to Baberu OCR (`ocr.baberu` / native).
+the OCR panel so the tool panel stays narrow, next to Baberu OCR (`ocr.baberu` / native).
 EXTERNAL models are downloaded as BUNDLES (`ocr::external_model_specs`): Baberu OCR, the selected
 PaddleOCR-VL variant (`OcrRuntimeOptions::paddle_vl_model`, persisted per title as
 `OCR.params.paddle_vl.model`, missing/unknown -> `official_1_6`), the EasyOCR model of the script
@@ -384,7 +419,7 @@ is an author note addressed to the translator, not a replica.
   draw), `TranslationDrawParams` / `draw` and the `StudioTab` impl. `host/hotkeys.rs`: the execute
   dispatch of every fired command. `host/tests.rs`: declarations identity, execute coverage of
   every declared command, contexts, hint-collapsed round trip, dock builder.
-- `tab.rs`: main tab state, canvas hooks, panel routing, OCR request building, advanced-recognition
+- `tab.rs`: main tab state, canvas hooks, OCR request building, advanced-recognition
   integration, footer metadata sync, text-detection mask/line storage, detector result storage,
   MT dispatch, and coalesced translation settings persistence. The title `settings.json` is
   written only via `ms_docstore::update` touching the tab's four sections (`OCR`,
@@ -469,6 +504,15 @@ is an author note addressed to the translator, not a replica.
 - `tab/route_inputs.rs` (child module of `tab`, desktop-only): `OcrRouteInputsRefresh`, the
   non-blocking refresh state machine of the OCR/detector routing inputs (injected reader, unit
   tests inline) and its production spawner over `ocr::read_ocr_route_inputs`.
+- `tab/dock.rs` (child module of `tab`): the tab's panel dock — `translation_default_dock_layout`
+  (re-exported by `tab.rs` for `host.rs`), `TranslationDockCx`, `draw_panel_dock` (declares all
+  eight tabs), the «Последние персонажи» body with its card helpers and size constants,
+  `text_detector_edit_panel_pos`; its unit tests pin the default layout (and that it solves into
+  disjoint panels) and the card geometry.
+- `tab/tool_panels.rs` (child module of `tab`): the five tools — `TranslationTool`, `ToolToggles`,
+  the toolbar and tool tab ids, restore / prepare / toggle / `apply_tool_dock_requests`, the
+  toolbar body and its measured size, the router `draw_tool_body` with one `draw_*_tool_body` per
+  tool; its unit tests pin independent toggling, focus-on-enable and the on-set round trip.
 
 ## Contracts and invariants
 - Input action ids are persistence keys (`user_config` -> `Hotkeys`): never rename one. Every
@@ -487,9 +531,15 @@ is an author note addressed to the translator, not a replica.
   them, so an early return above it would close the user's windows for that frame.
 - The default dock layout is the DICTIONARY of this tab's dock tabs: a `TabId` missing from
   `translation_default_dock_layout` is dropped from the user's stored arrangement on every load, so
-  adding a dock tab here means adding it to that builder too. It is registered under
+  adding a dock tab here means adding it to that builder too (all eight are pinned by
+  `host/tests.rs` and `tab/dock.rs`). It is registered under
   `AppTab::Translation.key()` through `StudioTab::default_dock_layout` as well; a builder wired in only one
   of the two places silently resets the stored arrangement.
+- A tool is open iff its `ToolToggles` flag is on; nothing reads that from the dock's output. The
+  toolbar is always visible (the only way back to a switched-off tool), and the tool tabs are
+  declared on every frame. Focus happens only on the frame a tool is switched on.
+- The `tool.<name>` extras flag keys and the `translation.tool*` tab ids are persistence keys:
+  never rename one without migrating stored layouts.
 - Text detector page results carry source size, block rectangles in source pixels, mask size, and
   mask alpha bytes. Mask buffers must match `width * height` and invalid geometry must be rejected.
 - Text-detector mask GPU eviction must drop only tiled `TextureHandle` pages and preserve detector
@@ -671,17 +721,20 @@ is an author note addressed to the translator, not a replica.
   runtime, edit `crates/ms-local-ai/src/local_ai.rs` (`LocalAiAvailability::resolve`,
   `AiRouteKind::availability`);
   to change which OCR selection runs on what, edit `ocr::ocr_route_kind` / `ocr_route`.
-- To change top-level translation UI routing, canvas overlays/hooks, OCR selection behavior,
-  detector storage, footer sync, or settings persistence, edit `tab.rs`.
+- To change canvas overlays/hooks, OCR selection behavior, detector storage, footer sync, or
+  settings persistence, edit `tab.rs`. To change the toolbar, the tools' on/off rules, focus or
+  persistence, or what a tool's body does with its panel's actions, edit `tab/tool_panels.rs`;
+  where the tools start and how big, `translation_default_dock_layout` in `tab/dock.rs` and the
+  `TOOL_TAB_*_SIZE_PX` constants.
 - To change which dock tabs this program tab declares, where its panels start, or what the
   text-detector edit boxes anchor to, edit `draw_panel_dock` / `text_detector_edit_panel_pos` /
-  `translation_default_dock_layout` in `tab.rs`; the «Лента» tab's own content, sizes, title and
+  `translation_default_dock_layout` in `tab/dock.rs`; the «Лента» tab's own content, sizes, title and
   declaration (`canvas::declare_ribbon_tab`) live in `crates/ms-canvas/src/`.
 - To change what the recent-character cards LOOK like or how they wrap, edit
-  `draw_recent_characters_tab_body` in `tab.rs`; to change how big their panel starts or how small
+  `draw_recent_characters_tab_body` in `tab/dock.rs`; to change how big their panel starts or how small
   it may get, edit the two `TRANSLATION_RECENT_CHARACTERS_TAB_*_SIZE_PX` constants there. The
   history itself is `collect_recent_character_history` and the digit lookup is
-  `recent_character_entry_for_rank`.
+  `recent_character_entry_for_rank`, both in `tab.rs`.
 - To change what the character list holds or in what order, edit
   `build_translation_character_names` (group order/dedup) and `collect_chapter_character_names`
   (which bubbles contribute a name) in `tab.rs`; to change WHEN it is rebuilt, edit

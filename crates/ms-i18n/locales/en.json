@@ -5031,7 +5031,6 @@
   "translation.tab.saving_mask_status": "Saving the mask...",
   "translation.tab.scope_current_page": "current page",
   "translation.tab.scope_whole_project": "whole project",
-  "translation.tab.section_porting_notice": "This section is being ported from the Python version.",
   "translation.tab.selection_no_pages_status": "Selection does not intersect any pages.",
   "translation.tab.selection_recognition_done_status": "Selection recognition complete.",
   "translation.tab.start_recognition_error": "Failed to start recognition.",

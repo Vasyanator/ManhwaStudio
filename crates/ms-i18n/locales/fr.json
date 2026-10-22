@@ -3813,7 +3813,6 @@
   "translation.tab.saving_mask_status": "Enregistrement du masque...",
   "translation.tab.scope_current_page": "page actuelle",
   "translation.tab.scope_whole_project": "tout le projet",
-  "translation.tab.section_porting_notice": "Cette section est en cours de portage depuis la version Python.",
   "translation.tab.selection_no_pages_status": "La sélection ne recoupe aucune page.",
   "translation.tab.selection_recognition_done_status": "Reconnaissance de la sélection terminée.",
   "translation.tab.start_recognition_error": "Impossible de lancer la reconnaissance.",

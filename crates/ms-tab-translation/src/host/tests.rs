@@ -133,7 +133,9 @@ fn hint_collapsed_round_trips_through_user_config() {
 }
 
 /// The host is a dock host whose builder is the tab's own default layout, and that layout names
-/// both dock tabs this program tab declares (a stored tab missing from it would be dropped on load).
+/// every dock tab this program tab declares — «Лента», «Последние персонажи», the toolbar and the
+/// five tools (a stored tab missing from it would be dropped on load). The ids are persistence
+/// keys, so they are spelled out here rather than taken from the constants.
 #[test]
 fn the_dock_builder_is_the_tabs_own_and_names_its_dock_tabs() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -141,7 +143,18 @@ fn the_dock_builder_is_the_tabs_own_and_names_its_dock_tabs() {
     let builder = host.default_dock_layout().expect("Translation hosts the panel dock");
     assert!(std::ptr::fn_addr_eq(builder, translation_default_dock_layout as fn() -> _));
     let layout = builder();
-    for id in [CANVAS_RIBBON_TAB, TabId::new("translation.recent_characters")] {
+    let tabs = [
+        CANVAS_RIBBON_TAB,
+        TabId::new("translation.recent_characters"),
+        TabId::new("translation.tools"),
+        TabId::new("translation.tool.bubbles"),
+        TabId::new("translation.tool.ocr"),
+        TabId::new("translation.tool.composition"),
+        TabId::new("translation.tool.machine_translation"),
+        TabId::new("translation.tool.text_detector"),
+    ];
+    for id in tabs {
         assert!(layout.panel_of_tab(id).is_some(), "the default layout does not name {id}");
     }
+    assert_eq!(layout.panels().iter().map(|panel| panel.tabs.len()).sum::<usize>(), tabs.len(), "a tab the test does not know");
 }

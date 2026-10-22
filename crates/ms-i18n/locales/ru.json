@@ -5049,7 +5049,6 @@
   "translation.tab.saving_mask_status": "Сохранение маски...",
   "translation.tab.scope_current_page": "текущая страница",
   "translation.tab.scope_whole_project": "весь проект",
-  "translation.tab.section_porting_notice": "Раздел переносится из Python-версии.",
   "translation.tab.selection_no_pages_status": "Выделение не пересекается со страницами.",
   "translation.tab.selection_recognition_done_status": "Распознавание выделения завершено.",
   "translation.tab.start_recognition_error": "Не удалось запустить распознавание.",

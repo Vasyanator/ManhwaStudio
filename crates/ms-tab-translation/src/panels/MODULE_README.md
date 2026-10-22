@@ -1,8 +1,8 @@
 # Module: crates/ms-tab-translation/src/panels
 
 ## Purpose
-Side-panel UI modules for the Translation tab. Panels render controls and return typed actions or
-option changes to `TranslationTabState`.
+Tool-panel UI modules for the Translation tab: each tool's panel is the body of its own dock tab.
+Panels render controls and return typed actions or option changes to `TranslationTabState`.
 
 ## Architecture
 Panels are UI boundaries, not worker owners. They keep editable option structs, lightweight
@@ -13,7 +13,8 @@ model access.
 The typical flow is:
 
 ```text
-TranslationTabState::draw_active_panel
+PanelDock::end (tool tab in front of a drawn, expanded panel)
+    -> TranslationTabState::draw_tool_body(tool) -> draw_*_tool_body
     -> draw_*_panel(options, status snapshots, capabilities)
     -> panel action struct / changed option flag
     -> tab.rs dispatches controller, canvas, storage, or settings work
@@ -42,7 +43,7 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   (`fix_caps_lock`, ON by default) sits with the other behavior toggles and asks the OCR
   worker to lower an entirely uppercase Latin/Cyrillic result to sentence case
   (`translation::ocr_case_fix`); it carries no UI logic of its own. Wider engines
-  (PaddleOCR-VL) live on a second engine row to keep the side panel from widening; PaddleOCR-VL
+  (PaddleOCR-VL) live on a second engine row to keep the tool panel from widening; PaddleOCR-VL
   shows no language controls, only its weight-variant combo (below) and an optional
   writing-system restriction: auto / korean / chinese / japanese. The six runtime engine-selection buttons are `AiButton`s gated on a
   per-engine `AiRequirement` (`engine_button_requirement`, permissive on an unknown capability so a
@@ -123,8 +124,8 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   uses — and replans only when the engine, params or page size change. The tab owns the cache
   and lends it to `draw_text_detector_panel`, which queries it after the option widgets ran, so
   the frame of an option change already shows the new plan. The page size reaches the
-  panel from `StudioApp::page_infos` through `draw_side_panel` (`detector_page_size`: no notice
-  while the page is loading, failed or 0x0). `plan_notice_text` / `plan_ctd_size_text` only
+  panel from `StudioApp::page_infos` through the host's `prepare_tool_frame`, which caches it on
+  the tab state (`detector_page_size`: no notice while the page is loading, failed or 0x0). `plan_notice_text` / `plan_ctd_size_text` only
   format the notice.
 - `machine_translation.rs`: tabbed MT UI with legacy provider/source/target controls and AI API
   controls: a "connection" accordion section (source/target languages, then the shared
@@ -221,8 +222,9 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   render time (`t!` is not `const`). Wire codes/tokens sent to the backend stay literal identities.
 
 ## Editing map
-- To add a new translation side panel, add the module here, route it in `TranslationPanel` and
-  `draw_active_panel` in `tab.rs`, and define an option/action boundary.
+- To add a new translation tool, add the module here, add a `TranslationTool` variant (tab id,
+  extras flag key, captions, toggle hotkey) and its `draw_tool_body` arm in `tab/tool_panels.rs`,
+  name its tab in `translation_default_dock_layout`, and define an option/action boundary.
 - To change OCR UI fields or language lists, edit `ocr.rs` and `ocr_langs.rs`; update settings
   parsing and request construction in `tab.rs`.
 - To change detector UI controls or edit-mode buttons, edit `text_detector.rs`; update

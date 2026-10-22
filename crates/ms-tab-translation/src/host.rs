@@ -11,8 +11,8 @@ Key items:
   canvas pulls `SharedCanvasSettings` from the bubbles model on its first draw.
 - `TranslationDrawParams` / `TranslationTab::draw`: this frame's input (handed to the tab state
   for the draw, fired commands executed), the bottom-hint rows built from binding labels, the
-  per-frame canvas configuration, the floating side panel and the canvas draw inside the root's
-  central panel.
+  per-frame canvas configuration, the tools' on-set restore and per-frame preparation, and the
+  canvas draw inside the root's central panel (the dock, with the tools, runs in its hook).
 - `impl StudioTab for TranslationTab`: input declarations (`crate::input::declarations`) and
   contexts (the canvas's plus the tab's), dock builder, GPU eviction, source-page window,
   NEAREST sampling, the exit-only hint-collapsed key.
@@ -40,6 +40,7 @@ use ms_studio_tab::StudioTab;
 use ms_widgets::panel_dock::{DockLayout, PanelDockState};
 use serde_json::Value;
 
+use crate::panels::text_detector::detector_page_size;
 use crate::tab::{TranslationTabState, translation_default_dock_layout};
 
 /// `user_config` key (under `Canvas`) of the Translation canvas' bottom-hint collapsed flag.
@@ -61,7 +62,7 @@ pub struct TranslationTab {
 /// What [`TranslationTab::draw`] borrows from the root for one frame.
 pub struct TranslationDrawParams<'a> {
     pub ctx: &'a egui::Context,
-    /// The window-root `Ui`: the tab opens its own `CentralPanel` in it, after its side panel.
+    /// The window-root `Ui`: the tab opens its own `CentralPanel` in it.
     pub ui: &'a mut egui::Ui,
     pub project: &'a ProjectData,
     /// Source-page geometry and load state (also the detector panel's per-page plan notice).
@@ -116,13 +117,16 @@ impl TranslationTab {
     }
 
     /// Draws the tab for one frame, in this order: the frame's input handed to the tab state
-    /// (with this frame's binding labels), the fired commands, the brush actions, the bottom-hint
-    /// rows, the lazy per-title settings load, the floating side panel, the canvas' per-frame
-    /// flags, the canvas inside a `CentralPanel` of `p.ui` (the panel dock runs inside it, in the
-    /// overlay hook), then the input copy is dropped.
+    /// (with this frame's binding labels), the tools' on-set restored from the dock (first frame
+    /// only, before any hotkey), the fired commands, the brush actions, the bottom-hint rows, the
+    /// lazy per-title settings load, the tools' per-frame preparation (current page size for the
+    /// detector, health and route-input caches), the canvas' per-frame flags, the canvas inside a
+    /// `CentralPanel` of `p.ui` (the panel dock with the toolbar and the tool tabs runs inside it,
+    /// in the overlay hook), then the input copy is dropped.
     pub fn draw(&mut self, p: TranslationDrawParams<'_>) {
         let TranslationDrawParams { ctx, ui, project, page_infos, texture_cache, status, panel_dock, input, input_registry } = p;
         self.state.begin_input_frame(input, input_registry);
+        self.state.restore_tool_toggles(panel_dock);
         self.run_fired_commands(ctx, project, input);
         if self.state.apply_brush_input(input) {
             ctx.request_repaint();
@@ -130,7 +134,7 @@ impl TranslationTab {
         let Self { canvas, state } = self;
         canvas.set_bottom_hint(Some(CanvasBottomHint { rows: state.input_labels().hint_rows(state.lines_edit_active()) }));
         state.sync_with_project_settings(project);
-        state.draw_side_panel(ctx, canvas, project, page_infos);
+        state.prepare_tool_frame(detector_page_size(page_infos.get(&canvas.current_page_idx())));
         canvas.set_overlay_render_suppressed(false);
         canvas.set_overlay_upload_min_interval_s(0.0);
         // `panel_dock` is lent for the frame and disjoint from `state` and `canvas`; the canvas

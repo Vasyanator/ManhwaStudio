@@ -36,8 +36,8 @@ Main items:
   so the page looks the same outside the selection afterwards.
 - `detection_pages_for_save`: the pages the Save button writes (see its doc).
 - `detector_overlay_visible_for`: the one owner of whether the detector mask and blocks are
-  drawn — with the Detector panel open, or while the selected OCR engine's "create mask and text
-  blocks" parameter is on (display only; the edit modes stay with the panel).
+  drawn — while the Detector tool is switched on, or while the selected OCR engine's "create mask
+  and text blocks" parameter is on (display only; the edit modes stay with the tool).
 
 Notes:
 GUI thread: no disk access here (the worker sends the page size along with the result; the
@@ -52,7 +52,7 @@ use ms_models::text_mask_model::TextMaskModel;
 use ms_project::ProjectData;
 use ms_theme::Severity;
 
-use super::{TranslationPanel, TranslationTabState, detector_rects_to_blocks_px, rasterize_resolved_blocks};
+use super::{TranslationTabState, TranslationTool, detector_rects_to_blocks_px, rasterize_resolved_blocks};
 use crate::panels::ocr::OcrPanelOptions;
 use crate::ocr::{DetectMaskFlags, OcrEngine, OcrRegionWant, OcrRuntimeOptions};
 use crate::panels::text_detector::TextDetectorAlgorithm;
@@ -62,14 +62,15 @@ use crate::text_detector::{
 };
 
 /// Whether the text detector's mask and blocks are drawn on the canvas: while the Detector
-/// panel is open, and while the selected OCR engine's "create mask and text blocks" parameter is
+/// tool is switched on (`detector_tool_on`, the tab's tool STATE — never the dock's output, which
+/// runs after the canvas draw), and while the selected OCR engine's "create mask and text blocks" parameter is
 /// on (PaddleOCR / Surya from `ocr_options`, NeuroLate from `neurolate_detect_mask`, the tab's
 /// `NeurolateSettings::detect_mask`; the rule is `RegionDetectEngine::selection_detects`).
-/// Display only: the interactive detector modes (mask brush, lines edit) stay tied to the panel,
-/// which turns them off when it closes. The one owner of the overlay's visibility.
-pub(super) fn detector_overlay_visible_for(active_panel: TranslationPanel, ocr_options: &OcrPanelOptions, neurolate_detect_mask: bool) -> bool {
+/// Display only: the interactive detector modes (mask brush, lines edit) stay tied to the tool,
+/// which turns them off when it is switched off. The one owner of the overlay's visibility.
+pub(super) fn detector_overlay_visible_for(detector_tool_on: bool, ocr_options: &OcrPanelOptions, neurolate_detect_mask: bool) -> bool {
     let flags = DetectMaskFlags { paddle: ocr_options.paddle_detect_mask, surya: ocr_options.surya_detect_mask, neurolate: neurolate_detect_mask };
-    active_panel == TranslationPanel::TextDetector || RegionDetectEngine::selection_detects(ocr_options.engine, flags)
+    detector_tool_on || RegionDetectEngine::selection_detects(ocr_options.engine, flags)
 }
 
 /// The page selection an OCR ran on: what its region detection crops.
@@ -94,9 +95,9 @@ fn region_algorithm(engine: RegionDetectEngine) -> TextDetectorAlgorithm {
 }
 
 impl TranslationTabState {
-    /// [`detector_overlay_visible_for`] of this tab's current panel and OCR options.
+    /// [`detector_overlay_visible_for`] of this tab's Detector tool state and OCR options.
     pub(super) fn detector_overlay_visible(&self) -> bool {
-        detector_overlay_visible_for(self.active_panel, &self.ocr_panel_options, self.neurolate_settings.detect_mask)
+        detector_overlay_visible_for(self.tools.is_on(TranslationTool::TextDetector), &self.ocr_panel_options, self.neurolate_settings.detect_mask)
     }
 
     /// Starts the detector of the OCR `engine` on `selection` when `options` turn that engine's
@@ -636,19 +637,19 @@ mod tests {
         assert!(tab.pending_region_detections.is_empty());
     }
 
-    /// The overlay shows with the Detector panel open, or while the selected engine's own
-    /// "create mask" parameter is on; another engine's flag or another panel does not.
+    /// The overlay shows with the Detector tool on, or while the selected engine's own
+    /// "create mask" parameter is on; another engine's flag or another tool does not.
     #[test]
-    fn detector_overlay_visibility_follows_the_panel_or_the_engine_parameter() {
+    fn detector_overlay_visibility_follows_the_tool_or_the_engine_parameter() {
         let options = |engine: OcrEngine, paddle: bool, surya: bool| OcrPanelOptions { engine, paddle_detect_mask: paddle, surya_detect_mask: surya, ..Default::default() };
-        assert!(detector_overlay_visible_for(TranslationPanel::TextDetector, &options(OcrEngine::MangaOcr, false, false), false));
-        assert!(!detector_overlay_visible_for(TranslationPanel::None, &options(OcrEngine::MangaOcr, true, true), true));
-        assert!(detector_overlay_visible_for(TranslationPanel::Ocr, &options(OcrEngine::PaddleOcr, true, false), false));
-        assert!(!detector_overlay_visible_for(TranslationPanel::Ocr, &options(OcrEngine::PaddleOcr, false, true), true));
-        assert!(detector_overlay_visible_for(TranslationPanel::None, &options(OcrEngine::Surya, false, true), false));
-        assert!(!detector_overlay_visible_for(TranslationPanel::Bubbles, &options(OcrEngine::Surya, true, false), true));
-        assert!(detector_overlay_visible_for(TranslationPanel::Ocr, &options(OcrEngine::NeuroLate, false, false), true));
-        assert!(!detector_overlay_visible_for(TranslationPanel::Ocr, &options(OcrEngine::NeuroLate, true, true), false));
+        assert!(detector_overlay_visible_for(true, &options(OcrEngine::MangaOcr, false, false), false));
+        assert!(!detector_overlay_visible_for(false, &options(OcrEngine::MangaOcr, true, true), true));
+        assert!(detector_overlay_visible_for(false, &options(OcrEngine::PaddleOcr, true, false), false));
+        assert!(!detector_overlay_visible_for(false, &options(OcrEngine::PaddleOcr, false, true), true));
+        assert!(detector_overlay_visible_for(false, &options(OcrEngine::Surya, false, true), false));
+        assert!(!detector_overlay_visible_for(false, &options(OcrEngine::Surya, true, false), true));
+        assert!(detector_overlay_visible_for(false, &options(OcrEngine::NeuroLate, false, false), true));
+        assert!(!detector_overlay_visible_for(false, &options(OcrEngine::NeuroLate, true, true), false));
     }
 
     /// The OCR runtime options of `engine` with NeuroLate's "create mask" set to `detect_mask`.
