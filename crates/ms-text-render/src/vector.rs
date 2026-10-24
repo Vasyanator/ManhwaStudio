@@ -2177,7 +2177,7 @@ mod tests {
         );
 
         // Extract our alpha channel and compare to the reference alpha.
-        let ours_alpha: Vec<u8> = canvas.chunks_exact(4).map(|px| px[3]).collect();
+        let ours_alpha: Vec<u8> = canvas.as_chunks::<4>().0.iter().map(|px| px[3]).collect();
         let iou = mask_iou(&ours_alpha, &reference.data);
         assert!(iou >= 0.93, "zeno-vs-swash IoU too low: {iou}");
 
@@ -2220,7 +2220,7 @@ mod tests {
             None,
         );
         let mut covered = 0usize;
-        for px in canvas_full.chunks_exact(4) {
+        for px in canvas_full.as_chunks::<4>().0 {
             if px[3] > 0 {
                 covered += 1;
                 assert_eq!([px[0], px[1], px[2]], [200, 30, 30], "RGB must be tint");
@@ -2243,7 +2243,7 @@ mod tests {
             &identity_lut(),
             None,
         );
-        for (full, half) in canvas_full.chunks_exact(4).zip(canvas_half.chunks_exact(4)) {
+        for (full, half) in canvas_full.as_chunks::<4>().0.iter().zip(canvas_half.as_chunks::<4>().0) {
             let expected = (f32::from(full[3]) * (128.0 / 255.0)).round() as i32;
             let got = i32::from(half[3]);
             assert!(

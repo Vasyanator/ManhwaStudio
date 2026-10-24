@@ -260,7 +260,7 @@ pub(super) fn box_moments_into(lab: &Field, robust: &Field, factor: usize, grid:
             let row = (coarse_row * factor + block_row).min(height - 1);
             let lab_row = &lab.data[row * width * 3..(row + 1) * width * 3];
             let robust_row = &robust.data[row * width..(row + 1) * width];
-            for (coarse_col, cell) in out.chunks_exact_mut(6).enumerate() {
+            for (coarse_col, cell) in out.as_chunks_mut::<6>().0.iter_mut().enumerate() {
                 for (block_col, (weight_slot, square_slot)) in weights.iter_mut().zip(squares.iter_mut()).enumerate() {
                     let col = (coarse_col * factor + block_col).min(width - 1);
                     let weight = robust_row[col];
@@ -281,7 +281,7 @@ pub(super) fn box_moments_into(lab: &Field, robust: &Field, factor: usize, grid:
                 cell[5] += pairwise_sum(&|index: usize| squares[index], 0, factor);
             }
         }
-        for cell in out.chunks_exact_mut(6) {
+        for cell in out.as_chunks_mut::<6>().0 {
             for value in &mut cell[1..] {
                 *value /= count;
             }

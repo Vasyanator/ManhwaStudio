@@ -189,7 +189,7 @@ mod tests {
         let second = "/data/user/0/app/cache/incoming/0001760000000001-000001";
         let take = decode_entries(&[entry(&format!("f\t{DIR}/00000/a.png\n")), format!("{second}\ns\ta.png\tweird\t\n")]);
         assert!(take.error.is_some());
-        assert!(take.batches.is_empty());
+        assert_eq!(take.batches, [] as [IncomingBatch; 0]);
         assert_eq!(take.to_release, vec![PathBuf::from(second), PathBuf::from(DIR)]);
     }
 

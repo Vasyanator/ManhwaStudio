@@ -514,7 +514,7 @@ fn request_dims(header: &Value) -> (usize, u32, u32) {
 /// pure red (the test's "text"), 0 elsewhere (padding is black, so it stays 0).
 fn fake_paddle_forward(header: &Value, blob: &[u8]) -> Result<(Value, Vec<u8>), String> {
     let (n, width, height) = request_dims(header);
-    let maps: Vec<u8> = blob.chunks_exact(3).map(|px| if px[0] > 200 && px[1] < 50 { 255 } else { 0 }).collect();
+    let maps: Vec<u8> = blob.as_chunks::<3>().0.iter().map(|px| if px[0] > 200 && px[1] < 50 { 255 } else { 0 }).collect();
     let response = json!({"engine": "paddle", "n": n, "map_width": width, "map_height": height, "channels": ["prob"]});
     Ok((response, maps))
 }

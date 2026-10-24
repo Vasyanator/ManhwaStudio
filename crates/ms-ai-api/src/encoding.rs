@@ -105,7 +105,7 @@ pub fn base64_decode(text: &str) -> Result<Vec<u8>, Base64Error> {
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
     let quads = bytes.len() / 4;
-    for (quad_index, quad) in bytes.chunks_exact(4).enumerate() {
+    for (quad_index, quad) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let last = quad_index + 1 == quads;
         // Padding is legal only in the final quad, as `xx==` or `xxx=`.
         let pad = quad.iter().rev().take_while(|&&byte| byte == b'=').count();

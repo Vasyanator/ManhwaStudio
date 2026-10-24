@@ -643,9 +643,7 @@ impl OverlayRuntimeState {
         let mut should_sync_model = false;
         if let Some(ov) = self.overlay_images.get_mut(&page_idx) {
             let overlay = Arc::make_mut(ov);
-            for px in &mut overlay.pixels {
-                *px = Color32::TRANSPARENT;
-            }
+            overlay.pixels.fill(Color32::TRANSPARENT);
             should_sync_model = true;
         }
         if should_sync_model {

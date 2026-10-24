@@ -1359,7 +1359,7 @@ fn waifu2x_image_to_rgba(api: &Waifu2xApi, image: &mut Waifu2xImage) -> Result<R
         4 => bytes,
         3 => {
             let mut expanded = Vec::with_capacity(pixel_count.saturating_mul(4));
-            for chunk in bytes.chunks_exact(3) {
+            for chunk in bytes.as_chunks::<3>().0 {
                 expanded.extend_from_slice(chunk);
                 expanded.push(255);
             }

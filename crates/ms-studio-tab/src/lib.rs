@@ -104,7 +104,7 @@ mod tests {
         let mut bare = Bare;
         let tab: &mut dyn StudioTab = &mut bare;
         assert_eq!(tab.input_declarations(), ms_input::Declarations::default());
-        assert!(tab.input_contexts().is_empty());
+        assert_eq!(tab.input_contexts(), [] as [ms_input::ContextId; 0]);
         assert!(tab.default_dock_layout().is_none());
         assert!(tab.source_page_window(3).is_empty());
         assert!(!tab.wants_nearest_source());
@@ -121,6 +121,6 @@ mod tests {
         tab.flush_debounced_stores_blocking();
         tab.on_committed_tree_changed();
         let shared: &dyn StudioTab = &Bare;
-        assert!(shared.input_contexts().is_empty());
+        assert_eq!(shared.input_contexts(), [] as [ms_input::ContextId; 0]);
     }
 }

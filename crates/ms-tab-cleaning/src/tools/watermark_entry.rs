@@ -868,7 +868,7 @@ fn compose_planes_on_background(
         }
     }
     let mut pixels = Vec::with_capacity(values / 3 * 4);
-    for pixel in c.chunks_exact(3).zip(s.chunks_exact(3)) {
+    for pixel in c.as_chunks::<3>().0.iter().zip(s.as_chunks::<3>().0) {
         let (c_px, s_px) = pixel;
         for channel in 0..3 {
             // Cast justification: the expression is clamped into 0..=255 and rounded, so it is
@@ -1861,7 +1861,7 @@ fn gradient_magnitude(image: &RgbaImage, rect: PixelRect) -> Vec<f32> {
     let mut luma = vec![0.0f32; width * height];
     for row in 0..height {
         let base = ((rect.y as usize + row) * stride + rect.x as usize) * 4;
-        for (column, px) in raw[base..base + width * 4].chunks_exact(4).enumerate() {
+        for (column, px) in raw[base..base + width * 4].as_chunks::<4>().0.iter().enumerate() {
             luma[row * width + column] =
                 LUMA_R * f32::from(px[0]) + LUMA_G * f32::from(px[1]) + LUMA_B * f32::from(px[2]);
         }

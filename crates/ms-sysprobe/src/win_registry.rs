@@ -126,7 +126,7 @@ impl RegKey {
         if value.value_type != REG_SZ && value.value_type != REG_EXPAND_SZ {
             return None;
         }
-        let units: Vec<u16> = value.data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+        let units: Vec<u16> = value.data.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
         let byte_len = u32::try_from(value.data.len()).ok()?;
         let text = decode_win32_utf16_strings(&units, byte_len).into_iter().next()?;
         let text = text.trim().to_string();

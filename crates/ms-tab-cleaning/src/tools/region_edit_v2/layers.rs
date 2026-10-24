@@ -520,7 +520,7 @@ impl MarksLayer {
             self.texture = None;
         }
         let mut set_px = 0usize;
-        for (pixel, rgba) in self.preview.pixels.iter_mut().zip(self.rgba.chunks_exact(4)) {
+        for (pixel, rgba) in self.preview.pixels.iter_mut().zip(self.rgba.as_chunks::<4>().0) {
             *pixel = Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
             set_px += usize::from(rgba[3] != 0);
         }
@@ -1791,9 +1791,9 @@ mod tests {
         let rgba = stack.marks_rgba();
         assert_eq!(rgba.len(), stack.marks.preview.pixels.len() * 4);
         let mut set = 0usize;
-        for (idx, px) in rgba.chunks_exact(4).enumerate() {
+        for (idx, px) in rgba.as_chunks::<4>().0.iter().enumerate() {
             if px[3] == 0 {
-                assert_eq!(px, [0, 0, 0, 0], "pixel {idx} is transparent but not canonical");
+                assert_eq!(*px, [0, 0, 0, 0], "pixel {idx} is transparent but not canonical");
             } else {
                 set += 1;
             }

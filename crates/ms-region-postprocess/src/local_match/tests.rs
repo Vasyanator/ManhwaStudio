@@ -62,7 +62,7 @@ fn diff(actual: &[u8], expected: &[u8], mask: &[u8]) -> Diff {
     let mut inside_values = 0_usize;
     let mut differing = 0_usize;
     let mut outside_identical = true;
-    for ((a, e), &m) in actual.chunks_exact(3).zip(expected.chunks_exact(3)).zip(mask) {
+    for ((a, e), &m) in actual.as_chunks::<3>().0.iter().zip(expected.as_chunks::<3>().0).zip(mask) {
         for (&x, &y) in a.iter().zip(e) {
             let delta = x.abs_diff(y);
             max_abs = max_abs.max(delta);
@@ -86,7 +86,7 @@ fn splitmix_and_jitter_grids_match_the_generator() -> TestResult {
     let text = std::fs::read_to_string(fixtures().join("jitter.json"))?;
     let json: serde_json::Value = serde_json::from_str(&text)?;
     let vectors = json["splitmix64"].as_array().ok_or("splitmix64 is not an array")?;
-    assert!(!vectors.is_empty());
+    assert_ne!(vectors.as_slice(), [] as [serde_json::Value; 0]);
     for vector in vectors {
         let key = vector["key"].as_u64().ok_or("key")?;
         let hash = vector["hash"].as_u64().ok_or("hash")?;

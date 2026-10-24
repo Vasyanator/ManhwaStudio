@@ -97,7 +97,7 @@ fn fit_and_apply(reference: &[u8], generated: &[u8], width: usize, is_sample: im
         .into_par_iter()
         .map(|job| {
             let (image, channel) = if job < 3 { (reference, job) } else { (generated, job - 3) };
-            let values: Vec<f32> = image.chunks_exact(3).enumerate().filter(|(index, _)| is_sample(*index)).map(|(_, px)| f32::from(px[channel])).collect();
+            let values: Vec<f32> = image.as_chunks::<3>().0.iter().enumerate().filter(|(index, _)| is_sample(*index)).map(|(_, px)| f32::from(px[channel])).collect();
             mean_std_f32(&values)
         })
         .collect();
@@ -116,7 +116,7 @@ fn fit_and_apply(reference: &[u8], generated: &[u8], width: usize, is_sample: im
     // Per-pixel, per-channel maps with no reduction: rows are independent.
     let row_len = width.max(1) * 3;
     out.par_chunks_mut(row_len).for_each(|row| {
-        for px in row.chunks_exact_mut(3) {
+        for px in row.as_chunks_mut::<3>().0 {
             for (v, map) in px.iter_mut().zip(&maps) {
                 *v = map.apply(*v);
             }
@@ -173,7 +173,7 @@ fn pairwise_sum_f32(a: &[f32]) -> f32 {
         let mut r = [0.0f32; 8];
         r.copy_from_slice(&a[..8]);
         let full = n - n % 8;
-        for block in a[8..full].chunks_exact(8) {
+        for block in a[8..full].as_chunks::<8>().0 {
             for (acc, &v) in r.iter_mut().zip(block) {
                 *acc += v;
             }

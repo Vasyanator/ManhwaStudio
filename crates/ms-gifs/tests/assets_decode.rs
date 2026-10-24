@@ -33,7 +33,7 @@ fn every_embedded_hint_streams_a_valid_looping_animation() {
             });
             assert!(!delay.is_zero(), "{} frame {index} has zero delay", hint.name());
             has_nonzero_pixel |= frame
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .any(|pixel| pixel.iter().any(|channel| *channel != 0));
             if index == 0 {
                 first_frame.clone_from(&frame);

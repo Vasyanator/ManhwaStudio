@@ -21,7 +21,7 @@ fn repeat(state: &mut MatchState, registry: &InputRegistry, button: &Button, env
 }
 
 fn release(state: &mut MatchState, registry: &InputRegistry, button: &Button, env: &ActiveSet) {
-    assert!(state.step(registry, &MatchEvent::Release { button: button.clone() }, env).is_empty());
+    assert_eq!(state.step(registry, &MatchEvent::Release { button: button.clone() }, env), [] as [MatchOutcome; 0]);
 }
 
 fn fired(outcomes: &[MatchOutcome]) -> Vec<&'static str> {
@@ -42,7 +42,7 @@ fn single(buttons: Vec<Button>) -> Binding {
 fn modifiers_are_exact_shift_p_does_not_fire_p() {
     let registry = registry(vec![command("p", Scope::Tab(TAB), vec![single(vec![key(egui::Key::P)])])]);
     let (mut state, env) = (MatchState::default(), env());
-    assert!(press(&mut state, &registry, &shift(), &env).is_empty());
+    assert_eq!(press(&mut state, &registry, &shift(), &env), [] as [&str; 0]);
     assert!(press(&mut state, &registry, &key(egui::Key::P), &env).is_empty(), "Shift+P must not fire P");
     release(&mut state, &registry, &key(egui::Key::P), &env);
     release(&mut state, &registry, &shift(), &env);
@@ -53,7 +53,7 @@ fn modifiers_are_exact_shift_p_does_not_fire_p() {
 fn the_completing_press_fires_and_a_modifier_may_complete_the_chord() {
     let registry = registry(vec![command("save", Scope::Session, vec![single(vec![ctrl(), key(egui::Key::S)])])]);
     let (mut state, env) = (MatchState::default(), env());
-    assert!(press(&mut state, &registry, &key(egui::Key::S), &env).is_empty());
+    assert_eq!(press(&mut state, &registry, &key(egui::Key::S), &env), [] as [&str; 0]);
     assert_eq!(press(&mut state, &registry, &ctrl(), &env), vec!["save"], "Ctrl pressed last completes Ctrl+S");
     assert!(press(&mut state, &registry, &key(egui::Key::A), &env).is_empty(), "a press outside the chord does not re-fire it");
 }
@@ -91,7 +91,7 @@ fn sequences_fire_on_the_last_chord_and_reset_on_a_non_continuing_press() {
 
     press(&mut state, &registry, &key(egui::Key::G), &env);
     release(&mut state, &registry, &key(egui::Key::G), &env);
-    assert!(press(&mut state, &registry, &key(egui::Key::X), &env).is_empty());
+    assert_eq!(press(&mut state, &registry, &key(egui::Key::X), &env), [] as [&str; 0]);
     release(&mut state, &registry, &key(egui::Key::X), &env);
     assert!(!state.sequence_pending(), "X continued nothing and reset the sequence");
     assert!(press(&mut state, &registry, &key(egui::Key::H), &env).is_empty(), "no timeout-free resurrection");
@@ -213,7 +213,7 @@ fn a_focused_text_edit_blocks_key_chords_only_and_a_popup_blocks_commands() {
     ]);
     let typing = ActiveSet { text_edit_focused: true, ..env() };
     let mut state = MatchState::default();
-    assert!(press(&mut state, &registry, &key(egui::Key::P), &typing).is_empty());
+    assert_eq!(press(&mut state, &registry, &key(egui::Key::P), &typing), [] as [&str; 0]);
     release(&mut state, &registry, &key(egui::Key::P), &typing);
     assert_eq!(press(&mut state, &registry, &ctrl(), &typing), vec!["ctrl_only"], "modifier-only chords ignore text focus");
     release(&mut state, &registry, &ctrl(), &typing);
@@ -223,7 +223,7 @@ fn a_focused_text_edit_blocks_key_chords_only_and_a_popup_blocks_commands() {
 
     let popup = ActiveSet { popup_open: true, ..env() };
     let mut state = MatchState::default();
-    assert!(press(&mut state, &registry, &key(egui::Key::P), &popup).is_empty());
+    assert_eq!(press(&mut state, &registry, &key(egui::Key::P), &popup), [] as [&str; 0]);
 }
 
 #[test]
@@ -236,7 +236,7 @@ fn only_repeat_commands_refire_on_auto_repeat() {
     assert_eq!(press(&mut state, &registry, &key(egui::Key::ArrowLeft), &env), vec!["nudge"]);
     assert_eq!(repeat(&mut state, &registry, &key(egui::Key::ArrowLeft), &env), vec!["nudge"]);
     assert_eq!(press(&mut state, &registry, &key(egui::Key::C), &env), vec!["toggle"]);
-    assert!(repeat(&mut state, &registry, &key(egui::Key::C), &env).is_empty());
+    assert_eq!(repeat(&mut state, &registry, &key(egui::Key::C), &env), [] as [&str; 0]);
 }
 
 #[test]
@@ -262,12 +262,12 @@ fn tab_and_context_conditions_gate_activity_and_reset_clears_everything() {
     ]);
     let other_tab = ActiveSet { active_tab: Some(ms_config::app_tab::AppTab::Cleaning), ..env() };
     let mut state = MatchState::default();
-    assert!(press(&mut state, &registry, &key(egui::Key::D), &other_tab).is_empty());
-    assert!(press(&mut state, &registry, &key(egui::Key::N), &env()).is_empty());
+    assert_eq!(press(&mut state, &registry, &key(egui::Key::D), &other_tab), [] as [&str; 0]);
+    assert_eq!(press(&mut state, &registry, &key(egui::Key::N), &env()), [] as [&str; 0]);
     let mut editing = env();
     editing.contexts.insert(ContextId("edit"));
     release(&mut state, &registry, &key(egui::Key::N), &editing);
     assert_eq!(press(&mut state, &registry, &key(egui::Key::N), &editing), vec!["in_edit"]);
-    assert!(state.step(&registry, &MatchEvent::Reset, &editing).is_empty());
+    assert_eq!(state.step(&registry, &MatchEvent::Reset, &editing), [] as [MatchOutcome; 0]);
     assert!(state.held().is_empty());
 }

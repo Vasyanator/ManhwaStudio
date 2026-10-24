@@ -323,7 +323,7 @@ pub(crate) fn pixel_values(img: &RgbImage) -> Result<Vec<f32>, OrtError> {
     }
     let plane = img.as_raw().len() / CHANNELS;
     let mut out = vec![0.0_f32; img.as_raw().len()];
-    for (i, px) in img.as_raw().chunks_exact(CHANNELS).enumerate() {
+    for (i, px) in img.as_raw().as_chunks::<CHANNELS>().0.iter().enumerate() {
         for (c, &value) in px.iter().enumerate() {
             out[c * plane + i] = (f32::from(value) / 255.0 - MEAN[c]) / STD[c];
         }

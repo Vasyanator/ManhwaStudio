@@ -200,7 +200,7 @@ pub(super) fn composite_marks_over(region: &egui::ColorImage, marks: &[u8]) -> O
     let pixels = region
         .pixels
         .iter()
-        .zip(marks.chunks_exact(4))
+        .zip(marks.as_chunks::<4>().0)
         .map(|(dst, mark)| {
             let alpha = mark[3];
             if alpha == 0 {

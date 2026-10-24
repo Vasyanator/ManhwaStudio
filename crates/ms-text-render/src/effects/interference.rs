@@ -987,8 +987,8 @@ mod tests {
         let mut changed_opaque = false;
         for (before, after) in image
             .rgba
-            .chunks_exact(4)
-            .zip(result.rgba.chunks_exact(4))
+            .as_chunks::<4>().0.iter()
+            .zip(result.rgba.as_chunks::<4>().0)
         {
             if before[3] == 0 {
                 // Fully transparent source pixels must stay untouched (silhouette preserved).

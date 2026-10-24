@@ -214,7 +214,7 @@ mod tests {
             sample[t * num_classes] = 1.0; // class 0 (blank) wins every step
         }
         let (text, conf) = decode_greedy(&sample, 3, num_classes, &table);
-        assert!(text.is_empty());
+        assert_eq!(text, "");
         assert!((conf - 0.0).abs() < 1e-9);
     }
 }

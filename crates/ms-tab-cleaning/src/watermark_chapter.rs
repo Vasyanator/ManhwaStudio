@@ -629,7 +629,7 @@ impl MarkTemplate {
         let mut centered = Vec::with_capacity(tw * th);
         for row in 0..th {
             let base = ((rect.y as usize + row) * pw + rect.x as usize) * 4;
-            for px in raw[base..base + tw * 4].chunks_exact(4) {
+            for px in raw[base..base + tw * 4].as_chunks::<4>().0 {
                 centered.push(luma_of(px[0], px[1], px[2]));
             }
         }
@@ -1115,7 +1115,7 @@ impl CalibrationSample {
         let mut observed = Vec::with_capacity(expected);
         for row in 0..rect.height as usize {
             let base = ((rect.y as usize + row) * pw + rect.x as usize) * 4;
-            for px in raw[base..base + rect.width as usize * 4].chunks_exact(4) {
+            for px in raw[base..base + rect.width as usize * 4].as_chunks::<4>().0 {
                 observed.push(f32::from(px[0]));
                 observed.push(f32::from(px[1]));
                 observed.push(f32::from(px[2]));
@@ -1221,7 +1221,7 @@ impl CalibrationSample {
                     return 0.0;
                 }
                 let sum: f32 = values
-                    .chunks_exact(3)
+                    .as_chunks::<3>().0.iter()
                     .map(|px| LUMA_R * px[0] + LUMA_G * px[1] + LUMA_B * px[2])
                     .sum();
                 sum / count_f32(pixels)
@@ -3640,7 +3640,7 @@ fn luma_plane(page: &RgbaImage, pw: usize, ph: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(pw * ph);
     out.extend(
         page.as_raw()
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|px| luma_of(px[0], px[1], px[2])),
     );
     out
@@ -4824,7 +4824,7 @@ mod tests {
         mark.composite(&mut page, rect, 1.0);
         let patch = remove_occurrence(&page, rect, &model, SubpixelShift::NONE)
             .expect("removal of a valid rect");
-        for (index, chunk) in patch.pixels.chunks_exact(4).enumerate() {
+        for (index, chunk) in patch.pixels.as_chunks::<4>().0.iter().enumerate() {
             for (channel, &byte) in chunk.iter().take(3).enumerate() {
                 let value = i32::from(byte);
                 assert!(
@@ -4888,7 +4888,7 @@ mod tests {
         let mut white = solid_page(page_size.0, page_size.1, [255; 3]);
         mark.composite(&mut white, rect, 1.0);
         let patch = remove_occurrence(&white, rect, &model, SubpixelShift::NONE).expect("removal");
-        for (index, chunk) in patch.pixels.chunks_exact(4).enumerate() {
+        for (index, chunk) in patch.pixels.as_chunks::<4>().0.iter().enumerate() {
             for (channel, &byte) in chunk.iter().take(3).enumerate() {
                 assert!(
                     i32::from(byte) >= 254,
@@ -5060,7 +5060,7 @@ mod tests {
         let deviation = |patch: &RegionPatch| -> f32 {
             let mut sum = 0.0f64;
             let mut count = 0usize;
-            for chunk in patch.pixels.chunks_exact(4) {
+            for chunk in patch.pixels.as_chunks::<4>().0 {
                 for &byte in chunk.iter().take(3) {
                     let error = f64::from(i32::from(byte) - i32::from(background));
                     sum += error * error;
@@ -5108,7 +5108,7 @@ mod tests {
         }
 
         let patch = remove_occurrence(&page, rect, &model, SubpixelShift::NONE).expect("removal");
-        for (index, chunk) in patch.pixels.chunks_exact(4).enumerate() {
+        for (index, chunk) in patch.pixels.as_chunks::<4>().0.iter().enumerate() {
             let x = index % width as usize;
             let expected = if x.is_multiple_of(2) { 0u8 } else { 255u8 };
             for (channel, &byte) in chunk.iter().take(3).enumerate() {

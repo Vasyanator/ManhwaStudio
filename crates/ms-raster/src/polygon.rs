@@ -68,7 +68,7 @@ pub fn fill_polygon_spans(points: &[(f32, f32)], width: usize, height: usize, mu
         }
         crossings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let row = y as usize; // `y >= min_y >= 0` and `y < max_y <= height`, so the cast is exact.
-        for pair in crossings.chunks_exact(2) {
+        for pair in crossings.as_chunks::<2>().0 {
             // Pixel centres inside the crossing interval: the first integer >= entry and the last
             // integer <= exit. Clamping happens in the float domain on purpose — `f32::min`/`max`
             // return the non-NaN operand, so a degenerate (infinite/NaN) edge still clamps into

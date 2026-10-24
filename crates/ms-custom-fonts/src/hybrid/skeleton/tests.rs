@@ -129,7 +129,7 @@ fn run_width(outline: &Outline, y: f64, x_hint: f64) -> f64 {
 /// Every contour is closed with at least 3 points and the outermost (largest) contour runs
 /// clockwise, like the crate's outlines.
 fn assert_valid(outline: &Outline) {
-    assert!(!outline.is_empty());
+    assert_ne!(outline.as_slice(), []);
     let polygons = polygons(outline);
     for polygon in &polygons {
         assert!(polygon.len() >= 3);
@@ -247,15 +247,15 @@ fn regular_and_bold_stems_blend_between() {
     let blended = blend(&[&a, &b], &[0.5, 0.5], &[advance_a, advance_b]).expect("'l' blends by skeleton");
     assert_valid(&blended);
     let bounds = sdf::bounds(&polygons(&blended)).expect("ink");
-    let mid_y = 0.5 * (bounds.y0 + bounds.y1);
-    let mid_x = 0.5 * (bounds.x0 + bounds.x1);
+    let mid_y = f64::midpoint(bounds.y0, bounds.y1);
+    let mid_x = f64::midpoint(bounds.x0, bounds.x1);
     let width_of = |outline: &Outline| {
         let box_ = sdf::bounds(&polygons(outline)).expect("ink");
-        run_width(outline, mid_y, 0.5 * (box_.x0 + box_.x1))
+        run_width(outline, mid_y, f64::midpoint(box_.x0, box_.x1))
     };
     let (thin, thick, mixed) = (width_of(&a), width_of(&b), run_width(&blended, mid_y, mid_x));
     assert!(thin < thick);
-    assert!((mixed - 0.5 * (thin + thick)).abs() < 3.0, "stem {mixed}, sources {thin} / {thick}");
+    assert!((mixed - f64::midpoint(thin, thick)).abs() < 3.0, "stem {mixed}, sources {thin} / {thick}");
 }
 
 #[test]

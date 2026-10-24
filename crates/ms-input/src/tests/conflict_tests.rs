@@ -47,7 +47,7 @@ fn a_sequence_prefix_in_one_scope_is_a_conflict() {
 #[test]
 fn an_inner_ctrl_wheel_shadows_only_the_command_alternative_of_view_zoom() {
     let registry = registry_with_view(vec![axis("rotate", Scope::Sub(Some(TAB)), vec![Binding::axis(crate::AxisSource::WheelY, Chord::new([ctrl()]))])], Vec::new());
-    assert!(registry.conflicts().conflicts.is_empty());
+    assert_eq!(registry.conflicts().conflicts, [] as [crate::Conflict; 0]);
     assert_eq!(registry.conflicts().shadows, vec![Shadow { inner: ActionId("rotate"), inner_alt: 0, outer: view::ZOOM, outer_alt: 0 }], "the pinch alternative stays unshadowed");
 }
 
@@ -121,7 +121,7 @@ fn accepted_modes_count_as_chord_buttons_for_commands() {
         command("two_t", Scope::Tab(TAB), vec![single(vec![key(egui::Key::Num2), key(egui::Key::T)])]),
     ]);
     assert_eq!(kinds(&registry), vec![(ConflictKind::SameChord, "create", Some("two_t"))], "with Num2 held both match T with equal specificity");
-    assert!(registry.conflicts().truncated.is_empty());
+    assert_eq!(registry.conflicts().truncated, [] as [ActionId; 0]);
 }
 
 #[test]

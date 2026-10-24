@@ -5000,7 +5000,7 @@ mod tests {
         all_gone.text = "Il".to_string();
         let gone_render = render_text_to_image(&all_gone, None).expect("consumed render");
         assert!(
-            gone_render.rgba.chunks_exact(4).all(|pixel| pixel[3] == 0),
+            gone_render.rgba.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0),
             "the run should have drawn no ink at all"
         );
         assert_eq!(gone_render.extra.mean_center, None);
@@ -5473,7 +5473,7 @@ mod tests {
         });
         assert!(rendered.width > 0);
         assert!(rendered.height > 0);
-        assert!(rendered.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        assert!(rendered.rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0));
     }
 
     /// Build a `cols x rows` identity mesh (every node at its identity position).
@@ -5517,7 +5517,7 @@ mod tests {
 
     /// Count of inked (alpha > 0) pixels.
     fn inked_pixels(rgba: &[u8]) -> usize {
-        rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
+        rgba.as_chunks::<4>().0.iter().filter(|px| px[3] > 0).count()
     }
 
     #[test]
@@ -5812,7 +5812,7 @@ mod tests {
             "vector-lines non-identity warp must change the render"
         );
         assert!(
-            warped.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0),
+            warped.rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0),
             "vector-lines warp must still ink pixels"
         );
         let (_, _, wmax_x, wmax_y) =
@@ -5862,7 +5862,7 @@ mod tests {
         params.text = "<m g=90>Hello world</m>".to_string();
         let rotated = render_text_to_image(&params, None).expect("rotated render");
         assert!(
-            rotated.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0),
+            rotated.rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0),
             "rotated block must render visible pixels"
         );
         let (rotated_w, rotated_h) = alpha_bounds_from_rgba(rotated.width, rotated.height, &rotated.rgba)
@@ -5904,7 +5904,7 @@ mod tests {
         params.global_rotation_deg = 90.0;
         let rotated = render_text_to_image(&params, None).expect("rotated render");
         assert!(
-            rotated.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0),
+            rotated.rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0),
             "rotated block must render visible pixels"
         );
         let (rotated_w, rotated_h) =
@@ -6981,7 +6981,7 @@ mod tests {
 
         params.global_rotation_deg = 90.0;
         let rotated = render_text_to_image(&params, None).expect("formula rotated render");
-        assert!(rotated.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        assert!(rotated.rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0));
         let (rotated_w, rotated_h) =
             alpha_bounds_from_rgba(rotated.width, rotated.height, &rotated.rgba)
                 .expect("formula rotated bounds");
@@ -7021,7 +7021,7 @@ mod tests {
 
         params.global_rotation_deg = 90.0;
         let rotated = render_text_to_image(&params, None).expect("vector-lines rotated render");
-        assert!(rotated.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        assert!(rotated.rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0));
         let (rotated_w, rotated_h) =
             alpha_bounds_from_rgba(rotated.width, rotated.height, &rotated.rgba)
                 .expect("vector-lines rotated bounds");
@@ -7105,15 +7105,15 @@ mod tests {
 
         params.line_placement_percent = 0.0;
         let centered = render_text_to_image(&params, None).expect("formula centered render");
-        assert!(centered.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        assert!(centered.rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0));
 
         params.line_placement_percent = 100.0;
         let top = render_text_to_image(&params, None).expect("formula top render");
-        assert!(top.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        assert!(top.rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0));
 
         params.line_placement_percent = -100.0;
         let bottom = render_text_to_image(&params, None).expect("formula bottom render");
-        assert!(bottom.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        assert!(bottom.rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0));
 
         let centered_key = (centered.width, centered.height, centered.rgba);
         let top_key = (top.width, top.height, top.rgba);

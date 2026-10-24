@@ -635,7 +635,7 @@ mod tests {
         // dependent, so only the contract itself is asserted: resolution never panics,
         // and an accepted stack always has a core tier.
         if let Some(resolved) = stack() {
-            assert!(!resolved.core().is_empty());
+            assert_ne!(resolved.core(), []);
             assert!(resolved.core().iter().all(|font| font.tier == Tier::Core));
         }
     }

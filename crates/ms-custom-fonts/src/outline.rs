@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn truetype_cleanup_drops_degenerate_contours_and_points() {
         let flat = Contour { start: Point::new(0.0, 0.0), segs: vec![Seg::Line(Point::new(10.0, 0.0))] };
-        assert!(to_truetype(&vec![flat], 'x').expect("in range").is_empty());
+        assert_eq!(to_truetype(&vec![flat], 'x').expect("in range"), [] as [Vec<TtPoint>; 0]);
 
         let with_straight_quad = Contour {
             start: Point::new(0.0, 0.0),

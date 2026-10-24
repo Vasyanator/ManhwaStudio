@@ -69,8 +69,8 @@ pub fn encode_reference_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<
     if rgba.len() != expected {
         return Err(ImageEditError::ShapeMismatch { detail: format!("RGBA buffer of {width}x{height} must be {expected} bytes, got {}", rgba.len()) });
     }
-    if rgba.chunks_exact(4).all(|pixel| pixel[3] == u8::MAX) {
-        let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect();
+    if rgba.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == u8::MAX) {
+        let rgb: Vec<u8> = rgba.as_chunks::<4>().0.iter().flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect();
         return encode_png(&rgb, width, height, ExtendedColorType::Rgb8);
     }
     encode_png(rgba, width, height, ExtendedColorType::Rgba8)

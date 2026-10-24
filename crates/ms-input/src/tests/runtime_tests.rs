@@ -597,7 +597,7 @@ fn a_diagonal_wheel_is_owned_per_component() {
     // Both owned: the event is removed and nothing scrolls.
     let out = diagonal_frame(&[egui::Key::Z, egui::Key::H], ON_VIEW, published());
     assert!(out.frame.axis(view::ZOOM).is_some() && out.frame.axis(H_SCROLL).is_some());
-    assert!(wheel_deltas(&out.events).is_empty());
+    assert_eq!(wheel_deltas(&out.events), [] as [egui::Vec2; 0]);
     assert_eq!(out.smooth_scroll, Vec2::ZERO);
 }
 

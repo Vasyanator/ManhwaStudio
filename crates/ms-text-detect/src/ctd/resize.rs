@@ -169,8 +169,8 @@ mod tests {
     fn constant_maps_stay_constant_and_bad_input_is_empty() {
         let src = vec![201_u8; 30 * 20];
         assert!(resize_linear_u8(&src, 30, 20, 47, 13).iter().all(|&v| v == 201));
-        assert!(resize_linear_u8(&src, 30, 21, 47, 13).is_empty());
-        assert!(resize_linear_u8(&src, 30, 20, 0, 13).is_empty());
+        assert_eq!(resize_linear_u8(&src, 30, 21, 47, 13), [] as [u8; 0]);
+        assert_eq!(resize_linear_u8(&src, 30, 20, 0, 13), [] as [u8; 0]);
     }
 
     #[test]

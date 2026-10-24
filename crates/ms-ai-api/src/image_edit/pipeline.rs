@@ -111,7 +111,7 @@ pub fn prepare(request: &ImageEditRequest, offer: &ModelOffer) -> Result<Prepare
     let (base_url, region_id) = resolve_endpoint(request)?;
 
     let (w, h, factor) = (to_usize(width)?, to_usize(height)?, usize::from(k));
-    let rgb: Vec<u8> = image.pixels().chunks_exact(4).flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect();
+    let rgb: Vec<u8> = image.pixels().as_chunks::<4>().0.iter().flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect();
     let raster = |error: ms_raster::RasterError| ImageEditError::ShapeMismatch { detail: error.to_string() };
     let sent_rgb = ms_raster::upscale_replicate(&rgb, w, h, 3, factor).map_err(raster)?;
     let image_png = encode_rgb_png(&sent_rgb, sent_width, sent_height)?;
@@ -337,7 +337,7 @@ mod tests {
     /// A "provider" that inverts every pixel of the image it was sent, at the sent size.
     fn invert_provider(call_png: &[u8]) -> Vec<u8> {
         let (width, height, rgba) = decode_rgba(call_png).unwrap_or_else(|error| panic!("{error:?}"));
-        let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|pixel| [255 - pixel[0], 255 - pixel[1], 255 - pixel[2]]).collect();
+        let rgb: Vec<u8> = rgba.as_chunks::<4>().0.iter().flat_map(|pixel| [255 - pixel[0], 255 - pixel[1], 255 - pixel[2]]).collect();
         encode_rgb_png(&rgb, width, height).unwrap_or_else(|error| panic!("{error:?}"))
     }
 
@@ -391,7 +391,7 @@ mod tests {
     fn empty_mask_replaces_the_whole_region_with_alpha_255() {
         let mut image = pattern(W, H);
         // A translucent source must still come back opaque.
-        let pixels: Vec<u8> = image.pixels().chunks_exact(4).flat_map(|p| [p[0], p[1], p[2], 40]).collect();
+        let pixels: Vec<u8> = image.pixels().as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2], 40]).collect();
         image = RgbaRegion::new(W, H, pixels).unwrap_or_else(|error| panic!("{error:?}"));
         for mask in [None, Some(vec![0u8; usize::try_from(W * H).unwrap_or(0)])] {
             let offer = offer(ImageEditProvider::OpenAi, "gpt-image-2");
@@ -400,8 +400,8 @@ mod tests {
             let prepared = prepared(&request, offer);
             assert!(prepared.call.mask.is_none(), "an unpainted Soft mask is not sent");
             let outcome = finish(&request, &prepared, &invert_provider(&prepared.call.image_png)).unwrap_or_else(|error| panic!("{error:?}"));
-            for (got, source) in outcome.image.pixels().chunks_exact(4).zip(image.pixels().chunks_exact(4)) {
-                assert_eq!(got, [255 - source[0], 255 - source[1], 255 - source[2], 255]);
+            for (got, source) in outcome.image.pixels().as_chunks::<4>().0.iter().zip(image.pixels().as_chunks::<4>().0) {
+                assert_eq!(*got, [255 - source[0], 255 - source[1], 255 - source[2], 255]);
             }
         }
     }

@@ -487,7 +487,7 @@ mod tests {
     /// sequential mirror least of all, which is what this image exists for.
     fn translucent_glyph_image() -> RenderedTextImage {
         let mut image = sample_glyph_image();
-        for pixel in image.rgba.chunks_exact_mut(4) {
+        for pixel in image.rgba.as_chunks_mut::<4>().0 {
             // Two coverage levels under one peak: the opaque body becomes 128, the 160 rim 96.
             pixel[3] = match pixel[3] {
                 255 => 128,

@@ -703,7 +703,7 @@ mod tests {
         fs::write(&path, b"old image bytes").expect("seed");
         write_bytes_atomic(&path, b"new", Durability::Contents).expect("replace");
         assert_eq!(fs::read(&path).expect("read back"), b"new");
-        assert!(temp_leftovers(dir.path()).is_empty());
+        assert_eq!(temp_leftovers(dir.path()), [] as [PathBuf; 0]);
     }
 
     /// The public byte API creates a file that did not exist (its parent does).
@@ -713,7 +713,7 @@ mod tests {
         let path = dir.path().join("fresh.webp");
         write_bytes_atomic(&path, b"\x00\x01binary", Durability::ContentsAndDirectory).expect("create");
         assert_eq!(fs::read(&path).expect("read back"), b"\x00\x01binary");
-        assert!(temp_leftovers(dir.path()).is_empty());
+        assert_eq!(temp_leftovers(dir.path()), [] as [PathBuf; 0]);
     }
 
     /// A missing parent directory is an error; nothing is created, no temp is left.
@@ -725,7 +725,7 @@ mod tests {
         let err = write_bytes_atomic(&path, b"bytes", Durability::Contents).expect_err("a missing parent must fail");
         assert!(matches!(err, AtomicWriteError::TempWrite { kind: std::io::ErrorKind::NotFound, .. }), "{err:?}");
         assert!(!missing.exists(), "the parent must not be created");
-        assert!(temp_leftovers(dir.path()).is_empty());
+        assert_eq!(temp_leftovers(dir.path()), [] as [PathBuf; 0]);
     }
 
     /// A failed rename (the target is a directory) leaves the old entry intact and removes

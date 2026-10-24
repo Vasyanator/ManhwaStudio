@@ -722,7 +722,7 @@ mod tests {
         assert!(
             image
                 .rgba
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .any(|chunk| chunk[3] > 0 && chunk[3] < 255),
             "expected partially eroded alpha"
         );

@@ -73,7 +73,7 @@ fn synthetic(w: usize, h: usize, tint: i32) -> Synthetic {
 /// Mean |a - b| over the pixels `select(index)` keeps.
 fn mean_abs(a: &[u8], b: &[u8], select: impl Fn(usize) -> bool) -> f64 {
     let (mut sum, mut count) = (0_u64, 0_u32);
-    for (index, (pa, pb)) in a.chunks_exact(3).zip(b.chunks_exact(3)).enumerate() {
+    for (index, (pa, pb)) in a.as_chunks::<3>().0.iter().zip(b.as_chunks::<3>().0).enumerate() {
         if select(index) {
             sum += pa.iter().zip(pb).map(|(x, y)| u64::from(x.abs_diff(*y))).sum::<u64>();
             count += 3;
@@ -96,7 +96,7 @@ fn outside_the_mask_nothing_changes() -> Result<(), PostprocessError> {
     let base = case.inputs.base.clone();
     let mask = case.inputs.mask.clone();
     let out = postprocess_region(case.inputs, &ON)?;
-    for (index, (o, b)) in out.chunks_exact(3).zip(base.chunks_exact(3)).enumerate() {
+    for (index, (o, b)) in out.as_chunks::<3>().0.iter().zip(base.as_chunks::<3>().0).enumerate() {
         if mask[index] == 0 {
             assert_eq!(o, b, "pixel {index} outside the mask");
         }

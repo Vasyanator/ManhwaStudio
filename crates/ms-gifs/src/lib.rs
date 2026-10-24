@@ -234,7 +234,7 @@ impl Player {
         };
 
         if self.decoder_buffer_len != self.frame_buffer_len {
-            for (rgb, rgba) in self.rgb_scratch.chunks_exact(3).zip(out.chunks_exact_mut(4)) {
+            for (rgb, rgba) in self.rgb_scratch.as_chunks::<3>().0.iter().zip(out.as_chunks_mut::<4>().0) {
                 rgba[..3].copy_from_slice(rgb);
                 rgba[3] = 255;
             }

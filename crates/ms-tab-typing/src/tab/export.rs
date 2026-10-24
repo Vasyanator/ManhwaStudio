@@ -2050,7 +2050,7 @@ fn scale_alpha_in_place(rgba: &mut [u8], opacity: f32) {
     if opacity >= 1.0 {
         return;
     }
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         // Clamped to 0..=255 first, so the cast cannot truncate.
         px[3] = (f32::from(px[3]) * opacity).round().clamp(0.0, 255.0) as u8;
     }

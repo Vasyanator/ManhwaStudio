@@ -11,8 +11,6 @@ Notes:
 - Archives are written with `zip::ZipWriter` into self-removing temp directories.
 */
 
-use std::io::Write as _;
-
 use super::*;
 use crate::test_fs::{content, len_u64, read, sha256_hex, temp_root, write};
 

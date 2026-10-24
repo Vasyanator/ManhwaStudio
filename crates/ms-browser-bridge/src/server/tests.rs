@@ -87,7 +87,7 @@ fn wrong_origin_gets_403() {
     let (_dir, server) = start("origin");
     let err = upgrade(server.port(), WS_PATH, "https://evil.example", None).expect_err("must be refused");
     assert_eq!(http_status(&err), Some(403));
-    assert!(server.status().peers.is_empty());
+    assert_eq!(server.status().peers, [] as [crate::api::PeerInfo; 0]);
 }
 
 #[test]
@@ -132,7 +132,7 @@ fn bad_hmac_is_rejected_and_closed() {
     assert_eq!(answer["type"], "reject");
     assert_eq!(answer["code"], "auth_failed");
     assert_eq!(ext.wait_close(LONG), Some(1008));
-    assert!(server.status().peers.is_empty());
+    assert_eq!(server.status().peers, [] as [crate::api::PeerInfo; 0]);
 }
 
 #[test]
@@ -160,7 +160,7 @@ fn hello_decision_table() {
         HelloVerdict::Accept { info, .. } => {
             assert_eq!(info.state, PeerState::Outdated);
             assert_eq!(info.protocol, 99);
-            assert!(info.modules.is_empty());
+            assert_eq!(info.modules, [] as [ModuleInfo; 0]);
             assert!(!info.build_current);
         }
         other @ HelloVerdict::Reject { .. } => panic!("expected outdated accept, got {other:?}"),
@@ -222,7 +222,7 @@ fn silent_upgrade_is_dropped_at_the_handshake_deadline() {
     let started = Instant::now();
     assert_eq!(ext.wait_close(LONG), Some(1008));
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(server.status().peers.is_empty());
+    assert_eq!(server.status().peers, [] as [crate::api::PeerInfo; 0]);
 }
 
 // ---- requests -------------------------------------------------------------------------------

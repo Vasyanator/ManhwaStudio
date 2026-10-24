@@ -5975,7 +5975,7 @@ mod tests {
                 crate::watermark_chapter::SubpixelShift::NONE,
             )
             .expect("removal");
-            for chunk in patch.pixels.chunks_exact(4) {
+            for chunk in patch.pixels.as_chunks::<4>().0 {
                 for &value in &chunk[..3] {
                     assert!(
                         value.abs_diff(expected) <= 1,

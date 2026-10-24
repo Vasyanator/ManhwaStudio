@@ -401,7 +401,7 @@ mod tests {
     fn key_stored_for_selected_service_refreshes_and_notifies() {
         let mut state = state();
         let outcome = state.apply_event(AiApiEvent::KeyStored { target: target(AiApiService::Groq, "") });
-        assert!(state.key_edit.is_empty());
+        assert_eq!(state.key_edit, "");
         assert_eq!(state.key_configured, Some(true));
         assert!(matches!(&outcome.follow_up, Some(AiApiRequest::RefreshMetadata { target }) if target.service() == AiApiService::Groq && target.endpoint().is_none()));
         let notice = outcome.notice.expect("key stored always notifies");
@@ -494,7 +494,7 @@ mod tests {
         let outcome = state.apply_event(AiApiEvent::MetadataLoaded(metadata(AiApiService::OpenAi, &["gpt-x"])));
         assert!(!outcome.model_changed);
         assert_eq!(state.model, "groq::kept");
-        assert!(state.models.is_empty());
+        assert_eq!(state.models, [] as [String; 0]);
         assert_eq!(state.status, "before");
     }
 
@@ -573,8 +573,8 @@ mod tests {
     #[test]
     fn compatible_service_has_no_default_model_choice() {
         let state = compatible_state("http://127.0.0.1:8080");
-        assert!(state.model.is_empty());
-        assert!(state.model_choices().is_empty());
+        assert_eq!(state.model, "");
+        assert_eq!(state.model_choices(), [] as [String; 0]);
     }
 
     #[test]
@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(state.models, vec!["local".to_string()]);
         state.base_url = "http://127.0.0.1:9090".to_string();
         assert!(state.commit_base_url_edit());
-        assert!(state.models.is_empty());
+        assert_eq!(state.models, [] as [String; 0]);
     }
 
     #[test]
@@ -662,7 +662,7 @@ mod tests {
 
         let outcome = state.apply_event(AiApiEvent::KeyStored { target: target(AiApiService::OpenAiCompatible, "http://127.0.0.1:9090/v1") });
         assert_eq!(state.key_configured, Some(true));
-        assert!(state.key_edit.is_empty());
+        assert_eq!(state.key_edit, "");
         assert!(matches!(&outcome.follow_up, Some(AiApiRequest::RefreshMetadata { target }) if target.endpoint() == Some("http://127.0.0.1:9090/v1/")));
     }
 

@@ -409,7 +409,7 @@ fn overlap_score(raw: &[Vec<Vec<Point>>], maps: &[AxisMap], weights: &[f64]) -> 
 fn axis_map(from0: f64, from1: f64, to0: f64, to1: f64) -> (f64, f64) {
     let extent = from1 - from0;
     if extent < MIN_SCALABLE_ADVANCE {
-        return (1.0, (to0 + to1) * 0.5 - (from0 + from1) * 0.5);
+        return (1.0, f64::midpoint(to0, to1) - f64::midpoint(from0, from1));
     }
     let scale = (to1 - to0) / extent;
     (scale, to0 - from0 * scale)
@@ -868,7 +868,7 @@ mod tests {
         let a = square(0.0, 0.0, 400.0, 700.0);
         let b = square(50.0, 0.0, 350.0, 700.0);
         let blended = blend(&[&a, &b], &[0.5, 0.5], &[1.0, 2.0e9]).expect("an in-range alignment remains");
-        assert!(!blended.is_empty());
+        assert_ne!(blended, [] as [Contour; 0]);
         // Non-finite coordinates never reach the grid.
         let broken = square(0.0, 0.0, f64::INFINITY, 100.0);
         assert!(blend(&[&broken, &small], &[0.5, 0.5], &[500.0, 500.0]).is_err());

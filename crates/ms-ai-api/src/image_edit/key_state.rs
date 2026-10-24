@@ -651,7 +651,7 @@ mod tests {
         state.key_edit = "sk-new".to_string();
         let toasts = pump_until_idle(&mut runner, &mut state, pressed(true, false, false));
         assert_eq!(toasts.iter().map(|toast| toast.severity).collect::<Vec<_>>(), [Severity::Success], "the saved toast");
-        assert!(state.key_edit.is_empty());
+        assert_eq!(state.key_edit, "");
     }
 
     #[test]

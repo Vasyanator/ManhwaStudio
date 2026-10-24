@@ -1138,7 +1138,7 @@ fn off_request_waits_for_a_stripped_promoted_release() {
     bench.router.set_enabled(false);
     assert_eq!(bench.router.apply_requested(), None, "a stripped press still waits for its release");
     let (out, _) = bench.step(vec![button(pos2(300.0, 10.0), PointerButton::Primary, false)], 0.03);
-    assert!(out.is_empty());
+    assert_eq!(out, [] as [egui::Event; 0]);
     assert_eq!(bench.router.apply_requested(), Some(false));
 }
 

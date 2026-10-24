@@ -276,7 +276,7 @@ fn capture_screen_rect_windows(rect: ScreenRect) -> Result<RgbaImage, String> {
         return Err("GetDIBits failed for the captured bitmap".to_string());
     }
 
-    for pixel in bgra.chunks_exact_mut(4) {
+    for pixel in bgra.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
 

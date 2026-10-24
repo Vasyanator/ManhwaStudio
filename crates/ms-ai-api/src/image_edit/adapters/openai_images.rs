@@ -132,7 +132,7 @@ mod tests {
         assert_eq!(spec.method, HttpMethod::Post);
         assert_eq!(spec.url, "https://api.openai.com/v1/images/edits");
         assert_eq!(spec.auth, Some(AuthScheme::Bearer));
-        assert!(spec.headers.is_empty());
+        assert_eq!(spec.headers, [] as [(&str, String); 0]);
         let mask_png = encode_mask_png(&mask, 2, 2, MaskPolarity::TransparentEdits).unwrap_or_default();
         let expected = MultipartForm::new()
             .text("model", "gpt-image-2.5-sunburst")

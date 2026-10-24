@@ -207,7 +207,7 @@ fn empty_and_flat_heatmaps_yield_no_blocks() {
     // An all-zero map: nothing exceeds `low`, so no component and an all-zero source mask.
     let heat = ProbMap::new(5, 4, vec![0; 20]).unwrap_or_else(|err| panic!("{err}"));
     let (blocks, mask) = postprocess_heatmap(&heat, [4, 3]).unwrap_or_else(|err| panic!("{err}"));
-    assert!(blocks.is_empty());
+    assert_eq!(blocks, [] as [crate::blocks::DetectRect; 0]);
     assert_eq!(mask, BinaryMask { size: [4, 3], alpha: vec![0; 12] });
     assert_eq!(postprocess_heatmap(&heat, [10_001, 10_000]), Err(MaskError::TooLarge { width: 10_001, height: 10_000 }));
 }

@@ -1647,7 +1647,7 @@ fn rgba_image_bytes(image: &RgbaImage) -> u64 {
 }
 
 fn rgba_is_fully_transparent(image: &RgbaImage) -> bool {
-    image.as_raw().chunks_exact(4).all(|pixel| pixel[3] == 0)
+    image.as_raw().as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0)
 }
 
 fn write_color32_as_straight_rgba(raw: &mut [u8], raw_idx: usize, color: egui::Color32) {

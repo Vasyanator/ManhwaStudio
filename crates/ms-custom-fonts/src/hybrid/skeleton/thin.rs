@@ -186,7 +186,7 @@ mod tests {
         ]);
         let skeleton = skeleton_pixels(&image, nx, ny);
         let pixels: Vec<usize> = (0..skeleton.len()).filter(|&slot| skeleton[slot]).collect();
-        assert!(!pixels.is_empty());
+        assert_ne!(pixels, [] as [usize; 0]);
         // Every skeleton pixel has at most two neighbours and they all sit on the middle rows.
         for &slot in &pixels {
             let neighbours = ring(&skeleton, slot, nx, ny).iter().filter(|&&flag| flag).count();

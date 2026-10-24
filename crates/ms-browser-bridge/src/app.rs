@@ -397,7 +397,7 @@ mod tests {
         assert_eq!(ledger.plan(&peers, later), [2]);
         ledger.record(&peers, &[2], later);
         // The identity's budget is spent: never again in this process.
-        assert!(ledger.plan(&peers, later + RELOAD_RETRY_AFTER * 10).is_empty());
+        assert_eq!(ledger.plan(&peers, later + RELOAD_RETRY_AFTER * 10), [] as [u64; 0]);
     }
 
     #[test]

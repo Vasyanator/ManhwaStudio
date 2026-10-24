@@ -123,7 +123,7 @@ pub(super) fn read_reference_file(path: &Path, name: &str) -> Flux3ReferenceLoad
     let size = [width, height];
     let side = |px: u32| usize::try_from(px).map_err(|err| refuse(err.to_string()));
     let image = egui::ColorImage::from_rgba_unmultiplied([side(width)?, side(height)?], decoded.as_raw());
-    let png = encode_color_image_png_rgba(&image).map_err(&refuse)?;
+    let png = encode_color_image_png_rgba(&image).map_err(refuse)?;
     Ok(Flux3Reference { name: name.to_string(), size, png: Arc::new(png) })
 }
 

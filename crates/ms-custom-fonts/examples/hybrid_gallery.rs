@@ -194,7 +194,7 @@ fn params(text: &str, font: &str, size: f32) -> TextRenderParams {
 
 /// Pastes `image` onto `canvas` at `(x, y)` with source-over blending.
 fn paste(canvas: &mut image::RgbaImage, image: &RenderedTextImage, x: u32, y: u32) {
-    for (index, pixel) in image.rgba.chunks_exact(4).enumerate() {
+    for (index, pixel) in image.rgba.as_chunks::<4>().0.iter().enumerate() {
         let index = u32::try_from(index).unwrap_or(u32::MAX);
         let (px, py) = (x + index % image.width.max(1), y + index / image.width.max(1));
         if px >= canvas.width() || py >= canvas.height() {

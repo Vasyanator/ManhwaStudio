@@ -1402,7 +1402,7 @@ mod tests {
         let path = dir.join("clean.png");
         RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 0])).save(&path).expect("write png");
         let decoded = decode_downscaled(&path, THUMB_LONG_SIDE_PX).expect("decode png");
-        assert!(decoded.rgba.chunks_exact(4).all(|px| px[3] == 0), "transparent PNG must stay transparent");
+        assert!(decoded.rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 0), "transparent PNG must stay transparent");
         std::fs::remove_dir_all(&dir).expect("remove scratch dir");
     }
 

@@ -425,7 +425,7 @@ mod tests {
             assert_eq!(cached.render(settings)?, fresh, "{settings:?}");
             let mut shown = vec![SENTINEL; w * h];
             cached.render_masked_into(settings, &mut shown, |px, [r, g, b]| *px = [r, g, b, 255])?;
-            for ((px, rgb), &m) in shown.iter().zip(fresh.chunks_exact(3)).zip(&mask) {
+            for ((px, rgb), &m) in shown.iter().zip(fresh.as_chunks::<3>().0).zip(&mask) {
                 let expected = if m == 0 { SENTINEL } else { [rgb[0], rgb[1], rgb[2], 255] };
                 assert_eq!(*px, expected, "{settings:?}");
             }

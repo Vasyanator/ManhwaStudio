@@ -1308,8 +1308,8 @@ mod tests {
         let mut strictly_smaller = 0usize;
         for (square_px, round_px) in square_image
             .rgba
-            .chunks_exact(4)
-            .zip(round_image.rgba.chunks_exact(4))
+            .as_chunks::<4>().0.iter()
+            .zip(round_image.rgba.as_chunks::<4>().0)
         {
             assert!(
                 round_px[3] <= square_px[3],

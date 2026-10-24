@@ -251,7 +251,7 @@ fn ctd_postprocess_validates_its_maps() {
     assert!(matches!(super::postprocess(&plan, &page, &wrong), Err(crate::pipeline::DetectError::MapShape { channel: 1, .. })));
     let ok = [map(sw, sh), map(sw, sh)];
     let (blocks, mask) = super::postprocess(&plan, &page, &ok).unwrap_or_else(|err| panic!("{err}"));
-    assert!(blocks.is_empty());
+    assert_eq!(blocks, [] as [DetectRect; 0]);
     assert!(mask.alpha.iter().all(|&v| v == 0));
     assert!(matches!(super::postprocess(&plan, &RgbImage::new(80, 100), &ok), Err(crate::pipeline::DetectError::PageSize { .. })));
 }

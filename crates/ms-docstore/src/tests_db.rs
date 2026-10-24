@@ -610,7 +610,7 @@ fn the_chapter_format_report_lists_existing_documents_by_tree() {
     fs::write(staging[1].path_for(DocFormat::Db), b"nope").expect("bad staging db");
     let report = chapter_format_report(&committed, &staging);
     assert_eq!(report.committed, vec![(DocKind::Bubbles, DocFormat::Db), (DocKind::Layers, DocFormat::Json)]);
-    assert!(report.staging.is_empty());
+    assert_eq!(report.staging, [] as [(DocKind, DocFormat); 0]);
     assert_eq!(report.unreadable.len(), 1);
     assert!(report.needs_conversion(DocFormat::Db));
 }

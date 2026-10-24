@@ -72,7 +72,7 @@ mod tests {
             Err(not_included) => {
                 // A build without node/npm (or with MS_SKIP_BROWSER_EXTENSION=1) is valid; it
                 // must still say why.
-                assert!(!not_included.reason.is_empty());
+                assert_ne!(not_included.reason, "");
                 return;
             }
         };

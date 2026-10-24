@@ -1426,7 +1426,7 @@ fn prepare_cost_gray(image: &RgbaImage) -> GrayImage {
 fn rgba_to_gray(image: &RgbaImage) -> GrayImage {
     let gray = image
         .as_raw()
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|px| {
             (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32)
                 .round()
@@ -1700,7 +1700,7 @@ fn row_is_uniform(image: &RgbaImage, row_index: usize, tolerance: u8) -> bool {
     let row = &image.as_raw()[row_start..row_start + width * 4];
     let mut min_rgb = [u8::MAX; 3];
     let mut max_rgb = [u8::MIN; 3];
-    for pixel in row.chunks_exact(4) {
+    for pixel in row.as_chunks::<4>().0 {
         for channel in 0..3 {
             min_rgb[channel] = min_rgb[channel].min(pixel[channel]);
             max_rgb[channel] = max_rgb[channel].max(pixel[channel]);

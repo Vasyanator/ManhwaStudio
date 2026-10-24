@@ -175,7 +175,7 @@ mod tests {
         let opts = RequestOptions { timeout: Duration::from_secs(1), attention_timeout: Duration::from_secs(1), cancel: None, on_event: None };
         assert_eq!(service.request(&req, &opts), Err(BridgeError::NotStarted));
         assert_eq!(service.request_reload(ReloadTarget::All), 0);
-        assert!(service.request_reload_peers(&[1]).is_empty());
+        assert_eq!(service.request_reload_peers(&[1]), [] as [u64; 0]);
     }
 
     #[test]

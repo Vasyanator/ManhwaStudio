@@ -38,7 +38,7 @@ pub fn composite_feathered(source: &RgbaRegion, edited: &[u8], mask: Option<&[u8
         Some(_) | None => None,
     };
     let mut out = Vec::with_capacity(source.pixels().len());
-    for (index, (src, dst)) in source.pixels().chunks_exact(4).zip(edited.chunks_exact(4)).enumerate() {
+    for (index, (src, dst)) in source.pixels().as_chunks::<4>().0.iter().zip(edited.as_chunks::<4>().0).enumerate() {
         let weight = alpha.as_ref().map_or(255, |alpha| alpha[index]);
         for channel in 0..3 {
             out.push(mix(src[channel], dst[channel], weight));

@@ -864,6 +864,6 @@ fn centre_on_ridge(point: Point, tangent: Vec2, index: &SegmentIndex, cell: f64)
             high = second;
         }
     }
-    let candidate = point + normal * (0.5 * (low + high));
+    let candidate = point + normal * f64::midpoint(low, high);
     if index.distance(candidate) > start { candidate } else { point }
 }

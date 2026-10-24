@@ -317,7 +317,7 @@ impl LocalSampling {
         // `padded_centred_lab` argument).
         let difference = geometry.padded_field(3, |row, values| {
             let start = row * width;
-            for (col, out) in values.chunks_exact_mut(3).enumerate() {
+            for (col, out) in values.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 if band[start + col] {
                     let target = tables.to_lab(rgb_at(reference, start + col));
                     let generated = tables.to_lab(rgb_at(current, start + col));
@@ -462,7 +462,7 @@ impl Geometry {
     fn padded_centred_lab(&self, tables: &LabTables, rgb: &[u8], weight: &[bool], center: [f32; 3]) -> Result<Field, LocalMatchError> {
         self.padded_field(3, |row, values| {
             let start = row * self.width;
-            for (col, out) in values.chunks_exact_mut(3).enumerate() {
+            for (col, out) in values.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 if weight[start + col] {
                     let lab = tables.to_lab(rgb_at(rgb, start + col));
                     for ((value, &channel), &c) in out.iter_mut().zip(&lab).zip(&center) {
@@ -567,7 +567,7 @@ fn robust_scale(centred: &Field, base_weight: &Field, geometry: &Geometry, level
     let sigma = (sigma_px * sigma_px - (cell_f * cell_f - 1.0) / 12.0).max(0.0).sqrt() / cell_f;
     // The first estimate's robust weight IS the base, so its channel 1 is the base grid.
     let first_grid = moment_grid(lab, base, None, factor)?;
-    let base_grid = Field::from_vec(first_grid.height, first_grid.width, 1, first_grid.data.chunks_exact(6).map(|cell| cell[0]).collect())?;
+    let base_grid = Field::from_vec(first_grid.height, first_grid.width, 1, first_grid.data.as_chunks::<6>().0.iter().map(|cell| cell[0]).collect())?;
     // The region's own cells (a ragged edge cell holds a few reflected pixels, negligible for a
     // global fallback); clamped like a Python slice.
     let top = geometry.pad;
@@ -603,7 +603,7 @@ fn robust_scale(centred: &Field, base_weight: &Field, geometry: &Geometry, level
     let mut value = Vec::with_capacity(grid_height * grid_width * 4);
     let mut share = Vec::with_capacity(grid_height * grid_width);
     let mut confidence = Vec::with_capacity(grid_height * grid_width);
-    for cell in up.data.chunks_exact(6) {
+    for cell in up.data.as_chunks::<6>().0 {
         value.extend_from_slice(&cell[..4]);
         share.push(cell[4]);
         confidence.push(cell[5]);
@@ -659,12 +659,12 @@ fn moment_grid(lab: &Field, robust: &Field, base_grid: Option<&Field>, factor: u
     box_moments_into(lab, robust, factor, &mut grid);
     match base_grid {
         Some(base) => {
-            for (cell, &value) in grid.data.chunks_exact_mut(6).zip(&base.data) {
+            for (cell, &value) in grid.data.as_chunks_mut::<6>().0.iter_mut().zip(&base.data) {
                 cell[0] = value;
             }
         }
         None => {
-            for cell in grid.data.chunks_exact_mut(6) {
+            for cell in grid.data.as_chunks_mut::<6>().0 {
                 cell[0] = cell[1];
             }
         }
@@ -687,7 +687,7 @@ fn estimate(grid: &Field, cells: &Cells, base_sum: f64, sigma: f64) -> Result<Sc
     let mut value = Vec::with_capacity(cell_count * 4);
     let mut share = Vec::with_capacity(cell_count);
     let mut confidence = Vec::with_capacity(cell_count);
-    for cell in blurred.data.chunks_exact(6) {
+    for cell in blurred.data.as_chunks::<6>().0 {
         let (cell_base, cell_weight) = (cell[0], cell[1]);
         for (channel, &total) in totals.iter().enumerate() {
             value.push(if cell_weight > min_weight { cell[2 + channel] / cell_weight.max(min_weight) } else { total });
@@ -752,7 +752,7 @@ fn correction_fields(target: &Field, target_share: &Field, local: &Field, local_
     let min_share = to_f32(LOCAL_MATCH_MIN_SHARE);
     let (gain_low, gain_high) = (to_f32(LOCAL_MATCH_GAIN_RANGE.0), to_f32(LOCAL_MATCH_GAIN_RANGE.1));
     let mut fields = Vec::with_capacity(target.data.len());
-    for (((t, &t_share), l), &l_share) in target.data.chunks_exact(4).zip(&target_share.data).zip(local.data.chunks_exact(4)).zip(&local_share.data) {
+    for (((t, &t_share), l), &l_share) in target.data.as_chunks::<4>().0.iter().zip(&target_share.data).zip(local.data.as_chunks::<4>().0).zip(&local_share.data) {
         let target_std = (t[3] - t[0] * t[0]).max(floor).sqrt();
         let local_std = (l[3] - l[0] * l[0]).max(floor).sqrt();
         let trust = (t_share.min(l_share) / min_share).clamp(0.0, 1.0);
@@ -770,7 +770,7 @@ fn correction_fields(target: &Field, target_share: &Field, local: &Field, local_
 fn offset_correction(offset: &Field, share: &Field) -> Result<Field, LocalMatchError> {
     let min_share = to_f32(LOCAL_MATCH_MIN_SHARE);
     let mut fields = Vec::with_capacity(share.data.len() * 4);
-    for (d, &s) in offset.data.chunks_exact(4).zip(&share.data) {
+    for (d, &s) in offset.data.as_chunks::<4>().0.iter().zip(&share.data) {
         let trust = (s / min_share).clamp(0.0, 1.0);
         fields.extend_from_slice(&[1.0, d[0] * trust, d[1] * trust, d[2] * trust]);
     }

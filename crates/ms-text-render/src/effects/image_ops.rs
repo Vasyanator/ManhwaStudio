@@ -742,7 +742,7 @@ pub(crate) fn average_opaque_rgba(rgba: &[u8]) -> [u8; 4] {
     let mut sum_a = 0.0f32;
     let mut covered = 0.0f32;
 
-    for chunk in rgba.chunks_exact(4) {
+    for chunk in rgba.as_chunks::<4>().0 {
         let alpha = chunk[3] as f32 / 255.0;
         if alpha <= f32::EPSILON {
             continue;
@@ -785,7 +785,7 @@ pub(crate) fn average_opaque_rgba(rgba: &[u8]) -> [u8; 4] {
 /// and disables the correction entirely.
 #[must_use]
 pub(crate) fn source_peak_alpha(rgba: &[u8]) -> u8 {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>().0.iter()
         .map(|pixel| pixel[3])
         .max()
         .unwrap_or(0)

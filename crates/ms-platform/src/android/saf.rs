@@ -129,7 +129,7 @@ pub(crate) fn decode_tree_listing(raw: Vec<String>) -> Result<Vec<TreeEntry>, St
         return Err(format!("malformed folder listing: {} fields is not a multiple of 4", rest.len()));
     }
     let mut entries: Vec<TreeEntry> = Vec::with_capacity(rest.len() / 4);
-    for chunk in rest.chunks_exact(4) {
+    for chunk in rest.as_chunks::<4>().0 {
         let index = entries.len();
         let is_dir = match chunk[0].as_str() {
             "d" => true,

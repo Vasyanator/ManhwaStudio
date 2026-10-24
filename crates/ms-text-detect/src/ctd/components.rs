@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn empty_and_full_windows() {
         let none = label_8(&[0; 6], 3, 2);
-        assert!(none.stats.is_empty());
+        assert_eq!(none.stats, [] as [ComponentStats; 0]);
         assert_eq!(none.background_area, 6);
         let full = label_8(&[1; 6], 3, 2);
         assert_eq!(full.stats, vec![ComponentStats { x0: 0, y0: 0, x1: 3, y1: 2, area: 6 }]);

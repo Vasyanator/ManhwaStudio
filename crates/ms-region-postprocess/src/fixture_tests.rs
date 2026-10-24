@@ -274,7 +274,7 @@ fn end_to_end_matches_patched_and_keeps_outside_bytes() -> TestResult {
         println!("{} expected vs patched: all {all:?}; inside mean {:.4}", case.name, inside.mean);
         assert!(all.max <= 2, "{}: {all:?}", case.name);
         assert!(inside.mean <= 0.3, "{}: inside {inside:?}", case.name);
-        for (i, (g, b)) in got.chunks_exact(3).zip(case.base.chunks_exact(3)).enumerate() {
+        for (i, (g, b)) in got.as_chunks::<3>().0.iter().zip(case.base.as_chunks::<3>().0).enumerate() {
             if case.mask[i] == 0 {
                 assert_eq!(g, b, "{}: pixel {i} outside the mask must be the base's bytes", case.name);
             }

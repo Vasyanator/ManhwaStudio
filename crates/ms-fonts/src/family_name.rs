@@ -191,7 +191,7 @@ fn read_name_table(path: &Path) -> Option<Vec<u8>> {
 /// `directory` is a flat run of 16-byte records; a partial trailing record is ignored.
 fn find_name_record(directory: &[u8]) -> Option<(u32, u32)> {
     directory
-        .chunks_exact(TABLE_RECORD_LEN)
+        .as_chunks::<TABLE_RECORD_LEN>().0.iter()
         .find(|record| record.starts_with(NAME_TAG))
         .and_then(|record| {
             let offset = u32::from_be_bytes(record.get(8..12)?.try_into().ok()?);

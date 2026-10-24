@@ -428,7 +428,7 @@ mod native {
             let transport = Arc::new(FakeTransport::new(vec![Ok(answer(200, OCR_PAGE))]));
             assert!(matches!(recognize_with(transport.clone(), &fast_limits(), flights(), "  ", request(), &|| false), Err(NeurolateError::KeyMissing)));
             assert!(matches!(recognize_with(transport.clone(), &fast_limits(), flights(), "nlk_k", request(), &|| true), Err(NeurolateError::Cancelled)));
-            assert!(transport.sent().is_empty());
+            assert_eq!(transport.sent(), [] as [Sent; 0]);
         }
 
         #[test]

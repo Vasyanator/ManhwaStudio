@@ -66,10 +66,10 @@ fn live_provider_returns_exactly_the_source_size() {
     let outcome = run_image_edit(&request, &key, &CancelFlag::new(), |stage| println!("live_image_edit: stage {stage:?}")).unwrap_or_else(|error| panic!("run failed: {error:?} ({error})"));
     assert_eq!((outcome.image.width(), outcome.image.height()), (width, height), "the finished image must be the source size");
     assert_eq!(outcome.sent_size, (width * u32::from(upscale), height * u32::from(upscale)), "the provider must answer the sent size");
-    assert!(outcome.image.pixels().chunks_exact(4).all(|pixel| pixel[3] == 255));
+    assert!(outcome.image.pixels().as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255));
     println!("live_image_edit: ok, sent and returned {:?}", outcome.sent_size);
     if std::env::var_os(KEEP_ENV).is_some() {
-        let rgb: Vec<u8> = outcome.image.pixels().chunks_exact(4).flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect();
+        let rgb: Vec<u8> = outcome.image.pixels().as_chunks::<4>().0.iter().flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect();
         let png = encode_rgb_png(&rgb, width, height).unwrap_or_else(|error| panic!("{error:?}"));
         let path = std::env::temp_dir().join(format!("ms_image_edit_live_{}.png", std::process::id()));
         std::fs::write(&path, png).unwrap_or_else(|error| panic!("{}: {error}", path.display()));

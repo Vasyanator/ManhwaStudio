@@ -61,7 +61,7 @@ pub struct RunwareTasks;
 fn task_uuid() -> String {
     let counter = TASK_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut bytes = [0u8; 16];
-    for (half, chunk) in bytes.chunks_exact_mut(8).enumerate() {
+    for (half, chunk) in bytes.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         let mut hasher = RandomState::new().build_hasher();
         hasher.write_u64(counter);
         hasher.write_usize(half);

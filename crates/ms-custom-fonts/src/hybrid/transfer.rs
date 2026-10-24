@@ -284,16 +284,16 @@ impl Reference {
         match widths.len() {
             0 => None,
             count if !count.is_multiple_of(2) => Some(widths[middle]),
-            _ => Some(0.5 * (widths[middle - 1] + widths[middle])),
+            _ => Some(f64::midpoint(widths[middle - 1], widths[middle])),
         }
     }
 
     /// Thickness of the vertical-scanline run nearest the ink middle at `column` of the width.
     fn horizontal_stem(&self, column: f64) -> Option<f64> {
         let x = self.ink.x0 + column * (self.ink.x1 - self.ink.x0);
-        let middle = 0.5 * (self.ink.y0 + self.ink.y1);
+        let middle = f64::midpoint(self.ink.y0, self.ink.y1);
         let runs = ink_runs(&self.polygons, x, true);
-        let nearest = runs.iter().min_by(|a, b| (0.5 * (a.0 + a.1) - middle).abs().total_cmp(&(0.5 * (b.0 + b.1) - middle).abs()))?;
+        let nearest = runs.iter().min_by(|a, b| (f64::midpoint(a.0, a.1) - middle).abs().total_cmp(&(f64::midpoint(b.0, b.1) - middle).abs()))?;
         Some(nearest.1 - nearest.0).filter(|&thickness| valid_stem(thickness))
     }
 
@@ -303,7 +303,7 @@ impl Reference {
         let centre = |fraction: f64| -> Option<(f64, f64)> {
             let y = self.row(fraction);
             let &(start, end) = ink_runs(&self.polygons, y, false).first()?;
-            (end - start <= SLANT_RUN_MAX_STEMS * stem).then_some((0.5 * (start + end), y))
+            (end - start <= SLANT_RUN_MAX_STEMS * stem).then_some((f64::midpoint(start, end), y))
         };
         let ((low_x, low_y), (high_x, high_y)) = (centre(SLANT_ROWS.0)?, centre(SLANT_ROWS.1)?);
         let tangent = (high_x - low_x) / (high_y - low_y);

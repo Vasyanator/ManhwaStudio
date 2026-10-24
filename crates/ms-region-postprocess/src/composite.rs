@@ -44,7 +44,7 @@ pub(crate) fn composite_masked_into<P: Send>(base: &[u8], corrected: &[u8], mask
     out.par_chunks_mut(width).enumerate().for_each(|(row, out_row)| {
         let start = row * width;
         let end = start + out_row.len();
-        let pixels = out_row.iter_mut().zip(base[start * 3..end * 3].chunks_exact(3)).zip(corrected[start * 3..end * 3].chunks_exact(3));
+        let pixels = out_row.iter_mut().zip(base[start * 3..end * 3].as_chunks::<3>().0).zip(corrected[start * 3..end * 3].as_chunks::<3>().0);
         for (((px, before), src), (&m, &a)) in pixels.zip(mask[start..end].iter().zip(&alpha[start..end])) {
             if m == 0 {
                 continue;
@@ -86,7 +86,7 @@ mod tests {
         let expected = composite_over_base(&base, &corrected, &mask, &alpha);
         let mut out = vec![None; 6];
         composite_masked_into(&base, &corrected, &mask, &alpha, 2, &mut out, |px, rgb| *px = Some(rgb));
-        for ((px, rgb), &m) in out.iter().zip(expected.chunks_exact(3)).zip(&mask) {
+        for ((px, rgb), &m) in out.iter().zip(expected.as_chunks::<3>().0).zip(&mask) {
             assert_eq!(*px, (m != 0).then(|| [rgb[0], rgb[1], rgb[2]]));
         }
     }

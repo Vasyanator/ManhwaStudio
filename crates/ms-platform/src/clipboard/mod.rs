@@ -162,6 +162,6 @@ mod tests {
         assert!(backend.user_message().contains("occupied-by-test"));
         let unavailable = Unavailable::new(PlatformFeature::ClipboardImage, UnavailableReason::NotOnThisPlatform);
         assert_eq!(ClipboardError::from(unavailable).user_message(), unavailable.user_message());
-        assert!(!ClipboardError::NoContent.user_message().is_empty());
+        assert_ne!(ClipboardError::NoContent.user_message(), "");
     }
 }

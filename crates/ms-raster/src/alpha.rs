@@ -36,8 +36,8 @@ pub fn rgba_over_white_to_rgb(rgba: &[u8], dst: &mut Vec<u8>) -> Result<(), Rast
         return Err(RasterError::NotWholePixels { len: rgba.len(), channels: RGBA_CHANNELS });
     }
     dst.reserve(rgba.len() / RGBA_CHANNELS * 3);
-    for pixel in rgba.chunks_exact(RGBA_CHANNELS) {
-        // Indexing is safe: `chunks_exact(4)` yields slices of exactly four bytes.
+    for pixel in rgba.as_chunks::<RGBA_CHANNELS>().0 {
+        // Indexing is safe: `as_chunks` yields arrays of exactly four bytes.
         let alpha = pixel[3];
         dst.push(component_over_white(pixel[0], alpha));
         dst.push(component_over_white(pixel[1], alpha));

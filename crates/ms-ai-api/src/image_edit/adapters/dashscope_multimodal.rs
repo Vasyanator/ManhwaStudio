@@ -163,7 +163,7 @@ mod tests {
     fn qwen_edit_request_matches_the_documented_body() {
         let spec = DashScopeMultimodal.submit(&dashscope_call("qwen-image-edit-max", SizeParamStyle::WStarH)).unwrap_or_else(|error| panic!("{error:?}"));
         assert_eq!((spec.method, spec.url.as_str(), spec.auth), (HttpMethod::Post, "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation", Some(AuthScheme::Bearer)));
-        assert!(spec.headers.is_empty());
+        assert_eq!(spec.headers, [] as [(&str, String); 0]);
         let expected = json!({
             "model": "qwen-image-edit-max",
             "input": { "messages": [{ "role": "user", "content": [{ "image": "data:image/png;base64,UE5HREFUQQ==" }, { "text": "Remove the speech bubble text" }] }] },

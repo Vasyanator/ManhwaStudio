@@ -798,7 +798,7 @@ mod tests {
 
     fn solid_overlay_rgba(w: usize, h: usize, color: [u8; 4]) -> Vec<u8> {
         let mut v = vec![0u8; w * h * 4];
-        for px in v.chunks_exact_mut(4) {
+        for px in v.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&color);
         }
         v

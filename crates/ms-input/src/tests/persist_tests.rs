@@ -148,7 +148,7 @@ fn v1_sections_migrate_to_format_two() {
     );
     assert_eq!(registry.bindings(view::ZOOM_IN), &[Binding::command(Chord::new([ctrl(), key(egui::Key::Plus)]))]);
     assert_eq!(registry.bindings(ActionId("translation.ocr.quick_mode")), &[Binding::mode([Button::Modifier(crate::ModifierKey::Alt)])]);
-    assert!(registry.bindings(ActionId("translation.panel.ocr.toggle")).is_empty());
+    assert_eq!(registry.bindings(ActionId("translation.panel.ocr.toggle")), []);
 }
 
 #[test]

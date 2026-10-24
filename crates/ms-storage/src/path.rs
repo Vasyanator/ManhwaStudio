@@ -71,9 +71,9 @@ mod tests {
 
     #[test]
     fn root_is_empty() {
-        assert!(normalize("").unwrap().is_empty());
-        assert!(normalize("/").unwrap().is_empty());
-        assert!(normalize(".").unwrap().is_empty());
+        assert_eq!(normalize("").unwrap(), [] as [String; 0]);
+        assert_eq!(normalize("/").unwrap(), [] as [String; 0]);
+        assert_eq!(normalize(".").unwrap(), [] as [String; 0]);
     }
 
     #[test]

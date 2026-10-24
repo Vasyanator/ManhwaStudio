@@ -254,7 +254,7 @@ fn crop(page: &image::RgbImage, seg: &[u8], window: [u32; 4]) -> Window {
     let mut win = Window { w, h, grey: Vec::with_capacity(w * h), bgr: [Vec::with_capacity(w * h), Vec::with_capacity(w * h), Vec::with_capacity(w * h)], pred: Vec::with_capacity(w * h) };
     for y in y1..y2 {
         let row = &raw[(y * page_w + x1) * 3..(y * page_w + x2) * 3];
-        for px in row.chunks_exact(3) {
+        for px in row.as_chunks::<3>().0 {
             let rgb = [px[0], px[1], px[2]];
             win.grey.push(grey_bgr_quirk(rgb));
             win.bgr[0].push(rgb[2]);

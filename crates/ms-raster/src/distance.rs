@@ -423,8 +423,8 @@ mod tests {
     /// A zero-area raster is valid and yields an empty output.
     #[test]
     fn zero_area_is_empty() -> Result<(), RasterError> {
-        assert!(squared_distance_with_costs(&[], 0, 7)?.is_empty());
-        assert!(squared_distance_to_mask(&[], 5, 0)?.is_empty());
+        assert_eq!(squared_distance_with_costs(&[], 0, 7)?, [] as [f32; 0]);
+        assert_eq!(squared_distance_to_mask(&[], 5, 0)?, [] as [f32; 0]);
         Ok(())
     }
 
@@ -432,8 +432,8 @@ mod tests {
     /// length check — on empty rasters, so nothing large is allocated.
     #[test]
     fn rejects_dimensions_beyond_the_exact_f32_domain() -> Result<(), RasterError> {
-        assert!(squared_distance_with_costs(&[], EDT_MAX_DIMENSION, 0)?.is_empty());
-        assert!(squared_distance_to_mask(&[], 0, EDT_MAX_DIMENSION)?.is_empty());
+        assert_eq!(squared_distance_with_costs(&[], EDT_MAX_DIMENSION, 0)?, [] as [f32; 0]);
+        assert_eq!(squared_distance_to_mask(&[], 0, EDT_MAX_DIMENSION)?, [] as [f32; 0]);
         let over = EDT_MAX_DIMENSION + 1;
         assert_eq!(squared_distance_with_costs(&[], over, 0), Err(RasterError::DimensionTooLarge { width: over, height: 0, max: EDT_MAX_DIMENSION }));
         assert_eq!(squared_distance_to_mask(&[], 0, over), Err(RasterError::DimensionTooLarge { width: 0, height: over, max: EDT_MAX_DIMENSION }));

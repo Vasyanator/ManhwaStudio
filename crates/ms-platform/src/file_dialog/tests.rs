@@ -192,7 +192,7 @@ fn every_message_key_is_shipped_and_interpolated() {
     ];
     for error in &errors {
         assert_key_in_shipped_catalogs(error.message_key());
-        assert!(!error.user_message().is_empty());
+        assert_ne!(error.user_message(), "");
         assert_eq!(error.to_string(), error.user_message());
     }
     assert!(errors[1].user_message().contains("d1"));

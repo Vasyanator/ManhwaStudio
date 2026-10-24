@@ -752,7 +752,7 @@ mod tests {
         assert_eq!(first.bbox.map(|bbox| (bbox.x, bbox.y, bbox.width, bbox.height)), Some((147, 133, 185, 133)));
         assert_eq!(first.polygons.len(), 1);
         assert_eq!(first.polygons[0].outer.len(), 231);
-        assert!(first.polygons[0].holes.is_empty());
+        assert_eq!(first.polygons[0].holes, [] as [Vec<[i32; 2]>; 0]);
         assert_eq!((first.region, &first.text_status), (None, &None));
         assert!(image.blocks.iter().all(super::OcrBlock::has_usable_mask));
     }

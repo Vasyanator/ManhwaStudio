@@ -248,12 +248,12 @@ where
 /// Returns the pixel bytes and colour type to hand the PNG / WebP encoder under `policy`:
 /// borrowed RGBA8, or a freshly packed RGB8 copy when `DropIfOpaque` finds every alpha == 255.
 fn pixels_for_alpha_policy(raw: &[u8], policy: AlphaPolicy) -> (std::borrow::Cow<'_, [u8]>, ExtendedColorType) {
-    let fully_opaque = || raw.chunks_exact(RGBA_CHANNELS).all(|px| px[3] == u8::MAX);
+    let fully_opaque = || raw.as_chunks::<RGBA_CHANNELS>().0.iter().all(|px| px[3] == u8::MAX);
     match policy {
         AlphaPolicy::DropIfOpaque if fully_opaque() => {
             let mut rgb = Vec::with_capacity(raw.len() / RGBA_CHANNELS * RGB_CHANNELS);
-            for px in raw.chunks_exact(RGBA_CHANNELS) {
-                // Indexing is safe: `chunks_exact(4)` yields slices of exactly four bytes.
+            for px in raw.as_chunks::<RGBA_CHANNELS>().0 {
+                // Indexing is safe: `as_chunks` yields arrays of exactly four bytes.
                 rgb.extend_from_slice(&px[..RGB_CHANNELS]);
             }
             (std::borrow::Cow::Owned(rgb), ExtendedColorType::Rgb8)
