@@ -11,7 +11,8 @@ Key items:
   backend supervisor (same availability, same storage-conversion autostart gate) for both the
   test launcher and the main window.
 - `init_full`: storage-mode probe -> pre-settings steps -> settings load -> pending storage
-  reconciliation -> settings-driven steps.
+  reconciliation -> settings-driven steps -> app-version registration -> eager browser-bridge
+  start (main run only, when a machine-translation service uses the browser transport).
 - `PreSettingsStep` / `SettingsStep`: one variant per seeding call, with the reason for its
   position next to the call.
 
@@ -140,16 +141,18 @@ enum SettingsStep {
     AutosavePolicy,
     SecondaryWindows,
     TouchGestures,
+    MtTransport,
 }
 
 /// The settings-driven steps in their order; all run before [`init_full`] returns, so before
 /// any window (`shell::run`) exists.
-const SETTINGS_STEPS: [SettingsStep; 5] = [
+const SETTINGS_STEPS: [SettingsStep; 6] = [
     SettingsStep::UiLocale,
     SettingsStep::UiScale,
     SettingsStep::AutosavePolicy,
     SettingsStep::SecondaryWindows,
     SettingsStep::TouchGestures,
+    SettingsStep::MtTransport,
 ];
 
 impl SettingsStep {
@@ -172,6 +175,10 @@ impl SettingsStep {
             // Seed the process-global touchscreen-gestures switch the main window's router reads
             // every frame; the General settings pane changes it live afterwards.
             Self::TouchGestures => ms_config::touch_gestures::seed_from_user_settings(user_settings),
+            // Seed the live per-service machine-translation transport (built-in requests or the
+            // browser extension) every MT run and the Cleaning prompt translator read; the MT
+            // panel changes it live afterwards.
+            Self::MtTransport => tabs::translation::mt_transport::seed_from_user_settings(user_settings),
         }
     }
 }
@@ -197,6 +204,9 @@ impl SettingsStep {
 /// - (f) precondition owned by the caller: on Android the working directory is the runtime
 ///   root BEFORE the first `ms_config` call of the process (`android_entry.rs::start` ->
 ///   `enter_runtime_root`, ahead of `native_main`); `run_native`'s log init is that first call.
+/// - (g) the eager browser-bridge start runs after the `MtTransport` seed (it reads the live
+///   transports) and after `register_app_version` (the bridge tells the extension that
+///   version); never for `--check-venv`, which exits right after this function.
 ///
 /// The pure facts of [`ProcessServices`] (`local_ai`, `host`) have no side effect, so where they
 /// are computed is not part of the contract. The AI backend supervisor is not started here (see
@@ -223,6 +233,14 @@ pub(super) fn init_full(cli: &Cli) -> anyhow::Result<ProcessServices> {
     }
     for step in SETTINGS_STEPS {
         step.run(&user_settings);
+    }
+    // Not a setting and order-free: the browser bridge tells the extension which app version it
+    // talks to, and library crates cannot read `MS_APP_VERSION`.
+    ms_browser_bridge::app::register_app_version(env!("MS_APP_VERSION"));
+    // (g) A service persisted as "through my browser": start the bridge now (on a worker), so
+    // the extension has connected by the first translation instead of failing it.
+    if !cli.check_venv {
+        tabs::translation::mt_transport::start_browser_bridge_if_used();
     }
     Ok(ProcessServices { user_settings, local_ai: LocalAiAvailability::for_process(cli.no_ai), host: launcher_host(cli.ignore_installed) })
 }
@@ -256,6 +274,7 @@ mod tests {
             SettingsStep::AutosavePolicy => 2,
             SettingsStep::SecondaryWindows => 3,
             SettingsStep::TouchGestures => 4,
+            SettingsStep::MtTransport => 5,
         }
     }
 

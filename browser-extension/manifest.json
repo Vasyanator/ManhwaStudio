@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "ManhwaStudio Bridge",
+  "short_name": "ManhwaStudio",
+  "version": "1.0.0",
+  "description": "Connects your browser to the running ManhwaStudio app (machine translation through your own browser session).",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwynrT6ifcUjvzNfiQb0ewYXSEbib1e2BrVOePooBCFmzyO4hBclaPZCx5cN/RUQVR+C84ZdoVRCxYPhN85wSuqccnABUEevCLIqK//8s8BDENgtxFeCEaNUpOCaFTxgEKjFP9o9OxlYqwnhKFnXjdfxbQUw13cORsIj2YlnGGuQr4A6PuqgSKL4yrUAzgDha09+uJKDDTuzlGi4917vSGbuX80MYElyfVZwhFtPpKkQkgdEdm/CgaT+Yzsoy6FaE+mvMXinFxnX4N+cJsHXB//t1J7PnQ9z4OzSsdTwxU7j8LjLzRqLlOKv5B7MR44fkfu/sJvAonXlEMZLkPNHQQwIDAQAB",
+  "minimum_chrome_version": "116",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": ["scripting", "storage", "alarms"],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "https://translate.google.com/*",
+    "https://www.deepl.com/*",
+    "https://translate.yandex.ru/*",
+    "https://translate.yandex.com/*"
+  ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}

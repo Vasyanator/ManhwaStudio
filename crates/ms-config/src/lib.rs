@@ -119,6 +119,12 @@ pub use touch_gestures::{GENERAL_TOUCH_GESTURES_KEY, touch_gestures_from_user_se
 // crate. The two keys are deliberately absent from `user_config_defaults()` (absent = legacy).
 pub mod torch_choice;
 
+// The machine-translation transport vocabulary (`MtTransport`: built-in HTTP or the user's
+// browser extension). It lives here because the persisted per-service choice is a `user_config`
+// value, and this crate cannot know `MtService` (owned by `ms-tab-translation`), so the setting
+// is keyed by the service's string key.
+pub mod mt_transport;
+
 // Single-image editing mode: the readable input-type table, the scratch-root resolver and
 // the `SingleImage` section of `user_config`. It lives here because the table is pure data
 // read by crates that do not know each other (launcher, installer, project, binary) and

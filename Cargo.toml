@@ -13,7 +13,7 @@ edition = "2024"
 rust-version = "1.95"
 
 [workspace]
-members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-docstore", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-custom-fonts", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-download", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-theme", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-raster", "crates/ms-region-postprocess", "crates/ms-text-detect", "crates/ms-native-runtime", "crates/ms-local-ai", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-studio-tab", "crates/ms-tab-translation", "crates/ms-ai-api", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-os-integration", "crates/ms-input", "crates/ms-platform", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
+members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-docstore", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-custom-fonts", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-download", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-theme", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-raster", "crates/ms-region-postprocess", "crates/ms-text-detect", "crates/ms-native-runtime", "crates/ms-local-ai", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-studio-tab", "crates/ms-tab-translation", "crates/ms-ai-api", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-os-integration", "crates/ms-input", "crates/ms-platform", "crates/ms-browser-ext", "crates/ms-browser-bridge", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
 # The Android port forks under `crates/` are separate workspaces patched in below; without
 # this exclusion Cargo would adopt them as implicit members of this workspace.
 exclude = ["crates/winit", "crates/egui"]
@@ -58,6 +58,7 @@ egui-shader-layers = { version = "0.2", default-features = false, features = ["g
 egui-large-image = "0.1"
 flate2 = "1"
 genai = "0.6"
+hex = "0.4"
 hyphenation = { version = "0.8", features = ["embed_all"] }
 image = { version = "0.25", default-features = true }
 # Defaults (`rayon`, `text`, `fft`) are OFF here because they can only be turned off in this table:
@@ -85,7 +86,9 @@ tempfile = "3"
 texture-synthesis = "0.8.2"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread"] }
-translators = { version = "0.1.5", default-features = false, features = ["google"] }
+# Loopback WebSocket: the backend IPC client (`ms-backend-ipc`) and the browser-extension bridge
+# server (`ms-browser-bridge`). Default features off: no TLS, only the HTTP upgrade handshake.
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 # Inverted on purpose: `ms-fonts` needs only the `std` feature, and defaults can be turned
 # off ONLY here. The two users that do want the full parser (the binary and `ms-widgets`,
 # for the font-properties window) opt back in with `default-features = true`.
@@ -318,6 +321,11 @@ ms-os-integration = { path = "crates/ms-os-integration" }
 # nothing above it depends on it — startup and the launcher's settings page only start
 # it and read its outcome.
 ms-installer = { path = "crates/ms-installer" }
+# The browser-extension bridge: startup registers the executable's version
+# (`ms_browser_bridge::app::register_app_version`, sent in the bridge's `welcome`), because
+# library crates cannot read `MS_APP_VERSION`. Native-only: its `app` module (the loopback
+# server wiring) does not exist on wasm.
+ms-browser-bridge = { path = "crates/ms-browser-bridge" }
 
 # Web-only dependencies. `uuid` is not named by this package: it is listed only to switch on
 # its `js` feature, which routes the RNG of the member crates' v4 UUIDs (ms-models, the typing,

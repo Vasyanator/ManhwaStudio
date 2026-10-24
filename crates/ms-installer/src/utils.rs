@@ -3346,40 +3346,6 @@ pub(super) fn apply_windows_no_window(cmd: &mut Command) {
     }
 }
 
-pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        let mut cmd = Command::new("cmd");
-        apply_windows_no_window(&mut cmd);
-        cmd.arg("/C").arg("start").arg("").arg(url);
-        cmd.spawn()
-            .map_err(|e| tf!("installer.utils.open_url_error", url = url, e = e))?;
-        return Ok(());
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| tf!("installer.utils.open_url_error", url = url, e = e))?;
-        return Ok(());
-    }
-
-    // No xdg-open on Android; it falls through to the typed unsupported-OS error.
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
-    {
-        Command::new("xdg-open")
-            .arg(url)
-            .spawn()
-            .map_err(|e| tf!("installer.utils.open_url_error", url = url, e = e))?;
-        return Ok(());
-    }
-
-    #[allow(unreachable_code)]
-    Err(tf!("installer.utils.open_url_unsupported_os_error", url = url))
-}
-
 fn lerp(start: f32, end: f32, t: f32) -> f32 {
     start + (end - start) * t.clamp(0.0, 1.0)
 }

@@ -275,7 +275,8 @@ Contracts:
   only, and are absent rather than wrong until the window is wide enough to mean something.
 - The prompt sent to the backend is the ENGLISH field. The optional second field plus
   the Google/Yandex/DeepL picker only fill it in, reusing the translation tab's own
-  dispatcher (`translate_texts_via_translator`) instead of a second copy of it. It is
+  dispatcher (`translate_texts_via_translator`, paced by the same process-wide MT request
+  limiter as a Translation run) instead of a second copy of it. It is
   never empty: an empty prompt blocks the run, so `FLUX2_DEFAULT_PROMPT` is substituted
   both for a fresh settings file and for one whose prompt is missing or blank.
 - `.status` and `.prompt_cache.list` are re-queried through the SAME one-shot arming as

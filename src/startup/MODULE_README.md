@@ -120,8 +120,10 @@ the prefix their mode needs, see "Run modes"):
 7. `mark_first_run_languages_if_needed` (before anything that persists the defaults tree), then
    the config seeds (`seed.rs`, HF token, typing-tab seeds), the on-disk locale reconcile
    (BEFORE `load_user_settings_for_startup`), settings load, pending storage reconciliation, UI
-   locale / UI scale / autosave policy / secondary windows / touch gestures seeding. Steps 6-7 are
-   `services::init_full`; its doc comment is the authoritative statement of rules (a)-(f).
+   locale / UI scale / autosave policy / secondary windows / touch gestures / MT transport
+   seeding, then the bridge's app-version registration and (main run only) the eager browser-bridge
+   start when a machine-translation service uses the browser transport. Steps 6-7 are
+   `services::init_full`; its doc comment is the authoritative statement of rules (a)-(g).
 8. `--check-venv` (terminal) -> `--continue-update` -> `--update` -> `--test-launcher` (the main
    window in test mode).
 9. AI backend supervisor (`ProcessServices::start_ai_backend_supervisor`: the process's

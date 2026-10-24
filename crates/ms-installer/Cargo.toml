@@ -45,7 +45,8 @@ ms-i18n = { path = "../ms-i18n" }
 # installer window's GUI thread.
 ms-thread = { path = "../ms-thread" }
 # The non-blocking folder picker of the installer's "custom install location" row
-# (`ms_platform::file_dialog`, `PickDirectoryPath`).
+# (`ms_platform::file_dialog`, `PickDirectoryPath`) and the finish screen's invite links
+# (`ms_platform::shell_open::open_url`).
 ms-platform = { path = "../ms-platform" }
 # The Windows OS records of an install (Uninstall / App Paths / "Open with" registry keys,
 # `ManhwaStudio.lnk` shortcuts, elevation probe and UAC relaunch) and their names. The

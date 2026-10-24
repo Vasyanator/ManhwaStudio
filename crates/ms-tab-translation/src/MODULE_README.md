@@ -86,7 +86,29 @@ Long work is delegated to focused controllers:
   and the stored detection's lazy load is started for it). Display only: the mask brush and the
   lines editor stay tied to the panel.
 - `machine_translation.rs` owns MT run threads, AI API MT chat batching/context pruning,
-  cancellation, and stale-event filtering.
+  cancellation, and stale-event filtering. A plain (Google / Yandex / DeepL) run builds ONE
+  provider backend (`machine_translators::run_session` for the service and its live transport,
+  `mt_transport::current`: built-in HTTP or the user's browser extension) and ONE limiter call
+  (`mt_limits::call::MtCall::for_run`: the run's cancel flag + a wait reporter) per run, hands the
+  provider `preferred_batch_size` consecutive bubbles per call and still emits one result and one
+  progress event per bubble in order. Limiter waits reach the panel as
+  `MtControllerEvent::RateLimitWait` (`MtPanelProgress::rate_limit_wait`, one status line); a
+  service throttled for longer than a run waits stops the run with `RunRateLimited` (Warning
+  toast), never `RunFailed`, so it is not mistaken for an AI credit/quota error. A stop-kind
+  item (`Cancelled` / `CoolingDown` / `ServiceUnavailable`) ends the run only after the rest of
+  its batch is applied; `ServiceUnavailable` (browser extension not connected / outdated /
+  disconnected) ends it with `RunFailed` and that message. A Stop seen right after a provider
+  call returned ends the run with `RunCancelled` WITHOUT applying that call's results
+  (`PlainMtRun::run`); with the browser transport's batches of up to 20 texts that drops the
+  translations already received in the call. A browser tab needing the user
+  reaches the panel as a `RateLimitWait` whose `reason` is `MtRateLimitWaitReason::
+  BrowserAttention` (the panel's "solve the check in the browser tab" line; Stop still works).
+  The transport is chosen per service in the MT panel: the click sets `mt_transport` at once on
+  the GUI thread and `BrowserExtensionController::save_transport` queues it for the controller's
+  ONE saver worker (serialized, latest-wins per service, so the persisted value is the last
+  click; a failure is a toast); a click to the browser transport also starts the bridge on a
+  worker. The MT panel skips the transport row for the one frame right after a service switch
+  (the tab built it for the previous service). Ordinary spacing waits are not shown (see `mt_limits/MODULE_README.md`).
 - Live AI API generation progress: every AI API OCR / MT request runs through
   `ms_ai_api::exec_chat_validated` (the tracked executor plus ONE format-repair retry, whose
   reason the generation widget shows). The OCR controller owns one `GenerationTracker` shared with its
@@ -472,12 +494,25 @@ is an author note addressed to the translator, not a replica.
   pruning, the validated AI exchange per batch / per ImageBubble, the run's issue list
   (`MtRunIssue`), run-level context notices (`MtControllerEvent::ContextNotice`: an unreadable
   notes template, character roster or term list is logged with its path and all of a prompt's
-  failures are shown as one warning toast; the request goes without those blocks), and backend dispatch.
+  failures are shown as one warning toast; the request goes without those blocks), the plain-MT
+  run loop (`PlainMtRun`: batching, per-bubble events, cancel, rate-limit stop), and backend
+  dispatch (`translate_texts_via_translator`: the String-typed entry of the cleaning tab, a
+  detached limiter call).
 - `ai_mt_response.rs` (native): pure reading / validation / merging of AI MT answers
   (`BatchCollector`), the repair message, per-item failure reasons, canonical history JSON,
   content checks (`content_warnings`) and the strict-output schema (`strict_answer_schema`).
 - `machine_translators/`: UI-agnostic Google, Yandex, and DeepL MT provider implementations behind
-  `MachineTranslatorBackend`.
+  `MachineTranslatorBackend` (typed per-text `MtItemError`, per-run `run_session` factory, shared
+  HTTP transport facts in `http.rs`; DeepL's one process-wide HTTP agent, a read-only global),
+  plus `browser.rs`, the same three services driven in the user's browser through the
+  ManhwaStudio extension (`ms-browser-bridge`). Own `MODULE_README.md`.
+- `mt_transport.rs`: the live per-service transport (`current` / `set` /
+  `seed_from_user_settings`, relaxed atomics seeded by the root's `SettingsStep::MtTransport`);
+  the persisted value and its writer are `ms_config::mt_transport`.
+- `mt_limits/`: the process-wide MT request limiter (pacing, cooldowns, cancellable reported
+  waits, long-text split) every provider request goes through, shared by Translation runs and
+  the Cleaning tab's prompt translator. Its one static registry is a documented exception to
+  global §5 (header of `mt_limits/registry.rs`). Own `MODULE_README.md`.
 - `panels/`: side-panel UI modules for OCR, bubble cards/footer fields, machine translation,
   text detector controls, composed text, and OCR language catalogs.
 - `adv_rec.rs`: floating advanced-recognition crop preview/editor with async crop preparation,
@@ -509,6 +544,13 @@ is an author note addressed to the translator, not a replica.
   eight tabs), the «Последние персонажи» body with its card helpers and size constants,
   `text_detector_edit_panel_pos`; its unit tests pin the default layout (and that it solves into
   disjoint panels) and the card geometry.
+- `tab/browser_extension.rs` (child module of `tab`, `pub(crate)` for the MT panel's view
+  types): `ExtensionUiState::from_status` (the extension block's ONE state, GUI-free: bridge
+  status + folder probe + embedded bundle), `BrowserExtensionController` (bridge start on first
+  view, folder probe, the install job `run_install_job` = install -> start -> open folder ->
+  reload stale peers, open folder, the MT transport save; all on workers, `poll` per frame) over
+  the `ExtensionOps` seam; `tab/browser_extension/tests.rs` pins the mapping table and the job
+  state machine with a fake.
 - `tab/tool_panels.rs` (child module of `tab`): the five tools — `TranslationTool`, `ToolToggles`,
   the toolbar and tool tab ids, restore / prepare / toggle / `apply_tool_dock_requests`, the
   toolbar body and its measured size, the router `draw_tool_body` with one `draw_*_tool_body` per
@@ -753,6 +795,12 @@ is an author note addressed to the translator, not a replica.
   Block order/cap and mask normalization rules live in `ms-text-detect`, not here.
 - To change MT run lifecycle, provider selection, cancellation, or batch dispatch, edit
   `machine_translation.rs`, `machine_translators/`, and `panels/machine_translation.rs`.
+- To change how MT reaches a service through the browser (packing, error meaning, timeouts),
+  edit `machine_translators/browser.rs`; the bridge itself is `ms-browser-bridge`. What the MT
+  panel shows about the extension and its install / start workers: `tab/browser_extension.rs`;
+  the transport row and extension block UI: `panels/machine_translation.rs`.
+- To change how often an MT service is asked, its cooldowns or the long-text split, edit
+  `mt_limits/` (numbers only in `mt_limits/table.rs`); providers never pace themselves.
 - To change bubble list editing, footer fields, search/filter behavior, or text write-through, edit
   `panels/bubbles.rs` and footer sync helpers in `tab.rs`.
 - To change composed text generation or export, edit `panels/composition.rs`.

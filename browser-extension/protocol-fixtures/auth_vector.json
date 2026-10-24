@@ -1,0 +1,7 @@
+{
+  "secret": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+  "nonce": "0123456789abcdef0123456789abcdef",
+  "client_nonce": "fedcba9876543210fedcba9876543210",
+  "client_auth": "cba4e4d7aeda4857434c4c898910d620d0091509e8d476fea6b061ee18e835ac",
+  "server_auth": "58fa6a2de4fc2a5e2c39286283c64fa29a9cf7cb419b87c76e4baf5db4389d75"
+}

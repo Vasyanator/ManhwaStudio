@@ -1,0 +1,35 @@
+[package]
+name = "ms-browser-ext"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+# The ManhwaStudio browser extension as an embedded bundle: its pinned Chromium id, the
+# bundle built from `browser-extension/` at build time (when node/npm exist) and the atomic,
+# version-stamped unpack into the app's data folder. GUI-free, no i18n, no logging; the only
+# crate of the workspace whose build script runs npm (see `src/MODULE_README.md`).
+
+[dependencies]
+# Stamp `ms-extension-stamp.json` (de)serialization.
+serde.workspace = true
+serde_json.workspace = true
+# Typed `InstallError` / `NotIncluded`.
+thiserror.workspace = true
+
+[build-dependencies]
+# `manifest.json` `key` (base64 DER public key) -> extension id. Only this crate decodes
+# base64 at build time, so the version stays local (Cargo.lock already carries 0.22).
+base64 = "0.22"
+# Bundle `build_id` = truncated sha256 over the bundled files; extension id = sha256 of the key.
+hex.workspace = true
+sha2.workspace = true
+# Reads `manifest.json`, writes `build-info.json`.
+serde_json.workspace = true
+
+[dev-dependencies]
+# The id test re-decodes the manifest key independently of the build script.
+base64 = "0.22"
+hex.workspace = true
+sha2.workspace = true
+# Unique, self-removing scratch directories for the install tests.
+tempfile.workspace = true

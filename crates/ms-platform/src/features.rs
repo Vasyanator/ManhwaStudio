@@ -78,11 +78,17 @@ pub enum PlatformFeature {
     /// pen from a finger there ([`UnavailableReason::PenTouchIndistinguishable`]); off on wasm,
     /// whose web entry has no input hook.
     CanvasTouchGestures,
+    /// Handing a URL to the default browser or a folder to the file manager (`shell_open`):
+    /// `cmd start` / `explorer.exe`, `open`, `xdg-open`. Android and wasm have no such handler.
+    ShellOpen,
+    /// The `ManhwaStudio` browser extension and its loopback bridge: needs a desktop Chromium
+    /// browser that loads an unpacked extension and a local WebSocket listener.
+    BrowserExtension,
 }
 
 impl PlatformFeature {
     /// Every feature, in declaration order (tests and diagnostics iterate it).
-    pub const ALL: [PlatformFeature; 16] = [
+    pub const ALL: [PlatformFeature; 18] = [
         PlatformFeature::PythonBackend,
         PlatformFeature::InstalledCopyManagement,
         PlatformFeature::NativeOnnxRuntime,
@@ -99,6 +105,8 @@ impl PlatformFeature {
         PlatformFeature::AppStorageVolumes,
         PlatformFeature::AllFilesAccess,
         PlatformFeature::CanvasTouchGestures,
+        PlatformFeature::ShellOpen,
+        PlatformFeature::BrowserExtension,
     ];
 
     /// Whether the current build target offers this feature. Decided at compile time from
@@ -128,7 +136,9 @@ impl PlatformFeature {
             | PlatformFeature::PersistentDirectoryPicker
             | PlatformFeature::NativeMessageBox
             | PlatformFeature::ClipboardImage
-            | PlatformFeature::ClipboardRichFormats => DESKTOP,
+            | PlatformFeature::ClipboardRichFormats
+            | PlatformFeature::ShellOpen
+            | PlatformFeature::BrowserExtension => DESKTOP,
         }
     }
 
@@ -166,7 +176,9 @@ impl PlatformFeature {
             | PlatformFeature::ClipboardRichFormats
             | PlatformFeature::AppStorageVolumes
             | PlatformFeature::AllFilesAccess
-            | PlatformFeature::CanvasTouchGestures => UnavailableReason::NotOnThisPlatform,
+            | PlatformFeature::CanvasTouchGestures
+            | PlatformFeature::ShellOpen
+            | PlatformFeature::BrowserExtension => UnavailableReason::NotOnThisPlatform,
         }
     }
 
@@ -189,6 +201,8 @@ impl PlatformFeature {
             PlatformFeature::AppStorageVolumes => "platform.unavailable.app_storage_volumes_error",
             PlatformFeature::AllFilesAccess => "platform.unavailable.all_files_access_error",
             PlatformFeature::CanvasTouchGestures => "platform.unavailable.canvas_touch_gestures_error",
+            PlatformFeature::ShellOpen => "platform.unavailable.shell_open_error",
+            PlatformFeature::BrowserExtension => "platform.unavailable.browser_extension_error",
         }
     }
 }
@@ -266,6 +280,17 @@ mod tests {
             let expected = !matches!(feature, PlatformFeature::AppStorageVolumes | PlatformFeature::AllFilesAccess);
             assert_eq!(feature.is_available(), expected, "{feature:?}");
             assert_eq!(feature.require().is_ok(), expected, "{feature:?}");
+        }
+    }
+
+    #[test]
+    fn shell_open_and_browser_extension_are_desktop_only() {
+        let expected = cfg!(not(any(target_arch = "wasm32", target_os = "android")));
+        for feature in [PlatformFeature::ShellOpen, PlatformFeature::BrowserExtension] {
+            assert_eq!(feature.is_available(), expected, "{feature:?}");
+            if !expected {
+                assert_eq!(feature.require(), Err(Unavailable::new(feature, UnavailableReason::NotOnThisPlatform)));
+            }
         }
     }
 

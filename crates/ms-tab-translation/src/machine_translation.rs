@@ -8,7 +8,8 @@ Main types:
   snapshot.
 - `MtTranslateItem` / `MtTranslateRequest`: per-bubble input and batch request payload, including
   optional ImageBubble multimodal payloads for AI API translation.
-- `MtControllerEvent`: UI-facing worker events.
+- `MtControllerEvent`: UI-facing worker events (including the rate-limit wait status
+  `RateLimitWait` / `MtRateLimitWait` and the rate-limit stop `RunRateLimited`).
 - `MtRunIssue` / `MtRunIssueKind`: the last run's per-bubble failures and content warnings, kept
   by the controller (`run_issues`) for the panel's warnings list and logged once there.
 - `TranslationMtController`: MT run lifecycle with immediate cancel semantics.
@@ -26,7 +27,17 @@ Runtime model:
 - detached/stale run events are ignored by `run_id` and never touch canvas state.
 
 Backend helper:
-- `translate_texts_via_translator` dispatches into `machine_translators` backends.
+- `translate_texts_via_translator` dispatches into `machine_translators` backends (built-in or
+  browser, by the live transport) with a detached limiter call (`MtCall::detached`: shared limiter, no cancel, silent waits); its
+  public String signature serves the cleaning tab's prompt translator.
+- The plain-MT run loop (`PlainMtRun`) builds ONE backend per run (`machine_translators::
+  run_session` for the service and its live transport, `mt_transport::current`) and one
+  `MtCall::for_run` (the run's cancel flag + a reporter that sends `WorkerEvent::RateLimitWait`,
+  limiter waits and browser-attention notices alike, `MtRateLimitWaitReason`). It hands the
+  provider `preferred_batch_size` consecutive bubbles per call and emits one result / progress
+  event per bubble in order. A text failing with `MtItemErrorKind::CoolingDown` stops the run
+  (`RunRateLimited`); `ServiceUnavailable` stops it with `RunFailed` (the browser extension is
+  not usable); `Cancelled` ends it as a cancelled run.
 - AI API translation sends JSON groups with bubble IDs and characters, sends ImageBubble binaries
   only in the active multimodal request, keeps text-only chat history across batches, and prunes old
   turns by an approximate context budget.
@@ -75,12 +86,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::time::Duration;
 use ms_thread::{self as thread, JoinHandle};
 
-use super::machine_translators::MachineTranslatorBackend;
+use super::machine_translators::{self, MachineTranslatorBackend, MtItemError, MtItemErrorKind};
 use super::machine_translators::deepl::DeeplMtBackend;
 use super::machine_translators::google::GoogleMtBackend;
 use super::machine_translators::yandex::YandexMtBackend;
+use crate::mt_limits::call::{MtCall, MtWaitReason, MtWaitStatus, whole_seconds_ceil};
+use crate::mt_limits::registry::MtLimiterRegistry;
+use crate::mt_transport;
+use ms_config::mt_transport::MtTransport;
 use ms_ai_api::{AiApiService, GenerationSnapshot, GenerationTracker};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_ai_api::{AiApiError, Validation, exec_chat_validated};
@@ -430,6 +446,49 @@ pub struct AiMtOptions {
     pub project: ProjectData,
 }
 
+/// Whole minutes in `secs`, rounded up and at least 1: the "try again in about N min" figure
+/// of the rate-limit messages (`translation.mt.rate_limit.*`, `translation.tab.mt_rate_limited_*`).
+#[must_use]
+pub(crate) fn whole_minutes_ceil(secs: u64) -> u64 {
+    secs.div_ceil(60).max(1)
+}
+
+/// What a reported run wait is waiting for (the panel words the notice by it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MtRateLimitWaitReason {
+    /// The service's request limiter (spacing, a request budget, another request in flight, a
+    /// short cooldown).
+    Limiter,
+    /// The browser tab of the service needs the user (a captcha or consent page): "solve the
+    /// check in the browser tab". Always without `remaining_secs`.
+    BrowserAttention,
+}
+
+/// A run waiting for a service's request limiter or for the user in the browser, as the MT
+/// panel shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MtRateLimitWait {
+    /// The service being waited for.
+    pub service: MtService,
+    /// Whole seconds left (rounded up) when known; `None` = waiting for another request of the
+    /// service that is still in flight, or for the user.
+    pub remaining_secs: Option<u32>,
+    /// What the run waits for.
+    pub reason: MtRateLimitWaitReason,
+}
+
+impl MtRateLimitWait {
+    /// The panel form of a wait report.
+    fn from_status(status: MtWaitStatus) -> Self {
+        let remaining_secs = status.remaining.map(|left| u32::try_from(whole_seconds_ceil(left)).unwrap_or(u32::MAX));
+        let reason = match status.reason {
+            MtWaitReason::Limiter => MtRateLimitWaitReason::Limiter,
+            MtWaitReason::BrowserAttention => MtRateLimitWaitReason::BrowserAttention,
+        };
+        Self { service: status.service, remaining_secs, reason }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum MtControllerEvent {
     RunStarted {
@@ -469,6 +528,19 @@ pub enum MtControllerEvent {
         context_used_chars: usize,
         context_budget_chars: usize,
         pruned_replicas: usize,
+    },
+    /// The run waits for a service's request limiter (`Some`), or that wait ended (`None`).
+    /// Only waits long enough to notice are reported.
+    RateLimitWait {
+        wait: Option<MtRateLimitWait>,
+    },
+    /// The run stopped because `service` limits requests for longer than a run waits; the
+    /// remaining bubbles stay untranslated. `retry_in_secs` = when the service is usable again.
+    RunRateLimited {
+        service: MtService,
+        translated: usize,
+        errors: usize,
+        retry_in_secs: u64,
     },
 }
 
@@ -740,6 +812,23 @@ impl TranslationMtController {
                         });
                     }
                 }
+                Ok(WorkerEvent::RateLimitWait { run_id, wait }) => {
+                    if self.is_active_run(run_id) {
+                        out.push(MtControllerEvent::RateLimitWait { wait });
+                    }
+                }
+                Ok(WorkerEvent::RunRateLimited {
+                    run_id,
+                    service,
+                    translated,
+                    errors,
+                    retry_in_secs,
+                }) => {
+                    if self.is_active_run(run_id) {
+                        self.finish_active_run();
+                        out.push(MtControllerEvent::RunRateLimited { service, translated, errors, retry_in_secs });
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.finish_active_run();
@@ -854,6 +943,26 @@ enum WorkerEvent {
         context_budget_chars: usize,
         pruned_replicas: usize,
     },
+    /// See `MtControllerEvent::RateLimitWait`.
+    RateLimitWait {
+        run_id: u64,
+        wait: Option<MtRateLimitWait>,
+    },
+    /// See `MtControllerEvent::RunRateLimited`; the run's last event.
+    RunRateLimited {
+        run_id: u64,
+        service: MtService,
+        translated: usize,
+        errors: usize,
+        retry_in_secs: u64,
+    },
+}
+
+/// Sends one worker event to the controller.
+fn send_worker_event(evt_tx: &Sender<WorkerEvent>, event: WorkerEvent) {
+    // The receiver lives in the controller and is gone only after the controller was dropped
+    // (tab closed, run detached): nobody is left to tell, so a failed send is not an error.
+    let _ = evt_tx.send(event);
 }
 
 fn run_translate_request(
@@ -892,95 +1001,166 @@ fn run_translate_request(
         return;
     }
 
-    for item in items {
-        // The non-AI translators have no batch context, so context-only replicas (if any leaked in)
-        // are skipped instead of being sent to the provider.
-        if !item.needs_translation {
-            continue;
-        }
-        if cancel_requested.is_requested() {
-            let _ = evt_tx.send(WorkerEvent::RunCancelled {
-                run_id,
-                translated,
-                errors,
-            });
-            return;
-        }
+    // ONE backend per run, so a provider keeps its run-scoped state (pooled agent, endpoint
+    // memory, the browser connection check) across every bubble; the limiter call carries the
+    // run's cancel flag and forwards its wait reports to the panel. The transport is read once:
+    // a switch in the panel applies to the next run.
+    let transport = mt_transport::current(service);
+    ms_log::runtime_log::log_info(format!("[MT] run {run_id}: {} over the {} transport, {total} bubble(s)", service.title(), transport.token()));
+    let backend = machine_translators::run_session(service, transport, &cancel_requested.requested);
+    let report_wait = |status: Option<MtWaitStatus>| {
+        send_worker_event(evt_tx, WorkerEvent::RateLimitWait { run_id, wait: status.map(MtRateLimitWait::from_status) });
+    };
+    let call = MtCall::for_run(MtLimiterRegistry::shared(), &cancel_requested.requested, &report_wait);
+    let run = PlainMtRun { run_id, service, source_lang: &source_lang, target_lang: &target_lang, total, evt_tx };
+    run.run(backend.as_ref(), &call, items);
+}
 
-        let item_id = item.bubble_id;
-        let backend_result =
-            translate_texts_via_translator(service, &source_lang, &target_lang, vec![item.text]);
+/// One plain (non-AI) machine-translation run: its identity, languages and event channel.
+struct PlainMtRun<'a> {
+    run_id: u64,
+    service: MtService,
+    source_lang: &'a str,
+    target_lang: &'a str,
+    /// Bubbles that need translation (the progress total).
+    total: usize,
+    evt_tx: &'a Sender<WorkerEvent>,
+}
 
-        if cancel_requested.is_requested() {
-            let _ = evt_tx.send(WorkerEvent::RunCancelled {
-                run_id,
-                translated,
-                errors,
-            });
-            return;
-        }
-
-        match backend_result {
-            Ok(mut results) => {
-                if results.len() != 1 {
-                    let err = tf!("translation.mt.invalid_response_error", results = results.len());
-                    let _ = evt_tx.send(WorkerEvent::ItemFailed {
-                        run_id,
-                        bubble_id: item_id,
-                        error: err,
-                    });
-                    errors += 1;
-                    send_mt_progress(
-                        evt_tx,
-                        WorkerProgressSnapshot::simple(run_id, translated, errors, total),
-                    );
-                    continue;
-                }
-
-                match results.pop().expect("len checked == 1") {
-                    Ok(text) => {
-                        let _ = evt_tx.send(WorkerEvent::ItemTranslated {
-                            run_id,
-                            bubble_id: item_id,
-                            translated_text: text,
-                            original_text: None,
-                        });
-                        translated += 1;
-                    }
-                    Err(err) => {
-                        let _ = evt_tx.send(WorkerEvent::ItemFailed {
-                            run_id,
-                            bubble_id: item_id,
-                            error: err,
-                        });
-                        errors += 1;
-                    }
-                }
-                send_mt_progress(
-                    evt_tx,
-                    WorkerProgressSnapshot::simple(run_id, translated, errors, total),
-                );
+impl PlainMtRun<'_> {
+    /// Translates the items that need it, `backend.preferred_batch_size()` consecutive bubbles
+    /// per backend call, and emits one `ItemTranslated` / `ItemFailed` plus one `Progress` per
+    /// bubble in input order, then exactly one terminal event: `RunFinished`, `RunCancelled`
+    /// (the cancel flag is checked before and after every call; a `Cancelled` item also ends
+    /// the run), `RunRateLimited` (the first `CoolingDown` item fails) or `RunFailed` (a
+    /// `ServiceUnavailable` item: the transport cannot serve any later text; its message is the
+    /// run's error, the item itself is not counted). A stop-kind item ends the run only after
+    /// its whole batch was applied: every `Ok` and `Failed` result of the batch is still
+    /// emitted; the remaining stop-kind items and later batches stay untranslated (not
+    /// counted). The first stop-kind item decides the terminal event.
+    fn run(&self, backend: &dyn MachineTranslatorBackend, call: &MtCall<'_>, items: Vec<MtTranslateItem>) {
+        // The non-AI translators have no batch context, so context-only replicas (if any leaked
+        // in) are skipped instead of being sent to the provider.
+        let (bubble_ids, texts): (Vec<i64>, Vec<String>) = items.into_iter().filter(|item| item.needs_translation).map(|item| (item.bubble_id, item.text)).unzip();
+        let batch_size = backend.preferred_batch_size().max(1);
+        let mut texts = texts.into_iter();
+        let mut counts = PlainMtCounts::default();
+        for batch_ids in bubble_ids.chunks(batch_size) {
+            if call.is_cancelled() {
+                self.send_cancelled(counts);
+                return;
             }
-            Err(err) => {
-                let _ = evt_tx.send(WorkerEvent::ItemFailed {
-                    run_id,
-                    bubble_id: item_id,
-                    error: err,
-                });
-                errors += 1;
-                send_mt_progress(
-                    evt_tx,
-                    WorkerProgressSnapshot::simple(run_id, translated, errors, total),
-                );
+            let batch_texts: Vec<String> = texts.by_ref().take(batch_ids.len()).collect();
+            let outcome = backend.translate_texts(call, self.source_lang, self.target_lang, batch_texts);
+            if call.is_cancelled() {
+                self.send_cancelled(counts);
+                return;
             }
+            match outcome {
+                Ok(results) if results.len() == batch_ids.len() => {
+                    if let Some(stop) = self.apply_batch(batch_ids, results, &mut counts) {
+                        match stop {
+                            RunStop::Cancelled => self.send_cancelled(counts),
+                            RunStop::RateLimited { retry_in } => send_worker_event(self.evt_tx, WorkerEvent::RunRateLimited {
+                                run_id: self.run_id,
+                                service: self.service,
+                                translated: counts.translated,
+                                errors: counts.errors,
+                                retry_in_secs: retry_in.as_secs(),
+                            }),
+                            RunStop::Failed { message } => send_worker_event(self.evt_tx, WorkerEvent::RunFailed { run_id: self.run_id, error: message }),
+                        }
+                        return;
+                    }
+                }
+                Ok(results) => {
+                    let error = tf!("translation.mt.invalid_response_error", expected = batch_ids.len(), results = results.len());
+                    self.fail_batch(batch_ids, &error, &mut counts);
+                }
+                // A provider-level failure fails every bubble of the batch with the same reason.
+                Err(error) => self.fail_batch(batch_ids, &error, &mut counts),
+            }
+        }
+        send_worker_event(self.evt_tx, WorkerEvent::RunFinished { run_id: self.run_id, translated: counts.translated, errors: counts.errors });
+    }
+
+    /// Emits the results of one batch in order (`Ok` -> `ItemTranslated`, `Failed` and the
+    /// first `CoolingDown` -> `ItemFailed`, each with its progress event) and returns the
+    /// first stop-kind item's reason, if any. Later stop-kind items are not reported: those
+    /// texts were never sent.
+    fn apply_batch(&self, bubble_ids: &[i64], results: Vec<Result<String, MtItemError>>, counts: &mut PlainMtCounts) -> Option<RunStop> {
+        let mut stop = None;
+        for (&bubble_id, result) in bubble_ids.iter().zip(results) {
+            match result {
+                Ok(translated_text) => {
+                    send_worker_event(self.evt_tx, WorkerEvent::ItemTranslated { run_id: self.run_id, bubble_id, translated_text, original_text: None });
+                    counts.translated += 1;
+                }
+                Err(MtItemError { message, kind }) => match kind {
+                    MtItemErrorKind::Failed => self.fail_item(bubble_id, message, counts),
+                    MtItemErrorKind::Cancelled => {
+                        stop.get_or_insert(RunStop::Cancelled);
+                        continue;
+                    }
+                    MtItemErrorKind::CoolingDown { retry_in } => {
+                        if stop.is_some() {
+                            continue;
+                        }
+                        stop = Some(RunStop::RateLimited { retry_in });
+                        self.fail_item(bubble_id, message, counts);
+                    }
+                    // The run's error says it once; the bubble stays untranslated, uncounted.
+                    MtItemErrorKind::ServiceUnavailable => {
+                        stop.get_or_insert(RunStop::Failed { message });
+                        continue;
+                    }
+                },
+            }
+            self.send_progress(*counts);
+        }
+        stop
+    }
+
+    /// Reports one failed bubble and counts it.
+    fn fail_item(&self, bubble_id: i64, error: String, counts: &mut PlainMtCounts) {
+        send_worker_event(self.evt_tx, WorkerEvent::ItemFailed { run_id: self.run_id, bubble_id, error });
+        counts.errors += 1;
+    }
+
+    /// Fails every bubble of a batch with `error`, each followed by its progress event.
+    fn fail_batch(&self, bubble_ids: &[i64], error: &str, counts: &mut PlainMtCounts) {
+        for &bubble_id in bubble_ids {
+            self.fail_item(bubble_id, error.to_string(), counts);
+            self.send_progress(*counts);
         }
     }
 
-    let _ = evt_tx.send(WorkerEvent::RunFinished {
-        run_id,
-        translated,
-        errors,
-    });
+    fn send_progress(&self, counts: PlainMtCounts) {
+        send_mt_progress(self.evt_tx, WorkerProgressSnapshot::simple(self.run_id, counts.translated, counts.errors, self.total));
+    }
+
+    fn send_cancelled(&self, counts: PlainMtCounts) {
+        send_worker_event(self.evt_tx, WorkerEvent::RunCancelled { run_id: self.run_id, translated: counts.translated, errors: counts.errors });
+    }
+}
+
+/// Why a plain MT run stops before its last batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunStop {
+    /// A provider answered `MtItemErrorKind::Cancelled` (the run was stopped).
+    Cancelled,
+    /// The service cools for longer than a run waits (`MtItemErrorKind::CoolingDown`).
+    RateLimited { retry_in: Duration },
+    /// The transport cannot serve the run (`MtItemErrorKind::ServiceUnavailable`); `message` is
+    /// the localized run error.
+    Failed { message: String },
+}
+
+/// Running totals of a plain MT run.
+#[derive(Debug, Clone, Copy, Default)]
+struct PlainMtCounts {
+    translated: usize,
+    errors: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1020,27 +1200,49 @@ fn send_mt_progress(evt_tx: &Sender<WorkerEvent>, progress: WorkerProgressSnapsh
     });
 }
 
-/// Dispatches a blocking MT request to the backend selected by `service`.
+/// Dispatches a blocking MT request to the backend selected by `service` and its live
+/// transport (`mt_transport::current`: built-in HTTP or the user's browser extension).
 ///
 /// `texts` are translated as one batch. The outer `Err` is a provider-level
-/// failure; the inner per-text `Result` is that text's own outcome. BLOCKING
-/// network I/O (DeepL additionally self-throttles): callers must run it on a
-/// worker thread, never on the GUI thread.
-///
-/// `pub(crate)` because the cleaning tab reuses it for its prompt translator;
-/// duplicating the three-arm match there would let the two dispatchers drift.
-// `pub`, not crate-private: consumed by the `cleaning` tab, which lives in another crate.
+/// failure; the inner per-text `Result` is that text's own outcome (its localized
+/// message). BLOCKING network I/O, paced by the process-wide MT limiter
+/// (`mt_limits`, a detached call: it cannot be stopped, waits at most
+/// `DETACHED_MAX_WAIT` and shows no wait status): callers must run it on a worker
+/// thread, never on the GUI thread. Over the browser transport the whole call has 30 s
+/// (`browser::DETACHED_OVERALL`) and fails at once, per text, when no extension is connected.
+// `pub`, not crate-private: the cleaning tab's prompt translator (another crate) reuses it;
+// duplicating the three-arm match there would let the two dispatchers drift.
 pub fn translate_texts_via_translator(
     service: MtService,
     source_lang: &str,
     target_lang: &str,
     texts: Vec<String>,
 ) -> Result<Vec<Result<String, String>>, String> {
-    match service {
-        MtService::Google => GoogleMtBackend.translate_texts(source_lang, target_lang, texts),
-        MtService::Yandex => YandexMtBackend.translate_texts(source_lang, target_lang, texts),
-        MtService::Deepl => DeeplMtBackend.translate_texts(source_lang, target_lang, texts),
-    }
+    let call = MtCall::detached();
+    let results = match mt_transport::current(service) {
+        MtTransport::Builtin => match service {
+            MtService::Google => GoogleMtBackend.translate_texts(&call, source_lang, target_lang, texts),
+            MtService::Yandex => YandexMtBackend.translate_texts(&call, source_lang, target_lang, texts),
+            MtService::Deepl => DeeplMtBackend.translate_texts(&call, source_lang, target_lang, texts),
+        },
+        #[cfg(not(target_arch = "wasm32"))]
+        MtTransport::Browser => machine_translators::browser::detached_session(service).translate_texts(&call, source_lang, target_lang, texts),
+        // No browser transport on the web: the service's web stub answers "unavailable".
+        #[cfg(target_arch = "wasm32")]
+        MtTransport::Browser => match service {
+            MtService::Google => GoogleMtBackend.translate_texts(&call, source_lang, target_lang, texts),
+            MtService::Yandex => YandexMtBackend.translate_texts(&call, source_lang, target_lang, texts),
+            MtService::Deepl => DeeplMtBackend.translate_texts(&call, source_lang, target_lang, texts),
+        },
+    }?;
+    Ok(item_results_to_messages(results))
+}
+
+/// The String form of a batch's per-text results for callers outside the run loop: every
+/// failure kind becomes its localized message (a detached call is never cancelled, and a
+/// cooldown is just that text's failure there).
+fn item_results_to_messages(results: Vec<Result<String, MtItemError>>) -> Vec<Result<String, String>> {
+    results.into_iter().map(|result| result.map_err(|err| err.message)).collect()
 }
 
 /// Web stub: AI API translation runs over `genai` + `tokio`, which are not
@@ -3340,5 +3542,268 @@ mod tests {
         assert!(!plain.contains("{\"items\": [...]}"));
         options.strict_json = true;
         assert!(super::build_ai_mt_system_prompt("en", "ru", &options).text.contains("{\"items\": [...]}"));
+    }
+}
+
+/// The plain-MT run loop (`PlainMtRun`: batching, per-bubble events, cancel, rate-limit stop)
+/// and the controller's mapping of the limiter events, over a scripted backend and a fake-clock
+/// limiter; no network.
+#[cfg(test)]
+mod plain_mt_tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::{
+        ActiveMtRun, MtControllerEvent, MtItemError, MtItemErrorKind, MtRateLimitWait, MtRateLimitWaitReason, MtRunCancel, MtService, MtTranslateItem, MtWaitStatus,
+        PlainMtRun, TranslationMtController, WorkerEvent, item_results_to_messages, whole_minutes_ceil,
+    };
+    use crate::machine_translators::MachineTranslatorBackend;
+    use crate::mt_limits::call::MtCall;
+    use crate::mt_limits::test_support::FakeClock;
+
+    type BatchReply = Result<Vec<Result<String, MtItemError>>, String>;
+
+    /// Records every batch it is given and answers scripted replies in order; once the script
+    /// is used up it translates every text as `tr <text>`. Optionally sets a cancel flag while
+    /// its `cancel_during`-th call (1-based) is in flight.
+    struct ScriptedBackend<'a> {
+        batch_size: usize,
+        replies: RefCell<VecDeque<BatchReply>>,
+        batches: RefCell<Vec<Vec<String>>>,
+        cancel_during: Option<(usize, &'a AtomicBool)>,
+    }
+
+    impl<'a> ScriptedBackend<'a> {
+        fn new(batch_size: usize, replies: Vec<BatchReply>) -> Self {
+            Self { batch_size, replies: RefCell::new(replies.into()), batches: RefCell::new(Vec::new()), cancel_during: None }
+        }
+
+        fn cancelling(mut self, call_number: usize, flag: &'a AtomicBool) -> Self {
+            self.cancel_during = Some((call_number, flag));
+            self
+        }
+
+        fn batches(&self) -> Vec<Vec<String>> {
+            self.batches.borrow().clone()
+        }
+    }
+
+    impl MachineTranslatorBackend for ScriptedBackend<'_> {
+        fn translate_texts(&self, _call: &MtCall<'_>, _source_lang: &str, _target_lang: &str, texts: Vec<String>) -> BatchReply {
+            self.batches.borrow_mut().push(texts.clone());
+            if let Some((call_number, flag)) = self.cancel_during
+                && self.batches.borrow().len() == call_number
+            {
+                flag.store(true, Ordering::Relaxed);
+            }
+            self.replies.borrow_mut().pop_front().unwrap_or_else(|| Ok(texts.iter().map(|text| Ok(format!("tr {text}"))).collect()))
+        }
+
+        fn preferred_batch_size(&self) -> usize {
+            self.batch_size
+        }
+    }
+
+    fn item(bubble_id: i64, needs_translation: bool) -> MtTranslateItem {
+        MtTranslateItem {
+            bubble_id,
+            page_idx: 0,
+            img_v: 0.0,
+            order: 0,
+            character: String::new(),
+            text: format!("t{bubble_id}"),
+            existing_translation: String::new(),
+            image: None,
+            needs_translation,
+        }
+    }
+
+    fn items(ids: &[i64]) -> Vec<MtTranslateItem> {
+        ids.iter().map(|&id| item(id, true)).collect()
+    }
+
+    fn failed(message: &str) -> Result<String, MtItemError> {
+        Err(MtItemError::failed(message.to_string()))
+    }
+
+    /// Compact, exhaustive rendering of the worker events for order assertions.
+    fn describe(event: &WorkerEvent) -> String {
+        match event {
+            WorkerEvent::RunStarted { total, .. } => format!("started {total}"),
+            WorkerEvent::ItemTranslated { bubble_id, translated_text, .. } => format!("ok {bubble_id} {translated_text}"),
+            WorkerEvent::ItemAreasTranslated { bubble_id, .. } => format!("areas {bubble_id}"),
+            WorkerEvent::ItemFailed { bubble_id, error, .. } => format!("fail {bubble_id} {error}"),
+            WorkerEvent::ItemWarning { bubble_id, .. } => format!("warn {bubble_id}"),
+            WorkerEvent::RunFinished { translated, errors, .. } => format!("finished {translated}/{errors}"),
+            WorkerEvent::RunCancelled { translated, errors, .. } => format!("cancelled {translated}/{errors}"),
+            WorkerEvent::RunFailed { error, .. } => format!("run failed {error}"),
+            WorkerEvent::ContextNotice { notice, .. } => format!("notice {notice}"),
+            WorkerEvent::Progress { translated, errors, total, .. } => format!("progress {translated}/{errors}/{total}"),
+            WorkerEvent::RateLimitWait { wait, .. } => format!("wait {wait:?}"),
+            WorkerEvent::RunRateLimited { service, translated, errors, retry_in_secs, .. } => format!("rate limited {service:?} {translated}/{errors} {retry_in_secs}"),
+        }
+    }
+
+    /// Runs `PlainMtRun` over `backend` with a fake-clock limiter and returns its events.
+    fn run_plain(backend: &ScriptedBackend<'_>, cancel: &AtomicBool, items: Vec<MtTranslateItem>) -> Vec<String> {
+        let (_clock, registry) = FakeClock::registry();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let ignore = |_status: Option<MtWaitStatus>| {};
+        let call = MtCall::for_run(&registry, cancel, &ignore);
+        let total = items.iter().filter(|item| item.needs_translation).count();
+        let run = PlainMtRun { run_id: 7, service: MtService::Deepl, source_lang: "ja", target_lang: "ru", total, evt_tx: &evt_tx };
+        run.run(backend, &call, items);
+        drop(evt_tx);
+        evt_rx.iter().map(|event| describe(&event)).collect()
+    }
+
+    fn texts(ids: &[i64]) -> Vec<String> {
+        ids.iter().map(|id| format!("t{id}")).collect()
+    }
+
+    #[test]
+    fn batch_size_one_sends_one_call_per_bubble_and_skips_context_items() {
+        let backend = ScriptedBackend::new(1, Vec::new());
+        let cancel = AtomicBool::new(false);
+        let mut run_items = items(&[1, 2]);
+        run_items.insert(1, item(9, false));
+        run_items.push(item(3, true));
+        let events = run_plain(&backend, &cancel, run_items);
+        assert_eq!(backend.batches(), [texts(&[1]), texts(&[2]), texts(&[3])]);
+        assert_eq!(events, ["ok 1 tr t1", "progress 1/0/3", "ok 2 tr t2", "progress 2/0/3", "ok 3 tr t3", "progress 3/0/3", "finished 3/0"]);
+    }
+
+    #[test]
+    fn batches_keep_input_order_and_per_item_errors() {
+        let backend = ScriptedBackend::new(2, vec![Ok(vec![Ok("a".to_string()), failed("bad 2")]), Ok(vec![failed("bad 3"), Ok("d".to_string())])]);
+        let cancel = AtomicBool::new(false);
+        let events = run_plain(&backend, &cancel, items(&[1, 2, 3, 4, 5]));
+        assert_eq!(backend.batches(), [texts(&[1, 2]), texts(&[3, 4]), texts(&[5])]);
+        assert_eq!(
+            events,
+            [
+                "ok 1 a", "progress 1/0/5", "fail 2 bad 2", "progress 1/1/5", "fail 3 bad 3", "progress 1/2/5", "ok 4 d", "progress 2/2/5", "ok 5 tr t5",
+                "progress 3/2/5", "finished 3/2",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wrong_result_count_or_a_provider_error_fails_the_whole_batch() {
+        let backend = ScriptedBackend::new(2, vec![Ok(vec![Ok("only one".to_string())]), Err("setup failed".to_string())]);
+        let cancel = AtomicBool::new(false);
+        let events = run_plain(&backend, &cancel, items(&[1, 2, 3, 4]));
+        assert_eq!(events.len(), 9, "{events:?}");
+        assert!(events[0].starts_with("fail 1 ") && events[2].starts_with("fail 2 ") && events[0] == events[2].replacen("fail 2", "fail 1", 1), "{events:?}");
+        assert_eq!(events[1], "progress 0/1/4");
+        assert_eq!(&events[4..], ["fail 3 setup failed", "progress 0/3/4", "fail 4 setup failed", "progress 0/4/4", "finished 0/4"]);
+    }
+
+    #[test]
+    fn cancel_during_a_call_ends_the_run_before_the_next_batch() {
+        let cancel = AtomicBool::new(false);
+        let backend = ScriptedBackend::new(2, Vec::new()).cancelling(2, &cancel);
+        let events = run_plain(&backend, &cancel, items(&[1, 2, 3, 4, 5]));
+        assert_eq!(backend.batches(), [texts(&[1, 2]), texts(&[3, 4])], "no call after the cancel");
+        assert_eq!(events, ["ok 1 tr t1", "progress 1/0/5", "ok 2 tr t2", "progress 2/0/5", "cancelled 2/0"]);
+    }
+
+    #[test]
+    fn a_cancelled_item_ends_the_run_and_a_set_flag_sends_nothing() {
+        let cancelled = Err(MtItemError { message: "stopped".to_string(), kind: MtItemErrorKind::Cancelled });
+        let backend = ScriptedBackend::new(3, vec![Ok(vec![Ok("a".to_string()), cancelled, Ok(String::new())])]);
+        let cancel = AtomicBool::new(false);
+        // The batch's other results are applied before the run ends.
+        assert_eq!(run_plain(&backend, &cancel, items(&[1, 2, 3, 4])), ["ok 1 a", "progress 1/0/4", "ok 3 ", "progress 2/0/4", "cancelled 2/0"]);
+
+        let untouched = ScriptedBackend::new(1, Vec::new());
+        let stopped = AtomicBool::new(true);
+        assert_eq!(run_plain(&untouched, &stopped, items(&[1])), ["cancelled 0/0"]);
+        assert!(untouched.batches().is_empty());
+    }
+
+    #[test]
+    fn a_cooling_service_fails_the_item_and_stops_the_run_after_its_batch() {
+        let cooling = |secs| Err(MtItemError { message: "cooling".to_string(), kind: MtItemErrorKind::CoolingDown { retry_in: Duration::from_secs(secs) } });
+        let backend = ScriptedBackend::new(5, vec![Ok(vec![Ok("a".to_string()), cooling(300), Ok("c".to_string()), cooling(200), failed("bad 5")])]);
+        let cancel = AtomicBool::new(false);
+        let events = run_plain(&backend, &cancel, items(&[1, 2, 3, 4, 5, 6]));
+        assert_eq!(backend.batches().len(), 1);
+        // Every Ok / Failed result of the batch is applied; only the first cooling item fails
+        // and decides the stop; the later cooling text and the next batch stay untranslated.
+        assert_eq!(
+            events,
+            ["ok 1 a", "progress 1/0/6", "fail 2 cooling", "progress 1/1/6", "ok 3 c", "progress 2/1/6", "fail 5 bad 5", "progress 2/2/6", "rate limited Deepl 2/2 300"]
+        );
+    }
+
+    #[test]
+    fn an_unavailable_service_fails_the_run_after_applying_its_batch() {
+        let unavailable = |message: &str| Err(MtItemError { message: message.to_string(), kind: MtItemErrorKind::ServiceUnavailable });
+        let backend = ScriptedBackend::new(4, vec![Ok(vec![Ok("a".to_string()), unavailable("not connected"), failed("bad 3"), unavailable("later")])]);
+        let cancel = AtomicBool::new(false);
+        let events = run_plain(&backend, &cancel, items(&[1, 2, 3, 4, 5]));
+        assert_eq!(backend.batches().len(), 1, "no call after the stop");
+        // Ok and Failed results are applied; the unavailable texts are not counted; the first
+        // unavailable message is the run's error.
+        assert_eq!(events, ["ok 1 a", "progress 1/0/5", "fail 3 bad 3", "progress 1/1/5", "run failed not connected"]);
+    }
+
+    #[test]
+    fn wait_reports_round_up_to_whole_seconds() {
+        let status = |remaining| MtWaitStatus { service: MtService::Google, remaining, reason: crate::mt_limits::call::MtWaitReason::Limiter };
+        assert_eq!(
+            MtRateLimitWait::from_status(status(Some(Duration::from_millis(2100)))),
+            MtRateLimitWait { service: MtService::Google, remaining_secs: Some(3), reason: MtRateLimitWaitReason::Limiter }
+        );
+        let attention = MtWaitStatus { service: MtService::Deepl, remaining: None, reason: crate::mt_limits::call::MtWaitReason::BrowserAttention };
+        assert_eq!(MtRateLimitWait::from_status(attention), MtRateLimitWait { service: MtService::Deepl, remaining_secs: None, reason: MtRateLimitWaitReason::BrowserAttention });
+        assert_eq!(MtRateLimitWait::from_status(status(Some(Duration::from_secs(4)))).remaining_secs, Some(4));
+        assert_eq!(MtRateLimitWait::from_status(status(None)).remaining_secs, None);
+        assert_eq!([whole_minutes_ceil(0), whole_minutes_ceil(59), whole_minutes_ceil(60), whole_minutes_ceil(61)], [1, 1, 1, 2]);
+    }
+
+    #[test]
+    fn detached_results_keep_only_the_messages() {
+        let results = vec![Ok("a".to_string()), failed("bad"), Err(MtItemError { message: "cool".to_string(), kind: MtItemErrorKind::CoolingDown { retry_in: Duration::from_secs(9) } })];
+        assert_eq!(item_results_to_messages(results), [Ok("a".to_string()), Err("bad".to_string()), Err("cool".to_string())]);
+    }
+
+    /// A controller whose active run is `run_id` (an already finished thread stands in for it).
+    fn controller_with_active_run(run_id: u64) -> TranslationMtController {
+        let mut controller = TranslationMtController::new();
+        let thread = ms_thread::spawn(|| {});
+        controller.active_run = Some(ActiveMtRun { run_id, cancel_requested: MtRunCancel::new(), thread });
+        controller.busy = true;
+        controller
+    }
+
+    fn send(controller: &TranslationMtController, event: WorkerEvent) {
+        controller.evt_tx.send(event).unwrap_or_else(|err| panic!("the controller owns the receiver: {err}"));
+    }
+
+    #[test]
+    fn controller_maps_limiter_events_of_the_active_run_only() {
+        let mut controller = controller_with_active_run(4);
+        let wait = MtRateLimitWait { service: MtService::Deepl, remaining_secs: Some(3), reason: MtRateLimitWaitReason::Limiter };
+        send(&controller, WorkerEvent::RateLimitWait { run_id: 3, wait: Some(wait) });
+        send(&controller, WorkerEvent::RateLimitWait { run_id: 4, wait: Some(wait) });
+        send(&controller, WorkerEvent::RateLimitWait { run_id: 4, wait: None });
+        send(&controller, WorkerEvent::RunRateLimited { run_id: 3, service: MtService::Google, translated: 9, errors: 9, retry_in_secs: 9 });
+        let events = controller.poll_events();
+        assert!(matches!(events.as_slice(), [MtControllerEvent::RateLimitWait { wait: Some(first) }, MtControllerEvent::RateLimitWait { wait: None }] if *first == wait), "{events:?}");
+        assert!(controller.is_busy(), "a stale run's stop must not end the active run");
+
+        send(&controller, WorkerEvent::RunRateLimited { run_id: 4, service: MtService::Google, translated: 2, errors: 1, retry_in_secs: 300 });
+        let events = controller.poll_events();
+        assert!(
+            matches!(events.as_slice(), [MtControllerEvent::RunRateLimited { service: MtService::Google, translated: 2, errors: 1, retry_in_secs: 300 }]),
+            "{events:?}"
+        );
+        assert!(!controller.is_busy());
+        assert!(controller.active_run.is_none());
     }
 }

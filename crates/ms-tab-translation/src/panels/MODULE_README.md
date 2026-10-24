@@ -143,6 +143,14 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   a right-click "Отобразить полный запрос" debug action (`MtPanelActions::preview_request_page` /
   `preview_request_all`) that asks `tab.rs` to assemble and display the first request without
   sending it.
+  The machine tab's transport row (under the service combo: «Встроенные запросы» / «Через мой
+  браузер» + a `HelpHint`) is drawn only when the tab lends an `MtTransportPanel` (the platform
+  can host the extension); a click returns `MtPanelActions::transport` = (service, choice). In
+  browser mode the extension block draws the lent `ExtensionPanelView` — the view types live in
+  `tab/browser_extension.rs` (the one exception to "panels do not name the tab": the state is
+  decided there, GUI-free) — and returns `install_extension` / `reveal_extension_folder`; the
+  `chrome://extensions` copy button uses `Context::copy_text` directly. A run's wait line reads
+  the browser-attention text for `MtRateLimitWaitReason::BrowserAttention`.
 - `bubbles.rs`: searchable bubble cards, debounced original/translation text syncing, footer field
   editing, character filters, and card context actions (the card's `Ui` senses clicks behind its
   widgets; the menu opens on the `translation.bubble_card.menu` gesture of the input frame,
@@ -237,7 +245,8 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   `TextDetectorAlgorithm::availability` / `DetectorUnavailable` in `text_detector.rs` (its
   truth-table test pins the current rules).
 - To change MT provider/language UI, edit `machine_translation.rs` and coordinate with
-  `translation/machine_translation.rs`.
+  `translation/machine_translation.rs`. The extension block's look: `machine_translation.rs`;
+  its states and jobs: `../tab/browser_extension.rs`.
 - To change bubble card editing or footer metadata UI, edit `bubbles.rs` and related footer sync
   code in `tab.rs`.
 - To change prompt composition, MiniJinja variables, sort/merge rules, or export formats, edit

@@ -4,8 +4,9 @@
 GUI-free platform seams. The one owner of "does this platform offer X" (`PlatformFeature`),
 of file open/save dialogs (`file_dialog`), of system clipboard reads (`clipboard`), of images
 other apps hand over (`incoming`: Android Share / "Open with"), of the Android credential store
-(`credentials`), of the installed package's native library directory (`native_libs`, Android)
-and of the pre-window native error box (`message`). The only crate that names `rfd` and `arboard`; its
+(`credentials`), of the installed package's native library directory (`native_libs`, Android),
+of handing a URL or folder to the OS shell (`shell_open`) and of the pre-window native error box
+(`message`). The only crate that names `rfd` and `arboard`; its
 Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the crate stack
 (deps: `ms-i18n`, `ms-log`); compiles for desktop, wasm32 and Android.
 
@@ -17,6 +18,16 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
   message. `unavailable_reason()` gives the table's reason per target (`CanvasTouchGestures` on
   Windows: pen and touch indistinguishable until winit handles `PT_PEN`; also off on wasm).
   `Waifu2xUpscaler` is Linux and Windows only (the pinned waifu2x release has no macOS package).
+  `ShellOpen` and `BrowserExtension` are desktop only.
+- **Shell open** (`shell_open.rs`): `open_url(url)` (default browser) and `reveal_dir(path)`
+  (file manager) spawn the platform handler and never wait for it, so they are GUI-thread safe;
+  on unix a detached `shell-open-reap` thread waits for the handler (no zombie) and logs a
+  non-zero exit at warn level with the program name only.
+  The per-OS command table is the pure `command_for(ShellTarget) -> ShellCommand`: Windows
+  `cmd /C start "" <url>` (no console window) / `explorer.exe <dir>`, macOS `open`, other unix
+  `xdg-open`. Failures are the typed `ShellOpenError` (`Unavailable` / `Spawn`) with a localized
+  `Display`; callers log them. Known gap: `cmd` splits a URL at an unquoted `&`, because
+  Rust does not quote an argument without spaces.
 - **File dialogs** (`file_dialog/`): `request(req, waker) -> PendingDialog` never blocks; the
   GUI polls the handle each frame. `pick_blocking(req)` is the worker form. A backend gets a
   `Completion` and calls `finish(result)` exactly once; dropping it unfinished reads as
@@ -136,6 +147,8 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 - `incoming/listing.rs`: pure decoding of the Kotlin listing and the release policy (host-tested).
 - `incoming/android.rs`: the JNI half (class load, native binding, static calls).
 - `message.rs`: `show_error_blocking` (startup only).
+- `shell_open.rs`: open a URL / reveal a folder through the OS shell, the per-OS command table
+  and `ShellOpenError` (messages `platform.shell_open.*_error`).
 - `native_libs.rs`: the Android package's native library directory (JNI, cached).
 - `credentials/mod.rs`: `CredentialError`, the Android operations, the pure `entry_name` and
   `decode_read_answer`; `credentials/android.rs`: the JNI calls; `credentials/tests.rs`: host
@@ -183,6 +196,8 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 - New dialog kind: `DialogKind` (append only: its index is the Kotlin bridge contract),
   `picked_from_paths`, each backend, and the `Picked` table.
 - New extension family for SAF: `file_dialog/mime.rs`.
+- Another OS shell action or a different handler program: `shell_open.rs` (`ShellTarget`,
+  the `platform_command` per cfg, and its per-OS test).
 - Android SAF launch / result / commit path: `file_dialog/android.rs` (JNI) +
   `android/saf.rs` (wire codes, names) + the Kotlin `SafBridge.kt` / `SafRequestActivity.kt`.
 - Android incoming images: Kotlin `IncomingImages.kt` (layout, copy, markers) +

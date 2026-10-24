@@ -48,7 +48,7 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   the entry points because a library cannot read it.
 - `install.rs`: installer UI, event types, public startup/service functions. Its folder picker
   (custom install location) is the non-blocking `ms_platform::file_dialog` (`PickDirectoryPath`,
-  polled each frame).
+  polled each frame); the finish screen's invite links open through `ms_platform::shell_open`.
 - `update.rs`: update window shell, background release re-check, test-version override,
   executable-update progress, PyTorch choice continuation, completion state, and no-update exit.
 - `utils.rs`: worker pipeline and platform helpers used by installer and updater UI: dependency

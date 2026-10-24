@@ -12,7 +12,7 @@ translated (bubbles, OCR, machine translation), cleaned (clean layers, inpaintin
 (rendered text layers) and exported.
 
 - **Rust application** — a Cargo workspace: the root package `manhwastudio_rs` (`src/`: a
-  library holding the application, plus a thin binary entry) over 44 `ms-*` library crates in
+  library holding the application, plus a thin binary entry) over 47 `ms-*` library crates in
   `crates/`. Builds for Linux and Windows (mandatory), macOS, `wasm32` (web entry,
   `src/web_entry.rs`; currently inactive and not kept building, `PROJECT_RULES.md`) and, in progress, Android (`dev-docs/ANDROID_PORT.md`; the library target
   exists so that build can export `android_main`).
@@ -53,13 +53,15 @@ root package (src/: lib.rs + thin main.rs, startup/, shell/, studio.rs, tabs/set
   <- ms-project / ms-widgets / ms-native-runtime / ms-local-ai
   <- ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-window-geometry / ms-os-integration / ms-input
   <- ms-config / ms-text-render
-  <- ms-backend-ipc / ms-docstore / ms-download / ms-fonts / ms-memory / ms-onnx / ms-platform
+  <- ms-backend-ipc / ms-docstore / ms-download / ms-fonts / ms-memory / ms-onnx / ms-platform / ms-browser-bridge
   <- ms-log / ms-text-detect
-  <- ms-actions / ms-custom-fonts / ms-gifs / ms-i18n / ms-raster / ms-storage / ms-text-util / ms-theme / ms-thread
+  <- ms-actions / ms-browser-ext / ms-custom-fonts / ms-gifs / ms-i18n / ms-raster / ms-storage / ms-text-util / ms-theme / ms-thread
 ```
 
 Non-obvious edges: `ms-tools` sits ABOVE `ms-canvas`; `ms-widgets` does NOT depend on
-`ms-models`; `ms-models` depends on `ms-text-render` (layer effects). Tab-to-tab edges exist and
+`ms-models`; `ms-models` depends on `ms-text-render` (layer effects); the browser bridge is used
+only by `ms-tab-translation` (with `ms-browser-ext`) and by the root (version registration), and
+does not depend on `ms-platform` (its consumers gate on `PlatformFeature::BrowserExtension`). Tab-to-tab edges exist and
 point down only: page-manager -> ps-editor -> typing; cleaning -> translation -> tabs-simple;
 `ms-settings-ui` depends on no tab crate and `ms-launcher` only on `ms-tabs-simple` (the
 shared wiki view). The studio never references
@@ -107,8 +109,16 @@ shared wiki view). The studio never references
   (`PlatformFeature::is_available()`, typed `Unavailable`), the async-shaped file-dialog seam
   (rfd on desktop, Storage Access Framework on Android), clipboard reads, the pre-window
   error box, the Android credential store (`credentials`) and the Android package's native
-  library directory (`native_libs`). The only crate naming `rfd` / `arboard`, and the one place JNI is used for
-  platform services.
+  library directory (`native_libs`), opening URLs and folders in other programs (`shell_open`).
+  The only crate naming `rfd` / `arboard`, and the one place JNI is used for platform services.
+- `ms-browser-ext` — the ManhwaStudio browser extension as part of the app: its pinned Chromium
+  id (from the manifest `key`), the bundle its build script builds from `browser-extension/`
+  with npm (absent when node/npm are missing; `NotIncluded` says why) and the atomic, stamped
+  unpack into `<data_dir>/browser_extension/chromium`. No `ms-*` dependencies; GUI-free.
+- `ms-browser-bridge` — the feature-agnostic loopback WebSocket bridge to that extension:
+  `bridge.json` pairing, mutual HMAC-SHA256 handshake, module capabilities, blocking
+  request / cancel / events for worker threads, reload; `app` is the one place that builds the
+  app's config (`ensure_started_for_app`), re-unpacks a stale folder and reloads stale peers.
 
 **Core (levels 3-7)**
 - `ms-config` — runtime root (`data_dir` / `program_dir`), `user_config` sections and defaults,
@@ -379,6 +389,8 @@ change) through `ms_studio_tab::StudioTab`; drawing and every ordered sequence s
   (AI API OCR and MT go through `ms-ai-api`). Its host `TranslationTab` owns the Translation
   canvas, its hotkeys and its bottom hint.
   Talks to the backend only through `ms-backend-ipc`; reads the pushed backend health snapshot (`ms_local_ai::backend_health`).
+  Google / DeepL / Yandex each have a transport (`user_config`, live in `mt_transport`): the
+  built-in HTTP requests or the user's Chromium through the extension (`ms-browser-bridge`).
 - **Cleaning** — `ms-tab-cleaning`: clean overlays, brush / region tools, two region-edit tools
   on ONE generic host (`tools/region_edit_v2`: `RegionEditHost` + `HostSpec`, engines behind
   `AiEngine`) — the local AI region editor (`tools/ai_editor`) and the cloud «ИИ редактирование
@@ -523,6 +535,18 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   the NeuroLate key) and the Hugging Face token (`ms_sysprobe::hf_token`, a cached
   process-wide value seeded off-thread). Keyring I/O never runs on the GUI thread; a token is
   never logged and reaches the backend only as a per-request field.
+- **Browser bridge** (`ms-browser-bridge`, native) — one process-wide `BridgeService`, started
+  on first use through `app::ensure_started_for_app`: a loopback (`127.0.0.1`) WebSocket server
+  that the user's MV3 extension (`browser-extension/`, unpacked from `ms-browser-ext`) connects
+  to. Pairing is the `bridge.json` file the app writes into the unpacked folder (port + secret);
+  both sides authenticate with HMAC-SHA256 over that secret, and the `Origin` is pinned to the
+  extension id. Compatibility is `PROTOCOL_VERSION` only, owned by `ms_browser_bridge::protocol`
+  and mirrored in `browser-extension/src/core/protocol.ts` (a test guards the mirror); the
+  bundle `build_id` only keeps the folder current and triggers reloads. Feature-agnostic:
+  consumers call modules by name (machine translation's `translate` is the first). The unpacked
+  folder is shared by every app process on the machine: the bridge owner holds an inter-process
+  lock for as long as it listens (a second process starts no server and reports
+  `OwnedByOtherProcess`), and every unpack holds a separate install lock.
 - **Threads** — spawned through `ms_thread` on any path that also runs on wasm; `rayon` for CPU
   work; `tokio` only in `ms-ai-api`.
 - **Versions** — the program version is the commit count of the build (`MS_APP_VERSION`,
@@ -569,6 +593,8 @@ logged error); the GUI thread only polls and applies results.
 | Batch processing of new projects | `ms-launcher/src/new_project/batch_processing/` |
 | System-registration probe / actions / elevated helper (`ShellExecuteExW` round trip + result file) | `ms-os-integration` (`report`, `actions`, `windows/elevation.rs`), driven by `ms-launcher/src/pages/system_registration.rs` and `settings_warnings` |
 | Settings warnings checks (full run per launcher entry, per-unit rechecks) | `ms-settings-ui/src/settings_warnings/`, driven by `ms-launcher/src/pages/settings_page.rs` |
+| Browser bridge: start (pairing file, bind, stale-folder re-unpack), listener + one thread per extension connection, stale-peer reload watcher | `ms-browser-bridge` (`app.rs`, `server/`) |
+| Browser extension install job (unpack, start, open the folder, reload stale peers), folder probe, MT transport save | `ms-tab-translation/src/tab/browser_extension.rs` (+ `ms_browser_bridge::app::install_guarded`) |
 
 ## 12. Key invariants
 
@@ -592,7 +618,11 @@ logged error); the GUI thread only polls and applies results.
   (`ms_platform::file_dialog`), system clipboard reads (`ms_platform::clipboard`), input
   bindings, their labels and conflicts (`ms-input`), finger gestures on canvases
   (`ms_input::touch`), custom-font synthesis and compiled-face naming (`ms-custom-fonts`) and the
-  custom-font identity namespace (`ms_tab_typing` `custom_fonts::identity`).
+  custom-font identity namespace (`ms_tab_typing` `custom_fonts::identity`), the browser-bridge
+  wire protocol (`ms_browser_bridge::protocol` + `browser-extension/src/core/protocol.ts`), the
+  app's bridge config and the extension unpack (`ms_browser_bridge::app`; one serialized
+  `install_guarded`), the extension id, bundle and folder (`ms-browser-ext`), opening URLs and
+  folders in other programs (`ms_platform::shell_open`).
   Layer and group visibility/opacity are `LayerDoc` facts, never one tab's view state.
 
 **Documents**
@@ -642,3 +672,5 @@ Detail: `src/studio/MODULE_README.md`, `crates/ms-models/src/MODULE_README.md`,
   `--continue-update` and the one-token `--version` are frozen by the installed 3.6.0 updater.
 - Rust <-> Python compatibility is decided solely by `PROTOCOL_VERSION` in `hello`; any contract
   change bumps it on both sides (rule: `PROJECT_RULES.md`).
+- App <-> browser-extension compatibility is decided solely by the bridge's own
+  `PROTOCOL_VERSION` (independent of the backend's); the handshake messages are frozen forever.

@@ -368,8 +368,9 @@ impl Flux2KleinEngine {
 
     /// Starts one machine-translation request for the user-language prompt.
     ///
-    /// The call BLOCKS on the network (DeepL additionally self-throttles), so it runs
-    /// on its own worker and the GUI only polls the channel.
+    /// The call BLOCKS on the network and may wait for the service's request limiter
+    /// (process-wide, shared with the Translation tab), so it runs on its own worker and
+    /// the GUI only polls the channel.
     pub(super) fn start_translate(&mut self) {
         if self.translate_rx.is_some() {
             return;

@@ -1,0 +1,1 @@
+{"type":"request","id":7,"module":"translate","method":"translate","params":{"site":"deepl","source":"ja","target":"ru","text":"こんにちは"},"timeout_ms":90000}

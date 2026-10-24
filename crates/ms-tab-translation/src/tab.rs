@@ -159,6 +159,11 @@ Machine translation flow:
 - `start_mt_with_items`: validates options and starts MT controller run.
 - `on_bubble_action` (CanvasHooks): queues translate action for bubble button.
 
+Browser-extension MT transport (MT panel):
+- `browser_extension`: the `tab/browser_extension.rs` controller; `draw_mt_tool_body` lends its
+  view and applies the transport / install / open-folder clicks, `poll_browser_extension` turns
+  its worker failures into toasts.
+
 AI API connection (OCR and MT panels):
 - `ocr_ai_api_tasks`, `mt_ai_api_tasks`: one `ms_ai_api::AiApiTaskRunner` per panel (key save /
   delete, metadata refresh), fed from the panels' `AiApiConnectionActions`.
@@ -263,7 +268,7 @@ use crate::machine_translation::{
     AiMtContextSource, AiMtImageDetail, AiMtImageMode, AiMtOptions, AiMtReasoning, AiMtSortMode,
     MtControllerEvent, MtImageArea, MtImageInput, MtImageSource, MtRequestPreview,
     MtRequestPreviewPart, MtService, MtTranslateItem, MtTranslateRequest, TranslationMtController,
-    bubble_order_for_sort, build_ai_mt_request_preview, character_for_bubble,
+    bubble_order_for_sort, build_ai_mt_request_preview, character_for_bubble, whole_minutes_ceil,
 };
 use crate::ocr::{
     OcrControllerEvent, OcrEngine, OcrLoadState, OcrRecognizeRequest, OcrRuntimeOptions,
@@ -335,6 +340,9 @@ mod route_inputs;
 mod dock;
 // The five tools: their vocabulary, the canvas tools bar, the tool window and one body per tool.
 mod tool_panels;
+// The MT panel's browser-extension block: its state and the bridge start / install workers
+// (`pub(crate)`: the MT panel draws its view types).
+pub(crate) mod browser_extension;
 
 use canvas_input::CanvasSelection;
 pub use dock::translation_default_dock_layout;
@@ -572,6 +580,9 @@ pub struct TranslationTabState {
     /// Key / metadata requests of the MT panel's AI API connection widget
     /// (`mt_panel_options.ai_api`), polled by `poll_ai_api_events`.
     mt_ai_api_tasks: AiApiTaskRunner,
+    /// The MT panel's browser-extension block (bridge start, folder probe, install job, the
+    /// transport save), polled every frame by `poll_browser_extension`.
+    browser_extension: browser_extension::BrowserExtensionController,
     text_detector_controller: TranslationTextDetectorController,
     text_detector_options: TextDetectorPanelOptions,
     text_detector_plan_notice: TextDetectorPlanNoticeCache,
@@ -766,6 +777,7 @@ impl TranslationTabState {
             mt_controller: TranslationMtController::default(),
             mt_panel_options: MtPanelOptions::default(),
             mt_ai_api_tasks: AiApiTaskRunner::default(),
+            browser_extension: browser_extension::BrowserExtensionController::default(),
             text_detector_controller: TranslationTextDetectorController::default(),
             text_detector_options: TextDetectorPanelOptions::default(),
             text_detector_plan_notice: TextDetectorPlanNoticeCache::default(),
@@ -3187,6 +3199,7 @@ impl TranslationTabState {
                     context_budget_chars,
                     pruned_replicas,
                 } => {
+                    // Replaces the whole progress, which also clears a finished limiter wait.
                     self.mt_progress = Some(MtPanelProgress {
                         translated,
                         errors,
@@ -3194,12 +3207,25 @@ impl TranslationTabState {
                         context_used_chars,
                         context_budget_chars,
                         pruned_replicas,
+                        rate_limit_wait: None,
                     });
                     self.push_toast(
                         ctx,
                         tf!("translation.tab.ai_mt_progress_status", translated = translated, total = total, errors = errors, used = format_context_chars(context_used_chars), budget = format_context_chars(context_budget_chars), pruned_replicas = pruned_replicas),
                         Severity::Info,
                         2.4,
+                    );
+                }
+                MtControllerEvent::RateLimitWait { wait } => {
+                    self.mt_progress.get_or_insert_default().rate_limit_wait = wait;
+                }
+                MtControllerEvent::RunRateLimited { service, translated, errors, retry_in_secs } => {
+                    self.mt_progress = None;
+                    self.push_toast(
+                        ctx,
+                        tf!("translation.tab.mt_rate_limited_stop_status", service = service.title(), minutes = whole_minutes_ceil(retry_in_secs), translated = translated, errors = errors),
+                        Severity::Warning,
+                        6.0,
                     );
                 }
             }
@@ -4437,6 +4463,7 @@ impl CanvasHooks for TranslationTabState {
         self.poll_ocr_model_downloads(ctx);
         self.poll_mt_events(ctx, canvas);
         self.poll_ai_api_events(ctx);
+        self.poll_browser_extension(ctx);
         self.poll_neurolate_key(ctx);
         // The canvas-wide rect selections (mouse and finger alike) come from the router's
         // claim; the canvas raises its own capture area while one is armed.

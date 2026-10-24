@@ -139,6 +139,15 @@ that defines the type.
   at startup by `src/startup/services.rs`, edited by the shared General pane) and `effective(available, setting)` /
   `enabled_with(available)`. The platform capability stays `ms_platform::PlatformFeature::
   CanvasTouchGestures` (this crate does not depend on `ms-platform`): the caller passes it in.
+- `mt_transport.rs`: the per-service machine-translation transport — `MtTransport` (`Builtin` /
+  `Browser`, frozen tokens `"builtin"` / `"browser"`), stored at
+  `TranslarionTab.MachineTranslation.transport.<service key>` (the section's misspelling is the
+  persisted key; `<service key>` is `MtService::key()`, passed as a string because this crate
+  does not know the services). NOT in `user_config_defaults()`: absent or an unknown token reads
+  as `Builtin`. Pure reader `transport_from_user_settings(&Value, service_key)`, blocking writer
+  `save_mt_transport(user_settings_file, service_key, transport)` (one docstore update, worker
+  thread only). Rust-only, outside `PROTOCOL_VERSION`. Also selects the MT limiter's lane in
+  `ms-tab-translation`.
 - `torch_choice.rs`: the shared torch-build vocabulary — `TorchFlavour` (frozen tokens
   `"cpu"`/`"cuda"`/`"rocm"`, plus the mapping from a torch local version tag `+cpu` / `+cu…` /
   `+rocm…`), `GfxArch` (a validated AMD processor name `gfxNNNN`: `parse` rejects `gfx000` and

@@ -5,7 +5,8 @@ edition = "2024"
 
 # GUI-free platform seams for ManhwaStudio: the platform capability table
 # (`PlatformFeature`), the async-shaped file-dialog seam, the system clipboard reads, the
-# Android credential store (`credentials`) and the pre-window error box. The only crate that names `rfd` and `arboard`; Android backends talk
+# Android credential store (`credentials`), the OS shell open helpers (`shell_open`) and the
+# pre-window error box. The only crate that names `rfd` and `arboard`; Android backends talk
 # to the JVM through `jni`. Compiles on every target (desktop, wasm32, Android): a backend a
 # target lacks answers with a typed `Unavailable`, never a fake success.
 [features]

@@ -4,7 +4,8 @@ UI panel for machine translation options in Translation tab.
 
 Main items:
 - `MtPanelOptions`: selected MT service + source/target languages.
-- `MtPanelProgress`: transient run progress shown while a translation is active.
+- `MtPanelProgress`: transient run progress shown while a translation is active, including the
+  current request-limiter wait (`rate_limit_wait`, one extra status line).
 - `MtPanelRun`: the per-frame run view the tab lends the panel (busy, can-cancel, progress, the
   live AI API generation snapshot and the last run's issues).
 - Run issues: a collapsed "Замечания последнего перевода" list under the actions (both tabs):
@@ -20,7 +21,14 @@ Main items:
   (per-ImageBubble) mode; the latter adds a chapter-context source switch (`ai_image_context_source`:
   original vs translation). Image modes are blocked only for a model `ms_ai_api::image_input_support`
   lists as text-only (`NotSupported`); `Supported` and `Unknown` models may use them.
-- `MtPanelActions`: UI actions requested by the user (`start` + `cancel`).
+- `MtPanelActions`: UI actions requested by the user (`start` + `cancel`, the transport choice,
+  the browser-extension buttons).
+- Transport row (machine tab, under the service combo): «Встроенные запросы» / «Через мой
+  браузер» for the selected service plus a `HelpHint`, drawn only when the tab lends an
+  `MtTransportPanel` (the platform can host the extension). In browser mode the extension block
+  draws the lent `ExtensionPanelView` (`tab/browser_extension.rs`): one state line, the
+  install / update button with the last install's outcome, and the three "load unpacked" steps
+  (`chrome://extensions` with a copy button, Developer mode, the folder with «Открыть папку»).
 - On the AI API tab the shared `ms_ai_api::draw_generation_status` widget sits under the
   start/cancel row, outside both accordion sections; its "Stop" is the same action as the
   cancel button (`MtPanelActions::cancel`).
@@ -31,14 +39,19 @@ Main items:
 Notes:
 - The panel has two tabs: legacy machine translation and AI API translation.
 - Source/target languages are selected via dropdowns.
+- The extension block only draws what the tab lends and returns clicks; the bridge start, the
+  install job, the folder opening and the config write run on the tab's
+  `BrowserExtensionController` workers.
 - No log output and no thread controls are shown in UI.
 */
 
 use crate::machine_translation::{
-    AiMtContextSource, AiMtImageDetail, AiMtImageMode, AiMtReasoning, AiMtSortMode, MtRunIssue,
-    MtRunIssueKind, MtService,
+    AiMtContextSource, AiMtImageDetail, AiMtImageMode, AiMtReasoning, AiMtSortMode, MtRateLimitWait,
+    MtRateLimitWaitReason, MtRunIssue, MtRunIssueKind, MtService,
 };
 use crate::panels::section_header_button;
+use crate::tab::browser_extension::{ExtensionPanelView, ExtensionUiState, InstallNotice};
+use ms_config::mt_transport::MtTransport;
 use ms_ai_api::{AiApiConnectionActions, AiApiConnectionState, GenerationSnapshot, ImageInputSupport, draw_connection, draw_generation_status, image_input_support};
 use ms_widgets::{HelpHint, WheelComboBox, WheelSlider};
 
@@ -77,6 +90,8 @@ pub struct MtPanelProgress {
     pub context_used_chars: usize,
     pub context_budget_chars: usize,
     pub pruned_replicas: usize,
+    /// The run is waiting for a service's request limiter (`None` = not waiting).
+    pub rate_limit_wait: Option<MtRateLimitWait>,
 }
 
 /// Sticky panel notice shown when an AI translation run stopped because of a probable credit/quota
@@ -162,7 +177,27 @@ pub struct MtPanelActions {
     /// Debug-only: right-click on "Перевести текущую страницу" -> build and show the first AI
     /// request for the current-page scope, without translating. AI API tab only.
     pub preview_request_page: bool,
+    /// The user picked another transport for this service (machine tab, transport row).
+    pub transport: Option<(MtService, MtTransport)>,
+    /// «Установить / обновить расширение» was clicked.
+    pub install_extension: bool,
+    /// «Открыть папку» of the extension folder was clicked.
+    pub reveal_extension_folder: bool,
 }
+
+/// The machine tab's transport row, lent by the tab only when the platform can host the
+/// browser extension (`PlatformFeature::BrowserExtension`); without it the row is hidden.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MtTransportPanel<'a> {
+    /// The live transport of the selected service (`crate::mt_transport::current`).
+    pub transport: MtTransport,
+    /// The extension block's view; built by the tab only while `transport` is `Browser`.
+    pub extension: Option<&'a ExtensionPanelView>,
+}
+
+/// The page the user opens to load an unpacked extension in Chromium browsers. A browser URL,
+/// not a caption, so it is not localized.
+const CHROMIUM_EXTENSIONS_URL: &str = "chrome://extensions";
 
 // `pub`, not crate-private: `MtLanguage`, its wire `code`, its `title()` label and the
 // `MT_SOURCE_LANGUAGES` table are all read by the `cleaning` tab's Flux.2 engine, which
@@ -268,7 +303,8 @@ pub const MT_SOURCE_LANGUAGES: &[MtLanguage] = &[
     },
 ];
 
-const MT_TARGET_LANGUAGES: &[MtLanguage] = &[
+// `pub(crate)`: the Google provider's tests check that it supports every target listed here.
+pub(crate) const MT_TARGET_LANGUAGES: &[MtLanguage] = &[
     MtLanguage {
         code: "ru",
         title: "translation.ocr_langs.russian",
@@ -348,16 +384,18 @@ const MT_TARGET_LANGUAGES: &[MtLanguage] = &[
 ];
 
 /// Draws the MT panel and returns this frame's user actions. `run` is the tab's view of the
-/// current run. `project_context_available` is
+/// current run. `transport` is the machine tab's transport row (`None` hides it).
+/// `project_context_available` is
 /// `false` in a single-image session: the notes / characters / terms toggles are then hidden
 /// (their persisted values stay untouched; `machine_translation::project_context_sources`
 /// ignores them for such a run).
-pub fn draw_machine_translation_panel(
+pub(crate) fn draw_machine_translation_panel(
     ui: &mut egui::Ui,
     run: MtPanelRun<'_>,
     stop_notice: &mut Option<MtStopNotice>,
     options: &mut MtPanelOptions,
     project_context_available: bool,
+    transport: Option<MtTransportPanel<'_>>,
 ) -> MtPanelActions {
     let mut actions = MtPanelActions::default();
 
@@ -378,7 +416,7 @@ pub fn draw_machine_translation_panel(
 
     match options.active_tab {
         MtPanelTab::Machine => {
-            draw_machine_tab(ui, run, options, &mut actions)
+            draw_machine_tab(ui, run, options, transport, &mut actions)
         }
         MtPanelTab::AiApi => draw_ai_api_tab(ui, run, options, project_context_available, &mut actions),
     }
@@ -474,10 +512,20 @@ fn draw_machine_tab(
     ui: &mut egui::Ui,
     run: MtPanelRun<'_>,
     options: &mut MtPanelOptions,
+    transport: Option<MtTransportPanel<'_>>,
     actions: &mut MtPanelActions,
 ) {
     let MtPanelRun { busy, can_cancel, progress, generation: _, issues: _ } = run;
+    let service_before = options.service;
     actions.options_changed |= draw_service_combo(ui, &mut options.service);
+    // The tab built `transport` for the service selected when the frame began: right after a
+    // switch it describes the previous service, so the row skips this one frame instead of
+    // showing (or toggling) the wrong service's transport.
+    if options.service != service_before {
+        ui.ctx().request_repaint();
+    } else if let Some(transport) = transport {
+        draw_transport_row(ui, options.service, transport, actions);
+    }
 
     actions.options_changed |=
         normalize_selected_lang(&mut options.source_lang, MT_SOURCE_LANGUAGES, "auto");
@@ -629,7 +677,114 @@ fn draw_translation_progress_status(ui: &mut egui::Ui, progress: Option<MtPanelP
         if progress.context_budget_chars > 0 {
             ui.small(tf!("translation.mt_panel.context_status", used = format_context_chars(progress.context_used_chars), budget = format_context_chars(progress.context_budget_chars), pruned = progress.pruned_replicas));
         }
+        if let Some(wait) = progress.rate_limit_wait {
+            ui.small(rate_limit_wait_text(wait));
+        }
     }
+}
+
+/// The status line of a run's wait: the browser tab needing the user, else the request
+/// limiter's seconds left when known, else "another request is in progress".
+fn rate_limit_wait_text(wait: MtRateLimitWait) -> String {
+    match (wait.reason, wait.remaining_secs) {
+        (MtRateLimitWaitReason::BrowserAttention, _) => tf!("translation.mt.browser.attention_status", service = wait.service.title()),
+        (MtRateLimitWaitReason::Limiter, Some(seconds)) => tf!("translation.mt_panel.rate_limit_wait_status", service = wait.service.title(), seconds = seconds),
+        (MtRateLimitWaitReason::Limiter, None) => tf!("translation.mt_panel.rate_limit_queue_status", service = wait.service.title()),
+    }
+}
+
+/// The transport row of the machine tab: the two transports of `service` plus a hint, then the
+/// extension block while the browser is selected and the tab lent its view.
+fn draw_transport_row(ui: &mut egui::Ui, service: MtService, transport: MtTransportPanel<'_>, actions: &mut MtPanelActions) {
+    let mut selected = transport.transport;
+    ui.horizontal_wrapped(|ui| {
+        let builtin = ui.selectable_value(&mut selected, MtTransport::Builtin, t!("translation.mt_panel.transport_builtin_button"));
+        let browser = ui.selectable_value(&mut selected, MtTransport::Browser, t!("translation.mt_panel.transport_browser_button"));
+        HelpHint::text(t!("translation.mt_panel.transport_hint")).show(ui);
+        if builtin.changed() || browser.changed() {
+            actions.transport = Some((service, selected));
+        }
+    });
+    if selected == MtTransport::Browser
+        && let Some(view) = transport.extension
+    {
+        draw_extension_block(ui, view, actions);
+    }
+}
+
+/// The colour and text of the extension's state line.
+fn extension_state_line(state: &ExtensionUiState) -> (egui::Color32, String) {
+    match state {
+        ExtensionUiState::Checking => (ms_theme::status::INFO, t!("translation.mt_panel.extension_checking_status").to_owned()),
+        ExtensionUiState::NotInBuild { .. } => (ms_theme::status::WARNING, t!("translation.mt_panel.extension_not_in_build_status").to_owned()),
+        ExtensionUiState::ServerFailed { error } => (ms_theme::status::ERROR, tf!("translation.mt_panel.extension_server_failed_status", error = error)),
+        ExtensionUiState::NotInstalled => (ms_theme::status::WARNING, t!("translation.mt_panel.extension_not_installed_status").to_owned()),
+        ExtensionUiState::InstalledNotConnected => (ms_theme::status::INFO, t!("translation.mt_panel.extension_not_connected_status").to_owned()),
+        ExtensionUiState::Outdated => (ms_theme::status::WARNING, t!("translation.mt_panel.extension_outdated_status").to_owned()),
+        ExtensionUiState::Connected { browser } if browser.is_empty() => (ms_theme::status::SUCCESS, t!("translation.mt_panel.extension_connected_unnamed_status").to_owned()),
+        ExtensionUiState::Connected { browser } => (ms_theme::status::SUCCESS, tf!("translation.mt_panel.extension_connected_status", browser = browser)),
+    }
+}
+
+/// The browser-extension block: state line, install / update button with the last outcome,
+/// and the "load unpacked" steps.
+fn draw_extension_block(ui: &mut egui::Ui, view: &ExtensionPanelView, actions: &mut MtPanelActions) {
+    let (color, text) = extension_state_line(&view.state);
+    ui.add(egui::Label::new(egui::RichText::new(text).color(color)).wrap());
+    if let ExtensionUiState::NotInBuild { reason } = view.state {
+        ui.small(tf!("translation.mt_panel.extension_not_in_build_reason_label", reason = reason));
+    }
+    ui.horizontal_wrapped(|ui| {
+        let install = ui.add_enabled(view.can_install && !view.install_running, egui::Button::new(t!("translation.mt_panel.extension_install_button")));
+        if install.clicked() {
+            actions.install_extension = true;
+        }
+        if view.install_running {
+            ui.spinner();
+        }
+    });
+    match &view.last_install {
+        None => {}
+        Some(InstallNotice::Installed { reloaded }) => {
+            ui.add(egui::Label::new(egui::RichText::new(t!("translation.mt_panel.extension_installed_status")).color(ms_theme::status::SUCCESS)).wrap());
+            if *reloaded > 0 {
+                ui.small(t!("translation.mt_panel.extension_reloading_status"));
+            }
+        }
+        Some(InstallNotice::Busy) => {
+            ui.add(egui::Label::new(egui::RichText::new(t!("translation.mt_panel.extension_install_busy_status")).color(ms_theme::status::INFO)).wrap());
+        }
+        Some(InstallNotice::Failed { error }) => {
+            let text = tf!("translation.mt_panel.extension_install_error", error = error);
+            ui.add(egui::Label::new(egui::RichText::new(text).color(ms_theme::status::ERROR)).wrap());
+        }
+    }
+    // The steps stay reachable when connected (another browser, a re-install) but start open.
+    egui::CollapsingHeader::new(t!("translation.mt_panel.extension_steps_heading"))
+        .id_salt("translation.mt_panel.extension_steps_heading")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(t!("translation.mt_panel.extension_step_open_label"));
+                ui.code(CHROMIUM_EXTENSIONS_URL);
+                if ui.small_button(t!("translation.common.copy_button")).clicked() {
+                    ui.ctx().copy_text(CHROMIUM_EXTENSIONS_URL.to_owned());
+                }
+            });
+            ui.add(egui::Label::new(t!("translation.mt_panel.extension_step_developer_mode_label")).wrap());
+            ui.add(egui::Label::new(t!("translation.mt_panel.extension_step_load_unpacked_label")).wrap());
+            match &view.folder {
+                Some(folder) => {
+                    ui.add(egui::Label::new(egui::RichText::new(folder.display().to_string()).code()).wrap());
+                    if ui.button(t!("translation.mt_panel.extension_open_folder_button")).clicked() {
+                        actions.reveal_extension_folder = true;
+                    }
+                }
+                None => {
+                    ui.weak(t!("translation.mt_panel.extension_folder_pending_label"));
+                }
+            }
+        });
 }
 
 fn format_context_chars(chars: usize) -> String {

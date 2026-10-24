@@ -71,6 +71,12 @@ ms-input = { path = "../ms-input" }
 ms-theme = { path = "../ms-theme" }
 # Localized labels (`t!` / `tf!` / `tp!`), mounted crate-wide in `lib.rs`.
 ms-i18n = { path = "../ms-i18n" }
+# The browser transport of machine translation: the loopback bridge to the ManhwaStudio
+# extension (`machine_translators/browser.rs`; `ms_browser_bridge::app` builds and starts it).
+ms-browser-bridge = { path = "../ms-browser-bridge" }
+# The embedded extension bundle and the installed folder's stamp, for the MT panel's extension
+# status and install action.
+ms-browser-ext = { path = "../ms-browser-ext" }
 # The AI API layer (`genai` re-export, service catalogue, OS credential-store API keys, client,
 # async bridge, model metadata, quota classifier) behind the AI API OCR engine and AI API MT.
 ms-ai-api = { path = "../ms-ai-api" }
@@ -93,15 +99,14 @@ unicode-script.workspace = true
 web-time.workspace = true
 
 # Native-only dependencies, matching the root manifest exactly so the graph keeps one copy
-# of each: blocking HTTP (`ureq`, the DeepL/Yandex backends), the concrete Google translator
-# (`translators`), the ONNX Runtime loader and the native
+# of each: blocking HTTP (`ureq`, the Google/DeepL/Yandex backends), the ONNX Runtime loader
+# and the native
 # OCR/detector manager (the ONNX sessions themselves stay behind `ms-native-runtime`). The LLM
 # client stack (`genai`, `tokio`) and the OS credential store (`keyring`) live in `ms-ai-api`.
 # Their call sites are `#[cfg(not(target_arch = "wasm32"))]`-gated; the wasm build compiles
 # error stubs instead.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ureq.workspace = true
-translators.workspace = true
 # The loader that resolves/downloads the onnxruntime dylib; the detector panel renders its
 # `OrtDownloadProgress`.
 ms-onnx-runtime = { path = "../ms-onnx-runtime" }

@@ -13,8 +13,13 @@ Submodules:
 - `adv_rec`: floating advanced-recognition window for manual OCR region selection.
 - `ai_mt_response`: reading, validating and merging AI API MT answers, content checks, the
   strict-output schema (native only).
-- `machine_translators`: concrete MT backends (Google/Yandex/DeepL) used by worker.
+- `machine_translators`: concrete MT backends (Google/Yandex/DeepL over built-in HTTP, and the
+  browser-extension provider `browser`) used by worker.
 - `machine_translation`: MT controller/worker and backend dispatch integration.
+- `mt_limits`: process-wide request-rate limiter of the MT services (pacing, cooldowns,
+  cancellable reported waits, long-text split); GUI-free, shared with the Cleaning tab's
+  prompt translator through `translate_texts_via_translator`.
+- `mt_transport`: the live per-service MT transport (built-in / browser), seeded at startup.
 - `ocr`: OCR controller/worker and backend transport.
 - `ocr_model_download`: status/download controller of the app-managed external model bundles
   (Baberu OCR, PaddleOCR-VL variants, EasyOCR scripts, Surya checkpoints; the Cleaning tab's
@@ -55,6 +60,10 @@ mod ai_mt_response;
 // through `translate_texts_via_translator`.
 pub mod machine_translation;
 mod machine_translators;
+// The one owner of MT request pacing and cooldowns (`mt_limits/MODULE_README.md`).
+mod mt_limits;
+// `pub` rather than crate-private: the root seeds the live per-service MT transport at startup.
+pub mod mt_transport;
 // The tab's NeuroLate settings and request-parameter rules (detector mode, OCR engine).
 mod neurolate;
 // `pub` rather than crate-private: the `cleaning` tab's mask generation, region-inpaint editor

@@ -1543,11 +1543,15 @@ impl eframe::App for InstallerApp {
                                 .add_sized([210.0, 36.0], egui::Button::new(t!("installer.install.open_button")))
                                 .clicked()
                             {
-                                if self.invite_telegram {
-                                    let _ = open_url_in_browser(TELEGRAM_INVITE_URL);
+                                if self.invite_telegram
+                                    && let Err(err) = ms_platform::shell_open::open_url(TELEGRAM_INVITE_URL)
+                                {
+                                    ms_log::runtime_log::log_warn(format!("[install] could not open the Telegram invite link: {err:?}"));
                                 }
-                                if self.invite_discord {
-                                    let _ = open_url_in_browser(DISCORD_INVITE_URL);
+                                if self.invite_discord
+                                    && let Err(err) = ms_platform::shell_open::open_url(DISCORD_INVITE_URL)
+                                {
+                                    ms_log::runtime_log::log_warn(format!("[install] could not open the Discord invite link: {err:?}"));
                                 }
                                 let install_dir = self
                                     .install_target_dir

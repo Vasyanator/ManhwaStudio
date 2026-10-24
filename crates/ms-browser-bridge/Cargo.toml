@@ -1,0 +1,45 @@
+[package]
+name = "ms-browser-bridge"
+version = "0.1.0"
+edition = "2024"
+
+# Feature-agnostic loopback WebSocket bridge between the app and the ManhwaStudio browser
+# extension: pairing file (`bridge.json`), mutually authenticated handshake (HMAC-SHA256),
+# capability announcement, request / response / cancel / events and reload. GUI-free. It knows no
+# feature (machine translation, downloads, ...): modules and methods are plain strings.
+# The wire protocol is mirrored by `browser-extension/src/core/protocol.ts`.
+
+[dependencies]
+# Localized `Display` of `BridgeError` (`t!` / `tf!`, keys `browser_bridge.*`), mounted
+# crate-wide via `#[macro_use] extern crate ms_i18n;` in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# Session log: listener start, rejected upgrades, handshakes, peer drops, protocol violations.
+ms-log = { path = "../ms-log" }
+# The extension facts `app.rs` builds the app's config from (folder, Chromium origin, embedded
+# bundle `build_id`) and the auto re-unpack. Level 0, so no layering question.
+ms-browser-ext = { path = "../ms-browser-ext" }
+# Wire messages, the pairing file and the request params / results (`serde_json::Value` is
+# part of the public API: modules are feature-agnostic, their params are opaque JSON).
+serde.workspace = true
+serde_json.workspace = true
+# HMAC-SHA256 handshake authentication (`auth.rs`). hmac 0.12 is the line that matches the
+# workspace's sha2 0.10 (`digest` 0.10); used only by this crate, so it stays local.
+hmac = "0.12"
+sha2.workspace = true
+# Lowercase hex of the secret, the nonces and the HMAC tags.
+hex.workspace = true
+# Typed public error (`BridgeError`); its localized text comes from helper functions in
+# `errors.rs`.
+thiserror.workspace = true
+
+# Native-only: the listener / connection threads and the OS randomness for the secret and the
+# nonces. The web build has no loopback server; `lib.rs` compiles those modules out there.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tungstenite.workspace = true
+# 0.3 is the copy tungstenite already pulls in (through rand 0.9): no new crate in the graph.
+getrandom = "0.3"
+
+# Unix: `geteuid` for the pairing file's owner check (`pairing.rs`: a foreign-owned `bridge.json`
+# is never trusted). Already a workspace dependency.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

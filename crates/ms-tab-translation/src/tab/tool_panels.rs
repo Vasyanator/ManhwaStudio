@@ -17,6 +17,9 @@ Main items:
 - `TranslationTabState::draw_tool_body`: routes to `draw_bubbles_tool_body`,
   `draw_ocr_tool_body`, `draw_composition_tool_body`, `draw_mt_tool_body`,
   `draw_detector_tool_body`.
+- `TranslationTabState::poll_browser_extension`: the browser-extension controller's per-frame
+  poll (failures -> toasts); `draw_mt_tool_body` lends the MT panel the transport row and the
+  extension view and applies their clicks.
 
 Notes:
 GUI thread only. "Open" is a STATE flag (`ToolToggles`), never read back from the dock: the
@@ -32,6 +35,7 @@ use eframe::egui;
 use egui::{Color32, Vec2};
 use ms_canvas::CanvasView;
 use ms_config::app_tab::AppTab;
+use ms_config::mt_transport::MtTransport;
 use ms_local_ai::local_ai::AiRouteKind;
 use ms_project::ProjectData;
 use ms_theme::Severity;
@@ -42,7 +46,7 @@ use super::{TranslationTabState, build_ocr_runtime_options};
 use crate::ocr::{OcrEngine, OcrLoadState};
 use crate::panels::bubbles::{BubblesPanelContext, draw_bubbles_panel};
 use crate::panels::composition::draw_composition_panel;
-use crate::panels::machine_translation::{MtPanelRun, draw_machine_translation_panel};
+use crate::panels::machine_translation::{MtPanelRun, MtTransportPanel, draw_machine_translation_panel};
 use crate::panels::ocr::{OcrPanelModelView, OcrPanelNeurolate, OcrSelectionHints, draw_ocr_panel};
 use crate::panels::text_detector::{
     TextDetectorAlgorithm, TextDetectorNeurolate, TextDetectorPanelView, draw_text_detector_panel,
@@ -570,6 +574,10 @@ impl TranslationTabState {
     ) {
         let mt_busy = self.mt_controller.is_busy();
         let mt_can_cancel = self.mt_has_active_or_pending();
+        // The transport row exists only where the browser extension can run; the extension view
+        // (which starts the bridge on first use) only while the selected service uses it.
+        let transport = ms_platform::PlatformFeature::BrowserExtension.is_available().then(|| crate::mt_transport::current(self.mt_panel_options.service));
+        let extension = (transport == Some(MtTransport::Browser)).then(|| self.browser_extension.view(ctx));
         // Machine translation (plain translators and AI API) is network code: no local
         // AI runtime is involved, so neither `--no-ai` nor the platform gates it.
         let actions = draw_machine_translation_panel(
@@ -584,9 +592,26 @@ impl TranslationTabState {
             &mut self.mt_stop_notice,
             &mut self.mt_panel_options,
             self.session_caps.title_documents,
+            transport.map(|transport| MtTransportPanel { transport, extension: extension.as_ref() }),
         );
         if actions.options_changed {
             self.mt_settings_dirty = true;
+        }
+        if let Some((service, transport)) = actions.transport {
+            // Live at once for the next run; persisted to `user_config` on a worker.
+            crate::mt_transport::set(service, transport);
+            self.browser_extension.save_transport(service, transport);
+            // Start the bridge right away (on a worker), so the extension can connect before
+            // the first request instead of after it.
+            if transport == MtTransport::Browser {
+                self.browser_extension.ensure_started();
+            }
+        }
+        if actions.install_extension {
+            self.browser_extension.start_install();
+        }
+        if actions.reveal_extension_folder {
+            self.browser_extension.reveal_folder();
         }
         self.mt_ai_api_tasks.submit_actions(&mut self.mt_panel_options.ai_api, actions.ai_api);
         if actions.start_all {
@@ -603,6 +628,14 @@ impl TranslationTabState {
         }
         if actions.cancel {
             self.cancel_active_mt(ctx);
+        }
+    }
+
+    /// Collects the browser-extension controller's finished jobs; a failed transport save or
+    /// folder opening becomes an error toast (the install outcome stays in the panel).
+    pub(super) fn poll_browser_extension(&mut self, ctx: &egui::Context) {
+        for notice in self.browser_extension.poll() {
+            self.push_toast(ctx, notice, Severity::Error, 3.0);
         }
     }
 

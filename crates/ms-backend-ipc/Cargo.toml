@@ -28,7 +28,7 @@ thiserror.workspace = true
 # AF_UNIX path is not always available. The wasm build has no backend process at all
 # and compiles a stub instead (see `client.rs` / `transport.rs` cfg gates).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+tungstenite.workspace = true
 
 # AF_UNIX sockets on Windows. `std::os::unix::net::UnixStream` has no Windows
 # counterpart, so the transport swaps in this crate's `UnixStream` under `cfg(windows)`.

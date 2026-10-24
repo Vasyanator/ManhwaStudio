@@ -90,6 +90,27 @@ android/app/src/main/assets/
 # Workspace crates (ms-log, ms-text-util, ms-text-render). Publish source,
 # manifests, and agent docs only; the shared build output lives in the ignored
 # root target/ directory.
+# ManhwaStudio browser extension (TypeScript sources, pinned npm lockfile, build script,
+# manifest, icons, protocol fixtures shared with the Rust tests). `node_modules/`, the build
+# output and the test output stay ignored by `*`.
+!browser-extension/
+!browser-extension/MODULE_README.md
+!browser-extension/package.json
+!browser-extension/package-lock.json
+!browser-extension/tsconfig.json
+!browser-extension/build.mjs
+!browser-extension/manifest.json
+!browser-extension/src/
+!browser-extension/src/**/
+!browser-extension/src/**/*.ts
+!browser-extension/src/**/*.md
+!browser-extension/test/
+!browser-extension/test/*.ts
+!browser-extension/icons/
+!browser-extension/icons/*.png
+!browser-extension/protocol-fixtures/
+!browser-extension/protocol-fixtures/*.json
+
 !crates/
 !crates/**/
 !crates/**/*.rs
@@ -293,6 +314,9 @@ requirements/
 spell_check/
 target/
 test/
+# Re-allow the browser extension tests (the generic `test/` rule above would hide them).
+!browser-extension/test/
+!browser-extension/test/*.ts
 venv/
 .venv/
 waifu2x/
