@@ -47,7 +47,7 @@ class PaddleOcrService:
         self._device_id: str | None = None
         self._last_error: str | None = None
         # Published copy of the state-derived health fields; `health()` never
-        # takes `_lock`, which a session load and inference hold (S-014).
+        # takes `_lock`, which inference holds (S-014).
         self._health = HealthSnapshot()
         self._publish_health_locked()
 
@@ -56,8 +56,8 @@ class PaddleOcrService:
 
         `ready`/`model`/`provider`/`device_id`/`last_error` come from the
         published snapshot; `models_root` and `model_exists` are filesystem
-        probes taken here, outside any service lock, so this answers while a
-        session load or an inference holds the instance lock.
+        probes taken here, outside any service lock, so this answers while
+        an inference holds the instance lock.
         """
         fields = self._health.read()
         try:
@@ -105,31 +105,37 @@ class PaddleOcrService:
         model_key = normalize_model_key(lang)
         provider_settings = resolve_provider_settings(UserConfig, device)
 
-        with self._lock:
-            try:
-                result = self._runtime.recognize(image_bgr, model_key, provider_settings)
-                lines = [
-                    line["text"]
-                    for line in result.get("lines", [])
-                    if isinstance(line, dict) and isinstance(line.get("text"), str)
-                ]
-                if reflect_strings:
-                    lines.reverse()
-                output_text = "\n".join(lines) if join_newlines else " ".join(lines)
+        try:
+            # Leases first, then the instance lock: acquiring may block in the
+            # residency arbiter, and no service may hold its lock across that
+            # without a lease (owner-rule premise,
+            # `runtime/residency/MODULE_README.md`).
+            with self._runtime.recognition_sessions(model_key, provider_settings) as leased:
+                with self._lock:
+                    result = self._runtime.recognize(leased, image_bgr, provider_settings)
+                    lines = [
+                        line["text"]
+                        for line in result.get("lines", [])
+                        if isinstance(line, dict) and isinstance(line.get("text"), str)
+                    ]
+                    if reflect_strings:
+                        lines.reverse()
+                    output_text = "\n".join(lines) if join_newlines else " ".join(lines)
 
-                self._model_key = model_key
-                self._provider = provider_settings.provider
-                self._device_id = provider_settings.device_id
-                self._last_error = None
-                self._publish_health_locked()
-                return {
-                    "lines": lines,
-                    "text": output_text.strip(),
-                }
-            except Exception as exc:
+                    self._model_key = model_key
+                    self._provider = provider_settings.provider
+                    self._device_id = provider_settings.device_id
+                    self._last_error = None
+                    self._publish_health_locked()
+                    return {
+                        "lines": lines,
+                        "text": output_text.strip(),
+                    }
+        except Exception as exc:
+            with self._lock:
                 self._last_error = str(exc)
                 self._publish_health_locked()
-                raise
+            raise
 
     @staticmethod
     def _decode_image_bgr(image_bytes: bytes) -> np.ndarray:

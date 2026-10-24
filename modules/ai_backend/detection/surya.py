@@ -184,16 +184,31 @@ class SuryaTextDetectorService:
         if self._predictor is not None and self._device == device and self._model_dir == model_dir:
             return self._predictor
 
+        requested_key = self._model_key(device)
+        dropped_key: str | None = None
         if self._device is not None and (self._device != device or self._model_dir != model_dir):
+            if self._predictor is not None:
+                dropped_key = self._model_key(self._device)
             self._drop_predictor_locked()
+            if dropped_key is not None:
+                # As on an eviction: the old weights go before the new load.
+                _clear_torch_cache()
+                if dropped_key != requested_key:
+                    # Another device: a key no lease of this call will register.
+                    self._model_manager.mark_unloaded(dropped_key)
 
-        checkpoint = require_local_checkpoint(model_dir, label=CHECKPOINT_LABEL)
+        try:
+            checkpoint = require_local_checkpoint(model_dir, label=CHECKPOINT_LABEL)
+        except Exception:
+            self._report_failed_reload_locked(requested_key, dropped_key)
+            raise
 
         try:
             from surya.detection import DetectionPredictor  # type: ignore
         except Exception as exc:
             self._last_error = f"Surya detection package is not available: {exc}"
             self._publish_health_locked()
+            self._report_failed_reload_locked(requested_key, dropped_key)
             raise RuntimeError(self._last_error) from exc
 
         try:
@@ -217,6 +232,7 @@ class SuryaTextDetectorService:
             self._device = None
             self._last_error = f"Surya detection init failed: {exc}"
             self._publish_health_locked()
+            self._report_failed_reload_locked(requested_key, dropped_key)
             raise RuntimeError(self._last_error) from exc
 
         self._device = device
@@ -234,6 +250,16 @@ class SuryaTextDetectorService:
             _clear_torch_cache()
             self._model_manager.mark_unloaded(model_key)
             return True
+
+    def _report_failed_reload_locked(self, requested_key: str, dropped_key: str | None) -> None:
+        """After a failed load: report `requested_key` unloaded when this call dropped it resident.
+
+        That happens on a directory change on the same device: the lease found
+        the key resident (so `mark_load_failed` is a no-op for it), but nothing
+        holds the model any more.
+        """
+        if dropped_key == requested_key:
+            self._model_manager.mark_unloaded(requested_key)
 
     def _drop_predictor_locked(self) -> None:
         """Forget the predictor, its device and directory; caller holds `self._lock`."""

@@ -18,7 +18,9 @@ cache):
 Main responsibilities:
 - list/quant management + on-demand download with byte-level progress, sized
   from the hub listing and retried / resumed / cancelled through
-  `engines/model_download.download_bearer_to_path`;
+  `engines/model_download.download_bearer_to_path`; the resolved listing is
+  cached per quant (`flux1-fill-dev-<quant>.listing.json`), so a complete model
+  needs no network;
 - lazy pipeline build (GGUF transformer + local components), pinned to the
   DISCRETE GPU (the integrated Ryzen iGPU is explicitly excluded);
 - MIOpen immediate mode on ROCm (set before torch import);
@@ -47,6 +49,7 @@ from __future__ import annotations
 
 import functools
 import io
+import json
 import logging
 import os
 import threading
@@ -335,7 +338,12 @@ class FluxFillInpaintService:
         """Download the selected GGUF quant + diffusers components into side_models.
 
         Files already present at the size the hub listing announced are skipped.
-        Progress is reported in bytes via `progress_callback("download", done,
+        The listing is fetched only when a file is missing: the last resolved
+        plan is cached next to the model (`_load_cached_plan`), so a complete
+        model runs offline. Without a cache (a model downloaded by an older
+        build) a failed listing is tolerated when the quant and the components
+        are already on disk — every published file passed its size / sha256
+        gate — and logged; otherwise it raises. Progress is reported in bytes via `progress_callback("download", done,
         total, label)`; a transient network failure is retried by the shared
         helper and shown as a retry `label` on the same frame shape, not as an
         error. `should_cancel` is polled per chunk and during every backoff wait.
@@ -350,7 +358,22 @@ class FluxFillInpaintService:
         os.makedirs(_flux_dir(), exist_ok=True)
         os.makedirs(_components_dir(), exist_ok=True)
 
-        plan = _build_download_plan(quant)
+        cached = _load_cached_plan(quant)
+        if cached is not None and all(_is_complete_file(item["dest"], int(item["size"])) for item in cached):
+            return
+        try:
+            plan = _build_download_plan(quant)
+        except RuntimeError:
+            if cached is None and _is_nonempty_file(gguf_path(quant)) and _components_present():
+                log.warning(
+                    "FLUX Fill: listing failed and no cached plan exists for %s; running the "
+                    "model already on disk without re-checking it against the hub",
+                    quant,
+                    exc_info=True,
+                )
+                return
+            raise
+        _save_cached_plan(quant, plan)
         # Filter to missing files only.
         missing = [item for item in plan if not _is_complete_file(item["dest"], int(item["size"]))]
         if not missing:
@@ -656,6 +679,94 @@ def _build_download_plan(quant: str) -> list[dict[str, Any]]:
             "size": _listed_size(COMPONENTS_REPO, sib),
             "sha256": hub_lfs_sha256(sib),
         })
+    return plan
+
+
+#: Format version of the cached plan file; another version is ignored and refetched.
+_PLAN_CACHE_VERSION = 1
+
+
+def _plan_cache_path(quant: str) -> str:
+    """`<flux dir>/flux1-fill-dev-<quant>.listing.json`: the last resolved plan of `quant`."""
+    return os.path.join(_flux_dir(), f"flux1-fill-dev-{quant}.listing.json")
+
+
+def _save_cached_plan(quant: str, plan: list[dict[str, Any]]) -> None:
+    """Persist `plan` (as `_build_download_plan` returned it) for offline runs; atomic.
+
+    Destinations are stored relative to `_flux_dir()`, so a moved installation
+    still finds its files. A write failure only costs the offline shortcut, so
+    it is logged and not raised.
+    """
+    root = _flux_dir()
+    payload = {
+        "version": _PLAN_CACHE_VERSION,
+        "quant": quant,
+        "files": [
+            {
+                "url": item["url"],
+                "rel": os.path.relpath(item["dest"], root),
+                "size": int(item["size"]),
+                "sha256": item["sha256"],
+            }
+            for item in plan
+        ],
+    }
+    path = _plan_cache_path(quant)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.warning("FLUX Fill: could not cache the download plan at %s: %s", path, exc)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        except OSError as cleanup_exc:
+            log.warning("FLUX Fill: could not remove %s: %s", tmp, cleanup_exc)
+
+
+def _load_cached_plan(quant: str) -> list[dict[str, Any]] | None:
+    """The plan `_save_cached_plan` stored for `quant`, or `None` (absent, unreadable, foreign).
+
+    An unreadable or malformed cache is logged and ignored: the caller then
+    fetches the listing as if there were none. A destination that would leave
+    `_flux_dir()` (absolute, or with `..`) invalidates the whole cache.
+    """
+    path = _plan_cache_path(quant)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        log.warning("FLUX Fill: ignoring the unreadable cached plan %s: %s", path, exc)
+        return None
+    root = _flux_dir()
+    try:
+        if payload["version"] != _PLAN_CACHE_VERSION or payload["quant"] != quant:
+            log.info("FLUX Fill: ignoring the cached plan %s of another version or quant", path)
+            return None
+        plan = []
+        for entry in payload["files"]:
+            rel = str(entry["rel"])
+            parts = rel.replace("\\", "/").split("/")
+            if os.path.isabs(rel) or ".." in parts:
+                raise ValueError(f"destination {rel!r} leaves the model directory")
+            sha256 = entry["sha256"]
+            plan.append({
+                "url": str(entry["url"]),
+                "dest": os.path.join(root, *parts),
+                "size": int(entry["size"]),
+                "sha256": None if sha256 is None else str(sha256),
+            })
+        if not plan:
+            raise ValueError("the plan lists no file")
+    except (KeyError, TypeError, ValueError) as exc:
+        log.warning("FLUX Fill: ignoring the malformed cached plan %s: %s", path, exc)
+        return None
     return plan
 
 

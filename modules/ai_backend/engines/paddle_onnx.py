@@ -7,7 +7,8 @@ Main responsibilities:
 - Build ONNX Runtime sessions for the selected Execution Provider and device id.
 - Run the PP-OCR recognition pipeline and the forward-only detection pass
   (`forward_det`, tiles prepared and post-processed by Rust) without Paddle
-  dependencies.
+  dependencies. Leasing a session (`det_session` / `recognition_sessions`) is
+  a step of its own, so a service takes its leases before its own lock.
 - Reuse runtime sessions across backend requests.
 - Configure ONNX Runtime cache directories used by MiGraphX where supported.
 
@@ -30,9 +31,10 @@ import math
 import os
 import re
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Iterator, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -427,6 +429,24 @@ class ManagedOnnxSession:
         self.lease.release()
 
 
+@dataclass
+class DetectionSession:
+    """A leased detection session plus its parsed `config.json` (`PaddleOnnxRuntime.det_session`)."""
+
+    managed: ManagedOnnxSession
+    cfg: DetConfig
+
+
+@dataclass
+class RecognitionSessions:
+    """Leased detection + recognition sessions of one model key (`PaddleOnnxRuntime.recognition_sessions`)."""
+
+    det: ManagedOnnxSession
+    rec: ManagedOnnxSession
+    det_cfg: DetConfig
+    rec_cfg: RecConfig
+
+
 class RuntimeFactory:
     def __init__(self, model_manager: SmallModelManager) -> None:
         self._lock = threading.Lock()
@@ -536,50 +556,66 @@ class PaddleOnnxRuntime:
             return choose_rec_bucket_width(requested_width, cfg)
         return requested_width
 
+    @contextmanager
+    def det_session(self, settings: ProviderSettings) -> Iterator[DetectionSession]:
+        """Lease the detection session for `settings` and release it on exit.
+
+        The session follows the MIGraphX->CPU rule of `_det_provider_settings`.
+        Acquiring may block in the residency arbiter (`begin_model_use`), so a
+        caller enters this BEFORE taking its own service lock (owner-rule
+        premise, `runtime/residency/MODULE_README.md`). Raises the model-path
+        errors of `resolve_det_model_path`, `ModelMemoryShortError` for a
+        refused admission and `RuntimeError` for a failed session build.
+        """
+        det_model_path = resolve_det_model_path()
+        det_cfg = parse_det_config(det_model_path.with_name("config.json"))
+        managed_runner = self._factory.acquire_runner(det_model_path, self._det_provider_settings(settings))
+        try:
+            yield DetectionSession(managed_runner, det_cfg)
+        finally:
+            managed_runner.release()
+
     def forward_det(
         self,
+        leased: DetectionSession,
         tiles_rgb: np.ndarray,
         settings: ProviderSettings,
     ) -> np.ndarray:
         """Run the PP-OCR detection network on a batch of RGB tiles.
 
-        `tiles_rgb` is `uint8 [n, h, w, 3]`, RGB, both sides a multiple of 32
-        (the caller validates; no resize happens here). Returns the raw float
-        probability batch `[n, 1, h, w]`. The detection session follows the
-        MIGraphX->CPU rule of `_det_provider_settings`.
+        `leased` comes from `det_session`; `settings` is the requested
+        selection (logged only). `tiles_rgb` is `uint8 [n, h, w, 3]`, RGB,
+        both sides a multiple of 32 (the caller validates; no resize happens
+        here). Returns the raw float probability batch `[n, 1, h, w]`.
 
-        Raises `RuntimeError` when the session cannot be built or the output
-        does not have the input's batch and spatial shape.
+        Raises `RuntimeError` when the output does not have the input's batch
+        and spatial shape.
         """
-        det_model_path = resolve_det_model_path()
-        det_cfg = parse_det_config(det_model_path.with_name("config.json"))
-        det_settings = self._det_provider_settings(settings)
-        managed_runner = self._factory.acquire_runner(det_model_path, det_settings)
-        try:
-            det_runner = managed_runner.runner
-            det_input = normalize_det_rgb(tiles_rgb, det_cfg)
-            log.info(
-                "Paddle det forward started: det_input=%s requested_provider=%s det_provider=%s",
-                _array_stats_str(det_input),
-                settings.provider,
-                det_runner.selected_provider,
+        det_runner = leased.managed.runner
+        det_input = normalize_det_rgb(tiles_rgb, leased.cfg)
+        log.info(
+            "Paddle det forward started: det_input=%s requested_provider=%s det_provider=%s",
+            _array_stats_str(det_input),
+            settings.provider,
+            det_runner.selected_provider,
+        )
+        det_pred = det_runner.run(det_input)
+        n, height, width = (int(v) for v in tiles_rgb.shape[:3])
+        if det_pred.ndim != 4 or tuple(det_pred.shape) != (n, 1, height, width):
+            raise RuntimeError(
+                f"Unexpected detector output shape: {tuple(det_pred.shape)}, expected {(n, 1, height, width)}"
             )
-            det_pred = det_runner.run(det_input)
-            n, height, width = (int(v) for v in tiles_rgb.shape[:3])
-            if det_pred.ndim != 4 or tuple(det_pred.shape) != (n, 1, height, width):
-                raise RuntimeError(
-                    f"Unexpected detector output shape: {tuple(det_pred.shape)}, expected {(n, 1, height, width)}"
-                )
-            return det_pred
-        finally:
-            managed_runner.release()
+        return det_pred
 
-    def recognize(
-        self,
-        image_bgr: np.ndarray,
-        model_key: str,
-        settings: ProviderSettings,
-    ) -> dict[str, Any]:
+    @contextmanager
+    def recognition_sessions(self, model_key: str, settings: ProviderSettings) -> Iterator[RecognitionSessions]:
+        """Lease the detection and recognition sessions of `model_key`; release both on exit.
+
+        Like `det_session`, a caller enters this BEFORE its own service lock.
+        A failed recognition acquire releases the detection lease already
+        taken. Raises the model-path errors of `resolve_model_paths`,
+        `ModelMemoryShortError` and `RuntimeError` for a failed session build.
+        """
         model_paths = resolve_model_paths(model_key)
         det_cfg = parse_det_config(model_paths.det_config_path)
         rec_cfg = parse_rec_config(model_paths.rec_dict_path)
@@ -593,219 +629,236 @@ class PaddleOnnxRuntime:
             managed_det_runner.release()
             raise
         try:
-            det_runner = managed_det_runner.runner
-            rec_runner = managed_rec_runner.runner
-            rec_cfg = adapt_rec_config_to_model_input(rec_cfg, rec_runner.input_shape)
-            rec_batch_size, rec_dynamic_batch = resolve_batch_shape(
-                rec_runner.input_shape,
-                DEFAULT_REC_BATCH_SIZE,
-            )
-            rec_decoder = CTCLabelDecoder(rec_cfg.character_dict)
-            det_post = DBPostProcess(
-                thresh=det_cfg.thresh,
-                box_thresh=det_cfg.box_thresh,
-                max_candidates=det_cfg.max_candidates,
-                unclip_ratio=det_cfg.unclip_ratio,
-            )
+            yield RecognitionSessions(managed_det_runner, managed_rec_runner, det_cfg, rec_cfg)
+        finally:
+            managed_rec_runner.release()
+            managed_det_runner.release()
 
-            det_input, src_h, src_w = preprocess_det_image(image_bgr, det_cfg)
-            log.info(
-                "Paddle recognize started: image=%s requested_provider=%s det_provider=%s rec_provider=%s det_input=%s rec_input_shape=%s batch_size=%s dynamic_batch=%s",
-                _array_stats_str(image_bgr),
-                settings.provider,
-                det_runner.selected_provider,
-                rec_runner.selected_provider,
-                _array_stats_str(det_input),
-                rec_runner.input_shape,
-                rec_batch_size,
-                rec_dynamic_batch,
-            )
-            det_pred = det_runner.run(det_input)
-            if det_pred.ndim != 4:
-                raise RuntimeError(f"Unexpected detector output shape: {det_pred.shape}")
-            boxes, det_scores = det_post.process_single(det_pred[0], src_h, src_w)
-            sorted_indices = sort_quad_indices(boxes)
-            det_map = np.asarray(det_pred[0, 0])
-            log.info(
-                "Recognizer detector result: boxes=%s sorted_indices=%s det_map=%s thresh=%.3f above_thresh=%s/%s",
-                len(boxes),
-                sorted_indices[:10],
-                _array_stats_str(det_map),
-                det_cfg.thresh,
-                int(np.count_nonzero(det_map > det_cfg.thresh)),
-                int(det_map.size),
-            )
+    def recognize(
+        self,
+        leased: RecognitionSessions,
+        image_bgr: np.ndarray,
+        settings: ProviderSettings,
+    ) -> dict[str, Any]:
+        """Run detection + recognition on one BGR image with sessions from `recognition_sessions`.
 
-            candidates: list[RecognitionCandidate] = []
-            for sort_idx, det_idx in enumerate(sorted_indices):
-                box = boxes[det_idx]
-                crop = get_rotate_crop_image(image_bgr, box)
-                if crop.size == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
-                    log.warning(
-                        "Skipping invalid crop: det_idx=%s sort_idx=%s crop_shape=%s box=%s",
-                        det_idx,
-                        sort_idx,
-                        crop.shape,
-                        box.astype(float).tolist(),
-                    )
-                    continue
-                candidates.append(
-                    RecognitionCandidate(
-                        sort_idx=sort_idx,
-                        det_idx=det_idx,
-                        box=box,
-                        det_score=float(det_scores[det_idx]) if det_idx < len(det_scores) else 0.0,
-                        crop=crop,
-                    )
+        `settings` is the requested selection (logged, and it picks the
+        MIGraphX width buckets through the runner's selected provider). Returns
+        `{"text", "lines", "det_boxes"}`; raises `RuntimeError` for a malformed
+        detector output.
+        """
+        det_cfg = leased.det_cfg
+        rec_cfg = leased.rec_cfg
+        det_runner = leased.det.runner
+        rec_runner = leased.rec.runner
+        rec_cfg = adapt_rec_config_to_model_input(rec_cfg, rec_runner.input_shape)
+        rec_batch_size, rec_dynamic_batch = resolve_batch_shape(
+            rec_runner.input_shape,
+            DEFAULT_REC_BATCH_SIZE,
+        )
+        rec_decoder = CTCLabelDecoder(rec_cfg.character_dict)
+        det_post = DBPostProcess(
+            thresh=det_cfg.thresh,
+            box_thresh=det_cfg.box_thresh,
+            max_candidates=det_cfg.max_candidates,
+            unclip_ratio=det_cfg.unclip_ratio,
+        )
+
+        det_input, src_h, src_w = preprocess_det_image(image_bgr, det_cfg)
+        log.info(
+            "Paddle recognize started: image=%s requested_provider=%s det_provider=%s rec_provider=%s det_input=%s rec_input_shape=%s batch_size=%s dynamic_batch=%s",
+            _array_stats_str(image_bgr),
+            settings.provider,
+            det_runner.selected_provider,
+            rec_runner.selected_provider,
+            _array_stats_str(det_input),
+            rec_runner.input_shape,
+            rec_batch_size,
+            rec_dynamic_batch,
+        )
+        det_pred = det_runner.run(det_input)
+        if det_pred.ndim != 4:
+            raise RuntimeError(f"Unexpected detector output shape: {det_pred.shape}")
+        boxes, det_scores = det_post.process_single(det_pred[0], src_h, src_w)
+        sorted_indices = sort_quad_indices(boxes)
+        det_map = np.asarray(det_pred[0, 0])
+        log.info(
+            "Recognizer detector result: boxes=%s sorted_indices=%s det_map=%s thresh=%.3f above_thresh=%s/%s",
+            len(boxes),
+            sorted_indices[:10],
+            _array_stats_str(det_map),
+            det_cfg.thresh,
+            int(np.count_nonzero(det_map > det_cfg.thresh)),
+            int(det_map.size),
+        )
+
+        candidates: list[RecognitionCandidate] = []
+        for sort_idx, det_idx in enumerate(sorted_indices):
+            box = boxes[det_idx]
+            crop = get_rotate_crop_image(image_bgr, box)
+            if crop.size == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
+                log.warning(
+                    "Skipping invalid crop: det_idx=%s sort_idx=%s crop_shape=%s box=%s",
+                    det_idx,
+                    sort_idx,
+                    crop.shape,
+                    box.astype(float).tolist(),
                 )
-                if len(candidates) <= 5:
-                    log.info(
-                        "Prepared candidate: det_idx=%s sort_idx=%s det_score=%.4f crop=%s box=%s",
-                        det_idx,
-                        sort_idx,
-                        float(det_scores[det_idx]) if det_idx < len(det_scores) else 0.0,
-                        _array_stats_str(crop),
-                        box.astype(float).tolist(),
-                    )
+                continue
+            candidates.append(
+                RecognitionCandidate(
+                    sort_idx=sort_idx,
+                    det_idx=det_idx,
+                    box=box,
+                    det_score=float(det_scores[det_idx]) if det_idx < len(det_scores) else 0.0,
+                    crop=crop,
+                )
+            )
+            if len(candidates) <= 5:
+                log.info(
+                    "Prepared candidate: det_idx=%s sort_idx=%s det_score=%.4f crop=%s box=%s",
+                    det_idx,
+                    sort_idx,
+                    float(det_scores[det_idx]) if det_idx < len(det_scores) else 0.0,
+                    _array_stats_str(crop),
+                    box.astype(float).tolist(),
+                )
 
-            lines_by_order: dict[int, dict[str, Any]] = {}
-            groups: dict[int, list[RecognitionCandidate]] = {}
+        lines_by_order: dict[int, dict[str, Any]] = {}
+        groups: dict[int, list[RecognitionCandidate]] = {}
+        for candidate in candidates:
+            requested_width = plan_rec_input_width(candidate.crop, rec_cfg)
+            bucket_width = self._rec_bucket_width(
+                requested_width,
+                rec_cfg,
+                rec_runner.selected_provider,
+            )
+            groups.setdefault(bucket_width, []).append(candidate)
+
+        use_fixed_batch_capacity = (
+            rec_dynamic_batch
+            and rec_runner.selected_provider == "MIGraphXExecutionProvider"
+        )
+        log.info(
+            "Recognition grouping: candidates=%s groups=%s fixed_batch_capacity=%s migraphx_buckets=%s",
+            len(candidates),
+            {width: len(items) for width, items in groups.items()},
+            use_fixed_batch_capacity,
+            rec_runner.selected_provider == "MIGraphXExecutionProvider",
+        )
+        for bucket_width in sorted(groups):
+            chunk = groups[bucket_width]
+            batch_capacity = rec_batch_size if use_fixed_batch_capacity else len(chunk)
+            rec_input = build_rec_batch_input(chunk, rec_cfg, bucket_width, batch_capacity)
+            log.info(
+                "Recognition batch prepared: bucket_width=%s actual_batch=%s batch_capacity=%s input=%s",
+                bucket_width,
+                len(chunk),
+                batch_capacity,
+                _array_stats_str(rec_input),
+            )
+            rec_pred = rec_runner.run(rec_input)
+            decoded_batch = rec_decoder.decode_batch(rec_pred)
+            log.info(
+                "Recognition batch decoded: bucket_width=%s actual_batch=%s decoded=%s",
+                bucket_width,
+                len(chunk),
+                len(decoded_batch),
+            )
+            for local_idx, (candidate, (text, rec_score)) in enumerate(zip(chunk, decoded_batch)):
+                _log_topk_for_logits(
+                    rec_pred[local_idx],
+                    rec_decoder,
+                    f"rec-batch det_idx={candidate.det_idx} sort_idx={candidate.sort_idx}",
+                )
+                cleaned = text.strip()
+                log.info(
+                    "Decoded candidate: det_idx=%s sort_idx=%s det_score=%.4f rec_score=%.4f raw=%s cleaned=%s",
+                    candidate.det_idx,
+                    candidate.sort_idx,
+                    float(candidate.det_score),
+                    float(rec_score),
+                    repr(text),
+                    repr(cleaned),
+                )
+                if not cleaned:
+                    continue
+                lines_by_order[candidate.sort_idx] = {
+                    "text": cleaned,
+                    "rec_score": float(rec_score),
+                    "det_score": float(candidate.det_score),
+                    "det_idx": int(candidate.det_idx),
+                    "box": candidate.box.astype(float).tolist(),
+                }
+
+        if not lines_by_order and candidates:
+            log.warning(
+                "Batched recognition returned no text for %s candidates; retrying sequentially.",
+                len(candidates),
+            )
             for candidate in candidates:
                 requested_width = plan_rec_input_width(candidate.crop, rec_cfg)
-                bucket_width = self._rec_bucket_width(
-                    requested_width,
-                    rec_cfg,
-                    rec_runner.selected_provider,
+                rec_input = np.ascontiguousarray(
+                    np.expand_dims(
+                        preprocess_rec_image_to_width(candidate.crop, rec_cfg, requested_width),
+                        axis=0,
+                    )
                 )
-                groups.setdefault(bucket_width, []).append(candidate)
-
-            use_fixed_batch_capacity = (
-                rec_dynamic_batch
-                and rec_runner.selected_provider == "MIGraphXExecutionProvider"
-            )
-            log.info(
-                "Recognition grouping: candidates=%s groups=%s fixed_batch_capacity=%s migraphx_buckets=%s",
-                len(candidates),
-                {width: len(items) for width, items in groups.items()},
-                use_fixed_batch_capacity,
-                rec_runner.selected_provider == "MIGraphXExecutionProvider",
-            )
-            for bucket_width in sorted(groups):
-                chunk = groups[bucket_width]
-                batch_capacity = rec_batch_size if use_fixed_batch_capacity else len(chunk)
-                rec_input = build_rec_batch_input(chunk, rec_cfg, bucket_width, batch_capacity)
                 log.info(
-                    "Recognition batch prepared: bucket_width=%s actual_batch=%s batch_capacity=%s input=%s",
-                    bucket_width,
-                    len(chunk),
-                    batch_capacity,
+                    "Sequential recognition input: det_idx=%s sort_idx=%s width=%s input=%s",
+                    candidate.det_idx,
+                    candidate.sort_idx,
+                    requested_width,
                     _array_stats_str(rec_input),
                 )
                 rec_pred = rec_runner.run(rec_input)
                 decoded_batch = rec_decoder.decode_batch(rec_pred)
+                if not decoded_batch:
+                    log.warning(
+                        "Sequential recognition produced empty decoded batch: det_idx=%s sort_idx=%s",
+                        candidate.det_idx,
+                        candidate.sort_idx,
+                    )
+                    continue
+                text, rec_score = decoded_batch[0]
+                _log_topk_for_logits(
+                    rec_pred[0],
+                    rec_decoder,
+                    f"rec-seq det_idx={candidate.det_idx} sort_idx={candidate.sort_idx}",
+                )
+                cleaned = text.strip()
                 log.info(
-                    "Recognition batch decoded: bucket_width=%s actual_batch=%s decoded=%s",
-                    bucket_width,
-                    len(chunk),
-                    len(decoded_batch),
+                    "Sequential decoded candidate: det_idx=%s sort_idx=%s det_score=%.4f rec_score=%.4f raw=%s cleaned=%s",
+                    candidate.det_idx,
+                    candidate.sort_idx,
+                    float(candidate.det_score),
+                    float(rec_score),
+                    repr(text),
+                    repr(cleaned),
                 )
-                for local_idx, (candidate, (text, rec_score)) in enumerate(zip(chunk, decoded_batch)):
-                    _log_topk_for_logits(
-                        rec_pred[local_idx],
-                        rec_decoder,
-                        f"rec-batch det_idx={candidate.det_idx} sort_idx={candidate.sort_idx}",
-                    )
-                    cleaned = text.strip()
-                    log.info(
-                        "Decoded candidate: det_idx=%s sort_idx=%s det_score=%.4f rec_score=%.4f raw=%s cleaned=%s",
-                        candidate.det_idx,
-                        candidate.sort_idx,
-                        float(candidate.det_score),
-                        float(rec_score),
-                        repr(text),
-                        repr(cleaned),
-                    )
-                    if not cleaned:
-                        continue
-                    lines_by_order[candidate.sort_idx] = {
-                        "text": cleaned,
-                        "rec_score": float(rec_score),
-                        "det_score": float(candidate.det_score),
-                        "det_idx": int(candidate.det_idx),
-                        "box": candidate.box.astype(float).tolist(),
-                    }
+                if not cleaned:
+                    continue
+                lines_by_order[candidate.sort_idx] = {
+                    "text": cleaned,
+                    "rec_score": float(rec_score),
+                    "det_score": float(candidate.det_score),
+                    "det_idx": int(candidate.det_idx),
+                    "box": candidate.box.astype(float).tolist(),
+                }
 
-            if not lines_by_order and candidates:
-                log.warning(
-                    "Batched recognition returned no text for %s candidates; retrying sequentially.",
-                    len(candidates),
-                )
-                for candidate in candidates:
-                    requested_width = plan_rec_input_width(candidate.crop, rec_cfg)
-                    rec_input = np.ascontiguousarray(
-                        np.expand_dims(
-                            preprocess_rec_image_to_width(candidate.crop, rec_cfg, requested_width),
-                            axis=0,
-                        )
-                    )
-                    log.info(
-                        "Sequential recognition input: det_idx=%s sort_idx=%s width=%s input=%s",
-                        candidate.det_idx,
-                        candidate.sort_idx,
-                        requested_width,
-                        _array_stats_str(rec_input),
-                    )
-                    rec_pred = rec_runner.run(rec_input)
-                    decoded_batch = rec_decoder.decode_batch(rec_pred)
-                    if not decoded_batch:
-                        log.warning(
-                            "Sequential recognition produced empty decoded batch: det_idx=%s sort_idx=%s",
-                            candidate.det_idx,
-                            candidate.sort_idx,
-                        )
-                        continue
-                    text, rec_score = decoded_batch[0]
-                    _log_topk_for_logits(
-                        rec_pred[0],
-                        rec_decoder,
-                        f"rec-seq det_idx={candidate.det_idx} sort_idx={candidate.sort_idx}",
-                    )
-                    cleaned = text.strip()
-                    log.info(
-                        "Sequential decoded candidate: det_idx=%s sort_idx=%s det_score=%.4f rec_score=%.4f raw=%s cleaned=%s",
-                        candidate.det_idx,
-                        candidate.sort_idx,
-                        float(candidate.det_score),
-                        float(rec_score),
-                        repr(text),
-                        repr(cleaned),
-                    )
-                    if not cleaned:
-                        continue
-                    lines_by_order[candidate.sort_idx] = {
-                        "text": cleaned,
-                        "rec_score": float(rec_score),
-                        "det_score": float(candidate.det_score),
-                        "det_idx": int(candidate.det_idx),
-                        "box": candidate.box.astype(float).tolist(),
-                    }
-
-            lines = [lines_by_order[idx] for idx in sorted(lines_by_order)]
-            log.info(
-                "Paddle recognize finished: det_boxes=%s candidates=%s lines=%s text_preview=%s",
-                len(boxes),
-                len(candidates),
-                len(lines),
-                _preview_text("\n".join(item["text"] for item in lines)),
-            )
-            return {
-                "text": "\n".join(item["text"] for item in lines),
-                "lines": lines,
-                "det_boxes": len(boxes),
-            }
-        finally:
-            managed_rec_runner.release()
-            managed_det_runner.release()
+        lines = [lines_by_order[idx] for idx in sorted(lines_by_order)]
+        log.info(
+            "Paddle recognize finished: det_boxes=%s candidates=%s lines=%s text_preview=%s",
+            len(boxes),
+            len(candidates),
+            len(lines),
+            _preview_text("\n".join(item["text"] for item in lines)),
+        )
+        return {
+            "text": "\n".join(item["text"] for item in lines),
+            "lines": lines,
+            "det_boxes": len(boxes),
+        }
 
 
 def normalize_model_key(raw: str) -> str:

@@ -9,7 +9,9 @@ Main responsibilities:
 - spy on `SmallModelManager.begin_model_use` and check `owner=` / `hint=`;
 - CTD: the hint is the checkpoint file's size on the leased device;
 - Surya: the hint is the checkpoint directory's size; a relative directory (refused
-  by the load) is never sized and gets an unknown-size hint.
+  by the load) is never sized and gets an unknown-size hint;
+- Paddle: the ONNX session is leased BEFORE the instance lock is taken (owner-rule
+  premise, S-059) and the forward pass runs under it.
 
 Notes:
 - The load and forward steps are stubbed, so no torch, weights or GPU are needed;
@@ -20,16 +22,54 @@ Notes:
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import numpy as np
 
 from modules.ai_backend.detection import ctd, surya
+from modules.ai_backend.detection import paddle as paddle_detector
+from modules.ai_backend.engines import paddle_onnx
+from modules.ai_backend.engines.paddle_onnx import ProviderSettings
 from modules.ai_backend.runtime.model_manager import SmallModelManager
 from modules.ai_backend.runtime.residency.holdings import FootprintHint
+
+
+def _free_for_another_thread(lock: Any) -> bool:
+    """True when another thread can take `lock` right now (works for `Lock` and `RLock`)."""
+    result: list[bool] = []
+
+    def probe() -> None:
+        acquired = lock.acquire(blocking=False)
+        if acquired:
+            lock.release()
+        result.append(acquired)
+
+    thread = threading.Thread(target=probe)
+    thread.start()
+    thread.join()
+    return result[0]
+
+
+class _LockProbingFactory:
+    """Duck-typed `RuntimeFactory`: records, per acquire, whether the service lock was free."""
+
+    def __init__(self, runner: Any) -> None:
+        self.runner = runner
+        self.service_lock: Any = None
+        self.lock_free_at_acquire: list[bool] = []
+        self.released = 0
+
+    def acquire_runner(self, _model_path: Path, _settings: ProviderSettings) -> Any:
+        self.lock_free_at_acquire.append(_free_for_another_thread(self.service_lock))
+        return SimpleNamespace(runner=self.runner, release=self._release)
+
+    def _release(self) -> None:
+        self.released += 1
 
 
 def _spy(manager: SmallModelManager, seen: list[tuple[Any, Any]]) -> Any:
@@ -82,6 +122,39 @@ class DetectionLeaseHintTests(unittest.TestCase):
     def test_surya_relative_directory_is_never_sized(self) -> None:
         self._surya_forward("")
         self.assertEqual(self.seen, [(surya._LEASE_OWNER, FootprintHint(device="cpu"))])
+
+
+class _ProbingDetRunner:
+    """Fake detection runner: records whether the service lock was free during `run`."""
+
+    selected_provider = "CPUExecutionProvider"
+
+    def __init__(self) -> None:
+        self.service_lock: Any = None
+        self.lock_free_at_run: list[bool] = []
+
+    def run(self, det_input: np.ndarray) -> np.ndarray:
+        self.lock_free_at_run.append(_free_for_another_thread(self.service_lock))
+        n, _channels, height, width = det_input.shape
+        return np.zeros((n, 1, height, width), dtype=np.float32)
+
+
+class PaddleLeaseOrderTests(unittest.TestCase):
+    def test_the_session_is_leased_before_the_instance_lock(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="ms-detection-order-")
+        self.addCleanup(tmp.cleanup)
+        runner = _ProbingDetRunner()
+        factory = _LockProbingFactory(runner)
+        service = paddle_detector.PaddleTextDetectorService(factory)  # type: ignore[arg-type]
+        factory.service_lock = service._lock
+        runner.service_lock = service._lock
+        with patch.object(paddle_onnx, "resolve_det_model_path", lambda: Path(tmp.name) / "det.onnx"), \
+                patch.object(paddle_detector, "resolve_provider_settings", lambda _cfg: ProviderSettings("CPUExecutionProvider", "0")):
+            maps = service.forward_tiles(np.zeros((1, 32, 32, 3), dtype=np.uint8))
+        self.assertEqual(maps.shape, (1, 1, 32, 32))
+        self.assertEqual(factory.lock_free_at_acquire, [True])
+        self.assertEqual(runner.lock_free_at_run, [False])
+        self.assertEqual(factory.released, 1)
 
 
 if __name__ == "__main__":

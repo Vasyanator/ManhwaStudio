@@ -10,8 +10,9 @@ Main responsibilities:
   `cuda:<device_id>`, every other EP to `cpu`;
 - `RuntimeFactory.acquire_runner` passes no owner (per-key default) and the
   `.onnx` file's size (x1.25, ONNX runtime) on that device;
-- `PaddleOnnxRuntime.recognize` releases the detection lease when the
-  recognition acquire raises (a refused admission must not leak a lease).
+- `PaddleOnnxRuntime.recognition_sessions` releases the detection lease when
+  the recognition acquire raises (a refused admission must not leak a lease),
+  and releases both leases when the caller's block raises.
 
 Notes:
 - The session build is stubbed (`OnnxSessionRunner`), so onnxruntime, weights
@@ -27,8 +28,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
-
-import numpy as np
 
 from modules.ai_backend.engines import paddle_onnx
 from modules.ai_backend.engines.paddle_onnx import PaddleOnnxRuntime, ProviderSettings, ResolvedModelPaths, RuntimeFactory
@@ -78,15 +77,16 @@ class RuntimeFactoryLeaseHintTests(unittest.TestCase):
 
 
 class _RefusingRecFactory:
-    """Duck-typed `RuntimeFactory`: the first acquire (detection) succeeds, the second raises."""
+    """Duck-typed `RuntimeFactory`: acquires after the `refuse_after`-th raise (`None`: never)."""
 
-    def __init__(self) -> None:
+    def __init__(self, refuse_after: int | None = 1) -> None:
+        self.refuse_after = refuse_after
         self.acquired = 0
         self.released = 0
 
     def acquire_runner(self, _model_path: Path, _settings: ProviderSettings) -> Any:
         self.acquired += 1
-        if self.acquired > 1:
+        if self.refuse_after is not None and self.acquired > self.refuse_after:
             raise RuntimeError("rec admission refused")
         return SimpleNamespace(runner=object(), release=self._release)
 
@@ -95,16 +95,28 @@ class _RefusingRecFactory:
 
 
 class RecognizeLeaseLeakTests(unittest.TestCase):
+    def setUp(self) -> None:
+        paths = ResolvedModelPaths(det_model_path=Path("/m/det.onnx"), det_config_path=Path("/m/det.json"), rec_model_path=Path("/m/rec.onnx"), rec_dict_path=Path("/m/dict.txt"))
+        for name, value in (("resolve_model_paths", lambda _key: paths), ("parse_det_config", lambda _path: None), ("parse_rec_config", lambda _path: None)):
+            patcher = patch.object(paddle_onnx, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_a_failed_rec_acquire_releases_the_det_lease(self) -> None:
         factory = _RefusingRecFactory()
         runtime = PaddleOnnxRuntime(factory)  # type: ignore[arg-type]
-        paths = ResolvedModelPaths(det_model_path=Path("/m/det.onnx"), det_config_path=Path("/m/det.json"), rec_model_path=Path("/m/rec.onnx"), rec_dict_path=Path("/m/dict.txt"))
-        with patch.object(paddle_onnx, "resolve_model_paths", lambda _key: paths), \
-                patch.object(paddle_onnx, "parse_det_config", lambda _path: None), \
-                patch.object(paddle_onnx, "parse_rec_config", lambda _path: None):
-            with self.assertRaisesRegex(RuntimeError, "rec admission refused"):
-                runtime.recognize(np.zeros((8, 8, 3), dtype=np.uint8), "ko", ProviderSettings("CPUExecutionProvider", "0"))
+        with self.assertRaisesRegex(RuntimeError, "rec admission refused"):
+            with runtime.recognition_sessions("ko", ProviderSettings("CPUExecutionProvider", "0")):
+                self.fail("the block must not run when an acquire fails")
         self.assertEqual((factory.acquired, factory.released), (2, 1))
+
+    def test_a_raising_block_releases_both_leases(self) -> None:
+        factory = _RefusingRecFactory(refuse_after=None)
+        runtime = PaddleOnnxRuntime(factory)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "inference failed"):
+            with runtime.recognition_sessions("ko", ProviderSettings("CPUExecutionProvider", "0")):
+                raise ValueError("inference failed")
+        self.assertEqual((factory.acquired, factory.released), (2, 2))
 
 
 if __name__ == "__main__":

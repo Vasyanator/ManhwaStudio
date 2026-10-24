@@ -42,7 +42,8 @@ its vision graph only and keeps both decoders on the CPU provider (see its bulle
   key) is languages + device + directory. Image decoding happens outside the service lock.
 - `paddle.py`: PaddleOCR ONNX (`ocr.paddle`, and `ocr.paddle_onnx` which is served by the same
   service). A thin adapter: all model resolution and session handling lives in
-  `engines/paddle_onnx.py`. The request field `paddle_lang` carries a model key such as
+  `engines/paddle_onnx.py`; it leases both sessions (`recognition_sessions`) before its instance
+  lock and runs inference under it. The request field `paddle_lang` carries a model key such as
   `korean_v5`, not a language.
 - `paddle_vl.py`: PaddleOCR-VL (`ocr.paddle_vl`). PyTorch/Transformers vision-language OCR built
   from the vendored classes of `paddle_vl_vendor/` (no `trust_remote_code`); it needs no text
@@ -74,7 +75,10 @@ its vision graph only and keeps both decoders on the CPU provider (see its bulle
 - `surya.py`: Surya OCR (`ocr.surya`). Foundation + recognition predictors from the request's
   `surya_recognition_dir`, plus an optional detection predictor from `surya_detection_dir` for the
   `ocr_with_boxes` task; each is leased under its own model key, and the directory is part of the
-  resident identity next to the device.
+  resident identity next to the device. A reload on another device or from another directory
+  reports every dropped predictor's key `mark_unloaded` (except the key being reloaded under the
+  caller's lease) and releases the allocator cache; a failed reload of a key it dropped reports
+  that key too, so the manager never counts a predictor nobody holds.
 - `script_constraint.py`: stateful UTF-8 `prefix_allowed_tokens_fn` used only by `paddle_vl.py`.
 - `test_lease_hints.py`: the MangaOCR, EasyOCR and Surya hint builders (Baberu's split hint and its
   lease spy are in `test_baberu.py` `LeaseHintTests`).

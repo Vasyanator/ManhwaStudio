@@ -41,8 +41,11 @@ never imports this package. Its only service call is `forward_tiles(tiles)` (Sur
 `ctd.py` and `surya.py` take a `SmallModelManager` (`../runtime/model_manager.py`) and hold a lease
 around every forward pass so the process-wide resident-model budget can unload them; each lease
 passes `owner=` (`_LEASE_OWNER`) and `hint=` (the checkpoint file / directory size, see
-`../runtime/residency/MODULE_README.md`). `paddle.py` has no lease of its own: ONNX sessions are
-leased inside `PaddleOnnxRuntime`.
+`../runtime/residency/MODULE_README.md`). Surya's reload on another device reports the old key
+`mark_unloaded`, and a failed reload from another directory on the same device reports the
+dropped key, as the OCR services do. `paddle.py` has no lease of its own: it enters
+`PaddleOnnxRuntime.det_session` (the ONNX session lease) before its instance lock and runs the
+forward pass under it.
 
 ## Files and submodules
 - `ctd.py`: CTD service. Keys the loaded network by `ctd:<device>` so a device change reloads it;

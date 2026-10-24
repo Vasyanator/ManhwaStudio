@@ -75,6 +75,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
+import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -570,9 +572,14 @@ def download_http_to_path(
       when unknown). It may raise to abort; the exception propagates and the
       staged bytes are parked.
     - `should_cancel()` is polled at every chunk and every `retry.cancel_poll_s`
-      of a backoff wait; when it answers true `DownloadCancelled` is raised. A
-      read that stalls mid-body is not interrupted: the cancel then lands when
-      it times out, at most `READ_TIMEOUT_S` later.
+      of a backoff wait; when it answers true `DownloadCancelled` is raised.
+      While a body streams, a watcher thread also polls it every
+      `retry.cancel_poll_s` and shuts the response's socket down on a cancel
+      (`_CancelWatch`), so a read stalled mid-body ends at once instead of at
+      its `READ_TIMEOUT_S` timeout. `should_cancel` must therefore be safe to
+      call from another thread (every caller passes `threading.Event.is_set`).
+      Waiting for the response HEADERS is not covered: that stays bounded by
+      the connect / read timeouts.
     - `on_retry(event)` is called before each backoff wait.
     - `get` / `sleep` are the transport and the clock seams (tests inject them;
       the Drive caller passes a `Session.get`); `None` means `requests.get` /
@@ -616,18 +623,22 @@ def download_http_to_path(
         # restarts every attempt from zero, and "dropped later than last time"
         # must not reset the budget forever.
         furthest = _existing_size(staging)
+        _sweep_stale_restart_files(Path(dest))
         while True:
             _raise_if_cancelled(should_cancel, name)
             try:
                 _http_attempt(
                     url, staging, on_progress, name=name, headers=base_headers, follow=follow,
                     expected_size=expected, should_cancel=should_cancel, get=fetch_get,
-                    chunk_size=chunk_size,
+                    chunk_size=chunk_size, cancel_poll_s=retry.cancel_poll_s,
                 )
                 break
             except _RestartFromZero:
                 continue
             except transient as exc:
+                # A body broken by the cancel watcher (or one that ended short
+                # after a cancel) is the cancel, not a network failure to retry.
+                _raise_if_cancelled(should_cancel, name, cause=exc)
                 staged = _existing_size(staging)
                 if staged > furthest:
                     # Progress was made: the budget is for failures in a row,
@@ -787,6 +798,7 @@ def _http_attempt(
     should_cancel: Callable[[], bool] | None,
     get: GetFn,
     chunk_size: int,
+    cancel_poll_s: float,
 ) -> None:
     """One attempt continuing `staging`; returns only when the body is complete.
 
@@ -906,21 +918,22 @@ def _http_attempt(
                 )
 
             whole = expected_size or (offset + announced if announced else 0)
-            if have > 0 and offset == 0:
-                log.info(
-                    "model download: the server ignored the resume range for %s (status %d); "
-                    "refetching into a side file, the %d staged bytes stay until it is longer",
-                    name, status, have,
-                )
-                done = _stream_restart(
-                    response, staging, on_progress, name=name, have=have, whole=whole,
-                    expected_size=expected_size, should_cancel=should_cancel, chunk_size=chunk_size,
-                )
-            else:
-                done = _stream_checked(
-                    response, staging, on_progress, name=name, offset=offset, whole=whole,
-                    expected_size=expected_size, should_cancel=should_cancel, chunk_size=chunk_size,
-                )
+            with _CancelWatch(response, should_cancel, cancel_poll_s, name):
+                if have > 0 and offset == 0:
+                    log.info(
+                        "model download: the server ignored the resume range for %s (status %d); "
+                        "refetching into a side file, the %d staged bytes stay until it is longer",
+                        name, status, have,
+                    )
+                    done = _stream_restart(
+                        response, staging, on_progress, name=name, have=have, whole=whole,
+                        expected_size=expected_size, should_cancel=should_cancel, chunk_size=chunk_size,
+                    )
+                else:
+                    done = _stream_checked(
+                        response, staging, on_progress, name=name, offset=offset, whole=whole,
+                        expected_size=expected_size, should_cancel=should_cancel, chunk_size=chunk_size,
+                    )
         break
 
     required = expected_size or (offset + announced if announced else 0)
@@ -970,6 +983,54 @@ def _is_html(response: Any) -> bool:
 def _restart_path(staging: Path) -> Path:
     """Side file a 200-to-a-range-request body is written to while the partial is kept."""
     return staging.with_name(f"{staging.name}.restart")
+
+
+def _sweep_stale_restart_files(dest: Path) -> None:
+    """Delete `_restart_path` side files of `dest` that no live transfer owns.
+
+    A side file only exists inside `_stream_restart`, whose `finally` promotes or
+    deletes it, so one can outlive its transfer only through a hard crash. Called
+    under `dest`'s download lock, so a side file named with OUR pid is such a
+    leftover (a crashed process that shared our pid). One named with another pid
+    is deleted only when `_pid_alive` proves that process is gone; while it runs
+    — or when liveness cannot be told — the file is kept: it may be a live
+    transfer of another backend process.
+    """
+    pattern = re.compile(re.escape(dest.name) + r"\.(\d+)\.part\.restart")
+    try:
+        entries = list(os.scandir(dest.parent))
+    except OSError as exc:
+        log.warning("model download: could not list %s to sweep stale restart files: %s", dest.parent, exc)
+        return
+    own_pid = os.getpid()
+    for entry in entries:
+        match = pattern.fullmatch(entry.name)
+        if match is None:
+            continue
+        pid = int(match.group(1))
+        if pid != own_pid and _pid_alive(pid) is not False:
+            continue
+        log.info("model download: removing the restart file %s left by a crashed transfer (pid %d)", entry.name, pid)
+        _unlink_quietly(Path(entry.path))
+
+
+def _pid_alive(pid: int) -> bool | None:
+    """Whether process `pid` exists; `None` when that cannot be told (no psutil, a probe error).
+
+    psutil, not `os.kill(pid, 0)`: on Windows `os.kill` with any signal but the
+    two console events TERMINATES the process. psutil is optional here, as in
+    `runtime/memory_budget.py`.
+    """
+    try:
+        import psutil
+    except ImportError as exc:
+        log.debug("model download: psutil unavailable, cannot tell whether pid %d runs (%s)", pid, exc)
+        return None
+    try:
+        return bool(psutil.pid_exists(pid))
+    except (OSError, psutil.Error) as exc:
+        log.warning("model download: could not tell whether pid %d runs: %s", pid, exc)
+        return None
 
 
 def _stream_restart(
@@ -1032,7 +1093,7 @@ def _stream_checked(
             f"Не удалось сохранить скачиваемый файл: {staging}\nОшибка: {exc}"
         ) from exc
     with handle:
-        for chunk in response.iter_content(chunk_size=chunk_size):
+        for chunk in _chunks_or_cancel(response, chunk_size, should_cancel, name):
             if not chunk:
                 continue
             if expected_size > 0 and done + len(chunk) > expected_size:
@@ -1049,6 +1110,118 @@ def _stream_checked(
             on_progress(done, whole)
             _raise_if_cancelled(should_cancel, name)
     return done
+
+
+def _chunks_or_cancel(
+    response: Any,
+    chunk_size: int,
+    should_cancel: Callable[[], bool] | None,
+    name: str,
+) -> Any:
+    """`response.iter_content(chunk_size)`, but a body that breaks after a cancel raises `DownloadCancelled`.
+
+    The cancel watcher ends a stalled read by shutting the socket down, which
+    surfaces as whatever the transport raises for a broken body (requests'
+    `ChunkedEncodingError` on Linux, for plain and TLS sockets alike); when the
+    cancel signal is up that error IS the cancel, so it is reported as one
+    (chained) instead of being retried or shown as a network failure.
+    """
+    chunks = iter(response.iter_content(chunk_size=chunk_size))
+    while True:
+        try:
+            chunk = next(chunks)
+        except StopIteration:
+            return
+        except Exception as exc:
+            _raise_if_cancelled(should_cancel, name, cause=exc)
+            raise
+        yield chunk
+
+
+class _CancelWatch:
+    """Shuts a streaming response's socket down when the caller cancels.
+
+    A read stalled mid-body would otherwise wait for its `READ_TIMEOUT_S`
+    timeout before the per-chunk cancel check runs again. While the context is
+    open, a daemon thread polls `should_cancel` every `poll_s` and, on a cancel,
+    calls `_interrupt_response` once, which wakes the blocked read at once; the
+    reader then raises `DownloadCancelled` (`_chunks_or_cancel`, and the retry
+    loop's cancel check). Leaving the context stops and joins the thread. With
+    `should_cancel=None` nothing is started. Only the socket is touched from the
+    watcher, never the response object, whose state belongs to the reader.
+    """
+
+    def __init__(
+        self,
+        response: Any,
+        should_cancel: Callable[[], bool] | None,
+        poll_s: float,
+        name: str,
+    ) -> None:
+        self._response = response
+        self._should_cancel = should_cancel
+        # A zero poll would spin; a cancel 10 ms late is still prompt.
+        self._poll_s = max(float(poll_s), 0.01)
+        self._name = name
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_CancelWatch":
+        if self._should_cancel is not None:
+            self._thread = threading.Thread(
+                target=self._run, name="model-download-cancel-watch", daemon=True
+            )
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+
+    def _run(self) -> None:
+        should_cancel = self._should_cancel
+        if should_cancel is None:
+            return
+        while not self._stop.wait(self._poll_s):
+            try:
+                cancelled = should_cancel()
+            except Exception:
+                # The reader polls the same callable per chunk and will raise
+                # this error itself; the watcher only stops watching.
+                log.exception("model download: the cancel check of %s raised in the watcher", self._name)
+                return
+            if cancelled:
+                _interrupt_response(self._response, self._name)
+                return
+
+
+def _interrupt_response(response: Any, name: str) -> bool:
+    """Shut down the socket under a streaming `requests` response; returns whether it was reached.
+
+    `shutdown(SHUT_RDWR)` (not `close`) is what wakes a read blocked in another
+    thread: closing a descriptor another thread is reading from does not. The
+    socket is reached through urllib3's `HTTPResponse.connection.sock`; a
+    response without one (an injected test transport, a transport that already
+    released the connection) is logged and left to the read timeout.
+    """
+    connection = getattr(getattr(response, "raw", None), "connection", None)
+    sock = getattr(connection, "sock", None)
+    if sock is None:
+        log.warning(
+            "model download: cancel of %s cannot reach the transfer's socket; "
+            "it stops at the next chunk or the read timeout (%.0f s)",
+            name, READ_TIMEOUT_S,
+        )
+        return False
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError as exc:
+        # Already closed or reset: the read is ending on its own anyway.
+        log.info("model download: shutting down the socket of cancelled %s failed: %s", name, exc)
+        return False
+    log.info("model download: cancel of %s interrupted the transfer's socket", name)
+    return True
 
 
 def _verify_complete(
@@ -1119,11 +1292,19 @@ def _sleep_cancellable(
     _raise_if_cancelled(should_cancel, name)
 
 
-def _raise_if_cancelled(should_cancel: Callable[[], bool] | None, name: str) -> None:
-    """Raise `DownloadCancelled` naming the transfer `name` when the cancel signal is up."""
+def _raise_if_cancelled(
+    should_cancel: Callable[[], bool] | None,
+    name: str,
+    *,
+    cause: BaseException | None = None,
+) -> None:
+    """Raise `DownloadCancelled` naming the transfer `name` when the cancel signal is up.
+
+    `cause`, when given, is the error the cancel interrupted; it is chained.
+    """
     if should_cancel is not None and should_cancel():
         log.info("model download: %s cancelled by the caller", name)
-        raise DownloadCancelled(f"Загрузка файла отменена: {name}")
+        raise DownloadCancelled(f"Загрузка файла отменена: {name}") from cause
 
 
 def _size_mismatch(name: str, expected: int, actual: int) -> SizeMismatchError:

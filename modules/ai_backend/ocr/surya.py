@@ -289,14 +289,17 @@ class SuryaOcrService:
         ):
             return self._recognition_predictor
 
+        requested_key = self._foundation_model_key(device)
+        dropped_keys: list[str] = []
         if self._device is not None and (self._device != device or self._recognition_dir != recognition_dir):
-            self._drop_all_predictors_locked()
+            dropped_keys = self._drop_for_reload_locked(keep=requested_key)
 
         try:
             checkpoint = require_local_checkpoint(recognition_dir, label=FOUNDATION_CHECKPOINT_LABEL)
         except Exception as exc:
             self._last_error = str(exc)
             self._publish_health_locked()
+            self._report_failed_reload_locked(requested_key, dropped_keys)
             raise
 
         try:
@@ -305,6 +308,7 @@ class SuryaOcrService:
         except Exception as exc:
             self._last_error = f"Surya OCR package is not available: {exc}"
             self._publish_health_locked()
+            self._report_failed_reload_locked(requested_key, dropped_keys)
             raise RuntimeError(self._last_error) from exc
 
         log.info("Surya OCR recognition predictor load start device=%s checkpoint=%s", device, checkpoint)
@@ -339,6 +343,7 @@ class SuryaOcrService:
             self._device = None
             self._last_error = f"Surya OCR init failed: {exc}"
             self._publish_health_locked()
+            self._report_failed_reload_locked(requested_key, dropped_keys)
             log.error(
                 "Surya OCR recognition predictor load failed device=%s duration_s=%.2f error=%s",
                 device,
@@ -379,14 +384,25 @@ class SuryaOcrService:
             and self._detection_dir == detection_dir
         ):
             return self._detection_predictor
+        requested_key = self._detector_model_key(device)
+        dropped_keys: list[str] = []
+        if self._detection_predictor is not None and self._device is not None:
+            # A detector from another directory (the device matches: the
+            # recognition load above dropped everything on a device change).
+            dropped_keys = [self._detector_model_key(self._device)]
+            _clear_torch_cache()
         self._detection_predictor = None
         self._detection_dir = None
+        for key in dropped_keys:
+            if key != requested_key:
+                self._model_manager.mark_unloaded(key)
 
         try:
             checkpoint = require_local_checkpoint(detection_dir, label=DETECTION_CHECKPOINT_LABEL)
         except Exception as exc:
             self._last_error = str(exc)
             self._publish_health_locked()
+            self._report_failed_reload_locked(requested_key, dropped_keys)
             raise
 
         try:
@@ -394,6 +410,7 @@ class SuryaOcrService:
         except Exception as exc:
             self._last_error = f"Surya detection package is not available: {exc}"
             self._publish_health_locked()
+            self._report_failed_reload_locked(requested_key, dropped_keys)
             raise RuntimeError(self._last_error) from exc
 
         log.info("Surya OCR detection predictor load start device=%s checkpoint=%s", device, checkpoint)
@@ -409,6 +426,7 @@ class SuryaOcrService:
             self._detection_predictor = None
             self._last_error = f"Surya detection init failed: {exc}"
             self._publish_health_locked()
+            self._report_failed_reload_locked(requested_key, dropped_keys)
             log.error(
                 "Surya OCR detection predictor load failed device=%s duration_s=%.2f error=%s",
                 device,
@@ -505,6 +523,40 @@ class SuryaOcrService:
             _clear_torch_cache()
             self._model_manager.mark_unloaded(model_key)
             return True
+
+    def _drop_for_reload_locked(self, *, keep: str) -> list[str]:
+        """Drop every predictor before a reload on another device or from another directory.
+
+        Caller holds `self._lock`. Returns the manager keys of the predictors that
+        were resident, and reports each of them `mark_unloaded` except `keep`:
+        the key about to be reloaded under the caller's lease, which that lease's
+        `mark_loaded` re-registers, or `_report_failed_reload_locked` reports
+        when the reload fails. The allocator cache is released, as on an
+        eviction, so the old weights are gone before the new load.
+        """
+        previous_device = self._device
+        dropped: list[str] = []
+        if previous_device is not None:
+            if self._foundation_predictor is not None or self._recognition_predictor is not None:
+                dropped.append(self._foundation_model_key(previous_device))
+            if self._detection_predictor is not None:
+                dropped.append(self._detector_model_key(previous_device))
+        self._drop_all_predictors_locked()
+        if dropped:
+            _clear_torch_cache()
+        for key in dropped:
+            if key != keep:
+                self._model_manager.mark_unloaded(key)
+        return dropped
+
+    def _report_failed_reload_locked(self, requested_key: str, dropped_keys: list[str]) -> None:
+        """After a failed load: report `requested_key` unloaded when this call dropped it resident.
+
+        The manager still counts such a key resident (its lease found it so and
+        `mark_load_failed` is a no-op for that lease), but nothing holds it now.
+        """
+        if requested_key in dropped_keys:
+            self._model_manager.mark_unloaded(requested_key)
 
     def _drop_all_predictors_locked(self) -> None:
         """Forget every predictor and the device; caller holds `self._lock`."""

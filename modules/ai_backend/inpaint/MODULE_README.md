@@ -198,7 +198,12 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   a failed call are parked for the next one), checked against the size the hub listing announced,
   and published with an atomic `os.replace`. The listing is mandatory: `_build_download_plan`
   raises when a listing fails or the quant is missing from it, so no file is ever sized `0` by
-  accident; a file on disk at another size is re-downloaded. `ensure_model()` deliberately runs
+  accident; a file on disk at another size is re-downloaded. The resolved plan is cached per quant
+  (`flux1-fill-dev-<quant>.listing.json` in the GGUF directory, destinations relative to it) and the
+  listing is fetched only when the cache is absent or a planned file is missing, so a complete model
+  runs offline. Without a cache (a model from an older build) a failed listing is tolerated, with a
+  WARNING, only when the quant and `_components_present()` are on disk: every published file passed
+  its gate. A malformed cache, or one whose destination leaves the directory, is ignored. `ensure_model()` deliberately runs
   outside `self._lock` and the IPC layer dispatches onto a thread pool, so two first uses of the
   same quant do reach it at once; the loser of each file's lock re-checks and skips instead of
   refetching. `_download_file_streaming` is a thin call into the shared helper, which takes the

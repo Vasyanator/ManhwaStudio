@@ -256,7 +256,15 @@ class LamaInpaintService:
                 if callable(unload):
                     unload(clear_cache=True)
             except Exception:
-                pass
+                # The old inpainter is dropped below either way, so its memory
+                # is freed with the last reference; only the explicit cache
+                # release was lost. The new model still loads.
+                log.warning(
+                    "LaMa: unloading the previous inpainter failed; dropping it anyway (previous_key=%s requested_key=%s)",
+                    previous_key,
+                    requested_key,
+                    exc_info=True,
+                )
             self._inpainter = None
             self._publish_health_locked()
             if previous_key is not None:

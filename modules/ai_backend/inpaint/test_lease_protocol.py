@@ -22,7 +22,9 @@ Main responsibilities:
   request unloaded or switched it) and reloaded under that now-stale lease is
   registered resident and evictable — `mark_loaded()` is called
   unconditionally after the load (the lease protocol in
-  `runtime/model_manager.py`).
+  `runtime/model_manager.py`);
+- verify a LaMa model switch whose old inpainter's `unload` raises logs the
+  failure, still reports the old key unloaded and loads the new model (S-060).
 
 Notes:
 - No torch, no diffusers, no weights and no GPU: each service's load step is
@@ -318,6 +320,41 @@ class StaleLeaseReloadTests(unittest.TestCase):
                     service.unload(),
                     "the eviction callback should already have dropped the reloaded model",
                 )
+
+
+class _RaisingUnloadInpainter:
+    """Stand-in inpainter whose explicit unload fails."""
+
+    def unload(self, clear_cache: bool = False) -> None:
+        raise RuntimeError("unload exploded")
+
+
+class _NewInpainter:
+    """Stand-in inpainter class: records its constructor arguments."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+
+class LamaSwitchUnloadFailureTests(unittest.TestCase):
+    def test_a_failed_unload_is_logged_and_the_switch_still_happens(self) -> None:
+        manager = SmallModelManager(max_loaded_models=2)
+        service = lama.LamaInpaintService(manager)
+        old_key = service._model_key_for("cpu", "old.ckpt")
+        service._inpainter = _RaisingUnloadInpainter()
+        service._active_device = "cpu"
+        service._active_checkpoint_name = "old.ckpt"
+        service._active_model_key = old_key
+        unloaded: list[str] = []
+        with patch.object(manager, "mark_unloaded", unloaded.append), \
+                patch.object(service, "_load_inpainter_class_locked", lambda: _NewInpainter), \
+                self.assertLogs(lama.log, level="WARNING") as logs:
+            with service._lock:
+                inpainter = service._ensure_inpainter_locked("cpu", "new.ckpt")
+        self.assertIsInstance(inpainter, _NewInpainter)
+        self.assertEqual(unloaded, [old_key])
+        self.assertEqual(service._active_model_key, service._model_key_for("cpu", "new.ckpt"))
+        self.assertTrue(any("unloading the previous inpainter failed" in line for line in logs.output))
 
 
 if __name__ == "__main__":

@@ -34,7 +34,10 @@ for cv2/onnxruntime at startup.
   `ManhwaStudio_AI_Models/ONNX/PaddleOCR`, builds ORT sessions for the selected Execution Provider
   and device id, runs the PP-OCR recognition pipeline and the forward-only detection pass
   (`PaddleOnnxRuntime.forward_det`; `normalize_det_rgb` is the one owner of the detection input
-  normalization) without any Paddle dependency,
+  normalization) without any Paddle dependency. Leasing is a separate step
+  (`det_session` / `recognition_sessions`, context managers that release on exit): a service
+  enters it BEFORE its own lock and runs `forward_det` / `recognize` under that lock (owner-rule
+  premise of `runtime/residency/MODULE_README.md`). It
   reuses sessions across backend requests through `runtime/model_manager.py` (owner = the
   per-session key, hint = the `.onnx` file x1.25 on `ProviderSettings.footprint_device()`,
   the one EP -> residency-device rule the ONNX OCR services share), and configures the
@@ -61,7 +64,8 @@ for cv2/onnxruntime at startup.
   no staging — Reline's catalog. The token is an ARGUMENT, never read from the environment: one
   caller reads `HF_TOKEN`, the other receives the token as a request field, and this layer must not
   decide which.
-- `test_paddle_onnx_lease.py`: `footprint_device` and the owner/hint `RuntimeFactory` leases with.
+- `test_paddle_onnx_lease.py`: `footprint_device`, the owner/hint `RuntimeFactory` leases with, and
+  `recognition_sessions` never leaking a lease.
 - `test_surya_checkpoints.py`, `test_model_download.py`: unit tests for the contracts above. A fake
   `surya.common.s3` (whose `download_directory` raises) is injected into `sys.modules` for the former; the `download_http_to_path` /
   `download_bearer_to_path` cases of the latter inject a scripted `get` and a recording `sleep`. Neither touches the network.
@@ -136,7 +140,9 @@ for cv2/onnxruntime at startup.
   server IGNORED the range, so the body is written to a side file (`<staging>.restart`) that
   replaces the partial only once it is LONGER than it — a failing restart never costs the bytes
   already staged (appending would produce a silently double-length file). A hard crash in that
-  window can leave the pid-scoped side file behind; it is never read. `416` truncates and
+  window can leave the pid-scoped side file behind; it is never read, and the next transfer of the
+  same destination deletes it (`_sweep_stale_restart_files`: our own pid, or a pid psutil proves
+  dead; kept while its process may run or liveness is unknown). `416` truncates and
   restarts. Restarts are immediate and not counted
   against the budget; they cannot loop because a restart sends no `Range`.
 - **`expected_size` is the integrity gate; `0` means unknown.** With a size, a destination at
@@ -148,11 +154,14 @@ for cv2/onnxruntime at startup.
   a backoff wait and raises `DownloadCancelled` — deliberately not a `RuntimeError`, because the
   IPC handlers forward `RuntimeError` text to the user as a readable refusal (every
   `DownloadError` message is such text and never carries the token). A caller's `on_progress` may
-  still raise its own cancellation type at a chunk boundary. **Bound:** the open response is not
-  closed from another thread, so on a socket that stalls mid-body the cancel is observed when the
-  read times out — at most `READ_TIMEOUT_S` (60 s) later; on a flowing transfer it is observed at
-  the next chunk, during a backoff wait within 100 ms. This is the one place where the
-  `PROJECT_RULES.md` "cancel interrupts the transfer" rule holds only up to that bound.
+  still raise its own cancellation type at a chunk boundary. While a body streams, `_CancelWatch`
+  polls `should_cancel` every `cancel_poll_s` on a daemon thread and on a cancel shuts the
+  response's socket down (`urllib3` `raw.connection.sock`, `shutdown`, never `close`, never the
+  response object), which ends a read stalled mid-body at once; a body error seen while the cancel
+  signal is up is reported as `DownloadCancelled` (chained), never retried. `should_cancel` must
+  therefore be thread-safe (callers pass `threading.Event.is_set`). **Bound:** waiting for the
+  response HEADERS is not watched and stays bounded by the `(15, 60)` timeouts, and a transport
+  whose socket cannot be reached (logged) falls back to the read timeout.
 - **User-facing texts name the model file** (the destination's name), never the pid-scoped
   staging file.
 - **Retry status reaches the UI only through the existing progress `label`** (`on_retry` ->

@@ -49,7 +49,7 @@ PADDLE_INPUT_ALIGN = 32
 
 
 class PaddleTextDetectorService:
-    """Paddle detection forward pass; sessions are leased inside `PaddleOnnxRuntime`."""
+    """Paddle detection forward pass; the session is leased (`PaddleOnnxRuntime.det_session`) before `_lock`."""
 
     def __init__(self, runtime_factory: RuntimeFactory) -> None:
         self._lock = threading.RLock()
@@ -58,7 +58,7 @@ class PaddleTextDetectorService:
         self._device_id: str | None = None
         self._last_error: str | None = None
         # Published copy of the state-derived health fields; `health()` never
-        # takes `_lock`, which a session load and the forward pass hold (S-014).
+        # takes `_lock`, which the forward pass holds (S-014).
         self._health = HealthSnapshot()
         self._publish_health_locked()
 
@@ -67,7 +67,7 @@ class PaddleTextDetectorService:
 
         `provider`/`device_id`/`last_error` come from the published snapshot;
         the model-path probe runs here, outside any service lock, so this
-        answers while a session load or a forward pass holds the instance lock.
+        answers while a forward pass holds the instance lock.
         """
         fields = self._health.read()
         try:
@@ -106,19 +106,25 @@ class PaddleTextDetectorService:
         failed session or a malformed / non-finite output.
         """
         n, height, width = validate_tiles(tiles, align=PADDLE_INPUT_ALIGN, engine="paddle")
-        with self._lock:
-            try:
-                provider_settings = resolve_provider_settings(UserConfig)
-                pred = self._runtime.forward_det(tiles, provider_settings)
-                maps = quantize_probability_maps(pred, engine="paddle")
-                self._provider = provider_settings.provider
-                self._device_id = provider_settings.device_id
-                self._last_error = None
-                self._publish_health_locked()
-                log.info("Paddle det forward done tiles=%s size=%sx%s", n, width, height)
-                return maps
-            except Exception as exc:
+        try:
+            provider_settings = resolve_provider_settings(UserConfig)
+            # The lease first, then the instance lock: acquiring may block in
+            # the residency arbiter, and no service may hold its lock across
+            # that without a lease (owner-rule premise,
+            # `runtime/residency/MODULE_README.md`).
+            with self._runtime.det_session(provider_settings) as leased:
+                with self._lock:
+                    pred = self._runtime.forward_det(leased, tiles, provider_settings)
+                    maps = quantize_probability_maps(pred, engine="paddle")
+                    self._provider = provider_settings.provider
+                    self._device_id = provider_settings.device_id
+                    self._last_error = None
+                    self._publish_health_locked()
+            log.info("Paddle det forward done tiles=%s size=%sx%s", n, width, height)
+            return maps
+        except Exception as exc:
+            with self._lock:
                 self._last_error = str(exc)
                 self._publish_health_locked()
-                log.exception("Paddle det forward failed tiles=%s size=%sx%s", n, width, height)
-                raise
+            log.exception("Paddle det forward failed tiles=%s size=%sx%s", n, width, height)
+            raise

@@ -6,8 +6,9 @@ Unit tests for the offline checkpoint contract of `SuryaTextDetectorService`:
 the predictor loads from the request's `model_dir` (as `checkpoint=` and in
 Surya's settings), a missing or incomplete directory is a "not downloaded"
 error before any load, nothing is downloaded, the directory is part of the
-predictor identity, and `health()` reports the resident directory instead of
-probing a library cache.
+predictor identity, `health()` reports the resident directory instead of
+probing a library cache, and a reload on another device (or a failed reload
+from another directory) tells the model manager the old predictor is gone.
 
 Notes:
 Fake `surya.*` and `torch` modules are injected into `sys.modules` and the
@@ -39,6 +40,7 @@ S3_DETECTOR_DEFAULT = "s3://text_detection/2025_05_07"
 class SuryaDetectorCheckpointTests(unittest.TestCase):
     def setUp(self) -> None:
         self.constructed: list[dict[str, Any]] = []
+        self.fail_construction = False
         test_case = self
         settings = types.SimpleNamespace(DETECTOR_MODEL_CHECKPOINT=S3_DETECTOR_DEFAULT)
         self.settings = settings
@@ -48,6 +50,8 @@ class SuryaDetectorCheckpointTests(unittest.TestCase):
                 test_case.constructed.append(
                     {"checkpoint": checkpoint, "device": device, "setting": settings.DETECTOR_MODEL_CHECKPOINT}
                 )
+                if test_case.fail_construction:
+                    raise RuntimeError("simulated detector load failure")
 
         def download_directory(remote_dir: str, local_dir: str) -> None:
             raise AssertionError(f"download_directory must never be called ({remote_dir} -> {local_dir})")
@@ -115,6 +119,31 @@ class SuryaDetectorCheckpointTests(unittest.TestCase):
 
         self.assertEqual([c["checkpoint"] for c in self.constructed], [self.model_dir, other])
         self.assertEqual(self.service.health()["model_dir"], other)
+
+    def test_a_device_change_reports_the_old_predictor_unloaded(self) -> None:
+        unloaded: list[str] = []
+        with patch.object(self.service._model_manager, "mark_unloaded", unloaded.append):
+            with self.service._lock:
+                self.service._ensure_predictor_locked("cpu", self.model_dir)
+                self.service._ensure_predictor_locked("mps", self.model_dir)
+
+        self.assertEqual(unloaded, [surya_detector.SuryaTextDetectorService._model_key("cpu")])
+        self.assertEqual([c["device"] for c in self.constructed], ["cpu", "mps"])
+
+    def test_a_failed_reload_from_another_dir_leaves_nothing_resident(self) -> None:
+        self.service.forward_tiles(self.tiles, model_dir=self.model_dir)
+        model_key = surya_detector.SuryaTextDetectorService._model_key("cpu")
+        self.assertTrue(self.service._model_manager.holdings()[model_key].resident)
+        other = str(Path(self.model_dir).parent / "other")
+        Path(other).mkdir()
+        self.ready.add(other)
+        self.fail_construction = True
+
+        with self.assertRaises(RuntimeError):
+            self.service.forward_tiles(self.tiles, model_dir=other)
+
+        # The lease found the key resident, so only the service can say it is gone.
+        self.assertEqual(self.service._model_manager.holdings(), {})
 
     def test_incomplete_dir_is_not_downloaded(self) -> None:
         self.ready.clear()

@@ -38,7 +38,10 @@ Main responsibilities:
   page, a wrong `Content-Length`, a 200 to a resume without the full length),
   keeps a partial until a from-zero restart is longer than it, measures
   progress against the furthest byte ever staged; and stops at a chunk or within 100 ms of a backoff wait when
-  cancelled, parking the bytes.
+  cancelled, parking the bytes; a read stalled mid-body is interrupted through
+  its socket by the cancel watcher instead of waiting for the read timeout;
+- verify stale `<staging>.restart` side files of a destination are swept before
+  a transfer (own pid, or a pid proven dead), and kept while their pid may run.
 
 Notes:
 The network is never involved. `download_to_path` takes the transport as a
@@ -55,6 +58,8 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from modules.ai_backend.engines import model_download as md
 
@@ -278,6 +283,49 @@ class _ScriptedGet:
     @property
     def remaining(self) -> int:
         return len(self._steps)
+
+
+class _FakeSocket:
+    """Socket stand-in whose `shutdown` wakes the stalled read of `_StallingResponse`."""
+
+    def __init__(self) -> None:
+        self.shut_down = False
+        self.woken = threading.Event()
+
+    def shutdown(self, how: int) -> None:
+        self.shut_down = True
+        self.woken.set()
+
+
+class _StallingResponse:
+    """A `200` that sends `body`, then blocks like a stalled socket until its socket is shut down.
+
+    The socket sits where urllib3 keeps it (`raw.connection.sock`); after the
+    shutdown the read raises the broken-body error a real transport raises.
+    """
+
+    def __init__(self, body: bytes, *, total: int) -> None:
+        self.status_code = 200
+        self.headers = {"Content-Length": str(total)}
+        self._body = body
+        self.sock = _FakeSocket()
+        self.raw = SimpleNamespace(connection=SimpleNamespace(sock=self.sock))
+        self.stalled = threading.Event()
+
+    def __enter__(self) -> "_StallingResponse":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_content(self, chunk_size: int = 1 << 20):
+        yield self._body
+        self.stalled.set()
+        self.sock.woken.wait(10)
+        raise ConnectionError("connection broken by the socket shutdown")
 
 
 def _partial(body: bytes, *, start: int, total: int, **kwargs) -> _Step:
@@ -679,6 +727,33 @@ class DownloadBearerToPathTests(unittest.TestCase):
         self.assertFalse(self.dest.exists())
         self.assertEqual(self._parked(), self.PAYLOAD[:512])
 
+    def test_a_cancel_interrupts_a_read_stalled_mid_body(self) -> None:
+        response = _StallingResponse(self.PAYLOAD[:1000], total=len(self.PAYLOAD))
+        cancel = threading.Event()
+
+        def cancel_once_stalled() -> None:
+            if response.stalled.wait(10):
+                cancel.set()
+
+        trigger = threading.Thread(target=cancel_once_stalled)
+        trigger.start()
+        started = time.monotonic()
+        try:
+            with self.assertRaises(md.DownloadCancelled) as caught:
+                self._run(lambda _url, **_kwargs: response, should_cancel=cancel.is_set)
+        finally:
+            trigger.join()
+        elapsed = time.monotonic() - started
+
+        # The socket was shut down by the watcher, not left to the 60 s read
+        # timeout (the stall itself gives up after 10 s, failing the bound).
+        self.assertTrue(response.sock.shut_down)
+        self.assertLess(elapsed, 5.0)
+        self.assertIsInstance(caught.exception.__cause__, ConnectionError)
+        # A cancel parks the bytes and is never retried.
+        self.assertEqual(self.retries, [])
+        self.assertEqual(self._parked(), self.PAYLOAD[:1000])
+
     def test_a_raising_progress_callback_aborts_and_parks(self) -> None:
         class _Stop(Exception):
             pass
@@ -895,6 +970,43 @@ class StagingHelperTests(unittest.TestCase):
         other.write_bytes(b"stale leftover")
         md._claim_staged_bytes(other, parked)
         self.assertFalse(other.exists())
+
+    def test_stale_restart_files_are_swept_only_when_no_live_process_owns_them(self) -> None:
+        self.dest.parent.mkdir(parents=True, exist_ok=True)
+        own = self.dest.with_name(f"{self.dest.name}.{os.getpid()}.part.restart")
+        dead = self.dest.with_name(f"{self.dest.name}.111111.part.restart")
+        live = self.dest.with_name(f"{self.dest.name}.222222.part.restart")
+        unknown = self.dest.with_name(f"{self.dest.name}.333333.part.restart")
+        other_dest = self.dest.with_name(f"other.bin.111111.part.restart")
+        for path in (own, dead, live, unknown, other_dest):
+            path.write_bytes(b"side")
+        liveness = {111111: False, 222222: True, 333333: None}
+
+        with patch.object(md, "_pid_alive", liveness.__getitem__):
+            md._sweep_stale_restart_files(self.dest)
+
+        self.assertFalse(own.exists())
+        self.assertFalse(dead.exists())
+        self.assertTrue(live.exists())
+        self.assertTrue(unknown.exists(), "a pid whose liveness is unknown keeps its file")
+        self.assertTrue(other_dest.exists(), "another destination's files are not touched")
+
+    def test_a_transfer_sweeps_its_own_stale_restart_file_first(self) -> None:
+        self.dest.parent.mkdir(parents=True, exist_ok=True)
+        own = self.dest.with_name(f"{self.dest.name}.{os.getpid()}.part.restart")
+        own.write_bytes(b"crash leftover")
+        payload = b"x" * 300
+
+        md.download_http_to_path(
+            "https://example/x", self.dest, expected_size=len(payload),
+            on_progress=lambda _done, _total: None, get=_ScriptedGet([_Step(payload)]), sleep=lambda _s: None,
+        )
+
+        self.assertEqual(self.dest.read_bytes(), payload)
+        self.assertFalse(own.exists())
+
+    def test_pid_alive_knows_this_process(self) -> None:
+        self.assertIn(md._pid_alive(os.getpid()), (True, None))
 
     def test_discard_staging_removes_both_names(self) -> None:
         self.dest.parent.mkdir(parents=True, exist_ok=True)

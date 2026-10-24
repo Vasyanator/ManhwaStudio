@@ -8,8 +8,9 @@ and assigned to Surya's settings), a missing or incomplete directory is a
 "not downloaded" error and nothing is ever downloaded, the presence check runs
 *before* the ROCm mmap->GPU staging patch is installed, only the predictor
 construction runs inside it, the patch is released again when the construction
-fails, recognition itself never runs under it, and unloading drops the right
-predictors.
+fails, recognition itself never runs under it, unloading drops the right
+predictors, and a reload on another device or from another directory tells the
+model manager about every predictor it dropped (a failed same-key reload too).
 
 Notes:
 - Fake `surya.*` and `torch` modules are injected into `sys.modules`, so the
@@ -315,6 +316,65 @@ class SuryaPredictorLoadTests(unittest.TestCase):
 
         self.assertFalse(self.service._unload_foundation_key(other_key))
         self.assertIsNotNone(self.service._recognition_predictor)
+
+    def _record_unloaded(self) -> list[str]:
+        unloaded: list[str] = []
+        seam = patch.object(self.service._model_manager, "mark_unloaded", unloaded.append)
+        seam.start()
+        self.addCleanup(seam.stop)
+        return unloaded
+
+    def test_a_device_change_reports_every_dropped_predictor(self) -> None:
+        self._load_recognition("cuda:0")
+        self._load_detection("cuda:0")
+        unloaded = self._record_unloaded()
+
+        self._load_recognition("cpu")
+
+        self.assertEqual(
+            unloaded,
+            [
+                service_module.SuryaOcrService._foundation_model_key("cuda:0"),
+                service_module.SuryaOcrService._detector_model_key("cuda:0"),
+            ],
+        )
+
+    def test_a_directory_change_reports_the_detector_and_keeps_the_reloaded_key(self) -> None:
+        self._load_recognition()
+        self._load_detection()
+        other = str(Path(self.rec_dir).parent / "other_recognition")
+        Path(other).mkdir()
+        self.ready.add(other)
+        unloaded = self._record_unloaded()
+
+        self.service._ensure_recognition_loaded_locked("cuda:0", other)
+
+        # The foundation key is reloaded under the caller's lease, which re-registers it.
+        self.assertEqual(unloaded, [service_module.SuryaOcrService._detector_model_key("cuda:0")])
+
+    def test_a_failed_same_key_reload_reports_the_key_unloaded(self) -> None:
+        self._load_recognition()
+        self._load_detection()
+        other_rec = str(Path(self.rec_dir).parent / "other_recognition")
+        other_det = str(Path(self.det_dir).parent / "other_detection")
+        for other in (other_rec, other_det):
+            Path(other).mkdir()
+            self.ready.add(other)
+        unloaded = self._record_unloaded()
+        self.fail_construction = True
+
+        with self.assertRaises(RuntimeError):
+            self.service._ensure_detection_loaded_locked("cuda:0", other_det)
+        with self.assertRaises(RuntimeError):
+            self.service._ensure_recognition_loaded_locked("cuda:0", other_rec)
+
+        self.assertEqual(
+            unloaded,
+            [
+                service_module.SuryaOcrService._detector_model_key("cuda:0"),
+                service_module.SuryaOcrService._foundation_model_key("cuda:0"),
+            ],
+        )
 
     def test_detector_unload_keeps_the_recognition_predictors(self) -> None:
         self._load_recognition()

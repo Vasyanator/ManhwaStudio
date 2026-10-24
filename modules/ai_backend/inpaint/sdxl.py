@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import functools
 import io
+import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +61,8 @@ MODEL_SUFFIXES = (".safetensors", ".ckpt")
 #: Owner name of this service's leases in the residency arbiter (owner rule; the
 #: nested LaMa prefill lease is LaMa's own owner).
 _LEASE_OWNER = "inpaint.sdxl"
+
+log = logging.getLogger(__name__)
 
 # The only Hugging Face repo id `model_path` may name. Rust downloads its pinned
 # fp16 files (`ms_sysprobe` external catalog) and sends that directory as the
@@ -439,11 +442,16 @@ class SdxlInpaintService:
                     if latents is not None:
                         preview = _latent_preview_rgb(latents)
                 except Exception:
+                    # A preview is cosmetic: the step still reports progress
+                    # without one, and the run must not fail over it.
+                    log.warning("SDXL latent preview failed at step %s/%s; reporting progress without a preview", int(step) + 1, total, exc_info=True)
                     preview = None
                 try:
                     progress_callback(int(step) + 1, total, preview)
                 except Exception:
-                    pass
+                    # Progress delivery (an IPC event) must not abort the
+                    # denoising run; the result is still returned to the caller.
+                    log.warning("SDXL progress callback failed at step %s/%s; continuing the run", int(step) + 1, total, exc_info=True)
                 return cb_kwargs
 
             pipe_kwargs["callback_on_step_end"] = _on_step_end
@@ -682,7 +690,9 @@ def _build_sdxl_inpaint_pipeline(source: SdxlModelSource, device: str) -> Any:
     try:
         pipe.enable_attention_slicing()
     except Exception:
-        pass
+        # Optional memory saving: the pipeline still runs without it, only with
+        # a higher attention peak.
+        log.warning("SDXL: enable_attention_slicing failed; running without attention slicing (device=%s source=%s)", device, source.kind, exc_info=True)
     # SDXL's VAE overflows in fp16 and produces darkened/NaN decodes. Enable the
     # built-in force_upcast so diffusers upcasts the VAE to fp32 only around the
     # decode step (and restores fp16 after); do NOT call upcast_vae() here, which
@@ -691,7 +701,7 @@ def _build_sdxl_inpaint_pipeline(source: SdxlModelSource, device: str) -> Any:
         try:
             pipe.vae.config.force_upcast = True
         except Exception:
-            pass
+            log.warning("SDXL: could not enable VAE force_upcast; fp16 decodes may come out darkened (device=%s source=%s)", device, source.kind, exc_info=True)
     return pipe
 
 

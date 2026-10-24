@@ -25,7 +25,11 @@ Main responsibilities:
   a quant missing from it raises, and every planned size comes from the listing;
 - verify `ensure_model` reports a retry as an ordinary `download` frame with a
   retry label, threads `should_cancel` into the transfer, and logs (once) rather
-  than swallows a failing progress callback.
+  than swallows a failing progress callback;
+- verify the resolved plan is cached next to the model: a complete model runs
+  with no listing at all, a missing file refetches the listing, a malformed or
+  escaping cache is ignored, and without a cache a failed listing is tolerated
+  only when the model is already on disk.
 
 Notes:
 - Fake `torch` and `diffusers` modules are injected into `sys.modules`, so the
@@ -807,6 +811,85 @@ class EnsureModelTests(unittest.TestCase):
         self.assertEqual(self.dest.read_bytes(), b"A" * 2048)
         callback_lines = [line for line in logs.output if "progress callback failed" in line]
         self.assertEqual(len(callback_lines), 1)
+
+
+class CachedPlanTests(unittest.TestCase):
+    """The listing is fetched once; a complete model never needs the network again."""
+
+    PAYLOAD = b"A" * 2048
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.dest = self.root / svc.gguf_filename("Q8_0")
+        self.listings = 0
+        self.listing_error: BaseException | None = None
+
+        def build_plan(quant: str) -> list[dict[str, object]]:
+            self.listings += 1
+            if self.listing_error is not None:
+                raise self.listing_error
+            return [{"url": "https://hf/flux.gguf", "dest": str(self.dest), "size": 2048, "sha256": None}]
+
+        for target, value in (
+            ("_flux_dir", lambda: str(self.root)),
+            ("_components_dir", lambda: str(self.root / "components")),
+            ("_build_download_plan", build_plan),
+        ):
+            seam = patch.object(svc, target, value)
+            seam.start()
+            self.addCleanup(seam.stop)
+        self.gets = 0
+
+        def get(url: str, **kwargs: object) -> _ScriptedFluxResponse:
+            self.gets += 1
+            return _ScriptedFluxResponse(self.PAYLOAD, status=200, announce=2048)
+
+        for name, value in (("_default_get", get), ("_default_sleep", lambda _s: None)):
+            seam = patch.object(md, name, value)
+            seam.start()
+            self.addCleanup(seam.stop)
+        self.service = svc.FluxFillInpaintService(SmallModelManager())
+
+    def test_a_complete_model_runs_without_a_listing(self) -> None:
+        self.service.ensure_model("Q8_0", None)
+        self.assertEqual((self.listings, self.gets), (1, 1))
+
+        self.listing_error = RuntimeError("offline")
+        self.service.ensure_model("Q8_0", None)
+
+        self.assertEqual((self.listings, self.gets), (1, 1))
+        self.assertEqual(svc._load_cached_plan("Q8_0"), [{"url": "https://hf/flux.gguf", "dest": str(self.dest), "size": 2048, "sha256": None}])
+
+    def test_a_missing_file_refetches_the_listing(self) -> None:
+        self.service.ensure_model("Q8_0", None)
+        self.dest.unlink()
+
+        self.service.ensure_model("Q8_0", None)
+
+        self.assertEqual((self.listings, self.gets), (2, 2))
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+
+    def test_a_malformed_or_escaping_cache_is_ignored(self) -> None:
+        cache = Path(svc._plan_cache_path("Q8_0"))
+        for content in ("{not json", '{"version": 1, "quant": "Q8_0", "files": [{"url": "u", "rel": "../x", "size": 1, "sha256": null}]}', '{"version": 1, "quant": "Q8_0", "files": []}'):
+            with self.subTest(content=content):
+                cache.write_text(content, encoding="utf-8")
+                self.assertIsNone(svc._load_cached_plan("Q8_0"))
+
+    def test_without_a_cache_a_failed_listing_is_tolerated_only_for_a_present_model(self) -> None:
+        self.listing_error = RuntimeError("offline")
+        with self.assertRaisesRegex(RuntimeError, "offline"):
+            self.service.ensure_model("Q8_0", None)
+
+        self.dest.write_bytes(self.PAYLOAD)
+        with patch.object(svc, "_components_present", lambda: True), \
+                self.assertLogs(svc.log, level="WARNING") as logs:
+            self.service.ensure_model("Q8_0", None)
+
+        self.assertEqual(self.gets, 0)
+        self.assertTrue(any("no cached plan" in line for line in logs.output))
 
 
 class UnloadTests(unittest.TestCase):
