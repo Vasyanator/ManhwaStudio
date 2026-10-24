@@ -104,10 +104,37 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   files by `crates/ms-canvas/src/settings.rs`, but loaded user-file-primary with a project fallback in
   `crates/ms-project/src/lib.rs::canvas_settings_from_config`.
   Without `SessionCapabilities::project_settings` (a single-image session;
-  `SettingsTabState::set_session_capabilities`, pushed once by `StudioApp::new`) it hides the comic-type preset and the project word list: their "project" is the throwaway scratch
-  chapter, and the spellcheck menu loses its project-dictionary target. The comic-type preset
-  writes its fields through `SharedCanvasSettings::apply_comic_type_preset` (`ms-models`), the
-  same owner the studio uses when the comic-type prompt is answered.
+  `SettingsTabState::set_session_capabilities`, pushed once by `StudioApp::new`) it hides the
+  title-kind row, the layout preset row and the project word list: their "project" is the
+  throwaway scratch chapter, and the spellcheck menu loses its project-dictionary target.
+  The two title rows are independent: «Тип тайтла» edits the title KIND (`comic_type`; written by
+  the canvas-settings saver, handed to the studio's in-memory project through
+  `take_title_kind_change`), the layout preset picker (`canvas_layout_presets.rs`) applies and
+  edits presets and stores the selection (`canvas.layout_preset`, written by the same saver
+  through `save_layout_preset_selection`). The pane never derives the kind or the selection from
+  the values. The first-open prompt's choice reaches the pane through
+  `SettingsTabState::apply_title_kind_layout`, which applies that kind's preset with its
+  EFFECTIVE (override-aware) values. Before drawing, the pane re-reads `BubblesModel`'s canvas
+  snapshot when its canvas revision moved (`refresh_canvas_settings_from_model`): canvases
+  publish their own edits there (the ribbon dock tab's «show bubbles» / opacity), and the pane
+  publishes its whole snapshot, so a stale copy would revert them.
+- `canvas_layout_presets.rs`: the layout preset block (`LayoutPresetsPane`, an
+  `ms_widgets::PresetPicker` over «Pages», «Webtoon» and the user presets) and its ordered
+  writer thread. The store and its rules (override / revert, version guard, JSON codec) belong to
+  `ms_project::canvas_layout` (`CanvasLayoutPresets`, `LayoutPresetOp`); this file decides what
+  each action means: Select applies the effective values; «None» keeps the values; Create stores
+  the current values under a free default name; Save commits values (built-ins: an override,
+  name fixed via `rename(false)`; user presets: verbatim, unique non-empty rename); Delete removes
+  a user preset (title goes to «None», values kept) or reverts a modified built-in (factory values
+  applied, selection kept); an unmodified built-in has no Delete. Unsaved = the title's layout
+  differs from the selection's effective values, a pending rename, or the entry's last write
+  failed (kept until a later write of that entry succeeds; the write-error line stays while any
+  entry is failed). The store path comes in `TitleLayoutSeed::layout_preset_store` (`None` in
+  tests: no test writes the real `user_config`). Every operation is one
+  read-modify-write of `user_config` `Canvas.layout_presets` on the writer thread, in order
+  (joined on drop, on the teardown worker); the store is decoded from the pre-read `user_config`
+  in `StudioApp::new` and handed over in `TitleLayoutSeed`. A title whose selected user preset was
+  renamed or deleted elsewhere reads as «None» when bound (known, accepted).
 - `studio_tab.rs`: the tab's empty `impl ms_studio_tab::StudioTab` (every hook keeps its no-op
   default), so the studio's `Tabs` can iterate all ten program tabs.
 - `typesetting/`: "Тайп" pane SUBMODULE (see its own `MODULE_README.md`). `mod.rs` is the
@@ -223,6 +250,8 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
   (`SettingsSectionId`, `SECTIONS`, `title_key`), then the dispatch `match` in `mod.rs::draw`
   (exhaustive, no `_ =>`), and add a focused renderer if it grows beyond trivial UI. The tab bar and
   order come from `sections_for(Studio)`; do not hand-list sections in `mod.rs`.
+- To change what a layout preset action does, edit `canvas_layout_presets.rs`; to change the
+  store's format, override rules or a built-in's factory values, `crates/ms-project/src/canvas_layout.rs`.
 - To change shared canvas/ribbon settings, edit `canvas_ribbon.rs` and the save/apply helpers in
   `mod.rs`. `SharedCanvasSettings` has NO serde derives, so ADDING a field means threading it by
   hand through: `crates/ms-models/src/bubbles_model.rs` (struct + `Default`), `crates/ms-project/src/lib.rs::CanvasSettings`

@@ -6,9 +6,14 @@ Composed-translation panel of the Translation tab: builds the prompt text from t
 bubbles, hosts the plain/MiniJinja formatting options, and exports the result to TXT/DOCX.
 
 Main responsibilities:
-- own `CompositionPanelOptions` (the settings boundary mirrored by the parser/writer in `tab.rs`)
+- own `CompositionPanelOptions` (the settings boundary read and written by `tab.rs` through the
+  codec below)
 - filter, sort and format bubbles into the composed text (`compose_translation_text`)
-- draw the «Текст» / «Параметры» sub-tabs and the export actions
+- own the ONE JSON mapping of `CompositionPanelOptions` (`write_composition_options_json` /
+  `read_composition_options_json`, `CompositionPanelOptions::stored_form`), shared by the
+  title settings and the composition presets
+- draw the «Текст» / «Параметры» sub-tabs (the preset picker of `composition_presets.rs` on
+  top of «Параметры») and the export actions
 - run a TXT/DOCX export: a non-blocking save dialog (`ms_platform::file_dialog`), then the write
   and the target's `commit()` on a worker (`write_export`)
 
@@ -17,7 +22,9 @@ Key structures:
 - ComposedItem: one formatted entry handed to the emission pass, including the non-emitting
   `DroppedReplica` barrier that stops hint lookahead
 - HintBinding: forward / dropped / trailing, the resolved attachment of one hint
-- EmitParams: emission-time settings (limit, merging, separators)
+- EmitParams: emission-time settings (limit, merging, separators, name format)
+- CharacterNamePosition / CharacterNameFormat: where and how a character name is attached to a
+  replica or merged group (one `attach` for every emission site)
 - ExportFormat / ExportStage: the export in flight (dialog open, or the worker writing)
 
 Key functions:
@@ -34,6 +41,7 @@ byte-identical to the pre-hint composer.
 */
 
 use ms_project::{Bubble, ProjectData};
+use crate::panels::composition_presets::CompositionPresets;
 use crate::panels::bubbles::{
     bubble_extra_bool, bubble_extra_i32, bubble_extra_string,
 };
@@ -41,7 +49,7 @@ use ms_widgets::WheelSpinBox;
 use eframe::egui;
 use minijinja::{AutoEscape, Environment, context};
 use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, PendingDialog, SaveTarget};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -51,6 +59,9 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 const LIMIT_MIN: usize = 100;
 const LIMIT_MAX: usize = 100_000;
 const LIMIT_DEFAULT: usize = 700;
+/// Default `character_name_prefix`: with the default `After` position it reproduces the
+/// historical `"{line} - {name}"` byte for byte. Mirrored in `ms_config`'s composition defaults.
+const DEFAULT_CHARACTER_NAME_PREFIX: &str = " - ";
 /// Runtime (not `const`) because `t!` is not const; resolves the active catalog value.
 #[must_use]
 fn no_items_text() -> &'static str {
@@ -137,7 +148,42 @@ impl CompositionSourceMode {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Where a replica's character name is attached in the plain composer (see
+/// [`CharacterNameFormat::attach`]). `After` is the historical layout (`"{line} - {name}"`).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum CharacterNamePosition {
+    /// `{prefix}{name}{suffix}{line}`.
+    Before,
+    /// `{line}{prefix}{name}{suffix}`.
+    #[default]
+    After,
+}
+
+impl CharacterNamePosition {
+    /// Persistence key (settings / preset JSON); never localize or rename.
+    pub fn key(self) -> &'static str {
+        match self {
+            CharacterNamePosition::Before => "before",
+            CharacterNamePosition::After => "after",
+        }
+    }
+
+    /// Parses [`Self::key`]; anything unrecognized reads as the default `After`.
+    pub fn from_key(raw: &str) -> Self {
+        if raw.trim().eq_ignore_ascii_case("before") {
+            Self::Before
+        } else {
+            Self::After
+        }
+    }
+}
+
+/// Every composition setting. One value is both the per-title `settings.json` `composition`
+/// section and the payload of a composition preset (`composition_presets`): its ONE JSON
+/// mapping is [`write_composition_options_json`] / [`read_composition_options_json`].
+/// `PartialEq` compares [`Self::stored_form`] values to tell "the preset differs from the
+/// screen".
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompositionPanelOptions {
     pub sort_method: CompositionSortMethod,
     pub source_mode: CompositionSourceMode,
@@ -153,6 +199,17 @@ pub struct CompositionPanelOptions {
     pub limit: usize,
     pub limit_enabled: bool,
     pub use_character_names: bool,
+    /// Side of the replica (or merged group) the character name goes to. Plain path only;
+    /// ignored while `use_character_names` is off.
+    pub character_name_position: CharacterNamePosition,
+    /// Text placed immediately before the character name. No separator is added between the
+    /// replica and the name, so this field carries it: the default `" - "` with `After`
+    /// reproduces the historical `"{line} - {name}"`. Escapes (`\n`, `\t`, …) are decoded at
+    /// compose time.
+    pub character_name_prefix: String,
+    /// Text placed immediately after the character name (e.g. `": "` with `Before`). Escapes are
+    /// decoded at compose time.
+    pub character_name_suffix: String,
     /// Include image-bubble translations in the composition. When enabled, each text area of an
     /// image bubble contributes one line `{translation}` (plus ` - {description}` when
     /// `use_character_names` is on and the description is non-empty).
@@ -188,6 +245,9 @@ impl Default for CompositionPanelOptions {
             limit: LIMIT_DEFAULT,
             limit_enabled: true,
             use_character_names: true,
+            character_name_position: CharacterNamePosition::After,
+            character_name_prefix: DEFAULT_CHARACTER_NAME_PREFIX.to_string(),
+            character_name_suffix: String::new(),
             include_image_bubbles: false,
             include_hint_bubbles: true,
             hint_wrap: "()".to_string(),
@@ -206,6 +266,168 @@ impl CompositionPanelOptions {
         self.hint_wrap = normalize_wrap_with(&self.hint_wrap);
         self.limit = self.limit.clamp(LIMIT_MIN, LIMIT_MAX);
     }
+
+    /// These options as they read back after a write + read through the JSON codec
+    /// ([`write_composition_options_json`] then [`read_composition_options_json`]): normalized,
+    /// and an empty `nl_replace` stored as one space ([`stored_nl_replace`]). Compare THIS
+    /// form, never the raw options, against a persisted value, or a reloaded title would show
+    /// a difference that is only the codec's own rewriting. Guarded by the round-trip test.
+    #[must_use]
+    pub fn stored_form(&self) -> Self {
+        let mut out = self.clone();
+        out.nl_replace = stored_nl_replace(&out.nl_replace);
+        out.normalize();
+        out
+    }
+}
+
+/// The value `nl_replace` is persisted as: an empty field means "replace with a space" (the
+/// field's hint), so it is stored as `" "`.
+#[must_use]
+fn stored_nl_replace(value: &str) -> String {
+    if value.is_empty() { " ".to_string() } else { value.to_string() }
+}
+
+/// Writes every field of `options` into a composition JSON object (the title `settings.json`
+/// `composition` section, or one entry of `composition_presets`). Keys the codec does not own
+/// (e.g. the title's selected-preset key) are left untouched. The ONE writer of this mapping.
+///
+/// The exhaustive destructuring is deliberate: a new option field must not compile until it
+/// is given a key here and in [`read_composition_options_json`].
+pub fn write_composition_options_json(obj: &mut Map<String, Value>, options: &CompositionPanelOptions) {
+    let CompositionPanelOptions {
+        sort_method,
+        source_mode,
+        ignore_translated_lines,
+        merge_same_character,
+        sep_same_character,
+        sep_between,
+        replica_prefix,
+        nl_replace,
+        nl_replace_enabled,
+        wrap_with,
+        wrap_with_enabled,
+        limit,
+        limit_enabled,
+        use_character_names,
+        character_name_position,
+        character_name_prefix,
+        character_name_suffix,
+        include_image_bubbles,
+        include_hint_bubbles,
+        hint_wrap,
+        hint_wrap_enabled,
+        hint_extra_sep,
+        jinja2_enabled,
+        jinja2_template,
+    } = options;
+    let mut put = |key: &str, value: Value| {
+        obj.insert(key.to_string(), value);
+    };
+    put("method", Value::String(sort_method.key().to_string()));
+    put("source_mode", Value::String(source_mode.key().to_string()));
+    put("ignore_translated_lines", Value::Bool(*ignore_translated_lines));
+    put("merge_same_character", Value::Bool(*merge_same_character));
+    put("sep_same_character", Value::String(sep_same_character.clone()));
+    put("sep_between", Value::String(sep_between.clone()));
+    put("replica_prefix", Value::String(replica_prefix.clone()));
+    put("nl_replace", Value::String(stored_nl_replace(nl_replace)));
+    put("nl_replace_enabled", Value::Bool(*nl_replace_enabled));
+    put("wrap_with", Value::String(normalize_wrap_with(wrap_with)));
+    put("wrap_with_enabled", Value::Bool(*wrap_with_enabled));
+    // `usize` -> `u64` is lossless on every supported target; the fallback only documents
+    // the impossible case instead of truncating.
+    let limit = u64::try_from((*limit).clamp(LIMIT_MIN, LIMIT_MAX)).unwrap_or(u64::MAX);
+    put("limit", Value::Number(limit.into()));
+    put("limit_enabled", Value::Bool(*limit_enabled));
+    put("use_character_names", Value::Bool(*use_character_names));
+    put("character_name_position", Value::String(character_name_position.key().to_string()));
+    put("character_name_prefix", Value::String(character_name_prefix.clone()));
+    put("character_name_suffix", Value::String(character_name_suffix.clone()));
+    put("include_image_bubbles", Value::Bool(*include_image_bubbles));
+    put("include_hint_bubbles", Value::Bool(*include_hint_bubbles));
+    put("hint_wrap", Value::String(normalize_wrap_with(hint_wrap)));
+    put("hint_wrap_enabled", Value::Bool(*hint_wrap_enabled));
+    put("hint_extra_sep", Value::String(hint_extra_sep.clone()));
+    put("jinja2_enabled", Value::Bool(*jinja2_enabled));
+    put("jinja2_template", Value::String(jinja2_template.clone()));
+}
+
+/// Overlays the keys present in a composition JSON object onto `options`, then normalizes
+/// them. An absent key, or one of the wrong JSON type, leaves its field as it was; callers
+/// that want "absent = default" start from `CompositionPanelOptions::default()`. The ONE
+/// reader of the mapping written by [`write_composition_options_json`].
+pub fn read_composition_options_json(obj: &Map<String, Value>, options: &mut CompositionPanelOptions) {
+    let CompositionPanelOptions {
+        sort_method,
+        source_mode,
+        ignore_translated_lines,
+        merge_same_character,
+        sep_same_character,
+        sep_between,
+        replica_prefix,
+        nl_replace,
+        nl_replace_enabled,
+        wrap_with,
+        wrap_with_enabled,
+        limit,
+        limit_enabled,
+        use_character_names,
+        character_name_position,
+        character_name_prefix,
+        character_name_suffix,
+        include_image_bubbles,
+        include_hint_bubbles,
+        hint_wrap,
+        hint_wrap_enabled,
+        hint_extra_sep,
+        jinja2_enabled,
+        jinja2_template,
+    } = options;
+    let read_bool = |key: &str, field: &mut bool| {
+        if let Some(value) = obj.get(key).and_then(Value::as_bool) {
+            *field = value;
+        }
+    };
+    read_bool("ignore_translated_lines", ignore_translated_lines);
+    read_bool("merge_same_character", merge_same_character);
+    read_bool("nl_replace_enabled", nl_replace_enabled);
+    read_bool("wrap_with_enabled", wrap_with_enabled);
+    read_bool("limit_enabled", limit_enabled);
+    read_bool("use_character_names", use_character_names);
+    read_bool("include_image_bubbles", include_image_bubbles);
+    read_bool("include_hint_bubbles", include_hint_bubbles);
+    read_bool("hint_wrap_enabled", hint_wrap_enabled);
+    read_bool("jinja2_enabled", jinja2_enabled);
+    let read_string = |key: &str, field: &mut String| {
+        if let Some(value) = obj.get(key).and_then(Value::as_str) {
+            *field = value.to_string();
+        }
+    };
+    read_string("sep_same_character", sep_same_character);
+    read_string("sep_between", sep_between);
+    read_string("replica_prefix", replica_prefix);
+    read_string("nl_replace", nl_replace);
+    read_string("wrap_with", wrap_with);
+    read_string("hint_wrap", hint_wrap);
+    read_string("hint_extra_sep", hint_extra_sep);
+    read_string("character_name_prefix", character_name_prefix);
+    read_string("character_name_suffix", character_name_suffix);
+    read_string("jinja2_template", jinja2_template);
+    if let Some(raw) = obj.get("method").and_then(Value::as_str) {
+        *sort_method = CompositionSortMethod::from_key(raw);
+    }
+    if let Some(raw) = obj.get("source_mode").and_then(Value::as_str) {
+        *source_mode = CompositionSourceMode::from_key(raw);
+    }
+    if let Some(raw) = obj.get("character_name_position").and_then(Value::as_str) {
+        *character_name_position = CharacterNamePosition::from_key(raw);
+    }
+    if let Some(value) = obj.get("limit").and_then(Value::as_u64) {
+        // Out of `usize` range can only mean "huge"; `normalize` clamps it to the maximum.
+        *limit = usize::try_from(value).unwrap_or(LIMIT_MAX);
+    }
+    options.normalize();
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -307,17 +529,24 @@ impl CompositionPanelState {
     }
 }
 
+/// What one frame of the composition panel asks of its host.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CompositionPanelActions {
+    /// The title's `composition` section changed — an option, or the selected preset — and
+    /// must be saved.
     pub options_changed: bool,
+    /// The composed text must be rebuilt from the (possibly changed) options.
     pub request_rebuild: bool,
 }
 
+/// Draws the panel: the «Текст» / «Параметры» sub-tabs over `options`. `presets` is the
+/// app-wide composition preset store, drawn at the top of «Параметры».
 pub fn draw_composition_panel(
     ui: &mut egui::Ui,
     project: &ProjectData,
     state: &mut CompositionPanelState,
     options: &mut CompositionPanelOptions,
+    presets: &mut CompositionPresets,
 ) -> CompositionPanelActions {
     let mut actions = CompositionPanelActions::default();
     options.normalize();
@@ -340,7 +569,7 @@ pub fn draw_composition_panel(
 
     match state.tab {
         CompositionTab::Text => draw_text_tab(ui, project, state, options, &mut actions),
-        CompositionTab::Params => draw_params_tab(ui, state, options, &mut actions),
+        CompositionTab::Params => draw_params_tab(ui, state, options, presets, &mut actions),
     }
 
     actions
@@ -429,12 +658,20 @@ fn draw_text_tab(
     }
 }
 
+/// The «Параметры» sub-tab: the preset picker first — OUTSIDE the MiniJinja-disabled scope,
+/// because a preset also switches `jinja2_enabled` — then every option.
 fn draw_params_tab(
     ui: &mut egui::Ui,
     state: &mut CompositionPanelState,
     options: &mut CompositionPanelOptions,
+    presets: &mut CompositionPresets,
     actions: &mut CompositionPanelActions,
 ) {
+    let preset_actions = presets.draw(ui, options);
+    actions.options_changed |= preset_actions.options_changed;
+    actions.request_rebuild |= preset_actions.request_rebuild;
+    ui.separator();
+
     let mut changed = false;
     let use_jinja = options.jinja2_enabled;
 
@@ -535,6 +772,13 @@ fn draw_params_tab(
                 t!("translation.common.use_character_names_label"),
             )
             .changed();
+        // The name layout belongs to the checkbox above: shown only while names are used, and
+        // indented so it reads as its sub-options.
+        if options.use_character_names {
+            ui.indent("translation.composition.character_name_options", |ui| {
+                changed |= draw_character_name_options(ui, options);
+            });
+        }
         changed |= ui
             .checkbox(
                 &mut options.merge_same_character,
@@ -639,6 +883,51 @@ fn draw_params_tab(
         actions.options_changed = true;
         actions.request_rebuild = true;
     }
+}
+
+/// Sub-options of «Использовать имена персонажей»: the before / after switch and the name's
+/// prefix and suffix. Returns whether any of them changed this frame.
+fn draw_character_name_options(ui: &mut egui::Ui, options: &mut CompositionPanelOptions) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        changed |= ui
+            .selectable_value(
+                &mut options.character_name_position,
+                CharacterNamePosition::Before,
+                t!("translation.composition.name_before_replica_label"),
+            )
+            .changed();
+        changed |= ui
+            .selectable_value(
+                &mut options.character_name_position,
+                CharacterNamePosition::After,
+                t!("translation.composition.name_after_replica_label"),
+            )
+            .changed();
+    });
+    ui.horizontal(|ui| {
+        ui.label(t!("translation.composition.name_prefix_label"));
+        changed |= ui
+            .add(
+                egui::TextEdit::singleline(&mut options.character_name_prefix)
+                    .id_salt("translation.composition.name_prefix_label")
+                    .desired_width(f32::INFINITY),
+            )
+            .on_hover_text(t!("translation.composition.name_affix_hint"))
+            .changed();
+    });
+    ui.horizontal(|ui| {
+        ui.label(t!("translation.composition.name_suffix_label"));
+        changed |= ui
+            .add(
+                egui::TextEdit::singleline(&mut options.character_name_suffix)
+                    .id_salt("translation.composition.name_suffix_label")
+                    .desired_width(f32::INFINITY),
+            )
+            .on_hover_text(t!("translation.composition.name_affix_hint"))
+            .changed();
+    });
+    changed
 }
 
 fn compose_plain(project: &ProjectData, options: &CompositionPanelOptions) -> String {
@@ -811,12 +1100,19 @@ fn compose_plain(project: &ProjectData, options: &CompositionPanelOptions) -> St
         });
     }
 
+    let name_prefix = decode_separator_text(&options.character_name_prefix);
+    let name_suffix = decode_separator_text(&options.character_name_suffix);
     let result_lines = emit_composition_items(
         &items,
         EmitParams {
             sep_between: &sep_between,
             sep_same_character: &sep_same_character,
             use_character_names: options.use_character_names,
+            name_format: CharacterNameFormat {
+                position: options.character_name_position,
+                prefix: &name_prefix,
+                suffix: &name_suffix,
+            },
             merge_same_character: options.merge_same_character,
             limit_enabled: options.limit_enabled,
             limit: options.limit,
@@ -904,9 +1200,36 @@ struct EmitParams<'a> {
     sep_between: &'a str,
     sep_same_character: &'a str,
     use_character_names: bool,
+    /// How a character name is attached to a replica or a merged group; used only while
+    /// `use_character_names` is on.
+    name_format: CharacterNameFormat<'a>,
     merge_same_character: bool,
     limit_enabled: bool,
     limit: usize,
+}
+
+/// Compose-time form of the character-name options: escapes already decoded, borrowed so
+/// [`EmitParams`] stays `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CharacterNameFormat<'a> {
+    position: CharacterNamePosition,
+    prefix: &'a str,
+    suffix: &'a str,
+}
+
+impl CharacterNameFormat<'_> {
+    /// Joins `text` (one replica line or a merged group) with `name`, adding nothing but the
+    /// prefix and suffix: `Before` -> `{prefix}{name}{suffix}{text}`, `After` ->
+    /// `{text}{prefix}{name}{suffix}`. Any separator between the text and the name is part of
+    /// the prefix (`After`) or the suffix (`Before`).
+    #[must_use]
+    fn attach(&self, text: &str, name: &str) -> String {
+        let Self { position, prefix, suffix } = *self;
+        match position {
+            CharacterNamePosition::Before => format!("{prefix}{name}{suffix}{text}"),
+            CharacterNamePosition::After => format!("{text}{prefix}{name}{suffix}"),
+        }
+    }
 }
 
 /// Emits `items` into the final list of composition entries, applying the character limit,
@@ -957,7 +1280,7 @@ fn emit_composition_items(items: &[ComposedItem], params: EmitParams<'_>) -> Vec
                     && let Some(prev) = prev_character.take()
                 {
                     let group_text =
-                        format!("{} - {prev}", current_group.join(params.sep_same_character));
+                        params.name_format.attach(&current_group.join(params.sep_same_character), &prev);
                     current_group.clear();
                     if !append_result_item(
                         &mut result_lines,
@@ -1004,7 +1327,7 @@ fn emit_composition_items(items: &[ComposedItem], params: EmitParams<'_>) -> Vec
                 }
 
                 if !params.merge_same_character {
-                    let single_line = format!("{line} - {character}");
+                    let single_line = params.name_format.attach(line, character);
                     if !admit_replica_with_hints(
                         &mut result_lines,
                         &mut current_length,
@@ -1027,7 +1350,7 @@ fn emit_composition_items(items: &[ComposedItem], params: EmitParams<'_>) -> Vec
                         None
                     } else {
                         prev_character.as_ref().map(|prev| {
-                            format!("{} - {prev}", current_group.join(params.sep_same_character))
+                            params.name_format.attach(&current_group.join(params.sep_same_character), prev)
                         })
                     };
                     let fits = {
@@ -1076,7 +1399,7 @@ fn emit_composition_items(items: &[ComposedItem], params: EmitParams<'_>) -> Vec
                     }
                     Some(prev) => {
                         let group_text =
-                            format!("{} - {prev}", current_group.join(params.sep_same_character));
+                            params.name_format.attach(&current_group.join(params.sep_same_character), prev);
                         if !append_result_item(
                             &mut result_lines,
                             &mut current_length,
@@ -1100,7 +1423,7 @@ fn emit_composition_items(items: &[ComposedItem], params: EmitParams<'_>) -> Vec
         && !current_group.is_empty()
         && let Some(prev) = prev_character
     {
-        let group_text = format!("{} - {prev}", current_group.join(params.sep_same_character));
+        let group_text = params.name_format.attach(&current_group.join(params.sep_same_character), &prev);
         force_append_result_item(
             &mut result_lines,
             &mut current_length,
@@ -1737,15 +2060,19 @@ fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposedItem, CompositionPanelOptions, CompositionSourceMode, EmitParams, compose_plain,
+        CharacterNameFormat, CharacterNamePosition, ComposedItem, CompositionPanelOptions, CompositionSortMethod, CompositionSourceMode, EmitParams, compose_plain,
         ExportFormat, emit_composition_items, image_bubble_area_translations, is_hint_bubble,
-        is_image_bubble, write_export,
+        is_image_bubble, read_composition_options_json, write_composition_options_json, write_export,
     };
     use ms_platform::file_dialog::SaveTarget;
     use ms_project::{Bubble, CanvasSettings, ProjectData, ProjectPaths};
     use serde_json::{Map, Value, json};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    /// The name format the default options produce: the historical `"{line} - {name}"`.
+    const HISTORICAL_NAME_FORMAT: CharacterNameFormat<'static> =
+        CharacterNameFormat { position: CharacterNamePosition::After, prefix: " - ", suffix: "" };
 
     /// Emission settings for the tests: the default separators, an optional character limit.
     fn params(limit: Option<usize>, use_character_names: bool, merge: bool) -> EmitParams<'static> {
@@ -1763,6 +2090,7 @@ mod tests {
             sep_between,
             sep_same_character: "\n",
             use_character_names,
+            name_format: HISTORICAL_NAME_FORMAT,
             merge_same_character: merge,
             limit_enabled: limit.is_some(),
             limit: limit.unwrap_or(0),
@@ -1791,6 +2119,57 @@ mod tests {
     /// An ordinary text bubble that exists in reading order but emits nothing.
     fn barrier() -> ComposedItem {
         ComposedItem::DroppedReplica
+    }
+
+    /// Write + read over the defaults reproduces `stored_form` exactly, for edge values the
+    /// codec rewrites (empty `nl_replace`, short wrap pairs, an out-of-range limit) and for
+    /// every non-default field — so a reloaded title or preset never shows a false difference.
+    #[test]
+    fn codec_round_trip_equals_stored_form() {
+        let edge = CompositionPanelOptions {
+            sort_method: CompositionSortMethod::Order,
+            source_mode: CompositionSourceMode::Translation,
+            ignore_translated_lines: false,
+            merge_same_character: false,
+            sep_same_character: "|".to_string(),
+            sep_between: "\\t".to_string(),
+            replica_prefix: "- ".to_string(),
+            nl_replace: String::new(),
+            nl_replace_enabled: false,
+            wrap_with: "[".to_string(),
+            wrap_with_enabled: false,
+            limit: 5,
+            limit_enabled: false,
+            use_character_names: false,
+            character_name_position: CharacterNamePosition::Before,
+            character_name_prefix: String::new(),
+            character_name_suffix: "\\n".to_string(),
+            include_image_bubbles: true,
+            include_hint_bubbles: false,
+            hint_wrap: String::new(),
+            hint_wrap_enabled: false,
+            hint_extra_sep: "\\n".to_string(),
+            jinja2_enabled: true,
+            jinja2_template: "{{ bubbles }}".to_string(),
+        };
+        for options in [CompositionPanelOptions::default(), edge] {
+            let mut obj = Map::new();
+            write_composition_options_json(&mut obj, &options);
+            let mut read_back = CompositionPanelOptions::default();
+            read_composition_options_json(&obj, &mut read_back);
+            assert_eq!(read_back, options.stored_form());
+            assert_eq!(read_back.stored_form(), read_back, "stored_form is idempotent");
+        }
+    }
+
+    /// Keys the codec does not own (the title's selected preset) survive a write.
+    #[test]
+    fn codec_write_keeps_foreign_keys() {
+        let mut obj = Map::new();
+        obj.insert("preset".to_string(), Value::String("mine".to_string()));
+        write_composition_options_json(&mut obj, &CompositionPanelOptions::default());
+        assert_eq!(obj.get("preset"), Some(&Value::String("mine".to_string())));
+        assert_eq!(obj.get("include_image_bubbles"), Some(&Value::Bool(false)));
     }
 
     #[test]
@@ -2276,5 +2655,113 @@ mod tests {
         std::fs::write(&blocker, b"x").expect("blocker file");
         let result = write_export(ExportFormat::Txt, SaveTarget::for_test(blocker.join("out.txt")), "x");
         assert!(result.is_err());
+    }
+
+    fn named_bubble(id: i64, img_v: f32, original: &str, character: &str) -> Bubble {
+        let mut bubble = text_bubble(id, img_v, original, "");
+        bubble.extra.insert("character_name".to_string(), Value::String(character.to_string()));
+        bubble
+    }
+
+    /// Two replicas of Ann, then one of Bob, all untranslated.
+    fn named_project() -> ProjectData {
+        test_project(vec![named_bubble(1, 0.1, "a1", "Ann"), named_bubble(2, 0.2, "a2", "Ann"), named_bubble(3, 0.3, "b1", "Bob")])
+    }
+
+    /// The default options keep the historical name layout byte for byte (golden strings of
+    /// the composer before the name options existed), merged and unmerged.
+    #[test]
+    fn default_name_options_reproduce_the_historical_output() {
+        let project = named_project();
+        let options = CompositionPanelOptions::default();
+        assert_eq!(compose_plain(&project, &options), "`a1`\n`a2` - Ann\n\n`b1` - Bob");
+        let unmerged = CompositionPanelOptions { merge_same_character: false, ..CompositionPanelOptions::default() };
+        assert_eq!(compose_plain(&project, &unmerged), "`a1` - Ann\n\n`a2` - Ann\n\n`b1` - Bob");
+    }
+
+    /// `Before` puts `{prefix}{name}{suffix}` in front of the line (or the merged group) with no
+    /// separator of its own; `After` appends it; escapes in both fields are decoded.
+    #[test]
+    fn name_position_prefix_and_suffix_shape_each_entry() {
+        let project = named_project();
+        let before = CompositionPanelOptions {
+            character_name_position: CharacterNamePosition::Before,
+            character_name_prefix: "[".to_string(),
+            character_name_suffix: "]: ".to_string(),
+            wrap_with_enabled: false,
+            ..CompositionPanelOptions::default()
+        };
+        assert_eq!(compose_plain(&project, &before), "[Ann]: a1\na2\n\n[Bob]: b1");
+        let before_unmerged = CompositionPanelOptions { merge_same_character: false, ..before.clone() };
+        assert_eq!(compose_plain(&project, &before_unmerged), "[Ann]: a1\n\n[Ann]: a2\n\n[Bob]: b1");
+
+        let after = CompositionPanelOptions {
+            character_name_position: CharacterNamePosition::After,
+            character_name_prefix: "\\n— ".to_string(),
+            character_name_suffix: ".".to_string(),
+            wrap_with_enabled: false,
+            merge_same_character: false,
+            ..CompositionPanelOptions::default()
+        };
+        assert_eq!(compose_plain(&project, &after), "a1\n— Ann.\n\na2\n— Ann.\n\nb1\n— Bob.");
+    }
+
+    /// With names off the name options change nothing.
+    #[test]
+    fn name_options_are_ignored_without_character_names() {
+        let project = named_project();
+        let options = CompositionPanelOptions {
+            use_character_names: false,
+            character_name_position: CharacterNamePosition::Before,
+            character_name_prefix: "X".to_string(),
+            character_name_suffix: "Y".to_string(),
+            wrap_with_enabled: false,
+            ..CompositionPanelOptions::default()
+        };
+        assert_eq!(compose_plain(&project, &options), "a1\n\na2\n\nb1");
+    }
+
+    /// A settings object or preset written before the name options existed reads as the
+    /// defaults; an unknown position reads as `After`; whitespace-only affixes survive verbatim,
+    /// so a reloaded preset never shows a false «unsaved».
+    #[test]
+    fn codec_name_options_missing_unknown_and_whitespace() {
+        let mut obj = Map::new();
+        write_composition_options_json(&mut obj, &CompositionPanelOptions::default());
+        for key in ["character_name_position", "character_name_prefix", "character_name_suffix"] {
+            assert!(obj.remove(key).is_some(), "{key} is written");
+        }
+        let mut read_back = CompositionPanelOptions::default();
+        read_composition_options_json(&obj, &mut read_back);
+        assert_eq!(read_back, CompositionPanelOptions::default());
+
+        obj.insert("character_name_position".to_string(), json!("sideways"));
+        let mut read_back = CompositionPanelOptions { character_name_position: CharacterNamePosition::Before, ..CompositionPanelOptions::default() };
+        read_composition_options_json(&obj, &mut read_back);
+        assert_eq!(read_back.character_name_position, CharacterNamePosition::After);
+
+        let spaced = CompositionPanelOptions {
+            character_name_position: CharacterNamePosition::Before,
+            character_name_prefix: " ".to_string(),
+            character_name_suffix: String::new(),
+            ..CompositionPanelOptions::default()
+        };
+        let mut obj = Map::new();
+        write_composition_options_json(&mut obj, &spaced);
+        let mut read_back = CompositionPanelOptions::default();
+        read_composition_options_json(&obj, &mut read_back);
+        assert_eq!(read_back, spaced.stored_form());
+        assert_eq!(read_back.stored_form(), spaced.stored_form(), "preset comparison form is unchanged by a reload");
+    }
+
+    /// `ms_config`'s project defaults tree reads back as `CompositionPanelOptions::default()`,
+    /// so a title without a `composition` section and a fresh panel agree.
+    #[test]
+    fn config_defaults_tree_matches_the_option_defaults() {
+        let defaults = ms_config::project_config_defaults();
+        let obj = defaults.get("composition").and_then(Value::as_object).expect("composition defaults section");
+        let mut read_back = CompositionPanelOptions { character_name_prefix: String::new(), ..CompositionPanelOptions::default() };
+        read_composition_options_json(obj, &mut read_back);
+        assert_eq!(read_back, CompositionPanelOptions::default().stored_form());
     }
 }

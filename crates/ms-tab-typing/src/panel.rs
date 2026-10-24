@@ -172,7 +172,7 @@ use crate::render_next::types::{
     VerticalLineDirection,
 };
 use ms_widgets::{
-    ColorPresets, SeedSpinBox, TabExtras, TextEditPlus, TextEditPlusTextColor,
+    ColorPresets, PresetPickerState, SeedSpinBox, TabExtras, TextEditPlus, TextEditPlusTextColor,
     ViewportColorSelector, WheelComboBox, WheelSlider, WheelSpinBox, random_seed,
 };
 use cosmic_text::{Attrs, FontSystem, Metrics, fontdb};
@@ -2466,11 +2466,13 @@ struct TypingCreatePanelState {
     /// preset's identity (it is the `presets_by_name` key), so renaming one is a
     /// remove-then-insert (`create_presets::save_current_preset`).
     selected_preset_name: Option<String>,
-    /// RENAME buffer of the selected global preset, kept in sync with `selected_preset_name`
-    /// on every selection change (apply, create, delete, «Нет»). Meaningless — and the text
-    /// box drawing it is disabled — while no preset is selected: there is nothing to rename
-    /// then, and this is not a "name the next preset" box (creation names itself).
-    preset_name_input: String,
+    /// UI state of the global-preset block (`ms_widgets::PresetPicker`): the RENAME buffer of
+    /// the selected global preset and its armed «Удалить» button. Re-synced with
+    /// `PresetPickerState::reset_to` on every selection change (apply, create, save, delete,
+    /// «Нет»). The buffer is meaningless — and its text box disabled — while no preset is
+    /// selected: there is nothing to rename then, and this is not a "name the next preset" box
+    /// (creation names itself). The arm auto-clears when the pointer leaves the button.
+    global_preset_picker: PresetPickerState,
     /// Whether the selected global preset carries changes that are NOT on disk yet, driving
     /// the section's unsaved-changes warning.
     ///
@@ -2480,13 +2482,9 @@ struct TypingCreatePanelState {
     /// raised at the ONE parameter-edit dispatch (`local_presets::store_current_params_snapshot`)
     /// and by the structural local-preset operations, and cleared only when a preset is
     /// created, saved, applied or deselected. A PENDING RENAME is deliberately NOT recorded
-    /// here — it is a plain string compare of `preset_name_input`, see
+    /// here — it is a plain string compare of the picker's rename buffer, see
     /// `create_presets::selected_preset_has_unsaved_changes`.
     selected_preset_dirty: bool,
-    /// Whether the global-preset section's «Удалить» button is ARMED, i.e. the user clicked
-    /// it once and the next plain click deletes the selected preset. Cleared by any
-    /// selection change and as soon as the pointer leaves the armed button.
-    preset_delete_armed: bool,
     /// Who owns the next parameter edit: the selected FONT or the selected LOCAL PRESET.
     /// Create panel only — the edit panel is constructed with the default [`ParamIdentityMode::Font`]
     /// and never offers the switch. Persisted in `user_config.TextTab.param_identity_mode`.

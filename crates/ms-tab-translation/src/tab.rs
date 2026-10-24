@@ -213,7 +213,8 @@ Key TranslationTabState field groups:
   `ocr_last_panel_engine`/`ocr_last_health_check_request_s`,
   `ai_backend_health*`,
   `mt_controller`, `mt_panel_options`, `text_detector_controller`,
-  `text_detector_options`, `composition_panel_options`, `composition_panel_state`.
+  `text_detector_options`, `composition_panel_options`, `composition_panel_state`,
+  `composition_presets` (app-wide presets; per-title selection).
 - Detector runtime/cache: `text_detector_results`, `text_detector_mask_textures`,
   shared `text_mask_model`, `text_mask_synced_revision`,
   `text_detector_status`, `text_detector_status_severity`, `text_detector_progress`,
@@ -287,9 +288,10 @@ use crate::panels::bubbles::{
     footer_state_for_bubble,
 };
 use crate::panels::composition::{
-    CompositionPanelOptions, CompositionPanelState, CompositionSortMethod, CompositionSourceMode,
-    compose_translation_text, normalize_wrap_with,
+    CompositionPanelOptions, CompositionPanelState, compose_translation_text, read_composition_options_json,
+    write_composition_options_json,
 };
+use crate::panels::composition_presets::{CompositionPresetRef, CompositionPresets, read_selected_preset, write_selected_preset};
 use crate::panels::machine_translation::{
     MtPanelOptions, MtPanelProgress, MtPanelTab, MtStopNotice,
 };
@@ -518,6 +520,8 @@ struct TranslationSettingsSaveRequest {
     ocr_options: OcrPanelOptions,
     mt_options: MtPanelOptions,
     composition_options: CompositionPanelOptions,
+    /// The selected composition preset, saved as `composition.preset` (`None` removes it).
+    composition_preset: Option<CompositionPresetRef>,
     text_detector_options: TextDetectorPanelOptions,
     neurolate: NeurolateSettings,
 }
@@ -707,6 +711,9 @@ pub struct TranslationTabState {
     bubbles_panel: BubblesPanelState,
     composition_panel_options: CompositionPanelOptions,
     composition_panel_state: CompositionPanelState,
+    /// App-wide composition presets (seeded by `seed_composition_presets`); the selection is
+    /// per title, saved with the `composition` section.
+    composition_presets: CompositionPresets,
     composition_rebuild_requested: bool,
     /// This frame's binding texts (`TranslationInputLabels::from_registry`), set by the host.
     input_labels: TranslationInputLabels,
@@ -855,6 +862,7 @@ impl TranslationTabState {
             bubbles_panel: BubblesPanelState::default(),
             composition_panel_options: CompositionPanelOptions::default(),
             composition_panel_state: CompositionPanelState::default(),
+            composition_presets: CompositionPresets::default(),
             composition_rebuild_requested: true,
             input_labels: TranslationInputLabels::default(),
             input_frame: None,
@@ -912,6 +920,15 @@ impl TranslationTabState {
     }
 }
 
+impl TranslationTabState {
+    /// Seeds the app-wide composition presets from the pre-read `user_config` root (no file
+    /// I/O); later preset operations persist to `preset_store` off the GUI thread (`None`: kept in
+    /// memory, the form every test construction uses). Called once by the host when the tab is built.
+    pub(crate) fn seed_composition_presets(&mut self, user_settings: &Value, preset_store: Option<PathBuf>) {
+        self.composition_presets = CompositionPresets::from_user_settings(user_settings, preset_store);
+    }
+}
+
 impl Drop for TranslationTabState {
     fn drop(&mut self) {
         let _ = self.settings_save_tx.send(TranslationSettingsSaveRequest {
@@ -919,6 +936,7 @@ impl Drop for TranslationTabState {
             ocr_options: OcrPanelOptions::default(),
             mt_options: MtPanelOptions::default(),
             composition_options: CompositionPanelOptions::default(),
+            composition_preset: None,
             text_detector_options: TextDetectorPanelOptions::default(),
             neurolate: NeurolateSettings::default(),
         });
@@ -5041,87 +5059,13 @@ impl TranslationTabState {
             return;
         }
 
-        if let Some(comp_obj) = project
-            .settings_data
-            .get("composition")
-            .and_then(Value::as_object)
-        {
-            if let Some(raw_method) = comp_obj.get("method").and_then(Value::as_str) {
-                self.composition_panel_options.sort_method =
-                    CompositionSortMethod::from_key(raw_method);
-            }
-            if let Some(raw_source) = comp_obj.get("source_mode").and_then(Value::as_str) {
-                self.composition_panel_options.source_mode =
-                    CompositionSourceMode::from_key(raw_source);
-            }
-            if let Some(value) = comp_obj
-                .get("ignore_translated_lines")
-                .and_then(Value::as_bool)
-            {
-                self.composition_panel_options.ignore_translated_lines = value;
-            }
-            if let Some(value) = comp_obj
-                .get("merge_same_character")
-                .and_then(Value::as_bool)
-            {
-                self.composition_panel_options.merge_same_character = value;
-            }
-            if let Some(value) = comp_obj.get("sep_same_character").and_then(Value::as_str) {
-                self.composition_panel_options.sep_same_character = value.to_string();
-            }
-            if let Some(value) = comp_obj.get("sep_between").and_then(Value::as_str) {
-                self.composition_panel_options.sep_between = value.to_string();
-            }
-            if let Some(value) = comp_obj.get("replica_prefix").and_then(Value::as_str) {
-                self.composition_panel_options.replica_prefix = value.to_string();
-            }
-            if let Some(value) = comp_obj.get("nl_replace").and_then(Value::as_str) {
-                self.composition_panel_options.nl_replace = value.to_string();
-            }
-            if let Some(value) = comp_obj.get("nl_replace_enabled").and_then(Value::as_bool) {
-                self.composition_panel_options.nl_replace_enabled = value;
-            }
-            if let Some(value) = comp_obj.get("wrap_with").and_then(Value::as_str) {
-                self.composition_panel_options.wrap_with = normalize_wrap_with(value);
-            }
-            if let Some(value) = comp_obj.get("wrap_with_enabled").and_then(Value::as_bool) {
-                self.composition_panel_options.wrap_with_enabled = value;
-            }
-            if let Some(value) = comp_obj.get("limit").and_then(Value::as_u64) {
-                self.composition_panel_options.limit = value as usize;
-            }
-            if let Some(value) = comp_obj.get("limit_enabled").and_then(Value::as_bool) {
-                self.composition_panel_options.limit_enabled = value;
-            }
-            if let Some(value) = comp_obj.get("use_character_names").and_then(Value::as_bool) {
-                self.composition_panel_options.use_character_names = value;
-            }
-            if let Some(value) = comp_obj
-                .get("include_image_bubbles")
-                .and_then(Value::as_bool)
-            {
-                self.composition_panel_options.include_image_bubbles = value;
-            }
-            if let Some(value) = comp_obj.get("include_hint_bubbles").and_then(Value::as_bool) {
-                self.composition_panel_options.include_hint_bubbles = value;
-            }
-            if let Some(value) = comp_obj.get("hint_wrap").and_then(Value::as_str) {
-                self.composition_panel_options.hint_wrap = normalize_wrap_with(value);
-            }
-            if let Some(value) = comp_obj.get("hint_wrap_enabled").and_then(Value::as_bool) {
-                self.composition_panel_options.hint_wrap_enabled = value;
-            }
-            if let Some(value) = comp_obj.get("hint_extra_sep").and_then(Value::as_str) {
-                self.composition_panel_options.hint_extra_sep = value.to_string();
-            }
-            if let Some(value) = comp_obj.get("jinja2_enabled").and_then(Value::as_bool) {
-                self.composition_panel_options.jinja2_enabled = value;
-            }
-            if let Some(value) = comp_obj.get("jinja2_template").and_then(Value::as_str) {
-                self.composition_panel_options.jinja2_template = value.to_string();
-            }
+        // Absent keys keep their current values (the codec overlays); the selected preset is
+        // re-selected without re-applying it, the title's own options win.
+        let composition = project.settings_data.get("composition").and_then(Value::as_object);
+        if let Some(comp_obj) = composition {
+            read_composition_options_json(comp_obj, &mut self.composition_panel_options);
         }
-
+        self.composition_presets.restore_selection(composition.and_then(read_selected_preset));
         self.composition_panel_options.normalize();
         self.composition_settings_loaded_for = Some(settings_path);
         self.composition_settings_dirty = false;
@@ -5191,6 +5135,7 @@ impl TranslationTabState {
             ocr_options: self.ocr_panel_options.clone(),
             mt_options: self.mt_panel_options.clone(),
             composition_options: self.composition_panel_options.clone(),
+            composition_preset: self.composition_presets.selection().cloned(),
             text_detector_options: self.text_detector_options.clone(),
             neurolate: self.neurolate_settings,
         };
@@ -6281,6 +6226,7 @@ fn spawn_translation_settings_saver_thread()
                 &latest.ocr_options,
                 &latest.mt_options,
                 &latest.composition_options,
+                latest.composition_preset.as_ref(),
                 &latest.text_detector_options,
                 &latest.neurolate,
             ) {
@@ -6299,6 +6245,8 @@ fn spawn_translation_settings_saver_thread()
 /// Persists the translation tab's four sections (`OCR`, `machine_translation`, `composition`,
 /// `text_detector`) into the title `settings.json` through the serialized
 /// `ms_docstore::update`, so concurrent writers of other keys are never reverted.
+/// `composition_preset` is the selected composition preset, written as `composition.preset`
+/// (`None` removes the key).
 ///
 /// # Errors
 /// Returns a technical message when the existing file cannot be read, does not parse, or
@@ -6309,6 +6257,7 @@ fn save_translation_settings_to_project_file(
     ocr_options: &OcrPanelOptions,
     mt_options: &MtPanelOptions,
     composition_options: &CompositionPanelOptions,
+    composition_preset: Option<&CompositionPresetRef>,
     text_detector_options: &TextDetectorPanelOptions,
     neurolate: &NeurolateSettings,
 ) -> Result<(), String> {
@@ -6322,6 +6271,11 @@ fn save_translation_settings_to_project_file(
             return Err(format!("settings root of '{}' is not a JSON object", settings_file.display()));
         };
         apply_translation_settings_sections(root_obj, ocr_options, mt_options, composition_options, text_detector_options, neurolate);
+        // `apply_translation_settings_sections` always leaves `composition` an object; the
+        // selected preset is written next to the options it was chosen for.
+        if let Some(composition_obj) = root_obj.get_mut("composition").and_then(Value::as_object_mut) {
+            write_selected_preset(composition_obj, composition_preset);
+        }
         Ok(())
     })
     .map_err(|err| format!("failed to save translation settings '{}': {err}", settings_file.display()))
@@ -6641,94 +6595,7 @@ fn apply_translation_settings_sections(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    composition_obj.insert(
-        "method".to_string(),
-        Value::String(composition_options.sort_method.key().to_string()),
-    );
-    composition_obj.insert(
-        "source_mode".to_string(),
-        Value::String(composition_options.source_mode.key().to_string()),
-    );
-    composition_obj.insert(
-        "ignore_translated_lines".to_string(),
-        Value::Bool(composition_options.ignore_translated_lines),
-    );
-    composition_obj.insert(
-        "merge_same_character".to_string(),
-        Value::Bool(composition_options.merge_same_character),
-    );
-    composition_obj.insert(
-        "sep_same_character".to_string(),
-        Value::String(composition_options.sep_same_character.clone()),
-    );
-    composition_obj.insert(
-        "sep_between".to_string(),
-        Value::String(composition_options.sep_between.clone()),
-    );
-    composition_obj.insert(
-        "replica_prefix".to_string(),
-        Value::String(composition_options.replica_prefix.clone()),
-    );
-    composition_obj.insert(
-        "nl_replace".to_string(),
-        Value::String(if composition_options.nl_replace.is_empty() {
-            " ".to_string()
-        } else {
-            composition_options.nl_replace.clone()
-        }),
-    );
-    composition_obj.insert(
-        "nl_replace_enabled".to_string(),
-        Value::Bool(composition_options.nl_replace_enabled),
-    );
-    composition_obj.insert(
-        "wrap_with".to_string(),
-        Value::String(normalize_wrap_with(&composition_options.wrap_with)),
-    );
-    composition_obj.insert(
-        "wrap_with_enabled".to_string(),
-        Value::Bool(composition_options.wrap_with_enabled),
-    );
-    composition_obj.insert(
-        "limit".to_string(),
-        Value::Number((composition_options.limit.clamp(100, 100_000) as u64).into()),
-    );
-    composition_obj.insert(
-        "limit_enabled".to_string(),
-        Value::Bool(composition_options.limit_enabled),
-    );
-    composition_obj.insert(
-        "use_character_names".to_string(),
-        Value::Bool(composition_options.use_character_names),
-    );
-    composition_obj.insert(
-        "include_image_bubbles".to_string(),
-        Value::Bool(composition_options.include_image_bubbles),
-    );
-    composition_obj.insert(
-        "include_hint_bubbles".to_string(),
-        Value::Bool(composition_options.include_hint_bubbles),
-    );
-    composition_obj.insert(
-        "hint_wrap".to_string(),
-        Value::String(normalize_wrap_with(&composition_options.hint_wrap)),
-    );
-    composition_obj.insert(
-        "hint_wrap_enabled".to_string(),
-        Value::Bool(composition_options.hint_wrap_enabled),
-    );
-    composition_obj.insert(
-        "hint_extra_sep".to_string(),
-        Value::String(composition_options.hint_extra_sep.clone()),
-    );
-    composition_obj.insert(
-        "jinja2_enabled".to_string(),
-        Value::Bool(composition_options.jinja2_enabled),
-    );
-    composition_obj.insert(
-        "jinja2_template".to_string(),
-        Value::String(composition_options.jinja2_template.clone()),
-    );
+    write_composition_options_json(&mut composition_obj, composition_options);
     root_obj.insert("composition".to_string(), Value::Object(composition_obj));
 
     let mut text_detector_obj = root_obj
@@ -7308,6 +7175,7 @@ mod settings_persistence_tests {
             &OcrPanelOptions::default(),
             &MtPanelOptions::default(),
             &CompositionPanelOptions::default(),
+            None,
             &TextDetectorPanelOptions::default(),
             &crate::neurolate::NeurolateSettings::default(),
         )

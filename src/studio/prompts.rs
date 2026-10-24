@@ -18,9 +18,9 @@ Key functions:
 
 Notes:
 - Unlike `shutdown.rs` / `incoming_open.rs`, these are owned structs with a narrow API: they do
-  not reach `StudioApp`'s fields. Applying a comic type (`StudioApp::apply_comic_type_preset`)
-  stays in `studio.rs` because it writes the project, the canvas, both shared models and the
-  Settings tab; it reports back through `fail` / `resolve`.
+  not reach `StudioApp`'s fields. Applying a comic type (`StudioApp::apply_comic_type_choice`)
+  stays in `studio.rs` because it writes the in-memory project and drives the Settings tab (which
+  applies the kind's layout preset to the shared models); it reports back through `fail` / `resolve`.
 - The device prompt only sends `AiBackendProbeCommand`s; it never blocks or waits for the
   backend. It closes itself once the pushed health snapshot no longer asks for a selection.
 - The two device pickers are `WheelComboBox`es (project rule: no stock `egui::ComboBox`) with a

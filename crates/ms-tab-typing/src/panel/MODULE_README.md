@@ -433,15 +433,19 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   font's key; that fan-out turned 67 real profiles into 162 stored ones (87 % of
   `user_config.json`) and made a preset claim parameters for fonts it was never configured for.
 - THE PANEL EDITS THE SELECTED PRESET; IT DOES NOT "SAVE A NAME".
-  - The combo lists «Нет», an ACTION row that CREATES a preset, then the sorted names.
+  - The block is the shared `ms_widgets::PresetPicker` (drawn by
+    `create_presets::draw_create_presets_body`); the widget owns the rows, the wheel rule, the
+    no-op filter, the popup-height id bucket, the armed delete and the warning line, and this
+    panel owns what each `PresetPickerAction` means. The combo lists «Нет», an ACTION row that
+    CREATES a preset, then the sorted names.
     `create_global_preset` names the preset itself (`typing.presets.default_name`, the LOWEST
     free 1-based index, so an index freed by a rename or a deletion is reused) and inherits
     `capture_current_preset`, so creation never depends on the name box.
-    **THE WHEEL MUST NEVER REACH THE CREATE ROW** (`global_preset_wheel_target` cycles «Нет» +
+    **THE WHEEL MUST NEVER REACH THE CREATE ROW** (the widget's `wheel_target` cycles «Нет» +
     the real presets only) — the create row exists in the popup alone, or a stray scroll over
     the closed combo would mint presets. Same rule and same shape as the local-preset combo.
     The popup's TOTAL ROW COUNT is folded into its `id_salt`
-    (`create_presets::global_preset_popup_id_bucket`) for the reason spelled out for the
+    (the widget's `popup_id_bucket`) for the reason spelled out for the
     local-preset combo below — the list grows in place, and a popup `Area` remembers its size
     under a fixed id and can only shrink. The bucket's cap comes from the LIVE style
     (`Spacing::combo_height` over a lower bound on the row pitch), because this combo sets no
@@ -449,8 +453,9 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
     A CREATION IS REFUSED UNDER `missing_font`, with the reason in the status line — the same
     rule `create_local_preset` follows: the panel then sits on a NEIGHBOUR of a font it could
     not resolve, and the capture would record that substituted font as the new preset's own.
-  - `preset_name_input` is the RENAME buffer of the selection, re-synced on every selection
-    change and disabled when nothing is selected. `save_current_preset` commits BOTH halves of
+  - `global_preset_picker` (`PresetPickerState`) holds the RENAME buffer of the selection and
+    the armed delete, re-synced with `reset_to` on every selection change (apply, create, save,
+    «Нет», delete) and disabled when nothing is selected. `save_current_preset` commits BOTH halves of
     the selected preset. THE NAME IS THE IDENTITY (it is the `presets_by_name` key), so a
     rename is remove-then-insert, and an empty name or one another preset already holds is
     REFUSED with a status line rather than applied — the second would silently destroy that

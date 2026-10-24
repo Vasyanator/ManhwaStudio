@@ -1558,7 +1558,7 @@ paths change.
         state.selected_font_idx = 0;
         state.font_size_px = 51.0;
         state.create_global_preset();
-        state.preset_name_input = "P".to_string();
+        state.global_preset_picker.set_name("P".to_string());
         state.save_current_preset();
 
         let saved = state.presets_by_name.get("P").expect("the preset is stored");
@@ -1594,7 +1594,7 @@ paths change.
             .clone()
             .expect("creating a preset selects it");
         assert_eq!(
-            state.preset_name_input, name,
+            state.global_preset_picker.name(), name,
             "the rename buffer is bound to the selection"
         );
         let saved = state
@@ -1653,7 +1653,7 @@ paths change.
             .clone()
             .expect("creating a preset selects it");
 
-        state.preset_name_input = "Крик".to_string();
+        state.global_preset_picker.set_name("Крик".to_string());
         state.save_current_preset();
 
         assert_eq!(state.selected_preset_name.as_deref(), Some("Крик"));
@@ -1676,14 +1676,14 @@ paths change.
     fn renaming_a_global_preset_onto_a_taken_name_is_refused() {
         let mut state = preset_editing_panel();
         state.create_global_preset();
-        state.preset_name_input = "Первый".to_string();
+        state.global_preset_picker.set_name("Первый".to_string());
         state.save_current_preset();
         state.font_size_px = 12.0;
         state.create_global_preset();
-        state.preset_name_input = "Второй".to_string();
+        state.global_preset_picker.set_name("Второй".to_string());
         state.save_current_preset();
 
-        state.preset_name_input = "Первый".to_string();
+        state.global_preset_picker.set_name("Первый".to_string());
         state.save_current_preset();
 
         assert_eq!(
@@ -1717,7 +1717,7 @@ paths change.
             .clone()
             .expect("creating a preset selects it");
 
-        state.preset_name_input = String::new();
+        state.global_preset_picker.set_name(String::new());
         state.save_current_preset();
 
         assert_eq!(state.selected_preset_name.as_deref(), Some(created.as_str()));
@@ -1736,10 +1736,10 @@ paths change.
         state.create_global_preset();
         // The trimmed spelling exists as a SEPARATE preset, which is what made the trimming
         // defect visible: the padded one could then never be saved.
-        state.preset_name_input = "Рао-кун".to_string();
+        state.global_preset_picker.set_name("Рао-кун".to_string());
         state.save_current_preset();
         state.create_global_preset();
-        state.preset_name_input = " Рао-кун ".to_string();
+        state.global_preset_picker.set_name(" Рао-кун ".to_string());
 
         state.save_current_preset();
 
@@ -1772,11 +1772,11 @@ paths change.
     fn a_whitespace_only_rename_counts_as_an_unsaved_change() {
         let mut state = preset_editing_panel();
         state.create_global_preset();
-        state.preset_name_input = " Рао-кун ".to_string();
+        state.global_preset_picker.set_name(" Рао-кун ".to_string());
         state.save_current_preset();
         assert!(!state.selected_preset_has_unsaved_changes());
 
-        state.preset_name_input = "Рао-кун".to_string();
+        state.global_preset_picker.set_name("Рао-кун".to_string());
 
         assert!(
             state.selected_preset_has_unsaved_changes(),
@@ -1791,17 +1791,17 @@ paths change.
     fn applying_a_global_preset_rebinds_the_rename_buffer() {
         let mut state = preset_editing_panel();
         state.create_global_preset();
-        state.preset_name_input = "Первый".to_string();
+        state.global_preset_picker.set_name("Первый".to_string());
         state.save_current_preset();
         state.create_global_preset();
-        state.preset_name_input = "Второй".to_string();
+        state.global_preset_picker.set_name("Второй".to_string());
         state.save_current_preset();
 
         state.apply_preset_by_name("Первый".to_string());
 
         assert_eq!(state.selected_preset_name.as_deref(), Some("Первый"));
         assert_eq!(
-            state.preset_name_input, "Первый",
+            state.global_preset_picker.name(), "Первый",
             "the buffer follows the selection",
         );
         assert!(
@@ -1812,7 +1812,7 @@ paths change.
         // A name that resolves to nothing changes neither the selection nor its buffer.
         state.apply_preset_by_name("Третий".to_string());
         assert_eq!(state.selected_preset_name.as_deref(), Some("Первый"));
-        assert_eq!(state.preset_name_input, "Первый");
+        assert_eq!(state.global_preset_picker.name(), "Первый");
     }
 
     /// A FAILED save re-raises the unsaved-changes warning only for the preset the LOST
@@ -1830,10 +1830,10 @@ paths change.
         ms_i18n::set_locale(&en).expect("en catalog installs");
         let mut state = preset_editing_panel();
         state.create_global_preset();
-        state.preset_name_input = "Первый".to_string();
+        state.global_preset_picker.set_name("Первый".to_string());
         state.save_current_preset();
         state.create_global_preset();
-        state.preset_name_input = "Второй".to_string();
+        state.global_preset_picker.set_name("Второй".to_string());
         state.save_current_preset();
         assert!(!state.selected_preset_has_unsaved_changes());
 
@@ -1898,7 +1898,7 @@ paths change.
         state.create_global_preset();
         // Frees index 2 by renaming the preset that holds it.
         state.apply_preset_by_name(tf!("typing.presets.default_name", index = 2));
-        state.preset_name_input = "Крик".to_string();
+        state.global_preset_picker.set_name("Крик".to_string());
         state.save_current_preset();
 
         state.create_global_preset();
@@ -1924,7 +1924,7 @@ paths change.
 
         assert!(state.presets_by_name.is_empty());
         assert_eq!(state.selected_preset_name, None);
-        assert!(state.preset_name_input.is_empty());
+        assert!(state.global_preset_picker.name().is_empty());
         assert_eq!(
             state.status_line,
             t!("typing.presets.create_blocked_missing_font").to_string(),
@@ -2011,8 +2011,8 @@ paths change.
 
         assert!(!state.presets_by_name.contains_key(&created));
         assert_eq!(state.selected_preset_name, None);
-        assert!(state.preset_name_input.is_empty());
-        assert!(!state.preset_delete_armed);
+        assert!(state.global_preset_picker.name().is_empty());
+        assert!(!state.global_preset_picker.is_delete_armed());
         assert_eq!(
             state.local_presets.len(),
             1,
@@ -2067,20 +2067,6 @@ paths change.
 
         assert!(!state.selected_preset_dirty);
         assert!(!state.selected_preset_has_unsaved_changes());
-    }
-
-    /// THE WHEEL NEVER CREATES A PRESET: its virtual list is «Нет» plus the real presets, so
-    /// a full cycle visits exactly those rows and never the popup's «create» row.
-    #[test]
-    fn the_global_preset_wheel_never_reaches_the_create_row() {
-        assert_eq!(create_presets::global_preset_wheel_target(None, 2, 1), Some(Some(0)));
-        assert_eq!(create_presets::global_preset_wheel_target(Some(0), 2, 1), Some(Some(1)));
-        // Past the last preset the cycle wraps to «Нет», not to a third row.
-        assert_eq!(create_presets::global_preset_wheel_target(Some(1), 2, 1), Some(None));
-        assert_eq!(create_presets::global_preset_wheel_target(None, 2, -1), Some(Some(1)));
-        // Nothing to move to, and no step at all, both report "no change".
-        assert_eq!(create_presets::global_preset_wheel_target(None, 0, 1), None);
-        assert_eq!(create_presets::global_preset_wheel_target(Some(0), 2, 0), None);
     }
 
     /// Unique temp directory for a preset-store test. Never the real `fonts/` and never the
@@ -7419,7 +7405,7 @@ paths change.
         assert!(state.custom_font.adhoc_recipe.is_none());
         assert!(state.missing_font.is_some(), "the hybrid is blocked, never substituted");
 
-        state.preset_name_input = "Новее".to_string();
+        state.global_preset_picker.set_name("Новее".to_string());
         state.save_current_preset();
         assert_eq!(
             state.presets_by_name.get("Новее").and_then(|preset| preset.font_recipe_raw.as_ref()),
@@ -7561,7 +7547,7 @@ paths change.
         assert_eq!(panel.status_line, caption);
         assert!(panel.latest_token > token, "a render still in flight is superseded");
 
-        panel.preset_name_input.clone_from(&preset_name);
+        panel.global_preset_picker.set_name(preset_name.clone());
         panel.save_current_preset();
         assert_eq!(panel.status_line, refusal);
         assert_eq!(

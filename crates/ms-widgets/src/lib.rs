@@ -35,6 +35,11 @@ FILE HEADER (crates/ms-widgets/src/lib.rs)
     only the UI state (which cell is targeted and the color it was last
     synchronized with); the preset set itself is caller-owned data and the
     caller persists it when `presets_changed` is reported.
+  - `PresetPicker` (+ `PresetPickerState`, `PresetPickerResponse`, `PresetPickerAction`): a
+    named-preset block — a wheel combo with «None», an optional «+ Create preset» row and the
+    presets, then the rename field of the selection with «Save» and a two-step red «Delete»,
+    and an unsaved-changes line. Draw only: it reports an action, the caller owns the list,
+    every decision and the name validation.
   - `MarkedScrollArea`: вертикальный скролл с разметкой бара (типизированные/
     свободные пометки под ползунком) и жёлобом элементов слева от бара.
   - `AiButton`: an AI-tool launch button that gates its own availability on the
@@ -139,6 +144,7 @@ pub mod hf_access_hint;
 mod marked_scroll;
 mod marquee;
 pub mod panel_dock;
+mod preset_picker;
 mod searchable_combo_box;
 mod seed_spin_box;
 mod spellchecked_line;
@@ -189,6 +195,7 @@ pub use panel_dock::{
     PanelLayoutWriter, PanelNode, PanelSizes, PanelTab, PanelTabHeader, SolvedLayout, SolvedPanel,
     SubWindowNode, TabExtras, TabId,
 };
+pub use preset_picker::{PresetPicker, PresetPickerAction, PresetPickerResponse, PresetPickerState};
 #[allow(unused_imports)]
 pub use searchable_combo_box::{
     RowLayout, SearchableComboBox, SearchableComboItem, SearchableComboResponse,

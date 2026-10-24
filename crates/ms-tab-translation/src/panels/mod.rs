@@ -13,6 +13,7 @@ Key functions:
 
 pub mod bubbles;
 pub mod composition;
+pub mod composition_presets;
 pub mod machine_translation;
 pub mod ocr;
 pub mod ocr_langs;

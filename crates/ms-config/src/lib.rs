@@ -1538,16 +1538,13 @@ pub fn user_config_defaults() -> Value {
             // `src/MODULE_README.md` for why those stale keys are left inert.
             "enabled_tabs": enabled_tabs
         },
+        // The canvas LAYOUT (aside widths / compaction / side / second column / stretch and the
+        // rest of the preset-owned fields) is per title and owned by `ms_project::canvas_layout`:
+        // it is not defaulted here. Older builds wrote those keys here; they are left in existing
+        // files as the migration source of unmigrated titles. The spellcheck toggles are
+        // per-title too (read from the title `canvas` object only).
         "Canvas": {
-            "scale_bubbles": true,
-            "aside_min_width_px": 450,
-            "aside_max_width_px": 550,
-            "aside_compact_mode": "none",
-            "aside_side_mode": "auto",
-            "aside_second_column": true,
             "bubble_status_rules": default_bubble_status_rules_value(),
-            "spellcheck_original": false,
-            "spellcheck_translation": true,
             "cache_pages": true,
             "translation_status_display": "marks",
             "opengl_enabled": false,
@@ -1721,30 +1718,21 @@ pub fn user_config_defaults() -> Value {
 }
 
 pub fn project_config_defaults() -> Value {
+    // The 13 canvas LAYOUT keys (bubble display types, on-top focus, page spacing / separation /
+    // edge margin, aside compaction / side / second column / scale, ...), at the root and in
+    // `canvas`, are deliberately absent: `ms_project::canvas_layout` owns them and their
+    // per-title fallback (the title kind's preset). A backfill here would write stale layout
+    // values into every opened title.
     json!({
         "bubble_type": "hybrid",
-        "editable_bubble_type": "aside",
-        "readonly_bubble_type": "aside",
-        "on_top_focus_mode": "around",
-        "page_spacing_px": 200,
         "opengl_enabled": false,
         "opengl_device": "auto",
         "canvas": {
             "bubble_type": "hybrid",
-            "editable_bubble_type": "aside",
-            "readonly_bubble_type": "aside",
-            "on_top_focus_mode": "around",
             "show_bubbles": true,
             "show_bubble_status": false,
             "bubble_opacity": 1.0,
-            "page_spacing_px": 200,
-            "separate_pages": true,
-            "vertical_edge_margin_px": 200,
             "side_margin_px": 20,
-            "aside_compact_mode": "none",
-            "aside_side_mode": "auto",
-            "aside_second_column": true,
-            "aside_scale_pct": 100,
             "tabs_autosync_enabled": true,
             "auto_insert_last_character": true,
             "project_custom_spellcheck_words": "",
@@ -1780,6 +1768,10 @@ pub fn project_config_defaults() -> Value {
             "limit": 700,
             "limit_enabled": true,
             "use_character_names": true,
+            "character_name_position": "after",
+            "character_name_prefix": " - ",
+            "character_name_suffix": "",
+            "include_image_bubbles": false,
             "include_hint_bubbles": true,
             "hint_wrap": "()",
             "hint_wrap_enabled": true,

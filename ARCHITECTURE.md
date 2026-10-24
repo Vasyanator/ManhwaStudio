@@ -284,7 +284,14 @@ shared wiki view). The studio never references
   (`layers.json` document): raster layers of the PS editor and inline text nodes of the typing
   tab. Legacy `text_images/` + `text_info.json` is read-only input, migrated in
   `ms-models::layer_model`.
-- `ComicType` (`Pages` / `Ribbon` / `Custom`) is a preset over two `CanvasSettings` fields.
+- `ComicType` (`Pages` / `Ribbon`; legacy `Custom`) is the title KIND, set by the first-open
+  prompt or Settings › «Тип тайтла», never derived from settings. The canvas LAYOUT (13
+  `CanvasSettings` fields) is stored per title (`canvas.layout_per_title` marks a migrated title)
+  and owned by `ms_project::canvas_layout` (built-in presets «Pages» / «Webtoon», the per-title
+  read and its migration rule, the title's preset selection, and the app-wide preset store in
+  `user_config` `Canvas.layout_presets`: user presets plus built-in overrides; every place that
+  applies a built-in — title fallback, image sets, first-open prompt, Settings picker — takes its
+  effective, override-aware values from `CanvasLayoutPresets::effective_builtin`).
 
 ## 5. Root runtime and shared models
 
@@ -311,7 +318,8 @@ shared wiki view). The studio never references
   viewer through its `draw`. Each tab reports the source-page window it needs
   (`active_source_page_window`), which drives residency and eviction.
 - `BubblesModel` — bubble list, `revision`, `canvas_revision` and `SharedCanvasSettings`
-  (cross-tab canvas settings persisted to the project settings and to `user_config`).
+  (cross-tab canvas settings persisted to the project settings, the layout per title; only a few
+  cross-title preferences go to `user_config`).
 - `CleanOverlaysModel` — per-page clean overlay kept twice and updated together: premultiplied
   `egui::ColorImage` for display and straight-alpha `RgbaImage` for tools, export and PNG.
   Several canvases (Cleaning, Typing) read it: deltas are NON-destructive, each consumer asks

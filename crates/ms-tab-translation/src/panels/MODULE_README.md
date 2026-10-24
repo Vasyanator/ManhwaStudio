@@ -170,9 +170,41 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   Hint bubbles are gated by `include_hint_bubbles` and formatted as
   `{hint_extra_sep}{hint_wrap}{line}{hint_wrap}{hint_extra_sep}` from `Bubble.text`, bypassing the
   source mode, `ignore_translated_lines`, the replica prefix and character names entirely.
+  With `use_character_names` on, a replica (or a merged same-character group) carries its
+  character name through ONE rule, `CharacterNameFormat::attach`: `Before` ->
+  `{prefix}{name}{suffix}{text}`, `After` -> `{text}{prefix}{name}{suffix}`, nothing else added
+  (the separator lives in the prefix / suffix, escapes decoded). The defaults (`After`, `" - "`,
+  `""`) are the historical `"{line} - {name}"` and must stay byte-identical; they are mirrored in
+  `ms_config::project_config_defaults` (guarded by a test). These options are plain-path only (the
+  MiniJinja template sees raw bubble fields) and do not apply to an image bubble's description.
+  The sub-options are drawn indented under the checkbox and only while it is on.
   The plain path runs in two passes: a formatting pass turning each bubble into a `ComposedItem`,
   then the pure `emit_composition_items` applying the limit, character merging and the hint
   attachment rule (below). Keeping emission pure is what makes those rules unit-testable.
+  It also owns the ONE JSON mapping of `CompositionPanelOptions`
+  (`write_composition_options_json` / `read_composition_options_json`, compared through
+  `CompositionPanelOptions::stored_form`), used by `tab.rs` for the title section and by the
+  presets.
+- `composition_presets.rs`: app-wide named presets of every composition option (sorting
+  included), drawn with `ms_widgets::PresetPicker` at the top of «Параметры». Two built-ins ship
+  (`BuiltinCompositionPreset`: «Экспорт перевода» / «Перевод через ИИ»), identified by a stable
+  `id()` with a localized `display_name()`; their values are `factory()`. Stored in `user_config`
+  › `TranslarionTab.composition_presets` = `{version: 1, builtin: {<id>: {…}}, user: {<name>: {…}}}`
+  (same keys as the title `composition` section; Python never reads it, listed in the v19
+  `PROTOCOL_VERSION` note); a store without a numeric `version` is the earlier flat
+  `{<name>: {…}}` map, read as user presets and moved under `user` by the first write; an unknown
+  version is read-only. Seeded from the pre-read `user_settings`
+  (`TranslationTabState::seed_composition_presets`; the store path is injected by the host's
+  caller, `None` in every test); every create / save / rename / delete is its own
+  read-modify-write on ONE ordered writer thread. An entry whose last write failed stays unsaved
+  (and the write-error line stays) until a later write of that entry succeeds. A built-in edit is
+  an override keyed by id (kept only while it differs from the factory values); deleting it
+  restores the factory values, an unmodified built-in has no «Delete» and no built-in can be
+  renamed. A user preset may share a built-in's display name (another language, or a copy made
+  before the built-ins shipped) and is then listed next to it; creating or renaming one to a
+  built-in's name in the current language is refused. The selection is per title
+  (`composition.preset` in `settings.json`, `{builtin: <id>}` / `{user: <name>}`, a plain string
+  read as a user name; written by the tab's settings saver); a missing user preset reads as «Нет».
 
 ## Contracts and invariants
 - Panels must not start long-running work directly. They return typed actions for `tab.rs` to
@@ -181,7 +213,9 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   state machines.
 - Option structs are the settings boundary between panel UI, project settings persistence, and
   controller request construction. Keep parser/writer mappings in `tab.rs` synchronized when
-  adding fields. The AI API connection state (`ai_api: AiApiConnectionState`) persists only
+  adding fields; composition is the exception — its mapping lives only in the `composition.rs`
+  codec (exhaustive destructuring makes a new field fail to compile there), and a new
+  composition option is preset material unless the preset value is split from the options. The AI API connection state (`ai_api: AiApiConnectionState`) persists only
   `service`, `base_url`, `model` and `system_instruction` (written by `tab.rs` as
   `OCR.params.ai_api.*` / `machine_translation.ai_api.*`; a missing `base_url` loads as empty); its key buffer is transient
   UI input stored only through `AiApiConnectionActions` -> `AiApiTaskRunner` in the OS credential
@@ -251,3 +285,6 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   code in `tab.rs`.
 - To change prompt composition, MiniJinja variables, sort/merge rules, or export formats, edit
   `composition.rs`.
+- To add a built-in composition preset, add a variant to `BuiltinCompositionPreset` in
+  `composition_presets.rs` (its `id()` is a persistence key: never rename it; its name is an i18n
+  key) and list it in `ALL`; preset storage and picker behaviour live in the same file.

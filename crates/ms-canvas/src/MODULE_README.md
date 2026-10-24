@@ -363,7 +363,10 @@ through the tab's `bubble_status_style`; the border is painted by `ms_widgets::b
 
 `canvas_defaults_agree_across_the_three_mirrors` lives at the bottom of `types.rs`, next to
 `CanvasState::default` — the only one of the three canvas-default mirrors reachable from a crate
-this high (the other two are in `ms-project` and `ms-models`, both below it).
+this high (the other two are in `ms-project` and `ms-models`, both below it). All three take their
+13 layout fields from the `ms-project` layout table (`BASE_BUILTIN.factory()`); here the one
+`CanvasLayout` -> `CanvasState` mapping is `CanvasState::with_layout` (`types.rs`), which both
+`CanvasState::default` and `canvas_state_from_project` build on.
 
 ## Files and submodules
 - `lib.rs`: public facade, hook trait, render orchestration, and synchronization with
@@ -391,6 +394,12 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   the ORT SIGILL guard marker written concurrently under the same lock. Its title `settings.json`
   half goes through `ms_docstore::update` for the same reason: the mutator edits only the canvas
   keys, so it cannot revert keys other writers (translation tab, spellcheck words) own.
+  Scope split: the title half writes the whole per-title LAYOUT (`ms_project::CanvasLayout`, all
+  `JSON_KEYS`) plus the marker `canvas.layout_per_title = true` (which makes the reader take the
+  layout from the title alone) and a legacy root mirror of the display types and focus for older
+  builds; the user half writes only the cross-title preferences (status rules, page cache, status
+  display, hint default). The preset SELECTION (`canvas.layout_preset`) is not written here: the
+  Settings pane's saver owns it.
   It also owns the pure conversions: `canvas_state_from_project` (project `CanvasSettings` ->
   `CanvasState`: legacy `bubble_type` resolution, enum normalization, no clamping),
   `shared_settings_from_state` (the one owner of the `CanvasState` -> `SharedCanvasSettings`

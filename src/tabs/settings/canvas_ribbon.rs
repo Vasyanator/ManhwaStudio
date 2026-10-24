@@ -15,6 +15,8 @@ Key functions:
 
 Notes:
 - Persistence is coalesced by a background worker in `settings/mod.rs`.
+- The layout preset block is `canvas_layout_presets.rs` (drawn here, under the title-kind row);
+  the pane's copy of the settings is refreshed from `BubblesModel` before any widget edits it.
 */
 
 use super::{DraggedBubbleConditionNode, SettingsTabState};
@@ -59,6 +61,8 @@ fn empty_group_slots() -> Vec<BubbleStatusCondition> {
 impl SettingsTabState {
     pub(super) fn draw_canvas_ribbon(&mut self, ui: &mut egui::Ui) {
         self.refresh_spellcheck_words_if_needed();
+        // Before any widget edits the pane's copy: a canvas may have published its own changes.
+        self.refresh_canvas_settings_from_model();
         let mut changed = false;
         ScrollArea::vertical()
             .id_salt("settings_canvas_ribbon_scroll")
@@ -68,46 +72,11 @@ impl SettingsTabState {
                 ui.small(t!("settings.canvas_ribbon.shared_tabs_hint"));
                 ui.add_space(8.0);
 
-                let active_preset = ComicType::from_canvas_preset_fields(
-                    &self.canvas_settings.aside_compact_mode,
-                    self.canvas_settings.separate_pages,
-                );
-                let mut selected_preset = active_preset;
-                // A single-image session's comic type is fixed to `Pages` by the open step (plan D4):
-                // the preset selector would only rewrite the throwaway scratch project.
+                // A single-image session's kind is fixed to `Pages` by the open step (plan D4) and its
+                // "title" is the throwaway scratch chapter: neither row has anything to edit there.
                 if self.project_settings {
-                    ui.horizontal(|ui| {
-                        ui.label(t!("settings.canvas_ribbon.preset_label"));
-                        ComboBox::from_id_salt("settings_canvas_ribbon_preset")
-                            .selected_text(selected_preset.display_name())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut selected_preset,
-                                    ComicType::Pages,
-                                    ComicType::Pages.display_name(),
-                                );
-                                ui.selectable_value(
-                                    &mut selected_preset,
-                                    ComicType::Ribbon,
-                                    ComicType::Ribbon.display_name(),
-                                );
-                                ui.selectable_value(
-                                    &mut selected_preset,
-                                    ComicType::Custom,
-                                    ComicType::Custom.display_name(),
-                                );
-                            });
-                    });
-                    ui.small(
-                        t!("settings.canvas_ribbon.preset_custom_hint"),
-                    );
-                }
-                // The preset's fields are written by their one owner
-                // (`SharedCanvasSettings::apply_comic_type_preset`); `Custom` writes nothing.
-                if selected_preset != active_preset
-                    && self.canvas_settings.apply_comic_type_preset(selected_preset)
-                {
-                    changed = true;
+                    changed |= self.draw_title_kind_row(ui);
+                    changed |= self.layout_presets.draw(ui, &mut self.title_layout.layout_preset, &mut self.canvas_settings);
                 }
                 ui.add_space(8.0);
 
@@ -404,6 +373,34 @@ impl SettingsTabState {
 
         if changed {
             self.publish_canvas_settings();
+        }
+    }
+
+    /// The «Тип тайтла» row: the title KIND (`comic_type`: pages or webtoon), independent of the
+    /// layout preset. A choice is recorded through `TitleLayoutState::choose_kind`; returns `true` when it
+    /// changed, so the caller publishes (the save request carries the kind). A legacy `Custom` or a
+    /// missing kind shows as «not set».
+    fn draw_title_kind_row(&mut self, ui: &mut Ui) -> bool {
+        let kind_label = |kind: Option<ComicType>| match kind {
+            Some(ComicType::Pages) => t!("settings.canvas_ribbon.title_kind_pages_label"),
+            Some(ComicType::Ribbon) => t!("settings.canvas_ribbon.title_kind_webtoon_label"),
+            Some(ComicType::Custom) | None => t!("settings.canvas_ribbon.title_kind_unset_label"),
+        };
+        let mut chosen = self.title_layout.kind;
+        ui.horizontal(|ui| {
+            ui.label(t!("settings.canvas_ribbon.title_kind_label"))
+                .on_hover_text(t!("settings.canvas_ribbon.title_kind_hint"));
+            ComboBox::from_id_salt("settings_canvas_ribbon_title_kind")
+                .selected_text(kind_label(chosen))
+                .show_ui(ui, |ui| {
+                    for kind in [ComicType::Pages, ComicType::Ribbon] {
+                        ui.selectable_value(&mut chosen, Some(kind), kind_label(Some(kind)));
+                    }
+                });
+        });
+        match chosen {
+            Some(kind) if chosen != self.title_layout.kind => self.title_layout.choose_kind(kind),
+            Some(_) | None => false,
         }
     }
 

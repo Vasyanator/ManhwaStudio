@@ -162,9 +162,8 @@ impl TypingCreatePanelState {
             preset_store_tx,
             preset_store_rx,
             selected_preset_name: None,
-            preset_name_input: String::new(),
+            global_preset_picker: PresetPickerState::default(),
             selected_preset_dirty: false,
-            preset_delete_armed: false,
             identity_mode,
             // The local-preset set arrives with the off-thread `presets.json` seed, exactly
             // like the global presets: the panel starts with none.

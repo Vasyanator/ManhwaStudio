@@ -341,6 +341,22 @@ crate's `[dev-dependencies]`, so no production build carries them.
   GUI. Two egui facts (still true in 0.36) the drawing depends on: the palette takes its width from
   `Spacing::slider_width`, not from an argument, and the popup must be
   `PopupCloseBehavior::CloseOnClickOutside` or the first click on a cell closes it.
+- `preset_picker.rs`: `PresetPicker`, the named-preset block — row 1 a `WheelComboBox` with
+  «None», an optional «+ Create preset» ACTION row (never drawn selected) and the caller's
+  names; row 2 the rename field of the SELECTION, «Save» and an optional two-step red
+  «Delete»; then a small `ms_theme::status::WARNING` line while the caller's `unsaved` flag or
+  a pending rename holds. Draw only: `show` reports at most one `PresetPickerAction`
+  (`Deselect`, `Create`, `Select(idx)`, `Save`, `Delete(idx)`) and the caller applies it,
+  validates the name (`PresetPickerState::name`, verbatim) and writes any status text. The
+  pure decisions are local and unit-tested: `wheel_target` (the wheel cycles «None» +
+  presets, never the create row), `action_changes_nothing` (re-selecting the selection or
+  «None» with none selected is dropped), `delete_step` (arm on a plain click, confirm on the
+  next plain click, a double click never counts, disarm when the pointer leaves) and
+  `popup_id_bucket` (the row-count bucket folded into the combo id, see the growing-popup
+  contract below). The name row keeps a fixed 190 pt reserve for its buttons. Builder options
+  `create_row`, `delete` and `rename` (all default `true`); `rename(false)` shows the
+  selection's name in a disabled field and leaves «Save» as a values-only commit. Consumer: the
+  typing tab's global presets.
 - `wheel_combo_box.rs`, `wheel_slider.rs`, `wheel_spin_box.rs`: input widgets that consume
   mouse-wheel changes without scrolling parent views.
 - `wheel_input_guard.rs`: shared popup/wheel guard used by wheel-aware widgets, and the
@@ -466,6 +482,14 @@ crate's `[dev-dependencies]`, so no production build carries them.
   egui memory (areas, focus, popups) does not. `close_requested` is a report: the caller closes
   the state or vetoes. A host that is covered must skip all of its own drawing and hotkeys but
   keep polling workers and keep calling `show` on its windows.
+- `PresetPickerState` is caller-held and NEVER re-synced at draw time: the caller calls
+  `reset_to` at every selection change (apply, create, save, deselect, delete), because the
+  block may sit in a collapsed section while the caller still asks `has_pending_rename`. The
+  widget never writes the caller's selection, and the rename field, «Save» and «Delete» are
+  disabled while nothing is selected. With `rename(false)` the widget never writes the rename
+  buffer either and a pending rename does not raise the warning line; such a caller treats
+  `Save` as "commit values under the selection's own name" and ignores the buffer. Its child ids are `(id_salt, "combo", bucket)` and
+  `(id_salt, "name")`, so `id_salt` must be language-independent.
 - `WheelComboBox::from_label` seeds the widget id from the label text. When the label is localized
   (`t!("…")`), chain `.id_salt("stable_key")` so the id stays language-independent
   (`docs/i18n_exclusions.md` §C); user-visible widget labels are localized through `ms-i18n`, but
@@ -482,6 +506,8 @@ crate's `[dev-dependencies]`, so no production build carries them.
 - To change text styling/highlight layout, edit `text_edit_plus.rs` and verify wrapped lines and
   explicit newlines.
 - To change viewport eyedropper behavior, edit `viewport_color_selector.rs`.
+- To change the named-preset block (rows, wheel rule, armed delete, warning line), edit
+  `preset_picker.rs`; what an action MEANS stays in the caller.
 - To change the preset grid, its palette defaults, or the update/cancel semantics, edit
   `color_preset_picker.rs`; to change WHERE a preset set comes from or goes, edit the caller,
   not the widget.

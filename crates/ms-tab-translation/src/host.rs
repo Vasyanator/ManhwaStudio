@@ -28,6 +28,7 @@ mod hotkeys;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
 
 use ms_canvas::{CanvasBottomHint, CanvasDrawParams, CanvasUiStatus, CanvasView, SourceTextureUploadBudget};
 use ms_config::CANVAS_SECTION;
@@ -83,14 +84,18 @@ impl TranslationTab {
     /// Builds the tab around an already-constructed `state` (the root injects its services).
     /// The canvas gets the Translation scroll salt, `bubbles_model`, and the bottom-hint collapsed
     /// flag read from `user_settings` (`Canvas.translation_hint_collapsed`; missing or non-bool =
-    /// expanded). No canvas settings are seeded: the canvas pulls them from `bubbles_model` by
-    /// revision on its first draw.
+    /// expanded). The composition presets are seeded from `user_settings` too and persist their
+    /// operations to `preset_store` (production: `ms_config::user_config_path()`; `None` keeps them
+    /// in memory — every test passes `None`, so no test can write the real `user_config`). No
+    /// canvas settings are seeded: the canvas pulls them from `bubbles_model` by revision on its
+    /// first draw.
     #[must_use]
-    pub fn new(state: TranslationTabState, bubbles_model: Arc<Mutex<BubblesModel>>, user_settings: &Value) -> Self {
+    pub fn new(mut state: TranslationTabState, bubbles_model: Arc<Mutex<BubblesModel>>, user_settings: &Value, preset_store: Option<PathBuf>) -> Self {
         let mut canvas = CanvasView::default();
         canvas.set_bottom_hint_collapsed(ms_config::section_bool(user_settings, CANVAS_SECTION, TRANSLATION_HINT_COLLAPSED_KEY, false));
         canvas.set_scroll_area_id_salt(TRANSLATION_CANVAS_SCROLL_SALT);
         canvas.set_bubbles_model(bubbles_model);
+        state.seed_composition_presets(user_settings, preset_store);
         Self { canvas, state }
     }
 

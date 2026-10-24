@@ -7,9 +7,9 @@ create-panel preset and formula-preset apply/save UI, the shared typing font
 combo, the initial preview request, and the face-index clamp.
 
 Main responsibilities:
-- draw and apply/create/rename/save/delete named create presets (a font-mode preset of
-  the ad-hoc custom font captures and applies its recipe, `font_recipe`), and apply/save
-  formula-layout presets;
+- draw named create presets through `ms_widgets::PresetPicker` and apply/create/rename/
+  save/delete them (a font-mode preset of the ad-hoc custom font captures and applies its
+  recipe, `font_recipe`), and apply/save formula-layout presets;
 - own the ONE font combo both typing panels draw (`draw_font_combo`): its rows,
   its own-typeface previews, its caption, its display clamp and its pick edge;
 - issue the initial preview render request and clamp the selected face index.
@@ -34,7 +34,7 @@ the parent module's types and imports.
 */
 
 use super::*;
-use ms_widgets::{RowLayout, SearchableComboBox, SearchableComboItem};
+use ms_widgets::{PresetPicker, PresetPickerAction, RowLayout, SearchableComboBox, SearchableComboItem};
 
 /// Maximum characters listed in one user-facing character list before it is
 /// truncated with a "+N more" suffix. Shared by the static coverage tooltip and
@@ -46,92 +46,6 @@ const MAX_SHOWN_CHARS: usize = 15;
 // character drawn by a fallback font — deliberately not red, both cases still render) and
 // `ms_theme::status::ERROR` for "this will not be readable" (a font lacking the writing system
 // entirely, or a character no font in the render base could draw).
-
-/// Fill of the global-preset «Удалить» button AT REST.
-///
-/// The button is red before it is armed too: deleting a preset is destructive whether or not
-/// the confirm step has been reached, and a neutral button that only turns red on the second
-/// click hides that from the first one. Muted, so the ARMED state
-/// (`ms_theme::status::DESTRUCTIVE_ARMED_FILL`, shared with the font-group delete control)
-/// still reads as an escalation.
-const PRESET_DELETE_IDLE_COLOR: egui::Color32 = egui::Color32::from_rgb(105, 38, 38);
-
-/// Width, in points, the preset name row keeps for the save and delete buttons that follow the
-/// rename field. Everything else on the row goes to the field itself.
-const PRESET_NAME_ROW_BUTTON_RESERVE_PT: f32 = 190.0;
-
-/// What a row of the global-preset combo asked for, collected inside the popup closure and
-/// applied after it (each arm needs `&mut self`, which the closure still borrows).
-#[derive(Debug)]
-enum GlobalPresetRowAction {
-    /// The «Нет» row: drop the selection and give the live local set back to the parked
-    /// document default.
-    Deselect,
-    /// The «create» row: a new preset inheriting everything on screen.
-    Create,
-    /// A preset row: apply the preset with that name.
-    Select(String),
-}
-
-/// Where a wheel notch over the CLOSED global-preset combo moves the selection.
-///
-/// The wheel cycles a VIRTUAL list — «Нет» (`0`) plus the real presets (`1 + position`). The
-/// popup's «create» row is deliberately NOT in that list, so no amount of scrolling can create
-/// a preset; creation stays an explicit click.
-///
-/// `selected` is the selection's position among the sorted preset names (`None` for «Нет») and
-/// `count` their number. Returns `None` when the selection does not move (no steps, or a wrap
-/// that lands back on the current row); otherwise `Some(position)`, whose inner `None` is «Нет».
-#[must_use]
-pub(super) fn global_preset_wheel_target(
-    selected: Option<usize>,
-    count: usize,
-    steps: i32,
-) -> Option<Option<usize>> {
-    let mut index = selected.map_or(0, |pos| pos + 1);
-    if !cycle_wrapped_index(&mut index, count + 1, steps) {
-        return None;
-    }
-    Some(index.checked_sub(1))
-}
-
-/// Rows the global-preset popup always draws, whatever the preset count: «Нет» and «создать».
-const GLOBAL_PRESET_POPUP_TEXT_ROWS: usize = 2;
-
-/// The row-count bucket that MUST be folded into the global-preset combo's `id_salt`.
-///
-/// THE POPUP AREA REMEMBERS ITS SIZE AND CAN ONLY SHRINK — the same defect
-/// `create_main_text::local_preset_popup_id_bucket` guards, and the same reasoning: a combo
-/// popup is an `Area`, its stored size is fed back as the body's `max_rect` every frame
-/// (`egui-0.35.0/src/area.rs:610-611`) and rewritten from the content's own `min_size`
-/// (`area.rs:665`), and a sizing pass runs only for an id with NO stored state
-/// (`area.rs:466`); stored areas are never pruned (`memory/mod.rs:1157`). Under a CONSTANT id
-/// the popup's height is therefore monotonically non-increasing for the whole session, so a
-/// popup first opened with one preset in it would clip every preset created afterwards —
-/// and this list grows in place, both through the «create» row and through a rename.
-///
-/// `row_count` is the TOTAL number of rows drawn («Нет» + the «create» row + the presets).
-/// The bucket is capped, because the popup's own height is capped: the body is a `ScrollArea`
-/// whose `max_height` is `Spacing::combo_height` when the combo sets no height of its own
-/// (`egui-0.35.0/src/containers/combo_box.rs:393`), so every count past the one that fills
-/// that cap measures identically and needs no id of its own. The cap is derived from the LIVE
-/// style rather than from a pixel or row constant, so a theme change cannot silently make it
-/// wrong.
-#[must_use]
-fn global_preset_popup_id_bucket(ui: &egui::Ui, row_count: usize) -> usize {
-    let spacing = ui.spacing();
-    // LOWER bound on one row's vertical step: a `selectable_label` is a `Button`, and no
-    // button is shorter than `interact_size.y`. A lower bound on the PITCH gives an UPPER
-    // bound on the number of rows that can still grow the popup, which is the safe
-    // direction — a bucket that changes too often costs one unused stored `Area`, one that
-    // changes too rarely brings the pinned-height defect back.
-    let row_pitch_pt = (spacing.interact_size.y + spacing.item_spacing.y).max(1.0);
-    // Clamped before the conversion, so it cannot truncate or lose a sign (CLAUDE.md §17
-    // allows `as` where the conversion is proven safe): 64 rows is far past what any style
-    // can fit into `combo_height`, and a degenerate style simply gets the widest bucket.
-    let max_rows = (spacing.combo_height / row_pitch_pt).ceil().clamp(1.0, 64.0) as usize;
-    row_count.clamp(1, max_rows)
-}
 
 /// Point size of the font combo's row previews, and of its own-typeface closed caption.
 ///
@@ -309,204 +223,57 @@ impl TypingCreatePanelState {
         );
     }
 
-    /// Body of the create-presets section: the preset selector combo (which also CREATES a
-    /// preset), the rename field of the selected preset with its save and delete buttons,
-    /// and the unsaved-changes warning. The strong section title is shown in the collapsing
-    /// header, so it is not drawn inline here.
+    /// Body of the create-presets section: the shared `ms_widgets::PresetPicker` — the preset
+    /// selector combo (which also CREATES a preset), the rename field of the selected preset
+    /// with its save and delete buttons, and the unsaved-changes warning. The strong section
+    /// title is shown in the collapsing header, so it is not drawn inline here.
     ///
     /// NO `ui.group` FRAME. The collapsing header already separates this section from its
     /// neighbours, and none of the sibling parameter sections draws one; a border here read
     /// as a second, redundant boundary around the one section that had it.
-    fn draw_create_presets_body(&mut self, ui: &mut egui::Ui) {
-        self.draw_global_preset_combo(ui);
-        self.draw_global_preset_name_row(ui);
-        self.draw_global_preset_unsaved_warning(ui);
-    }
-
-    /// The global-preset combo: «Нет», the «create» action row, then every preset by name.
     ///
-    /// THE WHEEL NEVER CREATES A PRESET. Wheel steps go through
-    /// [`global_preset_wheel_target`], which cycles a virtual list holding only «Нет» and the
-    /// real presets; the «create» row exists in the popup alone. Cycling into a creation
-    /// would mint presets on a stray scroll over the closed combo.
-    fn draw_global_preset_combo(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let mut names: Vec<String> = self.presets_by_name.keys().cloned().collect();
-            names.sort();
-            let selected_text = self
-                .selected_preset_name
-                .as_deref()
-                .unwrap_or(text_preset_none_label());
-            // Position of the selection IN `names`, `None` for «Нет». The row index in the
-            // popup is one higher for «Нет» and one more for the «create» row, but neither of
-            // those is addressable by the wheel, so the wheel works on this value.
-            let selected_pos = self
-                .selected_preset_name
-                .as_ref()
-                .and_then(|selected| names.iter().position(|name| name == selected));
-            // Collected inside the popup closure and applied AFTER it: every arm needs
-            // `&mut self`, which the closure would still be borrowing.
-            let mut action: Option<GlobalPresetRowAction> = None;
-            // The row-count bucket is part of the id: a popup `Area` remembers its size under
-            // a fixed id and can only ever shrink, so a constant salt would pin the height
-            // measured at the SHORTEST row count the popup was ever opened at — and this list
-            // grows in place, one row per created preset. See
-            // `global_preset_popup_id_bucket`. «Нет» + the «create» row are the two rows
-            // that exist before any preset does.
-            let row_count = names.len() + GLOBAL_PRESET_POPUP_TEXT_ROWS;
-            let popup_bucket = global_preset_popup_id_bucket(ui, row_count);
-            let preset_combo =
-                WheelComboBox::from_label(t!("typing.presets.current_preset_combo_id"))
-                    .id_salt(("typing.presets.current_preset_combo_id", popup_bucket))
-                    .selected_text(selected_text)
-                    .show_ui_with_wheel(ui, |ui| {
-                        if ui
-                            .selectable_label(selected_pos.is_none(), text_preset_none_label())
-                            .clicked()
-                        {
-                            action = Some(GlobalPresetRowAction::Deselect);
-                        }
-                        // Never drawn as "selected": creating leaves the NEW preset selected,
-                        // and this row is an action, not a state.
-                        if ui
-                            .selectable_label(false, t!("typing.presets.create_option"))
-                            .clicked()
-                        {
-                            action = Some(GlobalPresetRowAction::Create);
-                        }
-                        for (idx, name) in names.iter().enumerate() {
-                            if ui.selectable_label(selected_pos == Some(idx), name).clicked() {
-                                action = Some(GlobalPresetRowAction::Select(name.clone()));
-                            }
-                        }
-                    });
-            // Wheel steps are only reported while the popup is CLOSED, so they can never race
-            // with a click collected above.
-            if let Some(steps) = preset_combo.wheel_steps
-                && let Some(target) = global_preset_wheel_target(selected_pos, names.len(), steps)
-            {
-                action = Some(match target.and_then(|idx| names.get(idx).cloned()) {
-                    Some(name) => GlobalPresetRowAction::Select(name),
-                    None => GlobalPresetRowAction::Deselect,
-                });
-            }
-            // A row that IS the panel's current state is dropped here rather than inside the
-            // arms below, so every arm stays a plain action.
-            if action
-                .as_ref()
-                .is_some_and(|requested| self.global_preset_action_changes_nothing(requested))
-            {
-                action = None;
-            }
-            match action {
-                // «Нет»: ownership goes back to the panel itself. The session font profiles
-                // simply become the fonts' own again, and the LIVE local set — which belonged
-                // to the preset that was just dropped, in EITHER identity mode — goes back to
-                // the parked document default (`restore_default_local_set_after_deselect`).
-                Some(GlobalPresetRowAction::Deselect) => self.deselect_global_preset(),
-                Some(GlobalPresetRowAction::Create) => self.create_global_preset(),
-                // `apply_preset_by_name` has to see the PREVIOUS selection to know whether
-                // this is the transition that parks the default local set, so the selection is
-                // never written here.
-                Some(GlobalPresetRowAction::Select(name)) => {
+    /// The widget only reports what was asked for; every arm below is the panel's own domain
+    /// operation, and each of them re-syncs `global_preset_picker` itself. The wheel never
+    /// creates and no-op rows are already filtered by the widget.
+    fn draw_create_presets_body(&mut self, ui: &mut egui::Ui) {
+        let mut names: Vec<String> = self.presets_by_name.keys().cloned().collect();
+        names.sort();
+        let selected_pos = self
+            .selected_preset_name
+            .as_ref()
+            .and_then(|selected| names.iter().position(|name| name == selected));
+        let response = PresetPicker::new(
+            "typing.presets.current_preset_combo_id",
+            t!("typing.presets.current_preset_combo_id"),
+            &names,
+            selected_pos,
+        )
+        // The panel's own definition (dirty flag OR pending rename); the widget ORs in the
+        // rename compare again, which is the same string compare and changes nothing.
+        .unsaved(self.selected_preset_has_unsaved_changes())
+        .show(ui, &mut self.global_preset_picker);
+        match response.action {
+            // «Нет»: ownership goes back to the panel itself. The session font profiles
+            // simply become the fonts' own again, and the LIVE local set — which belonged
+            // to the preset that was just dropped, in EITHER identity mode — goes back to
+            // the parked document default (`restore_default_local_set_after_deselect`).
+            Some(PresetPickerAction::Deselect) => self.deselect_global_preset(),
+            Some(PresetPickerAction::Create) => self.create_global_preset(),
+            // `apply_preset_by_name` has to see the PREVIOUS selection to know whether
+            // this is the transition that parks the default local set, so the selection is
+            // never written here.
+            Some(PresetPickerAction::Select(idx)) => {
+                if let Some(name) = names.get(idx).cloned() {
                     self.apply_preset_by_name(name);
                     self.queue_preview_render();
                 }
-                None => {}
             }
-        });
-    }
-
-    /// Whether a combo row's action would change nothing — the row that already IS the
-    /// panel's state.
-    ///
-    /// Re-applying the selected preset would park and re-install its own local set for no
-    /// reason, and «Нет» with no selection would restore a default set that was never parked.
-    /// The «create» row is never a no-op: it always mints a preset.
-    #[must_use]
-    fn global_preset_action_changes_nothing(&self, action: &GlobalPresetRowAction) -> bool {
-        match action {
-            GlobalPresetRowAction::Deselect => self.selected_preset_name.is_none(),
-            GlobalPresetRowAction::Create => false,
-            GlobalPresetRowAction::Select(name) => {
-                self.selected_preset_name.as_deref() == Some(name.as_str())
-            }
+            Some(PresetPickerAction::Save) => self.save_current_preset(),
+            // The widget reports the index it was given as the selection, so deleting "the
+            // selected preset" is deleting that row.
+            Some(PresetPickerAction::Delete(_)) => self.delete_selected_preset(),
+            None => {}
         }
-    }
-
-    /// The rename field of the SELECTED preset plus the save and delete buttons.
-    ///
-    /// All three are disabled without a selection: there is nothing to rename, commit or
-    /// delete then, and the buffer is bound to the selection rather than being a name for a
-    /// preset that does not exist yet.
-    fn draw_global_preset_name_row(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let has_selection = self.selected_preset_name.is_some();
-            let field_width =
-                (ui.available_width() - PRESET_NAME_ROW_BUTTON_RESERVE_PT).max(120.0);
-            ui.add_enabled(
-                has_selection,
-                egui::TextEdit::singleline(&mut self.preset_name_input)
-                    .id_salt("typing_preset_name_input")
-                    .hint_text(t!("typing.presets.name_hint"))
-                    .desired_width(field_width),
-            );
-            if ui
-                .add_enabled(
-                    has_selection,
-                    egui::Button::new(t!("typing.presets.save_button")),
-                )
-                .clicked()
-            {
-                self.save_current_preset();
-            }
-            self.draw_global_preset_delete_control(ui, has_selection);
-        });
-    }
-
-    /// The two-step delete button of the selected preset: the first click ARMS it (the
-    /// caption switches to the confirm wording), a second PLAIN click deletes.
-    ///
-    /// Ported from `settings::typesetting::font_groups::draw_delete_control`, hardening
-    /// included: a physical DOUBLE-click cannot delete (the confirm step requires
-    /// `clicked() && !double_clicked()`, and a double-click delivers a press on two
-    /// consecutive frames), and the armed state AUTO-DISARMS as soon as the pointer is no
-    /// longer over the button, so a stale arm cannot turn a later unrelated click into a
-    /// deletion. Tinted red in BOTH states — it is destructive at rest — and more strongly so
-    /// once armed.
-    fn draw_global_preset_delete_control(&mut self, ui: &mut egui::Ui, enabled: bool) {
-        // A disabled button reports neither clicks nor hovers, so an arm left behind by a
-        // selection change could otherwise sit there until the next selection.
-        let armed = self.preset_delete_armed && enabled;
-        let button = if armed {
-            egui::Button::new(t!("typing.presets.delete_confirm_button"))
-                .fill(ms_theme::status::DESTRUCTIVE_ARMED_FILL)
-        } else {
-            egui::Button::new(t!("typing.presets.delete_button")).fill(PRESET_DELETE_IDLE_COLOR)
-        };
-        let response = ui.add_enabled(enabled, button);
-        if response.clicked() && !response.double_clicked() {
-            if armed {
-                self.delete_selected_preset();
-            } else {
-                self.preset_delete_armed = true;
-            }
-        } else if armed && !response.hovered() {
-            self.preset_delete_armed = false;
-        }
-    }
-
-    /// The yellow, small "this preset is not saved" line under the name row. Drawn only while
-    /// a preset is selected AND [`Self::selected_preset_has_unsaved_changes`] holds.
-    fn draw_global_preset_unsaved_warning(&mut self, ui: &mut egui::Ui) {
-        if !self.selected_preset_has_unsaved_changes() {
-            return;
-        }
-        ui.label(
-            egui::RichText::new(t!("typing.presets.unsaved_warning"))
-                .small()
-                .color(ms_theme::status::WARNING),
-        );
     }
 
     /// Whether the selected global preset differs from what the document on disk holds.
@@ -531,7 +298,7 @@ impl TypingCreatePanelState {
         let Some(name) = self.selected_preset_name.as_deref() else {
             return false;
         };
-        self.selected_preset_dirty || self.preset_name_input != name
+        self.selected_preset_dirty || self.global_preset_picker.has_pending_rename(Some(name))
     }
 
     /// Drops the global-preset selection («Нет» in the combo) and gives the live local set
@@ -543,19 +310,18 @@ impl TypingCreatePanelState {
     /// gating the restore on it left the panel owning the DEFAULT set while holding a global
     /// preset's — the first edit then persisted the preset's set over the user's own.
     ///
-    /// The rename buffer, the dirty flag and the armed delete button all belong to the
-    /// selection, so all three are cleared with it.
+    /// The picker state (rename buffer + armed delete button) and the dirty flag belong to the
+    /// selection, so they are cleared with it.
     pub(super) fn deselect_global_preset(&mut self) {
         self.selected_preset_name = None;
-        self.preset_name_input.clear();
+        self.global_preset_picker.reset_to(None);
         self.selected_preset_dirty = false;
-        self.preset_delete_armed = false;
         self.restore_default_local_set_after_deselect();
     }
 
     /// Applies a saved create preset — its per-font profile memory and its primary font —
-    /// and re-syncs everything bound to the selection: the rename buffer, the dirty flag and
-    /// the armed delete button.
+    /// and re-syncs everything bound to the selection: the picker state (rename buffer and
+    /// armed delete button, reset where the selection is written) and the dirty flag.
     ///
     /// The preset names its font ONCE, by identity (`TypingCreatePreset.font`). A value the
     /// migration could not resolve survives there in its legacy spelling, so this stays a
@@ -589,7 +355,6 @@ impl TypingCreatePanelState {
             return;
         }
         self.selected_preset_dirty = false;
-        self.preset_delete_armed = false;
     }
 
     /// The apply itself. Returns whether a preset was really installed — `false` only when
@@ -606,7 +371,7 @@ impl TypingCreatePanelState {
         // Marked applied BEFORE any profile is stored: from here on every parameter write
         // belongs to THIS preset's working set, not to the font's persisted default
         // (`create_render_data::store_current_font_profile_by_idx`, variant A).
-        self.preset_name_input.clone_from(&name);
+        self.global_preset_picker.reset_to(Some(&name));
         self.selected_preset_name = Some(name);
         // The MODE travels with the preset and is installed FIRST, because it decides which
         // of the two disjoint payloads below is the preset's real content. Persisting it
@@ -858,7 +623,7 @@ impl TypingCreatePanelState {
     ///
     /// The payload is [`Self::capture_current_preset`] — exactly what saving would have
     /// written — and the name is [`Self::free_default_preset_name`]. Deliberately independent
-    /// of `preset_name_input`: that buffer is the RENAME field of the SELECTED preset, so
+    /// of the picker's rename buffer (`global_preset_picker`): that buffer is the RENAME field of the SELECTED preset, so
     /// gating creation on it would make the combo's «create» row silently do nothing.
     ///
     /// This is a `no preset` → `preset` transition even when one was already applied (the new
@@ -894,11 +659,10 @@ impl TypingCreatePanelState {
         let preset = self.capture_current_preset();
         self.presets_by_name.insert(name.clone(), preset);
         self.park_default_local_set_for_global_preset();
-        self.preset_name_input.clone_from(&name);
+        self.global_preset_picker.reset_to(Some(&name));
         self.selected_preset_name = Some(name);
         // The preset was just written FROM what is on screen, so nothing is unsaved.
         self.selected_preset_dirty = false;
-        self.preset_delete_armed = false;
         self.spawn_presets_save(false);
     }
 
@@ -936,7 +700,7 @@ impl TypingCreatePanelState {
             return;
         }
         // VERBATIM (see the doc comment): the buffer IS the name, whitespace included.
-        let new_name = self.preset_name_input.clone();
+        let new_name = self.global_preset_picker.name().to_owned();
         if new_name.is_empty() {
             self.status_line = t!("typing.presets.empty_name_status").to_string();
             return;
@@ -954,10 +718,9 @@ impl TypingCreatePanelState {
             self.presets_by_name.remove(&current_name);
         }
         self.presets_by_name.insert(new_name.clone(), preset);
-        self.preset_name_input.clone_from(&new_name);
+        self.global_preset_picker.reset_to(Some(&new_name));
         self.selected_preset_name = Some(new_name);
         self.selected_preset_dirty = false;
-        self.preset_delete_armed = false;
         self.spawn_presets_save(false);
     }
 

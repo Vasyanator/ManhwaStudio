@@ -10,7 +10,12 @@ Main items:
   recovery below does not make the two crates circular — see the re-export note).
   `Bubble` stores per-bubble placement plus optional `bubble_class`
   (`text`/`image`) and optional `bubble_type` (`default`/`aside`/`on_top`) for text display.
-- `CanvasSettings` stores editable/readonly default bubble display types.
+- `CanvasSettings` stores editable/readonly default bubble display types. Its 13 layout fields
+  default from the layout table in `canvas_layout.rs` (`CanvasLayout`, `BuiltinLayoutPreset`,
+  `BASE_BUILTIN`, `LayoutPresetSelection`; re-exported here), which also owns their per-title
+  read and migration rule and the app-wide preset store (`CanvasLayoutPresets`).
+- `ComicType` is the title KIND (`comic_type`), written by `save_comic_type_to_project_file`;
+  it is never derived from the canvas settings.
 - `SessionKind` (`Project` / `SingleImage(Arc<SingleImageSession>)`), `SingleImageSession`
   (ordered per-page `SourceImageFacts`, the `SkippedSource` list, the scratch root),
   `SourceImageFormat`: the session a `ProjectData` belongs to (field `session`; every load sets
@@ -53,8 +58,10 @@ Main items:
   where all in-session mutations are staged before an explicit "save to project".
 - `ProjectPaths::image_bubbles_dir` and `unsaved_image_bubbles_dir`: saved and staged external
   ImageBubble media directories.
-- Canvas settings parsing keeps project-scoped keys in `settings.json`, while selected
-  canvas preferences can be sourced from global `user_config.json`.
+- Canvas settings parsing (`canvas_settings_from_config`) reads the layout per title (see
+  `canvas_layout.rs`) and the other project-scoped keys from `settings.json`; a few cross-title
+  preferences (status rules, page cache, status display, hint default) come from
+  `user_config.json` first.
 - Utility helpers for image collection, directory bootstrap and recursive copies.
 
 Storage:
@@ -92,6 +99,13 @@ use ms_page_ops::clean_binding::{classify_clean_fit, clean_overlay_file_name, Cl
 // projects root), not the `ms_storage` seam — see the note in `MODULE_README.md`.
 pub mod project_scan;
 pub mod save_merge;
+// The canvas LAYOUT presets: the preset-owned subset of `CanvasSettings` and the factory table
+// every canvas default is built from (one owner; see the file header).
+pub mod canvas_layout;
+pub use canvas_layout::{
+    BASE_BUILTIN, BuiltinLayoutPreset, CanvasLayout, CanvasLayoutPresets, LAYOUT_PRESETS_KEY, LayoutPresetOp, LayoutPresetSelection, LayoutPresetStoreError, apply_layout_preset_op,
+    apply_layout_preset_op_to_user_config, save_layout_preset_selection, seed_image_set_title,
+};
 // `PixelDigest`, the one "same pixels" test of the image-set mode. Compiled on every target:
 // the typing flatten (also built for wasm) computes it at save time.
 mod pixel_digest;
@@ -172,8 +186,16 @@ pub struct CanvasSettings {
     /// Initial `hint_show_outside_translation` value for newly created hint bubbles.
     /// Loaded user-file-primary with a project-file fallback (a cross-project user preference).
     pub hint_show_outside_default: bool,
+    /// The title's selected layout preset (`canvas.layout_preset`, read by
+    /// `LayoutPresetSelection::from_title`). Owned by the Settings pane, not part of
+    /// `SharedCanvasSettings`.
+    pub layout_preset: LayoutPresetSelection,
 }
 
+/// The title KIND (`comic_type` of its `settings.json`): page-based comic or webtoon ribbon. Set by
+/// the first-open prompt and by Settings › «Лента и пузыри» › «Тип тайтла»; never derived from the
+/// canvas settings. `Custom` is a legacy value older builds derived when the layout matched no
+/// preset; it stays readable and consumers treat it like an unknown kind.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ComicType {
     Pages,
@@ -198,80 +220,57 @@ impl ComicType {
             Self::Custom => "custom",
         }
     }
-
-    pub fn display_name(self) -> &'static str {
-        match self {
-            Self::Pages => t!("project.comic_type.pages"),
-            Self::Ribbon => t!("project.comic_type.ribbon"),
-            Self::Custom => t!("project.comic_type.custom"),
-        }
-    }
-
-    /// Canvas fields a preset writes: `(aside_compact_mode, separate_pages)`.
-    ///
-    /// `Custom` returns `None` — it is not a set of values but the absence of a match.
-    ///
-    /// This function and [`Self::from_canvas_preset_fields`] are a PAIR and must stay
-    /// exact inverses: the settings UI applies these values and then re-derives the
-    /// active preset from them on the very next frame, so any disagreement makes the
-    /// combo box jump to "Custom" the instant the user picks a preset. `preset_round_trip`
-    /// in the tests below locks that down.
-    pub fn canvas_preset(self) -> Option<(&'static str, bool)> {
-        match self {
-            Self::Pages => Some(("moderate", true)),
-            Self::Ribbon => Some(("none", false)),
-            Self::Custom => None,
-        }
-    }
-
-    /// Derives the active preset from the canvas fields, or `Custom` when they match none.
-    ///
-    /// The inverse of [`Self::canvas_preset`]; see the contract stated there.
-    pub fn from_canvas_preset_fields(aside_compact_mode: &str, separate_pages: bool) -> Self {
-        match (
-            aside_compact_mode.trim().to_ascii_lowercase().as_str(),
-            separate_pages,
-        ) {
-            ("moderate", true) => Self::Pages,
-            ("none", false) => Self::Ribbon,
-            _ => Self::Custom,
-        }
-    }
 }
 
 impl Default for CanvasSettings {
+    /// The non-layout defaults plus the layout of [`BASE_BUILTIN`] (the one layout table).
     fn default() -> Self {
+        let CanvasLayout {
+            separate_pages,
+            page_spacing_px,
+            vertical_edge_margin_px,
+            aside_compact_mode,
+            aside_min_width_px,
+            aside_max_width_px,
+            aside_scale_pct,
+            aside_side_mode,
+            scale_bubbles,
+            aside_second_column,
+            editable_bubble_type,
+            readonly_bubble_type,
+            on_top_focus_mode,
+        } = BASE_BUILTIN.factory();
         Self {
             bubble_type: "hybrid".to_string(),
-            editable_bubble_type: "aside".to_string(),
-            readonly_bubble_type: "aside".to_string(),
+            editable_bubble_type,
+            readonly_bubble_type,
             show_bubbles: true,
             show_bubble_status: false,
             bubble_status_rules: default_bubble_status_rules(),
             bubble_opacity: 1.0,
-            aside_min_width_px: 450,
-            aside_max_width_px: 550,
-            aside_compact_mode: "none".to_string(),
-            aside_side_mode: "auto".to_string(),
-            aside_second_column: true,
-            on_top_focus_mode: "around".to_string(),
-            scale_bubbles: true,
-            page_spacing_px: 200,
-            separate_pages: true,
-            vertical_edge_margin_px: 200,
+            aside_min_width_px,
+            aside_max_width_px,
+            aside_compact_mode,
+            aside_side_mode,
+            aside_second_column,
+            on_top_focus_mode,
+            scale_bubbles,
+            page_spacing_px,
+            separate_pages,
+            vertical_edge_margin_px,
             side_margin_px: 20,
-            aside_scale_pct: 100,
+            aside_scale_pct,
             auto_insert_last_character: true,
             spellcheck_original: false,
             spellcheck_translation: true,
             tabs_autosync_enabled: true,
             cache_pages: true,
-            // Marks by default, and deliberately independent of the canvas preset: the
-            // preset only owns `aside_compact_mode` / `separate_pages` (see
-            // `ComicType::canvas_preset`), so this value survives switching between the
-            // page and ribbon presets.
+            // Marks by default, and deliberately outside the layout presets
+            // (`canvas_layout::CanvasLayout` owns 13 fields, not this one), so this value
+            // survives switching between the page and webtoon presets.
             translation_status_display: "marks".to_string(),
             hint_show_outside_default: false,
+            layout_preset: LayoutPresetSelection::None,
         }
     }
 }
@@ -2028,31 +2027,32 @@ fn legacy_backup_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{stem}_legacy_xy.json"))
 }
 
+/// The canvas settings of one title. `settings` is the title's `settings.json` root (after the
+/// project defaults backfill), `user_settings` the `user_config` root.
+///
+/// The 13 layout fields and the preset selection come from `canvas_layout` (per title, with the
+/// legacy migration rule of `read_title_layout`; the title's own `comic_type` picks the fallback
+/// preset, taken with the user's override from `user_config` `Canvas.layout_presets`). A legacy `aside` / `on_top` `bubble_type` then pins both display types. The other
+/// fields read the title `canvas` object, a few with a legacy root key, and the cross-title user
+/// preferences (`bubble_status_rules`, `cache_pages`, `translation_status_display`,
+/// `hint_show_outside_default`) the user config first.
 fn canvas_settings_from_config(settings: &Value, user_settings: &Value) -> CanvasSettings {
     let mut out = CanvasSettings::default();
     let canvas = settings.get("canvas");
     let user_canvas = user_settings.get("Canvas");
+    let kind = comic_type_from_config(settings);
 
+    // The kind's preset as the user has it now (an edited «Pages» / «Webtoon» included), so a new
+    // title or an image set opens with the user's version of it.
+    let fallback = CanvasLayoutPresets::from_user_config(user_settings).fallback_for_kind(kind);
+    canvas_layout::read_title_layout(settings, user_settings, kind, &fallback).apply_to(&mut out);
+    out.layout_preset = LayoutPresetSelection::from_title(canvas, kind);
     if let Some(v) = canvas
         .and_then(|c| c.get("bubble_type"))
         .or_else(|| settings.get("bubble_type"))
         .and_then(Value::as_str)
     {
         out.bubble_type = v.to_string();
-    }
-    if let Some(v) = canvas
-        .and_then(|c| c.get("editable_bubble_type"))
-        .or_else(|| settings.get("editable_bubble_type"))
-        .and_then(Value::as_str)
-    {
-        out.editable_bubble_type = v.to_string();
-    }
-    if let Some(v) = canvas
-        .and_then(|c| c.get("readonly_bubble_type"))
-        .or_else(|| settings.get("readonly_bubble_type"))
-        .and_then(Value::as_str)
-    {
-        out.readonly_bubble_type = v.to_string();
     }
     if out.bubble_type.eq_ignore_ascii_case("aside")
         || out.bubble_type.eq_ignore_ascii_case("on_top")
@@ -2081,41 +2081,6 @@ fn canvas_settings_from_config(settings: &Value, user_settings: &Value) -> Canva
     {
         out.bubble_status_rules = rules;
     }
-    if let Some(v) = user_canvas
-        .and_then(|c| c.get("aside_min_width_px"))
-        .or_else(|| canvas.and_then(|c| c.get("aside_min_width_px")))
-        .and_then(Value::as_i64)
-    {
-        out.aside_min_width_px = (v as i32).max(40);
-    }
-    if let Some(v) = user_canvas
-        .and_then(|c| c.get("aside_max_width_px"))
-        .or_else(|| canvas.and_then(|c| c.get("aside_max_width_px")))
-        .and_then(Value::as_i64)
-    {
-        out.aside_max_width_px = (v as i32).max(40);
-    }
-    if let Some(v) = user_canvas
-        .and_then(|c| c.get("aside_compact_mode"))
-        .or_else(|| canvas.and_then(|c| c.get("aside_compact_mode")))
-        .and_then(Value::as_str)
-    {
-        out.aside_compact_mode = v.to_string();
-    }
-    if let Some(v) = user_canvas
-        .and_then(|c| c.get("aside_side_mode"))
-        .or_else(|| canvas.and_then(|c| c.get("aside_side_mode")))
-        .and_then(Value::as_str)
-    {
-        out.aside_side_mode = v.to_string();
-    }
-    if let Some(v) = user_canvas
-        .and_then(|c| c.get("aside_second_column"))
-        .or_else(|| canvas.and_then(|c| c.get("aside_second_column")))
-        .and_then(Value::as_bool)
-    {
-        out.aside_second_column = v;
-    }
     if let Some(v) = canvas
         .and_then(|c| c.get("bubble_opacity"))
         .and_then(Value::as_f64)
@@ -2123,48 +2088,10 @@ fn canvas_settings_from_config(settings: &Value, user_settings: &Value) -> Canva
         out.bubble_opacity = (v as f32).clamp(0.0, 1.0);
     }
     if let Some(v) = canvas
-        .and_then(|c| c.get("on_top_focus_mode"))
-        .or_else(|| settings.get("on_top_focus_mode"))
-        .and_then(Value::as_str)
-    {
-        out.on_top_focus_mode = v.to_string();
-    }
-    if let Some(v) = user_canvas
-        .and_then(|c| c.get("scale_bubbles"))
-        .or_else(|| canvas.and_then(|c| c.get("scale_bubbles")))
-        .and_then(Value::as_bool)
-    {
-        out.scale_bubbles = v;
-    }
-    if let Some(v) = canvas
-        .and_then(|c| c.get("page_spacing_px"))
-        .and_then(Value::as_i64)
-    {
-        out.page_spacing_px = (v as i32).max(0);
-    }
-    if let Some(v) = canvas
-        .and_then(|c| c.get("separate_pages"))
-        .and_then(Value::as_bool)
-    {
-        out.separate_pages = v;
-    }
-    if let Some(v) = canvas
-        .and_then(|c| c.get("vertical_edge_margin_px"))
-        .and_then(Value::as_i64)
-    {
-        out.vertical_edge_margin_px = (v as i32).max(0);
-    }
-    if let Some(v) = canvas
         .and_then(|c| c.get("side_margin_px"))
         .and_then(Value::as_i64)
     {
         out.side_margin_px = (v as i32).max(0);
-    }
-    if let Some(v) = canvas
-        .and_then(|c| c.get("aside_scale_pct"))
-        .and_then(Value::as_i64)
-    {
-        out.aside_scale_pct = (v as i32).clamp(25, 300);
     }
     if let Some(v) = canvas
         .and_then(|c| c.get("auto_insert_last_character"))
@@ -2213,9 +2140,6 @@ fn canvas_settings_from_config(settings: &Value, user_settings: &Value) -> Canva
         .and_then(Value::as_bool)
     {
         out.hint_show_outside_default = v;
-    }
-    if out.aside_max_width_px < out.aside_min_width_px {
-        out.aside_max_width_px = out.aside_min_width_px;
     }
     out
 }
@@ -2351,10 +2275,14 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+// Characterization tests of the canvas-settings reader (scope matrix, root fallbacks, clamps).
+#[cfg(test)]
+mod canvas_settings_tests;
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ComicType, LegacyEntry, LegacyRibbonGeometry, overlay_name_match_key, value_is_legacy_xy,
+        LegacyEntry, LegacyRibbonGeometry, overlay_name_match_key, value_is_legacy_xy,
     };
     use serde_json::json;
 
@@ -2403,53 +2331,6 @@ mod tests {
         std::fs::write(&path, b"[]").expect("reseed");
         super::persist_migrated_bubbles(&path, &[migrated_bubble()]).expect("persist again");
         assert_eq!(std::fs::read(&backup).expect("backup"), original, "backup is one-time");
-    }
-
-    /// `canvas_preset` and `from_canvas_preset_fields` must be exact inverses.
-    ///
-    /// The settings UI writes the values of the chosen preset and re-derives the active
-    /// preset from them on the next frame. When the two disagreed — `Pages` was applied as
-    /// `strong` while only `moderate` was recognised as `Pages` — picking "Pages" wrote the
-    /// wrong compact mode AND made the combo box flip straight back to "Custom".
-    #[test]
-    fn preset_round_trip() {
-        for preset in [ComicType::Pages, ComicType::Ribbon] {
-            let (mode, separate_pages) = preset
-                .canvas_preset()
-                .unwrap_or_else(|| panic!("{preset:?} must define canvas fields"));
-            assert_eq!(
-                ComicType::from_canvas_preset_fields(mode, separate_pages),
-                preset,
-                "preset {preset:?} applies ({mode}, {separate_pages}) but is not recognised back"
-            );
-        }
-        assert_eq!(ComicType::Custom.canvas_preset(), None);
-    }
-
-    /// The page preset uses the MODERATE compact mode, not the strong one: the strong mode
-    /// hides too much of a side bubble for page-based comics. Stated as its own test because
-    /// the round trip above would stay green if both halves were changed to `strong`.
-    #[test]
-    fn pages_preset_uses_moderate_compact_mode() {
-        assert_eq!(ComicType::Pages.canvas_preset(), Some(("moderate", true)));
-    }
-
-    /// Values matching no preset are `Custom`, including a mode that is merely mis-cased or
-    /// padded — the deriver normalises before matching.
-    #[test]
-    fn unmatched_fields_are_custom() {
-        assert_eq!(
-            ComicType::from_canvas_preset_fields("strong", true),
-            ComicType::Custom
-        );
-        assert_eq!(
-            ComicType::from_canvas_preset_fields("moderate", false),
-            ComicType::Custom
-        );
-        assert_eq!(
-            ComicType::from_canvas_preset_fields("  MODERATE ", true),
-            ComicType::Pages
-        );
     }
 
     /// Forward map used only by tests: place a normalized (u, v) point on page `idx`

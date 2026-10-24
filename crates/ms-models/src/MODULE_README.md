@@ -46,8 +46,11 @@ candidate.
   a separate monotonic lifetime counter of noted actions (never reset by a flush); single-image
   mode compares it with its last-write baseline to decide "dirty" (`src/studio/session/image_set/`).
 - `bubbles_model.rs`: shared bubble list, revision tracking, canvas settings, and
-  coalesced background saving. `SharedCanvasSettings::apply_comic_type_preset` is the one place a
-  comic-type preset (`ComicType::canvas_preset`) is written into shared canvas settings; the pure
+  coalesced background saving. `SharedCanvasSettings::layout` / `apply_layout` map its 13 layout
+  fields to and from `ms_project::CanvasLayout` (`apply_layout` is the one way a layout preset is
+  written into shared canvas settings; the layout is persisted per title, see `ms-canvas`
+  `settings.rs`), and its `Default` takes them from `ms_project::BASE_BUILTIN` (the
+  layout table owned by `ms-project` `canvas_layout.rs`), never from literals of its own; the pure
   project `CanvasSettings` -> `SharedCanvasSettings` conversion lives in `ms-canvas` (its
   normalizing enums are there). The bubbles document is written only through
   `ms_docstore::write` (`write_bubbles_snapshot_to`) and its staging existence is
@@ -106,8 +109,8 @@ BELOW `ms-canvas` and the tabs. egui appears here only as DATA types — pixel f
 an `egui::Ui` or `egui::Painter` in this crate is a layer violation. The crate may
 not name `ms-canvas`, `ms-widgets` or anything in `src/`.
 
-The three-way canvas-defaults agreement test (`canvas_defaults_agree_across_the_three_mirrors`)
-therefore lives with the mirror it cannot reach from here — `CanvasState::default` in
+The three-way canvas-defaults agreement test (`canvas_defaults_agree_across_the_three_mirrors`,
+the full layout against `BASE_BUILTIN` plus the named non-layout fields) therefore lives with the mirror it cannot reach from here — `CanvasState::default` in
 `crates/ms-canvas/src/types.rs` — and not next to `SharedCanvasSettings::default`.
 
 Four accessors of `layer_model/layer_doc.rs` (`LayerDoc::ensure_page_loaded`, `LayerDoc::node`,

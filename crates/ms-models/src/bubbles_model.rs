@@ -4,8 +4,9 @@ Shared runtime model for translation bubbles and canvas settings snapshots.
 
 Main items:
 - `SharedCanvasSettings`: lightweight cross-tab canvas settings payload, including
-  editable/readonly default display types for `default` bubbles. It owns applying a comic-type
-  preset (`apply_comic_type_preset`) to the shared settings.
+  editable/readonly default display types for `default` bubbles. It maps its 13 layout fields to
+  and from `ms_project::CanvasLayout` (`layout` / `apply_layout`, the one way a layout preset is
+  applied to shared settings); its `Default` takes them from `ms_project::BASE_BUILTIN`.
 - `BubblesModel`: thread-safe mutable bubbles store with revisions, async saver, and
   flush/hold barriers for destructive staging operations.
 - `runtime_bubble_to_record`: adapter from canvas runtime fields to persisted `Bubble`,
@@ -32,7 +33,7 @@ Threading/persistence:
 */
 
 use ms_config::bubble_status::{BubbleStatusRule, default_bubble_status_rules};
-use ms_project::{Bubble, ComicType};
+use ms_project::{BASE_BUILTIN, Bubble, CanvasLayout};
 use ms_docstore::{DocKind, DocRef};
 use ms_log::runtime_log;
 use anyhow::{Context, Result};
@@ -132,55 +133,140 @@ pub struct SharedCanvasSettings {
 }
 
 impl Default for SharedCanvasSettings {
+    /// The non-layout defaults (kept in step with `CanvasSettings::default` in
+    /// `crates/ms-project/src/lib.rs`) plus the layout of `ms_project::BASE_BUILTIN`, the one
+    /// layout table. `canvas_defaults_agree_across_the_three_mirrors` (ms-canvas `types.rs`)
+    /// guards the agreement.
     fn default() -> Self {
+        let CanvasLayout {
+            separate_pages,
+            page_spacing_px,
+            vertical_edge_margin_px,
+            aside_compact_mode,
+            aside_min_width_px,
+            aside_max_width_px,
+            aside_scale_pct,
+            aside_side_mode,
+            scale_bubbles,
+            aside_second_column,
+            editable_bubble_type,
+            readonly_bubble_type,
+            on_top_focus_mode,
+        } = BASE_BUILTIN.factory();
         Self {
             bubble_type: "hybrid".to_string(),
-            editable_bubble_type: "on_top".to_string(),
-            readonly_bubble_type: "aside".to_string(),
+            editable_bubble_type,
+            readonly_bubble_type,
             show_bubbles: true,
             show_bubble_status: false,
             bubble_status_rules: default_bubble_status_rules(),
             bubble_opacity: 1.0,
-            page_spacing: 200.0,
-            separate_pages: true,
-            edge_margin: 200.0,
+            page_spacing: px_to_world(page_spacing_px),
+            separate_pages,
+            edge_margin: px_to_world(vertical_edge_margin_px),
             side_margin: 20.0,
-            bubble_min_width: 500.0,
-            bubble_max_width: 550.0,
-            aside_compact_mode: "none".to_string(),
-            aside_side_mode: "auto".to_string(),
-            aside_second_column: true,
-            on_top_focus_mode: "around".to_string(),
-            scale_bubbles: true,
-            aside_scale_pct: 100,
+            bubble_min_width: px_to_world(aside_min_width_px),
+            bubble_max_width: px_to_world(aside_max_width_px),
+            aside_compact_mode,
+            aside_side_mode,
+            aside_second_column,
+            on_top_focus_mode,
+            scale_bubbles,
+            aside_scale_pct,
             auto_insert_last_character: true,
             spellcheck_original: false,
             spellcheck_translation: true,
             tabs_autosync_enabled: true,
             cache_pages: true,
-            // Kept in step with `CanvasSettings::default` in `crates/ms-project/src/lib.rs`: these two
-            // Default impls describe the same user-facing settings, and a disagreement
-            // shows up only as a one-frame flicker before the project's values load.
             translation_status_display: "marks".to_string(),
             hint_show_outside_default: false,
         }
     }
 }
 
+/// A persisted integer px length as shared-settings world units (`f32`).
+///
+/// Exact for |v| <= 2^24, far beyond any meaningful pixel length; above that the nearest `f32`
+/// is taken, the same conversion the canvas applies on open (`ms-canvas` `pixel_setting_to_f32`).
+fn px_to_world(value: i32) -> f32 {
+    value as f32
+}
+
+/// A shared-settings world length as persisted integer px: negative values clamp to 0 and the
+/// value is rounded to the nearest integer (the rounding of the project canvas writer).
+///
+/// Float-to-int `as` saturates at the `i32` bounds and maps NaN to 0; after `round()` no
+/// fraction is lost, so that documented saturation is the only possible change of value.
+fn world_to_px(value: f32) -> i32 {
+    value.max(0.0).round() as i32
+}
+
+/// Assigns `value` to `slot` and reports whether the stored value changed.
+fn assign_changed<T: PartialEq>(slot: &mut T, value: T) -> bool {
+    if *slot == value {
+        false
+    } else {
+        *slot = value;
+        true
+    }
+}
+
 impl SharedCanvasSettings {
-    /// Writes `comic_type`'s canvas preset (`ComicType::canvas_preset`: aside compact mode and
-    /// separate pages) into these settings — the one place a preset is applied to shared settings.
-    ///
-    /// Returns `true` iff a field value actually changed. `Custom` is no preset and leaves the
-    /// settings untouched (`false`). The preset strings are stored verbatim; they are exactly the
-    /// canvas enum's `as_str` forms, so a canvas pulling these settings stores the same values.
-    pub fn apply_comic_type_preset(&mut self, comic_type: ComicType) -> bool {
-        let Some((aside_compact_mode, separate_pages)) = comic_type.canvas_preset() else {
-            return false;
-        };
-        let changed = self.aside_compact_mode != aside_compact_mode || self.separate_pages != separate_pages;
-        self.aside_compact_mode = aside_compact_mode.to_string();
-        self.separate_pages = separate_pages;
+    /// The preset-owned layout of these settings, normalized (`CanvasLayout::normalized`); world
+    /// lengths become integer px through `world_to_px`.
+    #[must_use]
+    pub fn layout(&self) -> CanvasLayout {
+        CanvasLayout {
+            separate_pages: self.separate_pages,
+            page_spacing_px: world_to_px(self.page_spacing),
+            vertical_edge_margin_px: world_to_px(self.edge_margin),
+            aside_compact_mode: self.aside_compact_mode.clone(),
+            aside_min_width_px: world_to_px(self.bubble_min_width),
+            aside_max_width_px: world_to_px(self.bubble_max_width),
+            aside_scale_pct: self.aside_scale_pct,
+            aside_side_mode: self.aside_side_mode.clone(),
+            scale_bubbles: self.scale_bubbles,
+            aside_second_column: self.aside_second_column,
+            editable_bubble_type: self.editable_bubble_type.clone(),
+            readonly_bubble_type: self.readonly_bubble_type.clone(),
+            on_top_focus_mode: self.on_top_focus_mode.clone(),
+        }
+        .normalized()
+    }
+
+    /// Writes `layout` into these settings verbatim (px through `px_to_world`); every other
+    /// field is left as it is. Returns `true` iff a field value actually changed.
+    pub fn apply_layout(&mut self, layout: &CanvasLayout) -> bool {
+        let CanvasLayout {
+            separate_pages,
+            page_spacing_px,
+            vertical_edge_margin_px,
+            aside_compact_mode,
+            aside_min_width_px,
+            aside_max_width_px,
+            aside_scale_pct,
+            aside_side_mode,
+            scale_bubbles,
+            aside_second_column,
+            editable_bubble_type,
+            readonly_bubble_type,
+            on_top_focus_mode,
+        } = layout;
+        // `|=`, not `||`: every field is assigned even after the first change.
+        let mut changed = false;
+        changed |= assign_changed(&mut self.separate_pages, *separate_pages);
+        changed |= assign_changed(&mut self.page_spacing, px_to_world(*page_spacing_px));
+        changed |= assign_changed(&mut self.edge_margin, px_to_world(*vertical_edge_margin_px));
+        changed |= assign_changed(&mut self.aside_compact_mode, aside_compact_mode.clone());
+        changed |= assign_changed(&mut self.bubble_min_width, px_to_world(*aside_min_width_px));
+        changed |= assign_changed(&mut self.bubble_max_width, px_to_world(*aside_max_width_px));
+        changed |= assign_changed(&mut self.aside_scale_pct, *aside_scale_pct);
+        changed |= assign_changed(&mut self.aside_side_mode, aside_side_mode.clone());
+        changed |= assign_changed(&mut self.scale_bubbles, *scale_bubbles);
+        changed |= assign_changed(&mut self.aside_second_column, *aside_second_column);
+        changed |= assign_changed(&mut self.editable_bubble_type, editable_bubble_type.clone());
+        changed |= assign_changed(&mut self.readonly_bubble_type, readonly_bubble_type.clone());
+        changed |= assign_changed(&mut self.on_top_focus_mode, on_top_focus_mode.clone());
         changed
     }
 }
@@ -948,52 +1034,35 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Each preset writes exactly its two fields and reports the change; re-applying is a no-op.
+    /// `apply_layout` writes every layout field, reports a change exactly when one happened,
+    /// leaves the other fields alone, and `layout` reads the applied values back.
     #[test]
-    fn comic_preset_writes_its_fields_and_reports_change() {
-        for comic_type in [ComicType::Pages, ComicType::Ribbon] {
-            let Some((aside_compact_mode, separate_pages)) = comic_type.canvas_preset() else {
-                panic!("{comic_type:?} must carry a canvas preset");
-            };
-            let mut settings = SharedCanvasSettings { aside_compact_mode: "strong".to_string(), separate_pages: !separate_pages, ..SharedCanvasSettings::default() };
-            let mut expected = settings.clone();
-            expected.aside_compact_mode = aside_compact_mode.to_string();
-            expected.separate_pages = separate_pages;
-            assert!(settings.apply_comic_type_preset(comic_type), "{comic_type:?}");
-            assert_eq!(settings, expected, "{comic_type:?}");
-            assert!(!settings.apply_comic_type_preset(comic_type), "{comic_type:?} re-apply");
-            assert_eq!(settings, expected, "{comic_type:?} re-apply");
-        }
+    fn apply_layout_reports_change() {
+        let webtoon = ms_project::BuiltinLayoutPreset::Webtoon.factory();
+        let mut settings = SharedCanvasSettings { side_margin: 31.0, translation_status_display: "none".to_string(), ..SharedCanvasSettings::default() };
+        assert!(settings.apply_layout(&webtoon));
+        assert_eq!(settings.layout(), webtoon);
+        assert!(!settings.apply_layout(&webtoon), "re-apply is a no-op");
+        assert_eq!((settings.side_margin, settings.translation_status_display.as_str()), (31.0, "none"));
+        let mut one_field = webtoon.clone();
+        one_field.on_top_focus_mode = "aside".to_string();
+        assert!(settings.apply_layout(&one_field), "a single changed field counts");
+        assert_eq!(settings.on_top_focus_mode, "aside");
     }
 
-    /// A change of only one of the two fields still counts as a change.
+    /// `layout` is normalized: tokens folded, lengths rounded to px and clamped like the reader.
     #[test]
-    fn comic_preset_reports_a_single_field_change() {
-        let mut settings = SharedCanvasSettings { aside_compact_mode: "moderate".to_string(), separate_pages: false, ..SharedCanvasSettings::default() };
-        assert!(settings.apply_comic_type_preset(ComicType::Pages));
-        assert!(settings.separate_pages);
-        let mut settings = SharedCanvasSettings { aside_compact_mode: "strong".to_string(), separate_pages: false, ..SharedCanvasSettings::default() };
-        assert!(settings.apply_comic_type_preset(ComicType::Ribbon));
-        assert_eq!(settings.aside_compact_mode, "none");
+    fn layout_is_normalized() {
+        let settings = SharedCanvasSettings { page_spacing: -2.0, edge_margin: 10.6, bubble_min_width: 12.0, bubble_max_width: 8.0, aside_compact_mode: " NONE".to_string(), aside_scale_pct: 400, ..SharedCanvasSettings::default() };
+        let layout = settings.layout();
+        assert_eq!((layout.page_spacing_px, layout.vertical_edge_margin_px, layout.aside_min_width_px, layout.aside_max_width_px, layout.aside_scale_pct), (0, 11, 40, 40, 300));
+        assert_eq!(layout.aside_compact_mode, "none");
     }
 
-    /// `Custom` is not a preset: nothing changes.
+    /// The default's layout is the base preset.
     #[test]
-    fn comic_preset_custom_leaves_settings_untouched() {
-        let mut settings = SharedCanvasSettings { aside_compact_mode: "strong".to_string(), ..SharedCanvasSettings::default() };
-        let before = settings.clone();
-        assert!(!settings.apply_comic_type_preset(ComicType::Custom));
-        assert_eq!(settings, before);
-    }
-
-    /// The applied fields derive back to the same preset (the settings combo's round trip).
-    #[test]
-    fn comic_preset_round_trips_through_preset_fields() {
-        for comic_type in [ComicType::Pages, ComicType::Ribbon] {
-            let mut settings = SharedCanvasSettings::default();
-            settings.apply_comic_type_preset(comic_type);
-            assert_eq!(ComicType::from_canvas_preset_fields(&settings.aside_compact_mode, settings.separate_pages), comic_type);
-        }
+    fn default_layout_is_the_base_preset() {
+        assert_eq!(SharedCanvasSettings::default().layout(), BASE_BUILTIN.factory());
     }
 
     /// Builds a unique temporary staging path so the background saver of each test model
