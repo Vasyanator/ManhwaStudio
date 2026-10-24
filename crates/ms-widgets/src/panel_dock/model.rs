@@ -167,8 +167,11 @@ impl DockEdge {
 /// position along the *shared* side, as a fraction of the free travel
 /// (`shared side length - panel side length`): `0.0` makes the panel flush with
 /// the start of that side (left or top), `1.0` flush with its end (right or
-/// bottom), `0.5` centres it. Values outside the range and non-finite values are
-/// clamped by the solver, never rejected.
+/// bottom), `0.5` centres it. For a `Panel` anchor the travel is NEGATIVE when
+/// the panel is longer than the target's side: the panel then overhangs it, and
+/// `0.0` / `1.0` make their starts / ends coincide — either way the shorter of
+/// the two sides lies inside the longer one. Values outside the range and
+/// non-finite values are clamped by the solver, never rejected.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PanelAnchor {
     /// Free-floating: the panel's own `pos` is authoritative.

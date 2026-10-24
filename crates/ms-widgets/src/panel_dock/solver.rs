@@ -17,19 +17,23 @@ Main responsibilities:
 
 Key structures:
 - `PanelSizes`: sanitized `PanelId -> Vec2` input map.
-- `PanelChrome`: measured, style-dependent header/frame overhead of a panel.
+- `PanelChrome`: measured, style-dependent ONE-ROW header/frame overhead,
+  shared by every panel.
+- `PanelHeaderMetrics`, `PanelHeaders`: what one panel's header costs beyond
+  that one row (wrapped caption rows, caption-driven minimum width).
 - `SolvedPanel`, `SolvedLayout`: the solver's output.
 
 Key functions:
-- `solve`: the whole contract; deterministic, side-effect free, panic free.
+- `solve_with_headers`: the whole contract; deterministic, side-effect free,
+  panic free. `solve` is the same call with no per-panel header metrics.
 - `relieve_overflow`: one shrink pass on one axis, driven by the exact
   derivative of each overflowing panel's edge with respect to every size.
 
 Notes:
 This file must stay a pure function of its inputs: no egui context, no memory,
 no logging, no interior mutability. Everything it needs about the previous frame
-(measured content sizes, manual resizes) arrives through `desired` / `mins` and
-`PanelNode::size_override`.
+(measured content sizes, manual resizes, header rows) arrives through
+`desired` / `mins` / `headers` and `PanelNode::size_override`.
 */
 
 use std::cmp::Ordering;
@@ -200,13 +204,18 @@ impl Axis {
     }
 }
 
-/// The style-dependent vertical overhead of a drawn panel, measured by
-/// `CollapsiblePanel` and fed back into the next frame's solve.
+/// The style-dependent vertical overhead of a drawn panel whose header strip is
+/// ONE row tall, measured by `CollapsiblePanel` and fed back into the next
+/// frame's solve.
 ///
 /// Both values are OUTER heights in points and are identical for every panel of
 /// one frame (same widget, same style), which is why the driver keeps a single
-/// instance rather than a per-panel map. Before the first panel has ever been
-/// drawn they fall back to the nominal [`COLLAPSED_PANEL_HEIGHT`].
+/// instance rather than a per-panel map. A header whose captions wrap onto more
+/// rows costs more than this; that surplus depends on the panel's width and its
+/// captions, so it is reported per panel as [`PanelHeaderMetrics`] and added by
+/// [`PanelChrome::with_header`] — the one-row value itself never changes with
+/// wrapping. Before the first panel has ever been drawn both values fall back to
+/// the nominal [`COLLAPSED_PANEL_HEIGHT`].
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct PanelChrome {
     /// Outer height of a COLLAPSED panel: the frame margins plus the header
@@ -246,6 +255,113 @@ impl PanelChrome {
         (self.collapsed_height - other.collapsed_height)
             .abs()
             .max((self.body_overhead - other.body_overhead).abs())
+    }
+
+    /// The overhead of one particular panel: this one-row chrome plus the extra
+    /// caption rows its header drew ([`PanelHeaderMetrics::extra_height`]),
+    /// added to BOTH heights — a collapsed panel shows the same rows.
+    #[must_use]
+    pub fn with_header(self, header: PanelHeaderMetrics) -> Self {
+        Self {
+            collapsed_height: self.collapsed_height + header.extra_height,
+            body_overhead: self.body_overhead + header.extra_height,
+        }
+    }
+}
+
+/// What ONE panel's header strip costs beyond the shared one-row
+/// [`PanelChrome`], measured by `CollapsiblePanel` on the frame it was drawn and
+/// fed into the next frame's solve.
+///
+/// Tab captions wrap onto further rows when the panel is too narrow for one, and
+/// a row always holds at least one caption, so a caption wider than the strip
+/// sets the narrowest width the panel can be drawn at. Both values are a
+/// function of the panel's WIDTH and its captions only, never of its height:
+/// width -> rows -> height, never back, which is what keeps the one-frame lag
+/// from oscillating. `Default` (both `0.0`) is a one-row header with no width
+/// requirement — the value of a panel never drawn.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct PanelHeaderMetrics {
+    /// Outer height, in points, the caption rows BELOW the first one add to the
+    /// panel. `0.0` for a header that fits one row.
+    pub extra_height: f32,
+    /// Smallest outer width, in points, at which every caption still fits a row
+    /// of its own: the lead in front of the first caption (frame, collapse
+    /// arrow, drag grip), the widest caption and the frame's trailing margin.
+    /// A physical bound like [`PANEL_MIN_WIDTH`], so it raises both the request
+    /// and the shrink floor. `0.0` when the strip shows no caption.
+    pub min_width: f32,
+}
+
+impl PanelHeaderMetrics {
+    /// Builds a measurement, replacing a non-finite or negative component with
+    /// `0.0` — "no extra row, no width requirement" — so a broken measurement
+    /// degrades into the one-row header instead of poisoning the layout.
+    #[must_use]
+    pub fn new(extra_height: f32, min_width: f32) -> Self {
+        Self {
+            extra_height: sanitize_scalar(extra_height).max(0.0),
+            min_width: sanitize_scalar(min_width).max(0.0),
+        }
+    }
+
+    /// Largest difference, in points, between this measurement and `other`.
+    /// The driver uses it to decide whether the layout still has to converge.
+    #[must_use]
+    pub fn max_difference(self, other: Self) -> f32 {
+        (self.extra_height - other.extra_height)
+            .abs()
+            .max((self.min_width - other.min_width).abs())
+    }
+}
+
+/// A `PanelId -> PanelHeaderMetrics` map, sanitized on insertion like
+/// [`PanelSizes`]. A panel without an entry is solved with
+/// [`PanelHeaderMetrics::default`], i.e. a one-row header.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PanelHeaders {
+    headers: BTreeMap<PanelId, PanelHeaderMetrics>,
+}
+
+impl PanelHeaders {
+    /// Creates an empty map.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stores a sanitized measurement, returning the previous one.
+    pub fn insert(&mut self, id: PanelId, header: PanelHeaderMetrics) -> Option<PanelHeaderMetrics> {
+        self.headers
+            .insert(id, PanelHeaderMetrics::new(header.extra_height, header.min_width))
+    }
+
+    /// The measurement stored for `id`, or the one-row default.
+    #[must_use]
+    pub fn get(&self, id: PanelId) -> PanelHeaderMetrics {
+        self.headers.get(&id).copied().unwrap_or_default()
+    }
+
+    /// Number of stored entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.headers.len()
+    }
+
+    /// `true` when no measurement is stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.headers.is_empty()
+    }
+}
+
+impl FromIterator<(PanelId, PanelHeaderMetrics)> for PanelHeaders {
+    fn from_iter<I: IntoIterator<Item = (PanelId, PanelHeaderMetrics)>>(iter: I) -> Self {
+        let mut headers = Self::new();
+        for (id, header) in iter {
+            headers.insert(id, header);
+        }
+        headers
     }
 }
 
@@ -400,9 +516,12 @@ impl SolvedLayout {
 /// * `mins` — the outer size below which a panel must not be *shrunk*. Missing
 ///   entries default to `(0.0, chrome.collapsed_height + PANEL_MIN_CONTENT_HEIGHT)`,
 ///   and every minimum is raised to what the widget can physically draw.
-/// * `chrome` — the header/frame overhead the widget MEASURED on the previous
-///   frame. Passing [`PanelChrome::default`] reproduces the nominal estimate,
-///   which is only correct before a panel has ever been drawn.
+/// * `chrome` — the one-row header/frame overhead the widget MEASURED on the
+///   previous frame. Passing [`PanelChrome::default`] reproduces the nominal
+///   estimate, which is only correct before a panel has ever been drawn.
+///
+/// This is [`solve_with_headers`] with every header one row tall and no
+/// caption-driven width floor; see there for the per-panel header input.
 ///
 /// Guarantees: deterministic (equal inputs give equal output), idempotent
 /// (re-solving a layout whose sizes are the solved ones reproduces the same
@@ -419,6 +538,31 @@ pub fn solve(
     mins: &PanelSizes,
     chrome: PanelChrome,
 ) -> SolvedLayout {
+    solve_with_headers(layout, host, area, desired, mins, chrome, &PanelHeaders::new())
+}
+
+/// [`solve`] with what each panel's header strip measured beyond the shared
+/// one-row `chrome` — the contract and guarantees are the same.
+///
+/// `headers` — per panel, last frame's [`PanelHeaderMetrics`]; a missing entry
+/// is a one-row header. For that panel the extra caption rows are added to
+/// `chrome` ([`PanelChrome::with_header`]): a collapsed panel is exactly that
+/// tall, its body budget is the rect minus that overhead, and its hard height
+/// floor and default minimum grow with it. `min_width` joins
+/// [`PANEL_MIN_WIDTH`] as the hard WIDTH floor, which raises the request and
+/// stops the horizontal shrink alike, because the widget cannot draw a caption
+/// narrower than it is. Neither value depends on the height the panel is solved
+/// at, so re-solving a settled layout with a settled measurement reproduces it.
+#[must_use]
+pub fn solve_with_headers(
+    layout: &DockLayout,
+    host: HostId,
+    area: Rect,
+    desired: &PanelSizes,
+    mins: &PanelSizes,
+    chrome: PanelChrome,
+    headers: &PanelHeaders,
+) -> SolvedLayout {
     let area = sanitize_rect(area);
 
     let nodes: BTreeMap<PanelId, &PanelNode> = layout
@@ -434,8 +578,9 @@ pub fn solve(
     let mut requested: BTreeMap<PanelId, Vec2> = BTreeMap::new();
     let mut floor: BTreeMap<PanelId, Vec2> = BTreeMap::new();
     for (id, node) in &nodes {
-        floor.insert(*id, panel_floor(node, mins, chrome));
-        requested.insert(*id, panel_requested(node, desired, chrome));
+        let header = headers.get(*id);
+        floor.insert(*id, panel_floor(node, mins, chrome, header));
+        requested.insert(*id, panel_requested(node, desired, chrome, header));
     }
 
     let mut sizes = requested.clone();
@@ -460,7 +605,12 @@ pub fn solve(
         let mut rects = propagate(&members, &nodes, &sizes, area);
         // The axes are independent (see `Axis`), so each one is relieved on its
         // own; a chain too wide is shrunk exactly like a chain too tall, which
-        // is what keeps every panel's resize grip inside the area.
+        // keeps every panel's resize grip inside the area — as long as the
+        // floors fit. Caption-driven width floors (`PanelHeaderMetrics::min_width`)
+        // can sum past the area's width for panels docked side by side; the chain
+        // is then translated, not shrunk further, and its far end (with that
+        // panel's grip) sits outside the area. Accepted: drawing a caption
+        // narrower than it is would overflow the panel instead.
         for axis in [Axis::Y, Axis::X] {
             for _ in 0..MAX_SHRINK_ITERATIONS {
                 let taken = chain.relieve_overflow(axis, &mut sizes, &rects);
@@ -498,7 +648,7 @@ pub fn solve(
             let body_max_height = if node.collapsed {
                 0.0
             } else {
-                (rect.height() - chrome.body_overhead).max(0.0)
+                (rect.height() - chrome.with_header(headers.get(id)).body_overhead).max(0.0)
             };
             solved.panels.insert(
                 id,
@@ -514,34 +664,39 @@ pub fn solve(
     solved
 }
 
-/// Smallest outer size `CollapsiblePanel` can physically draw for `node`.
+/// Smallest outer size `CollapsiblePanel` can physically draw for `node`, whose
+/// header measured `header` beyond the one-row `chrome`.
 ///
 /// This is a bound on the WIDGET, not a preference of the caller: a solved rect
 /// below it would be smaller than the panel actually on screen, and everything
-/// placed one [`DOCK_GAP`] away from that rect would overlap the panel.
-fn panel_hard_floor(node: &PanelNode, chrome: PanelChrome) -> Vec2 {
+/// placed one [`DOCK_GAP`] away from that rect would overlap the panel. The
+/// width is [`PANEL_MIN_WIDTH`] or the caption-driven minimum, whichever is
+/// larger.
+fn panel_hard_floor(node: &PanelNode, chrome: PanelChrome, header: PanelHeaderMetrics) -> Vec2 {
+    let chrome = chrome.with_header(header);
     let height = if node.collapsed {
         chrome.collapsed_height
     } else {
         chrome.body_overhead + PANEL_MIN_BODY_HEIGHT
     };
-    Vec2::new(PANEL_MIN_WIDTH, height)
+    Vec2::new(PANEL_MIN_WIDTH.max(header.min_width), height)
 }
 
 /// Size below which the shrink step must not push a panel: `mins` when present,
-/// the documented default otherwise, never below [`panel_hard_floor`].
-fn panel_floor(node: &PanelNode, mins: &PanelSizes, chrome: PanelChrome) -> Vec2 {
+/// the documented default (over this panel's own header) otherwise, never below
+/// [`panel_hard_floor`].
+fn panel_floor(node: &PanelNode, mins: &PanelSizes, chrome: PanelChrome, header: PanelHeaderMetrics) -> Vec2 {
     let min = mins.get(node.id).unwrap_or(Vec2::new(
         0.0,
-        chrome.collapsed_height + PANEL_MIN_CONTENT_HEIGHT,
+        chrome.with_header(header).collapsed_height + PANEL_MIN_CONTENT_HEIGHT,
     ));
-    let hard = panel_hard_floor(node, chrome);
+    let hard = panel_hard_floor(node, chrome, header);
     Vec2::new(min.x.max(hard.x), min.y.max(hard.y))
 }
 
 /// Outer size a panel asks for: a manual resize wins over the measured size,
-/// which wins over the default; a collapsed panel is always exactly one MEASURED
-/// header tall.
+/// which wins over the default; a collapsed panel is always exactly its MEASURED
+/// header tall (the one-row chrome plus its own extra caption rows).
 ///
 /// The declared minimum deliberately does NOT participate: `min_size` means
 /// "never shrink me below this", and using it to raise the REQUEST would make a
@@ -549,16 +704,16 @@ fn panel_floor(node: &PanelNode, mins: &PanelSizes, chrome: PanelChrome) -> Vec2
 /// below it would then hang a `min_size`-sized hole away from a panel that ends
 /// much earlier. Only [`panel_hard_floor`] applies, because the widget cannot
 /// draw anything smaller than that.
-fn panel_requested(node: &PanelNode, desired: &PanelSizes, chrome: PanelChrome) -> Vec2 {
+fn panel_requested(node: &PanelNode, desired: &PanelSizes, chrome: PanelChrome, header: PanelHeaderMetrics) -> Vec2 {
     let asked = node
         .size_override
         .map(sanitize_size)
         .or_else(|| desired.get(node.id))
         .unwrap_or(DEFAULT_PANEL_SIZE);
-    let hard = panel_hard_floor(node, chrome);
+    let hard = panel_hard_floor(node, chrome, header);
     let width = asked.x.max(hard.x);
     if node.collapsed {
-        Vec2::new(width, chrome.collapsed_height)
+        Vec2::new(width, hard.y)
     } else {
         Vec2::new(width, asked.y.max(hard.y))
     }
@@ -2238,5 +2393,155 @@ mod tests {
             let again = third_pass.get(id).expect("panel solved again");
             assert_eq!(panel.rect, again.rect, "panel {id}");
         }
+    }
+
+    fn headers(entries: &[(u32, f32, f32)]) -> PanelHeaders {
+        entries
+            .iter()
+            .map(|(id, extra, min_width)| (PanelId::new(*id), PanelHeaderMetrics::new(*extra, *min_width)))
+            .collect()
+    }
+
+    /// `solve` is the per-panel call with every header one row tall: the
+    /// callers outside this directory that never pass header metrics keep the
+    /// exact layout they had.
+    #[test]
+    fn solve_is_the_per_panel_call_with_one_row_headers() {
+        let chrome = PanelChrome::new(32.0, 36.0);
+        let mut layout = DockLayout::new();
+        layout.insert_panel(free_at(0, TAB_A, 40.0, 30.0)).expect("insert 0");
+        let mut below = node(1, TAB_B);
+        attach(&mut below, 0, DockEdge::Bottom, 0.0);
+        layout.insert_panel(below).expect("insert 1");
+        let desired = sizes(&[(0, 300.0, 500.0), (1, 260.0, 500.0)]);
+        let plain = solve(&layout, HostId::MainWindow, AREA, &desired, &PanelSizes::new(), chrome);
+        for no_headers in [PanelHeaders::new(), headers(&[(0, 0.0, 0.0), (1, 0.0, 0.0)])] {
+            let with = solve_with_headers(&layout, HostId::MainWindow, AREA, &desired, &PanelSizes::new(), chrome, &no_headers);
+            assert_eq!(plain, with);
+        }
+    }
+
+    /// Extra caption rows belong to ONE panel: its collapsed height and its body
+    /// overhead grow by them, its neighbours' do not.
+    #[test]
+    fn extra_caption_rows_grow_only_their_own_panels_header() {
+        let chrome = PanelChrome::new(32.0, 36.0);
+        let mut layout = DockLayout::new();
+        let mut head = node(0, TAB_A);
+        head.collapsed = true;
+        layout.insert_panel(head).expect("insert 0");
+        let mut middle = node(1, TAB_B);
+        attach(&mut middle, 0, DockEdge::Bottom, 0.0);
+        layout.insert_panel(middle).expect("insert 1");
+        let mut last = node(2, TAB_C);
+        attach(&mut last, 1, DockEdge::Bottom, 0.0);
+        layout.insert_panel(last).expect("insert 2");
+
+        let solved = solve_with_headers(
+            &layout,
+            HostId::MainWindow,
+            AREA,
+            &sizes(&[(0, 300.0, 400.0), (1, 300.0, 200.0), (2, 300.0, 200.0)]),
+            &PanelSizes::new(),
+            chrome,
+            &headers(&[(0, 22.0, 0.0), (1, 44.0, 0.0)]),
+        );
+        let collapsed = solved.get(PanelId::new(0)).expect("solved 0");
+        assert!((collapsed.rect.height() - (32.0 + 22.0)).abs() < FIT_EPSILON);
+        assert!((collapsed.body_max_height - 0.0).abs() < FIT_EPSILON);
+        let middle = solved.get(PanelId::new(1)).expect("solved 1");
+        assert!((middle.rect.top() - collapsed.rect.bottom() - DOCK_GAP).abs() < FIT_EPSILON);
+        assert!((middle.body_max_height - (200.0 - 36.0 - 44.0)).abs() < FIT_EPSILON);
+        let last = solved.get(PanelId::new(2)).expect("solved 2");
+        assert!((last.body_max_height - (200.0 - 36.0)).abs() < FIT_EPSILON);
+    }
+
+    /// Extra rows raise the panel's hard height floor too: a request below one
+    /// header plus the minimum body is lifted to what the widget draws.
+    #[test]
+    fn extra_caption_rows_raise_the_hard_height_floor() {
+        let chrome = PanelChrome::new(32.0, 36.0);
+        let mut layout = DockLayout::new();
+        layout.insert_panel(node(0, TAB_A)).expect("insert 0");
+        let solved = solve_with_headers(
+            &layout,
+            HostId::MainWindow,
+            AREA,
+            &sizes(&[(0, 300.0, 10.0)]),
+            &PanelSizes::new(),
+            chrome,
+            &headers(&[(0, 22.0, 0.0)]),
+        );
+        let panel = rect_of(&solved, 0);
+        assert!((panel.height() - (36.0 + 22.0 + PANEL_MIN_BODY_HEIGHT)).abs() < FIT_EPSILON);
+    }
+
+    /// A caption wider than the panel's request sets the panel's width, and the
+    /// horizontal shrink cannot take it away: it is a physical floor like
+    /// `PANEL_MIN_WIDTH`, so a chain too wide for the area is translated rather
+    /// than drawn narrower than its caption.
+    #[test]
+    fn a_caption_width_floor_raises_the_request_and_stops_the_shrink() {
+        let chrome = PanelChrome::new(32.0, 36.0);
+        let mut layout = DockLayout::new();
+        layout.insert_panel(node(0, TAB_A)).expect("insert 0");
+        let desired = sizes(&[(0, 100.0, 200.0)]);
+        let wide = solve_with_headers(&layout, HostId::MainWindow, AREA, &desired, &sizes(&[(0, 10.0, 50.0)]), chrome, &headers(&[(0, 0.0, 180.0)]));
+        assert!((rect_of(&wide, 0).width() - 180.0).abs() < FIT_EPSILON);
+
+        let narrow_area = Rect::from_min_size(Pos2::ZERO, Vec2::new(150.0, 800.0));
+        let squeezed = solve_with_headers(&layout, HostId::MainWindow, narrow_area, &desired, &PanelSizes::new(), chrome, &headers(&[(0, 0.0, 180.0)]));
+        let panel = squeezed.get(PanelId::new(0)).expect("solved 0");
+        assert!((panel.rect.width() - 180.0).abs() < FIT_EPSILON);
+        assert!(panel.shrunk);
+
+        // Below `PANEL_MIN_WIDTH` the caption floor changes nothing.
+        let tiny = solve_with_headers(&layout, HostId::MainWindow, AREA, &sizes(&[(0, 10.0, 200.0)]), &PanelSizes::new(), chrome, &headers(&[(0, 0.0, 12.0)]));
+        assert!((rect_of(&tiny, 0).width() - PANEL_MIN_WIDTH).abs() < FIT_EPSILON);
+    }
+
+    /// The no-oscillation contract of wrapped headers: a layout solved with a
+    /// settled header measurement, re-solved with its own sizes as the request
+    /// and the SAME measurement, reproduces itself — in a chain the area makes
+    /// shrink on both axes.
+    #[test]
+    fn re_solving_with_a_settled_header_measurement_changes_nothing() {
+        let chrome = PanelChrome::new(32.0, 36.0);
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 500.0));
+        let mut layout = DockLayout::new();
+        layout.insert_panel(free_at(0, TAB_A, 8.0, 8.0)).expect("insert 0");
+        let mut below = node(1, TAB_B);
+        attach(&mut below, 0, DockEdge::Bottom, 0.0);
+        layout.insert_panel(below).expect("insert 1");
+        let mut beside = node(2, TAB_C);
+        attach(&mut beside, 1, DockEdge::Right, 0.0);
+        layout.insert_panel(beside).expect("insert 2");
+        let header = headers(&[(0, 22.0, 210.0), (1, 44.0, 150.0), (2, 0.0, 90.0)]);
+        let first = solve_with_headers(
+            &layout,
+            HostId::MainWindow,
+            area,
+            &sizes(&[(0, 260.0, 300.0), (1, 240.0, 320.0), (2, 260.0, 300.0)]),
+            &PanelSizes::new(),
+            chrome,
+            &header,
+        );
+        let settled: PanelSizes = first.iter().map(|(id, panel)| (id, panel.rect.size())).collect();
+        let second = solve_with_headers(&layout, HostId::MainWindow, area, &settled, &PanelSizes::new(), chrome, &header);
+        for (id, panel) in first.iter() {
+            let again = second.get(id).expect("panel solved again");
+            assert_eq!(panel.rect, again.rect, "panel {id}");
+            assert_eq!(panel.body_max_height, again.body_max_height, "panel {id}");
+        }
+        assert!(rect_of(&first, 0).width() >= 210.0 - FIT_EPSILON);
+    }
+
+    #[test]
+    fn a_broken_header_measurement_degrades_to_a_one_row_header() {
+        assert_eq!(PanelHeaderMetrics::new(f32::NAN, -3.0), PanelHeaderMetrics::default());
+        assert_eq!(PanelHeaderMetrics::new(f32::INFINITY, 20.0), PanelHeaderMetrics::new(0.0, 20.0));
+        let a = PanelHeaderMetrics::new(22.0, 100.0);
+        assert!((a.max_difference(PanelHeaderMetrics::new(20.0, 105.0)) - 5.0).abs() < FIT_EPSILON);
+        assert_eq!(PanelHeaders::new().get(PanelId::new(7)), PanelHeaderMetrics::default());
     }
 }

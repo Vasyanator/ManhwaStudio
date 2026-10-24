@@ -15,18 +15,21 @@ Main responsibilities:
   to leave the window (`paint_detach_preview`; the verdict itself is
   `window::drag_tension`);
 - keep two panels from being docked into the SAME slot (`resolve_slot`);
-- answer the two questions a tab drop asks: at which index does it land in a
-  header strip (`insertion_index`), and did it land on bare dock area
-  (`empty_space_drop`).
+- answer the two questions a tab drop asks: at which index — and on which
+  caption row, where the marker goes — does it land in a header strip
+  (`insertion_slot`, rows from `header_rows`), and did it land on bare dock
+  area (`empty_space_drop`).
 
 Key structures:
 - `DraggedTab`: drag-and-drop payload of a tab header.
 - `DragSession`: the panel move in flight, owned by `PanelDockState`.
 - `SnapCandidate`, `SnapTargets`: the result and the inputs of the snap search.
+- `InsertionSlot`: where a tab dropped on a header strip lands and where its
+  marker is drawn.
 
 Key functions:
-- `find_snap`, `panel_snap_candidates`, `resolve_slot`, `insertion_index`,
-  `empty_space_drop`, `paint_snap_preview`, `paint_detach_preview`,
+- `find_snap`, `panel_snap_candidates`, `resolve_slot`, `header_rows`,
+  `insertion_slot`, `empty_space_drop`, `paint_snap_preview`, `paint_detach_preview`,
   `paint_insertion_marker`.
 
 Notes:
@@ -43,6 +46,7 @@ handling (`window.rs` decides, `mod.rs` applies), not a second gesture.
 */
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use egui::{Pos2, Rect, Stroke, Vec2};
 
@@ -69,8 +73,9 @@ const DETACH_PREVIEW_GAP: f32 = 5.0;
 /// on a one-pixel seam.
 const SLOT_OVERLAP_EPSILON: f32 = 1.0;
 
-/// Free travel, in points, below which an alignment fraction is meaningless
-/// (the panel is as long as the side it is aligned along) and reported as `0.0`.
+/// Magnitude of free travel, in points, below which an alignment fraction is
+/// meaningless (the panel is as long as the side it is aligned along) and
+/// reported as `0.0`.
 const ALIGN_EPSILON: f32 = 0.5;
 
 /// Drag-and-drop payload of a tab header (plan §4.8b).
@@ -348,8 +353,15 @@ fn inside_candidate(dragged: Rect, area: Rect, edge: DockEdge) -> (f32, f32, [Po
 /// Position along a side as a fraction of the free travel, clamped to
 /// `0.0..=1.0`. A side with no free travel (or a non-finite input) reports
 /// `0.0`, which the solver reads as "flush with the start of the side".
+///
+/// `travel` may be NEGATIVE: the panel is longer than the side it docks to.
+/// The fraction then addresses an overhang instead of a slide — `0.0` flush with
+/// the side's start, `1.0` flush with its end, values between hang the panel
+/// past both ends — which is exactly what `solver::place_outside` computes from
+/// the same signed travel. The clamp keeps the shorter side inside the longer
+/// one whichever of the two is the target.
 fn fraction(offset: f32, travel: f32) -> f32 {
-    if !offset.is_finite() || !travel.is_finite() || travel <= ALIGN_EPSILON {
+    if !offset.is_finite() || !travel.is_finite() || travel.abs() <= ALIGN_EPSILON {
         return 0.0;
     }
     (offset / travel).clamp(0.0, 1.0)
@@ -468,17 +480,114 @@ fn prospective_rect(
     }
 }
 
-/// Index a tab dropped at `pointer_x` takes in a header strip whose existing
-/// headers have the given horizontal centres, in strip order.
+/// Splits the caption rects of one header strip, in strip order, into the rows
+/// the wrapping header laid them out in; each range indexes `captions`.
 ///
-/// A drop left of a header's centre lands before it, right of it after it, so
-/// the insertion point follows the cursor without a dead zone.
+/// A caption starts a new row when its vertical centre lies below everything
+/// the current row holds — rows are stacked top to bottom with item spacing
+/// between them, so the test needs no x coordinate and no row height. The one
+/// owner of "which row is this caption on": the widget's grab zones and every
+/// drop decision read rows from here, so they can never disagree. Non-finite
+/// rects stay in the row they follow; empty input gives no row.
 #[must_use]
-pub fn insertion_index(header_centers: &[f32], pointer_x: f32) -> usize {
-    header_centers
+pub(super) fn header_rows(captions: &[Rect]) -> Vec<Range<usize>> {
+    let mut rows = Vec::new();
+    let mut start = 0_usize;
+    let mut row_bottom = f32::NEG_INFINITY;
+    for (index, rect) in captions.iter().enumerate() {
+        if index > start && rect.center().y > row_bottom {
+            rows.push(start..index);
+            start = index;
+            row_bottom = rect.bottom();
+        } else {
+            row_bottom = row_bottom.max(rect.bottom());
+        }
+    }
+    if start < captions.len() {
+        rows.push(start..captions.len());
+    }
+    rows
+}
+
+/// Where a tab dropped on a header strip lands, and where the insertion marker
+/// announcing it is drawn.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct InsertionSlot {
+    /// Index the tab takes in the strip's tab order, `0..=captions.len()`.
+    pub index: usize,
+    /// Horizontal position of the marker.
+    pub x: f32,
+    /// Top of the marker: the hovered row's top (the strip's top on its first
+    /// row).
+    pub top: f32,
+    /// Bottom of the marker: the hovered row's bottom (the strip's bottom on its
+    /// last row).
+    pub bottom: f32,
+}
+
+impl InsertionSlot {
+    /// The marker as a vertical segment, top to bottom.
+    #[must_use]
+    pub fn marker(self) -> [Pos2; 2] {
+        [Pos2::new(self.x, self.top), Pos2::new(self.x, self.bottom)]
+    }
+}
+
+/// Decides where a tab dropped at `pointer` lands in a header strip whose
+/// captions occupy `captions` (strip order, possibly wrapped onto several rows
+/// — see [`header_rows`]) inside `strip`.
+///
+/// The row is the one whose band holds `pointer.y`: bands meet halfway between
+/// two rows, the first reaches up to the strip's top and the last down to its
+/// bottom, so a pointer anywhere on the strip has exactly one row. Inside that
+/// row a drop left of a caption's centre lands before it and right of it after
+/// it, so the insertion point follows the cursor without a dead zone; the index
+/// counts every caption of the earlier rows first. The marker is drawn on THAT
+/// row: at the left edge of the caption the tab would push aside, or right of
+/// the row's last caption when the pointer is past it — even though the index
+/// is then the same as "before the next row's first caption", the user aimed at
+/// the end of this row. A strip without captions takes index `0`, with the
+/// marker at its left edge.
+///
+/// The single owner of this rule: the panel's own drop zone, the cross-window
+/// landing and the cross-window marker all ask it.
+#[must_use]
+pub fn insertion_slot(captions: &[Rect], strip: Rect, pointer: Pos2) -> InsertionSlot {
+    let rows = header_rows(captions);
+    let extent = |row: &Range<usize>| -> (f32, f32) {
+        let rects = captions.get(row.clone()).unwrap_or_default();
+        let top = rects.iter().map(Rect::top).fold(f32::INFINITY, f32::min);
+        let bottom = rects.iter().map(Rect::bottom).fold(f32::NEG_INFINITY, f32::max);
+        (top, bottom)
+    };
+    // Index of the hovered row: the first whose band ends below the pointer.
+    // A non-finite `pointer.y` compares false everywhere and lands on the last.
+    let hovered = (0..rows.len())
+        .find(|&index| match (rows.get(index), rows.get(index + 1)) {
+            (Some(row), Some(next)) => pointer.y < (extent(row).1 + extent(next).0) * 0.5,
+            _ => true,
+        });
+    let Some(row) = hovered.and_then(|index| rows.get(index)) else {
+        return InsertionSlot {
+            index: 0,
+            x: strip.left(),
+            top: strip.top(),
+            bottom: strip.bottom(),
+        };
+    };
+    let rects = captions.get(row.clone()).unwrap_or_default();
+    let before = rects
         .iter()
-        .filter(|center| center.is_finite() && **center < pointer_x)
-        .count()
+        .filter(|rect| rect.center().x.is_finite() && rect.center().x < pointer.x)
+        .count();
+    let index = row.start + before;
+    let x = rects
+        .get(before)
+        .map_or_else(|| rects.last().map_or(strip.left(), Rect::right), Rect::left);
+    let (row_top, row_bottom) = extent(row);
+    let top = if row.start == 0 { strip.top() } else { row_top };
+    let bottom = if row.end == captions.len() { strip.bottom() } else { row_bottom };
+    InsertionSlot { index, x, top, bottom }
 }
 
 /// Decides whether a tab released at `pos` landed on BARE dock area, which is
@@ -520,15 +629,16 @@ pub fn paint_snap_preview(ctx: &egui::Context, candidate: &SnapCandidate) {
 }
 
 /// Paints the insertion marker of a tab drop the receiving window could not sense
-/// itself: a vertical line at `x`, spanning `strip`.
+/// itself: `slot`'s vertical line, over the caption row the drop lands on.
 ///
 /// The same mark `CollapsiblePanel` paints while a tab is dragged over its own
 /// header strip, in the same selection colour — but drawn by the DRIVER, because
 /// a drag that crossed a window border leaves the receiving window without a
 /// pointer to hover with (`cross_window.rs`). Painted on `Order::Tooltip`, so it
 /// registers no widget and cannot steal the drop it announces.
-pub fn paint_insertion_marker(ctx: &egui::Context, strip: Rect, x: f32) {
-    if !strip.is_finite() || !x.is_finite() {
+pub fn paint_insertion_marker(ctx: &egui::Context, slot: InsertionSlot) {
+    let marker = slot.marker();
+    if !marker.iter().all(|point| point.x.is_finite() && point.y.is_finite()) {
         return;
     }
     let color = ctx.style_of(ctx.theme()).visuals.selection.stroke.color;
@@ -536,13 +646,7 @@ pub fn paint_insertion_marker(ctx: &egui::Context, strip: Rect, x: f32) {
         egui::Order::Tooltip,
         egui::Id::new("ms_panel_dock_cross_window_marker"),
     ));
-    painter.line_segment(
-        [
-            Pos2::new(x, strip.top()),
-            Pos2::new(x, strip.bottom()),
-        ],
-        Stroke::new(SNAP_LINE_WIDTH, color),
-    );
+    painter.line_segment(marker, Stroke::new(SNAP_LINE_WIDTH, color));
 }
 
 /// Paints the TEAR-OUT preview: a dashed outline of what would fly into a window
@@ -873,14 +977,83 @@ mod tests {
         );
     }
 
+    /// Captions `(left, top, width)` 18 pt tall, as the header lays them out.
+    fn captions(entries: &[(f32, f32, f32)]) -> Vec<Rect> {
+        entries
+            .iter()
+            .map(|(left, top, width)| rect(*left, *top, *width, 18.0))
+            .collect()
+    }
+
+    /// One row: the index follows the pointer across the caption centres, and
+    /// the marker spans the whole strip, exactly as before captions wrapped.
     #[test]
-    fn the_insertion_index_follows_the_pointer_across_the_header_centres() {
-        let centers = [100.0, 200.0, 300.0];
-        assert_eq!(insertion_index(&centers, 40.0), 0);
-        assert_eq!(insertion_index(&centers, 150.0), 1);
-        assert_eq!(insertion_index(&centers, 250.0), 2);
-        assert_eq!(insertion_index(&centers, 900.0), 3);
-        assert_eq!(insertion_index(&[], 900.0), 0);
+    fn a_one_row_strip_inserts_by_the_caption_centres() {
+        let strip = rect(50.0, 47.0, 300.0, 18.0);
+        let row = captions(&[(60.0, 47.0, 80.0), (160.0, 47.0, 80.0), (260.0, 47.0, 80.0)]);
+        let at = |x: f32| insertion_slot(&row, strip, Pos2::new(x, 56.0));
+        assert_eq!(at(40.0).index, 0);
+        assert_eq!(at(150.0).index, 1);
+        assert_eq!(at(250.0).index, 2);
+        assert_eq!(at(900.0).index, 3);
+        // Before a caption: its left edge; past the last one: its right edge.
+        assert_eq!(at(150.0).x, 160.0);
+        assert_eq!(at(900.0).x, 340.0);
+        assert_eq!(at(150.0).marker(), [Pos2::new(160.0, strip.top()), Pos2::new(160.0, strip.bottom())]);
+        // Above or below the strip still lands on its only row.
+        assert_eq!(insertion_slot(&row, strip, Pos2::new(150.0, -100.0)).index, 1);
+        let empty = insertion_slot(&[], strip, Pos2::new(900.0, 56.0));
+        assert_eq!(empty.index, 0);
+        assert_eq!(empty.x, strip.left());
+    }
+
+    /// Wrapped rows: the hovered ROW decides, and the index counts every
+    /// caption of the rows above it first. An x-only rule would count row-one
+    /// captions right of the pointer as "after" a drop on row two.
+    #[test]
+    fn a_wrapped_strip_inserts_on_the_hovered_row() {
+        // Row one: captions 0 and 1; row two (4 pt spacing): captions 2 and 3,
+        // starting under the first caption.
+        let strip = rect(50.0, 47.0, 200.0, 40.0);
+        let rows = captions(&[(60.0, 47.0, 80.0), (148.0, 47.0, 90.0), (60.0, 69.0, 60.0), (128.0, 69.0, 70.0)]);
+        assert_eq!(header_rows(&rows), vec![0..2, 2..4]);
+        // Row one.
+        let first = insertion_slot(&rows, strip, Pos2::new(100.0, 52.0));
+        assert_eq!(first.index, 0);
+        assert_eq!((first.top, first.bottom), (strip.top(), 65.0));
+        // Row two, left of its first caption's centre: before caption 2.
+        let second = insertion_slot(&rows, strip, Pos2::new(70.0, 80.0));
+        assert_eq!(second.index, 2);
+        assert_eq!(second.x, 60.0);
+        assert_eq!((second.top, second.bottom), (69.0, strip.bottom()));
+        // Row two, between its captions.
+        assert_eq!(insertion_slot(&rows, strip, Pos2::new(125.0, 80.0)).index, 3);
+        // Past the end of row one: index 2, but the marker stays on row one.
+        let end_of_first = insertion_slot(&rows, strip, Pos2::new(245.0, 55.0));
+        assert_eq!(end_of_first.index, 2);
+        assert_eq!(end_of_first.x, 238.0);
+        assert_eq!(end_of_first.bottom, 65.0);
+        // Past the end of the last row: appended.
+        let end = insertion_slot(&rows, strip, Pos2::new(245.0, 80.0));
+        assert_eq!(end.index, 4);
+        assert_eq!(end.x, 198.0);
+        // The bands meet halfway between the rows (65 .. 69 -> 67).
+        assert_eq!(insertion_slot(&rows, strip, Pos2::new(70.0, 66.9)).index, 0);
+        assert_eq!(insertion_slot(&rows, strip, Pos2::new(70.0, 67.1)).index, 2);
+    }
+
+    #[test]
+    fn header_rows_break_where_a_caption_drops_below_its_row() {
+        assert!(header_rows(&[]).is_empty());
+        let one = captions(&[(0.0, 0.0, 10.0), (20.0, 0.0, 10.0)]);
+        assert_eq!(header_rows(&one), vec![0..2]);
+        let three = captions(&[(0.0, 0.0, 10.0), (0.0, 22.0, 10.0), (20.0, 22.0, 10.0), (0.0, 44.0, 10.0)]);
+        assert_eq!(header_rows(&three), vec![0..1, 1..3, 3..4]);
+        // A broken rect never panics and never opens a row of its own.
+        let broken = [rect(0.0, 0.0, 10.0, 18.0), Rect::NAN, rect(0.0, 22.0, 10.0, 18.0)];
+        assert_eq!(header_rows(&broken), vec![0..2, 2..3]);
+        let slot = insertion_slot(&broken, rect(0.0, 0.0, 100.0, 40.0), Pos2::new(f32::NAN, f32::NAN));
+        assert!(slot.index <= broken.len());
     }
 
     #[test]
@@ -905,5 +1078,74 @@ mod tests {
         assert_eq!(fraction(f32::NAN, 100.0), 0.0);
         assert_eq!(fraction(-50.0, 100.0), 0.0);
         assert_eq!(fraction(500.0, 100.0), 1.0);
+        assert_eq!(fraction(10.0, -0.25), 0.0);
+    }
+
+    #[test]
+    fn a_negative_travel_addresses_an_overhang_and_keeps_the_shorter_side_inside() {
+        // The panel is 100 pt longer than the side: hanging 50 pt past the start
+        // is halfway, 100 pt past it is flush with the end.
+        assert!((fraction(-50.0, -100.0) - 0.5).abs() < 1e-6);
+        assert!((fraction(-100.0, -100.0) - 1.0).abs() < 1e-6);
+        // Starting AFTER the side's start or overhanging past its end would leave
+        // the shorter side sticking out: clamped back to the nearer flush end.
+        assert_eq!(fraction(30.0, -100.0), 0.0);
+        assert_eq!(fraction(-250.0, -100.0), 1.0);
+    }
+
+    #[test]
+    fn a_wider_panel_docks_below_a_narrower_one_where_it_was_dropped() {
+        // The reported defect: a panel WIDER than its target always snapped flush
+        // with the target's left side, so its own left edge could never reach
+        // further left than the target's.
+        let target = rect(300.0, 100.0, 200.0, 200.0);
+        let dragged = rect(240.0, 100.0 + 200.0 + DOCK_GAP, 300.0, 150.0);
+        let panels = [(PanelId::new(0), target)];
+        let candidate = find_snap(dragged, SnapTargets {
+            area: AREA,
+            panels: &panels,
+        })
+        .expect("a candidate");
+        let PanelAnchor::Panel { edge, align, .. } = candidate.anchor else {
+            panic!("expected a panel anchor, got {:?}", candidate.anchor);
+        };
+        assert_eq!(edge, DockEdge::Bottom);
+        // The solver reproduces the drop position exactly.
+        let placed = place_outside(target, edge, align, dragged.size());
+        assert!((placed.left() - dragged.left()).abs() < 0.01);
+        assert!((placed.top() - dragged.top()).abs() < 0.01);
+
+        // Dropped too far left, it stops flush with the target's right side.
+        let too_far = rect(100.0, dragged.top(), 300.0, 150.0);
+        let candidate = find_snap(too_far, SnapTargets {
+            area: AREA,
+            panels: &panels,
+        })
+        .expect("a candidate");
+        let PanelAnchor::Panel { edge, align, .. } = candidate.anchor else {
+            panic!("expected a panel anchor, got {:?}", candidate.anchor);
+        };
+        let placed = place_outside(target, edge, align, too_far.size());
+        assert!((placed.right() - target.right()).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_taller_panel_docks_beside_a_shorter_one_where_it_was_dropped() {
+        // The same rule on the other axis: docking to a side.
+        let target = rect(100.0, 300.0, 200.0, 150.0);
+        let dragged = rect(100.0 + 200.0 + DOCK_GAP, 260.0, 200.0, 250.0);
+        let panels = [(PanelId::new(0), target)];
+        let candidate = find_snap(dragged, SnapTargets {
+            area: AREA,
+            panels: &panels,
+        })
+        .expect("a candidate");
+        let PanelAnchor::Panel { edge, align, .. } = candidate.anchor else {
+            panic!("expected a panel anchor, got {:?}", candidate.anchor);
+        };
+        assert_eq!(edge, DockEdge::Right);
+        let placed = place_outside(target, edge, align, dragged.size());
+        assert!((placed.top() - dragged.top()).abs() < 0.01);
+        assert!((placed.left() - dragged.left()).abs() < 0.01);
     }
 }

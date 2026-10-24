@@ -14,7 +14,8 @@ Main responsibilities:
 
 Key structures:
 - `PanelDockState`: per-program-tab layouts, last-frame measurements (content
-  and pinned-bottom heights), per-tab extra state (`extras.rs`), dirty flag.
+  and pinned-bottom heights per tab, header rows and caption width per panel),
+  per-tab extra state (`extras.rs`), dirty flag.
 - `DockArea`: where the dock may place panels this frame.
 - `PanelDock`: the frame driver (`begin` → `tab(..).show(..)` → `end`).
 - `PanelDockOutput`: rects of the panels drawn this frame, each recorded with
@@ -88,8 +89,8 @@ pub use persist::{
 };
 pub use solver::{
     COLLAPSED_PANEL_HEIGHT, DEFAULT_PANEL_SIZE, DOCK_GAP, PANEL_MIN_BODY_HEIGHT,
-    PANEL_MIN_CONTENT_HEIGHT, PANEL_MIN_WIDTH, PanelChrome, PanelSizes, SolvedLayout, SolvedPanel,
-    solve,
+    PANEL_MIN_CONTENT_HEIGHT, PANEL_MIN_WIDTH, PanelChrome, PanelHeaderMetrics, PanelHeaders,
+    PanelSizes, SolvedLayout, SolvedPanel, solve, solve_with_headers,
 };
 pub use tab::PanelTab;
 pub use window::{
@@ -146,6 +147,35 @@ impl Default for TabMeta {
 /// enough to need another frame. A first measurement is always news.
 fn pinned_height_changed(previous: Option<f32>, height: f32) -> bool {
     previous.is_none_or(|previous| (previous - height).abs() >= MEASUREMENT_EPSILON)
+}
+
+/// Whether a panel's drawn header `measured` differs from the `previous` one the
+/// frame was solved with by enough to need another frame. A panel never drawn
+/// was solved as a one-row header with no width floor (`None` reads as the
+/// default). Any panel showing a caption reports a `min_width` above zero, so
+/// its FIRST draw per layout key is always news and costs one extra frame, as
+/// does a caption whose text changed (a language switch) — even when the floor
+/// lies far below the panel's width and the re-solve moves nothing. That is the
+/// price of comparing the measurement rather than its effect on the solve.
+fn header_metrics_changed(previous: Option<PanelHeaderMetrics>, measured: PanelHeaderMetrics) -> bool {
+    previous.unwrap_or_default().max_difference(measured) >= MEASUREMENT_EPSILON
+}
+
+/// One panel's header measurement as the driver caches it: the metrics plus the
+/// captions they were measured WITH.
+///
+/// The tabs are part of the entry because a `PanelId` is not a stable identity:
+/// `DockLayout` mints `max + 1`, so a panel created after the highest one
+/// vanished reuses its id, and a panel's shown tabs change when one is hidden
+/// or moved. Metrics are only ever applied to a panel showing exactly the tabs
+/// they were measured for ([`plan_frame`]); anything else is solved as a fresh
+/// one-row header until it is drawn.
+#[derive(Clone, Debug, PartialEq)]
+struct MeasuredHeader {
+    /// The panel's visible tabs, in strip order, when the header was drawn.
+    tabs: Vec<TabId>,
+    /// What the header measured beyond the one-row chrome.
+    metrics: PanelHeaderMetrics,
 }
 
 /// Localised caption producer of one declared tab, evaluated once per frame and
@@ -246,9 +276,21 @@ pub struct PanelDockState {
     /// inside a tab alone, and the per-frame `frame_layout` clone would otherwise
     /// have to copy it.
     tab_extras: BTreeMap<String, BTreeMap<TabId, TabExtras>>,
-    /// Header/frame overhead the widget measured the last time any panel was
-    /// drawn. It is style-dependent, so it is measured rather than assumed; one
-    /// value covers every panel because they all draw the same header widget.
+    /// What each PANEL's header measured beyond [`PanelDockState::chrome`] the
+    /// last time it was drawn — the extra caption rows and the caption-driven
+    /// minimum width — keyed by `AppTab::key()` and then `PanelId`, because a
+    /// `PanelId` is only unique inside one program tab's layout. Next frame's
+    /// solve reads it (`solve_with_headers`); a panel without an entry is
+    /// solved as a one-row header. A derived cache like `measured`: never
+    /// persisted, never `dirty`.
+    /// Entries are dropped for panels that left the layout (end of every drawn
+    /// frame) and for the whole key on «Сбросить раскладку».
+    header_metrics: BTreeMap<String, HashMap<PanelId, MeasuredHeader>>,
+    /// Header/frame overhead of a ONE-ROW header, as the widget measured it the
+    /// last time any panel was drawn. It is style-dependent, so it is measured
+    /// rather than assumed; one value covers every panel because they all draw
+    /// the same header widget, and what wrapped caption rows add is per panel
+    /// ([`PanelDockState::header_metrics`]).
     chrome: PanelChrome,
     /// The detached OS windows this dock owns. Shared by every program tab: a
     /// sub-window outlives a tab switch and simply shows whatever the newly
@@ -635,7 +677,10 @@ impl PanelDockState {
     }
 
     /// Outer size `tab`'s content asked for the last time it was drawn in the
-    /// program tab `layout_key`.
+    /// program tab `layout_key`, with its panel's header counted as ONE row: the
+    /// extra caption rows a wrapped header drew are left out, because they belong
+    /// to the panel and its current width, not to the tab ([`plan_frame`] adds
+    /// the panel's current rows back).
     ///
     /// The key is part of the question: a tab several program tabs declare is
     /// measured once per arrangement, and the answer for one of them says
@@ -686,6 +731,43 @@ impl PanelDockState {
             .entry(layout_key.to_owned())
             .or_default()
             .insert(tab, height);
+    }
+
+    /// Every cached header measurement of the program tab `layout_key`.
+    fn header_measurements(&self, layout_key: &str) -> Option<&HashMap<PanelId, MeasuredHeader>> {
+        self.header_metrics.get(layout_key)
+    }
+
+    /// Remembers what `panel`'s header measured, showing `tabs`, while the
+    /// program tab `layout_key` was drawing it.
+    fn remember_header_metrics(&mut self, layout_key: &str, panel: PanelId, tabs: &[TabId], metrics: PanelHeaderMetrics) {
+        let entry = MeasuredHeader {
+            tabs: tabs.to_vec(),
+            metrics,
+        };
+        // Same lookup-before-entry reasoning as `remember_measurement`.
+        if let Some(headers) = self.header_metrics.get_mut(layout_key) {
+            headers.insert(panel, entry);
+            return;
+        }
+        self.header_metrics
+            .entry(layout_key.to_owned())
+            .or_default()
+            .insert(panel, entry);
+    }
+
+    /// Drops the header measurements of panels the layout `layout_key` no
+    /// longer holds (removed, merged away), so a later panel that reuses the id
+    /// cannot inherit them. A panel moved to another window keeps its entry:
+    /// it is still the same panel with the same captions.
+    fn prune_header_metrics(&mut self, layout_key: &str) {
+        let Some(layout) = self.layouts.get(layout_key) else {
+            self.header_metrics.remove(layout_key);
+            return;
+        };
+        if let Some(headers) = self.header_metrics.get_mut(layout_key) {
+            headers.retain(|panel, _| layout.panel(*panel).is_some());
+        }
     }
 
     /// Extra state stored for `tab` inside the program tab `layout_key`, if the
@@ -818,8 +900,9 @@ impl PanelDockState {
         true
     }
 
-    /// Header/frame overhead measured on the last drawn frame, or the nominal
-    /// estimate before anything has been drawn.
+    /// One-row header/frame overhead measured on the last drawn frame, or the
+    /// nominal estimate before anything has been drawn. A panel whose captions
+    /// wrapped is taller by its own extra rows, which this value leaves out.
     #[must_use]
     pub fn chrome(&self) -> PanelChrome {
         self.chrome
@@ -864,6 +947,9 @@ impl PanelDockState {
             return false;
         }
         self.layouts.insert(key.to_owned(), layout);
+        // The default rebuilds panels under ids the old layout may have used
+        // for other panels; their header measurements describe those.
+        self.header_metrics.remove(key);
         self.drag = None;
         self.dirty = true;
         true
@@ -1419,19 +1505,25 @@ fn draw_host<'frame, C>(
         // another program tab was drawn describes another arrangement.
         let no_measurements = HashMap::new();
         let measured = state.measurements(layout_key).unwrap_or(&no_measurements);
-        let plan = plan_frame(layout, host, decls, measured);
+        let no_headers = HashMap::new();
+        let headers = state.header_measurements(layout_key).unwrap_or(&no_headers);
+        let plan = plan_frame(layout, host, decls, measured, headers);
         // Panels with nothing to draw are removed from the layout the SOLVER
         // sees, never from the stored one: a hidden panel must not reserve
         // its slot in the chain, or the panels below it would float over a
         // gap where nothing is drawn.
         let effective = frame_layout(layout, &plan);
-        let solved = solve(
+        // Last frame's header rows and caption widths, per panel: width ->
+        // rows -> height is a one-way chain, so solving with them converges
+        // within the same one-frame lag as every other measurement.
+        let solved = solve_with_headers(
             &effective,
             host,
             area,
             &plan.desired,
             &plan.mins,
             state.chrome,
+            &plan.headers,
         );
         (plan, solved)
     };
@@ -1496,11 +1588,16 @@ fn draw_host<'frame, C>(
 
         // The panel's minimum, not the active tab's: the panel is sized by its
         // largest tab, so the grip must not let the user drag it below what
-        // another of its tabs declared.
-        let min_size = plan.mins.get(panel_plan.id).unwrap_or(Vec2::new(
+        // another of its tabs declared. The widest caption is a floor too —
+        // the panel cannot be drawn narrower — so a resize may not pin a width
+        // the solver would only have to raise again.
+        let previous_header = panel_plan.header;
+        let header_floor = previous_header.unwrap_or_default();
+        let declared_min = plan.mins.get(panel_plan.id).unwrap_or(Vec2::new(
             0.0,
-            state.chrome.collapsed_height + PANEL_MIN_CONTENT_HEIGHT,
+            state.chrome.with_header(header_floor).collapsed_height + PANEL_MIN_CONTENT_HEIGHT,
         ));
+        let min_size = Vec2::new(declared_min.x.max(header_floor.min_width), declared_min.y);
         // What must keep a transparent panel visible even with the pointer
         // nowhere near it. Both are gestures the panel is the TARGET of, and a
         // panel that faded out in the middle of one would blink at the user:
@@ -1571,6 +1668,13 @@ fn draw_host<'frame, C>(
         // touch of `state` in this loop.
         state.finish_tab_extras(layout_key, active, extras);
         chrome = drawn.chrome;
+        // The solve above used last frame's header rows; a header that now
+        // wraps differently (the panel's width changed, a caption appeared)
+        // needs one more frame to get the height it takes.
+        if header_metrics_changed(previous_header, drawn.header) {
+            outcome.needs_repaint = true;
+        }
+        state.remember_header_metrics(layout_key, panel_plan.id, &panel_plan.visible_tabs, drawn.header);
         if let Some(height) = drawn.pinned_bottom_height {
             // The scroll viewport was sized from the PREVIOUS height; a section
             // that changed needs one more frame to get the room it now takes.
@@ -1658,10 +1762,20 @@ fn draw_host<'frame, C>(
             // it), not a ratchet. It does mean a tab dragged out of a wide panel
             // carries that width with it, which is correct: it is the last width
             // that tab was actually drawn at.
+            //
+            // The panel's extra caption rows are taken OUT of the stored height:
+            // they depend on the panel's width and on which tabs it shows, not on
+            // this tab, and only the active tab is ever re-measured. Kept in, an
+            // inactive tab would hold the panel one row taller after it widened,
+            // and a tab moved elsewhere would carry its old panel's rows along.
+            // `plan_frame` adds the rows of whatever panel shows the tab.
             state.remember_measurement(
                 layout_key,
                 active,
-                Vec2::new(panel_plan.assumed_size.x, measured.y),
+                Vec2::new(
+                    panel_plan.assumed_size.x,
+                    (measured.y - drawn.header.extra_height).max(0.0),
+                ),
             );
         }
     }
@@ -1860,6 +1974,9 @@ fn draw_host<'frame, C>(
         outcome.needs_repaint = true;
     }
     state.chrome = chrome;
+    // After this frame's own mutations: a panel merged away or removed by them
+    // must not leave measurements a reused id could pick up.
+    state.prune_header_metrics(layout_key);
     // What this window offered a drop, for the frame's address resolution. The
     // record is written even when the gesture ended in this very pass: the window
     // the drop belongs to may not have drawn yet, and it is the whole frame — not
@@ -2014,21 +2131,13 @@ fn paint_cross_window_feedback(
             grab_offset,
             header_size,
         } => match cross_window::tab_landing(area, targets, local) {
-            TabLanding::HeaderStrip { panel, index } => {
+            TabLanding::HeaderStrip { panel, .. } => {
                 if let Some(target) = targets.iter().find(|target| target.panel == panel) {
-                    // Left edge of the header the tab would push aside; past the
-                    // last one, the right edge of that one. Same rule the widget
-                    // uses for its own strip (`panel.rs::tab_drop_zone`).
-                    let x = target.header_rects.get(index).map_or_else(
-                        || {
-                            target
-                                .header_rects
-                                .last()
-                                .map_or(target.header_strip.left(), Rect::right)
-                        },
-                        Rect::left,
-                    );
-                    drag::paint_insertion_marker(ctx, target.header_strip, x);
+                    // The marker of the very slot `tab_landing` chose: one rule
+                    // (`drag::insertion_slot`) for the index, the caption row and
+                    // the marker, shared with the widget's own strip.
+                    let slot = drag::insertion_slot(&target.header_rects, target.header_strip, local);
+                    drag::paint_insertion_marker(ctx, slot);
                 }
             }
             TabLanding::BareArea { pos } => {
@@ -3644,6 +3753,10 @@ struct PanelPlan {
     /// Tabs of this panel that were declared this frame AND are visible, in the
     /// panel's own tab order. These are the headers the panel shows.
     visible_tabs: Vec<TabId>,
+    /// Last frame's header measurement of this panel, when it was taken with
+    /// exactly [`PanelPlan::visible_tabs`] shown; `None` otherwise (never drawn,
+    /// other captions, a reused id), which the solve treats as a one-row header.
+    header: Option<PanelHeaderMetrics>,
     /// Tab whose body is drawn, or `None` when the panel has nothing to show.
     active_tab: Option<TabId>,
     /// `true` when the tab this panel actually DRAWS asked for the
@@ -3662,6 +3775,8 @@ struct FramePlan {
     panels: Vec<PanelPlan>,
     desired: PanelSizes,
     mins: PanelSizes,
+    /// Every [`PanelPlan::header`] that is `Some`, as the solver's input.
+    headers: PanelHeaders,
 }
 
 /// Decides, without drawing anything, what each panel of `host` shows this frame
@@ -3678,8 +3793,13 @@ struct FramePlan {
 ///   the one that happens to be active, so switching tabs never resizes the
 ///   panel and a smaller tab is stretched into it. The same maximum is taken over
 ///   the declared minimums, because the panel has to satisfy all of them at once;
-/// * a tab's own size is its last measurement, else the declared `initial_size`,
-///   else the declared `min_size`. A tab that has NEVER been drawn and declares
+/// * a tab's own size is its last measurement plus the panel's CURRENT extra
+///   caption rows (measurements are stored with a one-row header, see
+///   `PanelDockState::measured_size`), else the declared `initial_size`, else the
+///   declared `min_size` — both outer sizes the caller chose, so no rows are
+///   added to them;
+/// * a panel's header metrics are last frame's, and only when they were taken
+///   with exactly the tabs it shows now ([`MeasuredHeader`]); A tab that has NEVER been drawn and declares
 ///   neither contributes nothing to the maximum — there is nothing honest to
 ///   contribute — and joins it with its real size on the first frame it is shown,
 ///   which costs the one extra frame every first measurement costs
@@ -3697,6 +3817,7 @@ fn plan_frame(
     host: HostId,
     decls: &BTreeMap<TabId, TabMeta>,
     measured: &HashMap<TabId, Vec2>,
+    headers: &HashMap<PanelId, MeasuredHeader>,
 ) -> FramePlan {
     let mut nodes: Vec<&PanelNode> = layout.panels_in_host(host).collect();
     nodes.sort_by_key(|node| node.id);
@@ -3723,9 +3844,17 @@ fn plan_frame(
         } else {
             &visible_tabs
         };
+        let header = headers
+            .get(&node.id)
+            .filter(|entry| entry.tabs == visible_tabs)
+            .map(|entry| entry.metrics);
+        let extra_rows = header.map_or(0.0, |header| header.extra_height);
+        if let Some(header) = header {
+            plan.headers.insert(node.id, header);
+        }
         let declared = sources
             .iter()
-            .filter_map(|tab| tab_request(*tab, decls, measured))
+            .filter_map(|tab| tab_request(*tab, decls, measured, extra_rows))
             .reduce(Vec2::max);
         let min = sources
             .iter()
@@ -3754,8 +3883,9 @@ fn plan_frame(
                 .size_override
                 .or(declared)
                 .unwrap_or(DEFAULT_PANEL_SIZE),
-            active_request: tab_request(size_source, decls, measured),
+            active_request: tab_request(size_source, decls, measured, extra_rows),
             visible_tabs,
+            header,
             active_tab,
             transparent,
         });
@@ -3763,8 +3893,9 @@ fn plan_frame(
     plan
 }
 
-/// Outer size ONE tab contributes to its panel's request: its last measurement,
-/// else the declared `initial_size`, else the declared `min_size`.
+/// Outer size ONE tab contributes to its panel's request: its last measurement
+/// with the panel's `extra_rows` (points of caption rows beyond the first) added
+/// to its height, else the declared `initial_size`, else the declared `min_size`.
 ///
 /// `None` means the tab has never been drawn and the caller declared no size for
 /// it, i.e. the dock knows nothing about how big it wants to be.
@@ -3772,11 +3903,12 @@ fn tab_request(
     tab: TabId,
     decls: &BTreeMap<TabId, TabMeta>,
     measured: &HashMap<TabId, Vec2>,
+    extra_rows: f32,
 ) -> Option<Vec2> {
     let meta = decls.get(&tab).copied().unwrap_or_default();
     measured
         .get(&tab)
-        .copied()
+        .map(|size| Vec2::new(size.x, size.y + extra_rows))
         .or(meta.initial_size)
         .or(meta.min_size)
 }
@@ -4361,7 +4493,7 @@ mod tests {
             (TAB_A, meta(true, None, None)),
             (TAB_B, meta(false, None, None)),
         ]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new(), &HashMap::new());
         assert_eq!(plan.panels.len(), 1);
         assert_eq!(plan.panels[0].visible_tabs, vec![TAB_A]);
         assert_eq!(plan.panels[0].active_tab, Some(TAB_A));
@@ -4386,6 +4518,7 @@ mod tests {
             HostId::MainWindow,
             &transparent_active,
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(plan.panels[0].active_tab, Some(TAB_A));
         assert!(plan.panels[0].transparent);
@@ -4400,6 +4533,7 @@ mod tests {
             &layout,
             HostId::MainWindow,
             &transparent_sibling,
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert_eq!(plan.panels[0].active_tab, Some(TAB_A));
@@ -4418,7 +4552,7 @@ mod tests {
             (TAB_A, transparent_meta(false)),
             (TAB_B, meta(true, None, None)),
         ]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &fallback, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &fallback, &HashMap::new(), &HashMap::new());
         assert_eq!(plan.panels[0].active_tab, Some(TAB_B));
         assert!(!plan.panels[0].transparent);
 
@@ -4428,7 +4562,7 @@ mod tests {
             (TAB_A, transparent_meta(false)),
             (TAB_B, meta(false, None, None)),
         ]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &nothing_shown, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &nothing_shown, &HashMap::new(), &HashMap::new());
         assert_eq!(plan.panels[0].active_tab, None);
         assert!(!plan.panels[0].transparent);
     }
@@ -4445,7 +4579,7 @@ mod tests {
             (TAB_A, meta(false, None, None)),
             (TAB_B, transparent_meta(true)),
         ]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new(), &HashMap::new());
         assert_eq!(plan.panels[0].active_tab, Some(TAB_B));
         assert!(plan.panels[0].transparent);
     }
@@ -4459,7 +4593,7 @@ mod tests {
             .insert_panel(panel_with(0, &[TAB_A, TAB_C]))
             .expect("insert 0");
         let decls = decls(&[(TAB_A, meta(true, None, None))]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new(), &HashMap::new());
         assert_eq!(plan.panels[0].visible_tabs, vec![TAB_A]);
         assert!(!plan.panels[0].transparent);
     }
@@ -4474,7 +4608,7 @@ mod tests {
             (TAB_A, meta(false, None, None)),
             (TAB_B, meta(true, None, None)),
         ]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new(), &HashMap::new());
         assert_eq!(plan.panels[0].active_tab, Some(TAB_B));
         // The model's own active tab is untouched: visibility is not a user
         // choice and must not overwrite one.
@@ -4489,7 +4623,7 @@ mod tests {
         let mut layout = DockLayout::new();
         layout.insert_panel(panel_with(0, &[TAB_A])).expect("insert");
         let decls = decls(&[(TAB_A, meta(false, None, Some(Vec2::new(300.0, 200.0))))]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new(), &HashMap::new());
         assert_eq!(plan.panels.len(), 1);
         assert!(plan.panels[0].visible_tabs.is_empty());
         assert_eq!(plan.panels[0].active_tab, None);
@@ -4534,7 +4668,7 @@ mod tests {
             (TAB_B, meta(false, None, Some(Vec2::new(300.0, 200.0)))),
             (TAB_C, meta(true, None, Some(Vec2::new(300.0, 200.0)))),
         ]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new(), &HashMap::new());
         let effective = frame_layout(&layout, &plan);
         assert_eq!(effective.panels().len(), 2);
         assert_eq!(effective.panel(PanelId::new(1)), None);
@@ -4591,7 +4725,7 @@ mod tests {
             (TAB_A, meta(false, None, Some(Vec2::new(300.0, 200.0)))),
             (TAB_B, meta(true, None, Some(Vec2::new(300.0, 180.0)))),
         ]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new(), &HashMap::new());
         let effective = frame_layout(&layout, &plan);
         assert_eq!(
             effective
@@ -4636,7 +4770,7 @@ mod tests {
         let mut measured = HashMap::new();
         measured.insert(TAB_A, Vec2::new(310.0, 420.0));
 
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &measured);
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &measured, &HashMap::new());
         assert_eq!(
             plan.desired.get(PanelId::new(0)),
             Some(Vec2::new(310.0, 420.0))
@@ -4675,7 +4809,7 @@ mod tests {
         measured.insert(TAB_A, Vec2::new(420.0, 150.0));
         measured.insert(TAB_B, Vec2::new(300.0, 460.0));
 
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &measured);
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &measured, &HashMap::new());
         assert_eq!(
             plan.desired.get(PanelId::new(0)),
             Some(Vec2::new(420.0, 460.0))
@@ -4706,7 +4840,7 @@ mod tests {
         let mut measured = HashMap::new();
         measured.insert(TAB_A, Vec2::new(240.0, 200.0));
 
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &measured);
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &measured, &HashMap::new());
         // Panel 0: a measured tab and a declared-but-never-drawn one.
         assert_eq!(
             plan.desired.get(PanelId::new(0)),
@@ -4731,7 +4865,7 @@ mod tests {
             (TAB_A, meta(true, Some(Vec2::new(340.0, 100.0)), None)),
             (TAB_B, meta(true, Some(Vec2::new(120.0, 260.0)), None)),
         ]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new(), &HashMap::new());
         assert_eq!(
             plan.mins.get(PanelId::new(0)),
             Some(Vec2::new(340.0, 260.0))
@@ -4750,7 +4884,7 @@ mod tests {
             (TAB_A, meta(true, Some(Vec2::new(200.0, 120.0)), None)),
             (TAB_B, meta(false, Some(Vec2::new(600.0, 700.0)), None)),
         ]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new(), &HashMap::new());
         assert_eq!(
             plan.desired.get(PanelId::new(0)),
             Some(Vec2::new(200.0, 120.0))
@@ -4774,13 +4908,13 @@ mod tests {
         measured.insert(TAB_A, Vec2::new(420.0, 150.0));
         measured.insert(TAB_B, Vec2::new(300.0, 460.0));
 
-        let first = plan_frame(&layout, HostId::MainWindow, &decls, &measured);
+        let first = plan_frame(&layout, HostId::MainWindow, &decls, &measured, &HashMap::new());
         // The driver stores the PANEL's width against the drawn tab, and the
         // content height it measured; both tabs eventually hold that width.
         let assumed = first.panels[0].assumed_size;
         measured.insert(TAB_A, Vec2::new(assumed.x, 150.0));
         measured.insert(TAB_B, Vec2::new(assumed.x, 460.0));
-        let second = plan_frame(&layout, HostId::MainWindow, &decls, &measured);
+        let second = plan_frame(&layout, HostId::MainWindow, &decls, &measured, &HashMap::new());
         assert_eq!(first.desired, second.desired);
         assert_eq!(first.panels, second.panels);
     }
@@ -4796,7 +4930,7 @@ mod tests {
             (TAB_A, meta(true, None, None)),
             (TAB_C, meta(true, None, None)),
         ]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new(), &HashMap::new());
         // Insertion order was 2 then 0; the plan is always ascending by id, which
         // is what makes drawing order deterministic.
         let ids: Vec<PanelId> = plan.panels.iter().map(|panel| panel.id).collect();
@@ -4818,7 +4952,7 @@ mod tests {
         };
         layout.insert_panel(node).expect("insert 0");
         let decls = decls(&[(TAB_A, meta(true, None, Some(Vec2::new(300.0, 240.0))))]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new(), &HashMap::new());
         let solved = solve(
             &layout,
             HostId::MainWindow,
@@ -4953,7 +5087,7 @@ mod tests {
             (TAB_A, meta(true, None, Some(sizes[0].1))),
             (TAB_B, meta(true, None, Some(sizes[1].1))),
         ]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &shown, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &shown, &HashMap::new(), &HashMap::new());
         let solved = solve(
             &frame_layout(&layout, &plan),
             HostId::MainWindow,
@@ -4971,7 +5105,7 @@ mod tests {
             (TAB_A, meta(false, None, Some(sizes[0].1))),
             (TAB_B, meta(true, None, Some(sizes[1].1))),
         ]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &hidden, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &hidden, &HashMap::new(), &HashMap::new());
         let effective = frame_layout(&layout, &plan);
         assert_eq!(
             effective.panel(PanelId::new(1)).expect("survivor").anchor,
@@ -5003,6 +5137,7 @@ mod tests {
                 HostId::MainWindow,
                 &decls(&[(TAB_A, meta(true, None, Some(Vec2::new(300.0, 200.0))))]),
                 &HashMap::new(),
+            &HashMap::new(),
             );
             let solved = solve(
                 &frame_layout(layout, &plan),
@@ -5038,7 +5173,7 @@ mod tests {
             (TAB_B, meta(true, None, Some(Vec2::new(280.0, 190.0)))),
             (TAB_C, meta(true, None, Some(Vec2::new(300.0, 200.0)))),
         ]);
-        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new(), &HashMap::new());
         assert_eq!(plan.panels[0].assumed_size, DEFAULT_PANEL_SIZE);
         assert_eq!(plan.panels[1].assumed_size, Vec2::new(280.0, 190.0));
         assert_eq!(plan.panels[2].assumed_size, Vec2::new(420.0, 260.0));
@@ -5269,6 +5404,7 @@ mod tests {
             HostId::MainWindow,
             &declared,
             state.measurements("typing").unwrap_or(&no_measurements),
+            &HashMap::new(),
         );
         assert_eq!(typing.panels[0].assumed_size, Vec2::new(560.0, 480.0));
 
@@ -5278,6 +5414,7 @@ mod tests {
             HostId::MainWindow,
             &declared,
             state.measurements("cleaning").unwrap_or(&no_measurements),
+            &HashMap::new(),
         );
         assert_eq!(cleaning.panels[0].assumed_size, Vec2::new(340.0, 160.0));
     }
@@ -5578,8 +5715,8 @@ mod tests {
             (TAB_B, meta(true, None, Some(Vec2::new(300.0, 200.0)))),
         ]);
 
-        let main = plan_frame(layout, HostId::MainWindow, &decls, &HashMap::new());
-        let sub = plan_frame(layout, HostId::SubWindow(0), &decls, &HashMap::new());
+        let main = plan_frame(layout, HostId::MainWindow, &decls, &HashMap::new(), &HashMap::new());
+        let sub = plan_frame(layout, HostId::SubWindow(0), &decls, &HashMap::new(), &HashMap::new());
         // Every panel is planned by exactly one window, and the detached tab is
         // planned only by the window that holds it.
         assert_eq!(main.panels.len(), 1);
@@ -5994,6 +6131,7 @@ mod tests {
             HostId::SubWindow(0),
             &decls(&[]),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert!(plan.panels.is_empty());
     }
@@ -6122,5 +6260,193 @@ mod tests {
         assert!(pinned_height_changed(None, 40.0));
         assert!(pinned_height_changed(Some(20.0), 40.0));
         assert!(!pinned_height_changed(Some(40.0), 40.4));
+    }
+
+    #[test]
+    fn a_header_measurement_repaints_only_when_it_is_news() {
+        // A panel never drawn was solved as a one-row header: measuring exactly
+        // that costs no extra frame.
+        assert!(!header_metrics_changed(None, PanelHeaderMetrics::default()));
+        assert!(header_metrics_changed(None, PanelHeaderMetrics::new(22.0, 0.0)));
+        assert!(header_metrics_changed(None, PanelHeaderMetrics::new(0.0, 160.0)));
+        let settled = PanelHeaderMetrics::new(22.0, 160.0);
+        assert!(!header_metrics_changed(Some(settled), PanelHeaderMetrics::new(22.4, 160.4)));
+        assert!(header_metrics_changed(Some(settled), PanelHeaderMetrics::new(0.0, 160.0)));
+    }
+
+    const WRAP_LAYOUT_KEY: &str = "test.wrap";
+    const WRAP_TABS: [(TabId, &str); 3] = [
+        (TabId::new("test.wrap.a"), "Слои"),
+        (TabId::new("test.wrap.b"), "Действия"),
+        (TabId::new("test.wrap.c"), "Превью текста"),
+    ];
+
+    /// One free panel holding the three wrap tabs, pinned by hand to `WIDTH`
+    /// points wide and 220 tall.
+    fn wrap_layout<const WIDTH: u16>() -> DockLayout {
+        let mut layout = DockLayout::new();
+        let mut panel = PanelNode::new(
+            PanelId::new(0),
+            HostId::MainWindow,
+            WRAP_TABS.iter().map(|(id, _)| *id).collect(),
+        )
+        .expect("three distinct tabs make a valid panel");
+        panel.pos = Pos2::new(20.0, 20.0);
+        panel.size_override = Some(Vec2::new(f32::from(WIDTH), 220.0));
+        layout.insert_panel(panel).expect("the only panel");
+        layout
+    }
+
+    /// Drives `frames` headless frames of a dock showing the three wrap tabs in
+    /// the layout `build` makes, returning the state and the panel's rect per
+    /// frame.
+    fn drive_wrap_dock(build: fn() -> DockLayout, frames: usize) -> (PanelDockState, Vec<Option<Rect>>) {
+        let ctx = egui::Context::default();
+        let mut state = PanelDockState::default();
+        state.ensure_default_layout(WRAP_LAYOUT_KEY, build);
+        let mut rects = Vec::new();
+        for _ in 0..frames {
+            // `FullOutput` carries this test's paint output only; nothing is
+            // rendered, so dropping it is the whole intent.
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                let mut dock = PanelDock::begin(
+                    ui.ctx(),
+                    &mut state,
+                    DockArea {
+                        rect: AREA,
+                        layout_key: WRAP_LAYOUT_KEY,
+                    },
+                );
+                for (id, title) in WRAP_TABS {
+                    dock.tab(id).title(move || title).show(|ui, _cx: &mut ()| {
+                        ui.label("body");
+                    });
+                }
+                let output = dock.end(&mut ());
+                rects.push(output.panel_rect(PanelId::new(0)));
+            })
+            .drop_without_applying_deltas();
+        }
+        (state, rects)
+    }
+
+    fn wrap_header(state: &PanelDockState) -> PanelHeaderMetrics {
+        state
+            .header_measurements(WRAP_LAYOUT_KEY)
+            .and_then(|headers| headers.get(&PanelId::new(0)))
+            .expect("the panel was drawn")
+            .metrics
+    }
+
+    /// End to end through the driver: a panel pinned narrower than its longest
+    /// caption is laid out at the caption-driven minimum width on the next
+    /// frame, its captions wrap, and the layout then SETTLES — the same rect on
+    /// every later frame, so width -> rows -> height never feeds back.
+    #[test]
+    fn a_panel_narrower_than_its_longest_caption_widens_once_and_settles() {
+        let (state, rects) = drive_wrap_dock(wrap_layout::<60>, 6);
+        let header = wrap_header(&state);
+        let settled = rects
+            .last()
+            .copied()
+            .flatten()
+            .expect("the panel is on screen");
+        assert!(header.min_width > 60.0, "{header:?}");
+        assert!(header.extra_height > 0.0, "the captions wrapped: {header:?}");
+        assert!((settled.width() - header.min_width).abs() < 0.01, "{settled:?} vs {header:?}");
+        // Settled: nothing moves any more.
+        assert_eq!(rects[3], rects[5]);
+        assert_eq!(rects[4], rects[5]);
+        // The user's manual size is a request, not something the floor rewrites.
+        let stored = state
+            .layout(WRAP_LAYOUT_KEY)
+            .and_then(|layout| layout.panel(PanelId::new(0)))
+            .and_then(|panel| panel.size_override);
+        assert_eq!(stored, Some(Vec2::new(60.0, 220.0)));
+    }
+
+    /// A tab's stored measurement counts its panel's header as ONE row: the same
+    /// tab drawn in a wrapped and in a one-row panel stores the same height, so
+    /// an inactive tab cannot keep a widened panel a row too tall and a moved tab
+    /// carries no rows of its old panel.
+    #[test]
+    fn a_stored_tab_height_leaves_the_wrapped_rows_out() {
+        let (narrow, _) = drive_wrap_dock(wrap_layout::<60>, 6);
+        let (wide, _) = drive_wrap_dock(wrap_layout::<600>, 6);
+        assert!(wrap_header(&narrow).extra_height > 0.0);
+        assert_eq!(wrap_header(&wide).extra_height, 0.0);
+        let tab = WRAP_TABS[0].0;
+        let narrow_height = narrow.measured_size(WRAP_LAYOUT_KEY, tab).expect("measured").y;
+        let wide_height = wide.measured_size(WRAP_LAYOUT_KEY, tab).expect("measured").y;
+        assert!((narrow_height - wide_height).abs() < 0.01, "{narrow_height} vs {wide_height}");
+    }
+
+    /// The plan adds the panel's CURRENT rows to a measured height — and only
+    /// when the cached header was measured with exactly the tabs shown now; a
+    /// declared size is an outer size and gets nothing added.
+    #[test]
+    fn the_plan_adds_the_panels_current_rows_to_measured_tabs_only() {
+        let mut layout = DockLayout::new();
+        layout.insert_panel(panel_with(0, &[TAB_A, TAB_B])).expect("insert 0");
+        layout.insert_panel(panel_with(1, &[TAB_C])).expect("insert 1");
+        let decls: BTreeMap<TabId, TabMeta> = [
+            (TAB_A, meta(true, None, None)),
+            (TAB_B, meta(true, None, None)),
+            (TAB_C, meta(true, None, Some(Vec2::new(200.0, 150.0)))),
+        ]
+        .into_iter()
+        .collect();
+        let measured: HashMap<TabId, Vec2> = [(TAB_A, Vec2::new(300.0, 200.0))].into_iter().collect();
+        let rows = PanelHeaderMetrics::new(22.0, 180.0);
+        let matching: HashMap<PanelId, MeasuredHeader> = [
+            (PanelId::new(0), MeasuredHeader { tabs: vec![TAB_A, TAB_B], metrics: rows }),
+            (PanelId::new(1), MeasuredHeader { tabs: vec![TAB_C], metrics: rows }),
+        ]
+        .into_iter()
+        .collect();
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &measured, &matching);
+        assert_eq!(plan.desired.get(PanelId::new(0)), Some(Vec2::new(300.0, 222.0)));
+        assert_eq!(plan.desired.get(PanelId::new(1)), Some(Vec2::new(200.0, 150.0)));
+        assert_eq!(plan.headers.get(PanelId::new(0)), rows);
+        assert_eq!(plan.panels[0].active_request, Some(Vec2::new(300.0, 222.0)));
+
+        // Measured with other captions (a reused id, a tab hidden since): not
+        // this panel's header, so it is solved as a fresh one-row header.
+        let stale: HashMap<PanelId, MeasuredHeader> =
+            [(PanelId::new(0), MeasuredHeader { tabs: vec![TAB_C], metrics: rows })].into_iter().collect();
+        let plan = plan_frame(&layout, HostId::MainWindow, &decls, &measured, &stale);
+        assert_eq!(plan.desired.get(PanelId::new(0)), Some(Vec2::new(300.0, 200.0)));
+        assert!(plan.headers.is_empty());
+        assert_eq!(plan.panels[0].header, None);
+    }
+
+    /// Header measurements never outlive their panel: a panel gone from the
+    /// layout loses its entry, and «Сбросить раскладку» drops the whole key,
+    /// because the default rebuilds panels under ids the old layout used.
+    #[test]
+    fn header_measurements_are_dropped_with_their_panel_and_on_reset() {
+        let mut state = PanelDockState::new();
+        state.ensure_default_layout("typing", single_panel_default_layout);
+        {
+            let layout = state.layout_mut("typing").expect("layout");
+            layout
+                .insert_panel(panel_with(9, &[TAB_C]))
+                .expect("a panel the user created");
+        }
+        let rows = PanelHeaderMetrics::new(22.0, 180.0);
+        state.remember_header_metrics("typing", PanelId::new(0), &[TAB_A], rows);
+        state.remember_header_metrics("typing", PanelId::new(9), &[TAB_C], rows);
+        state.remember_header_metrics("typing", PanelId::new(4), &[TAB_B], rows);
+        state.prune_header_metrics("typing");
+        let kept: BTreeSet<PanelId> = state
+            .header_measurements("typing")
+            .expect("entries remain")
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(kept, [PanelId::new(0), PanelId::new(9)].into_iter().collect());
+
+        assert!(state.reset_layout("typing"));
+        assert!(state.header_measurements("typing").is_none());
     }
 }

@@ -54,7 +54,7 @@ use std::cmp::Ordering;
 
 use egui::{Pos2, Rect, Vec2};
 
-use super::drag::insertion_index;
+use super::drag::insertion_slot;
 use super::model::{HostId, PanelId};
 
 /// Geometry of one window of the dock, in the shared monitor frame.
@@ -275,9 +275,11 @@ pub struct PanelDropTarget {
     /// Its outer rect, in its window's screen coordinates.
     pub rect: Rect,
     /// Its header strip — the drop zone that takes a tab — in the same
-    /// coordinates.
+    /// coordinates. Every caption row of a wrapped header is inside it.
     pub header_strip: Rect,
-    /// Rects of the tab captions inside that strip, in strip order.
+    /// Rects of the tab captions inside that strip, in strip order, over as
+    /// many rows as the header wrapped them onto
+    /// ([`super::drag::insertion_slot`] reads the rows back).
     pub header_rects: Vec<Rect>,
 }
 
@@ -320,14 +322,9 @@ pub fn tab_landing(area: Rect, panels: &[PanelDropTarget], local: Pos2) -> TabLa
         .iter()
         .find(|target| target.header_strip.contains(local))
     {
-        let centers: Vec<f32> = target
-            .header_rects
-            .iter()
-            .map(|rect| rect.center().x)
-            .collect();
         return TabLanding::HeaderStrip {
             panel: target.panel,
-            index: insertion_index(&centers, local.x),
+            index: insertion_slot(&target.header_rects, target.header_strip, local).index,
         };
     }
     if !area.contains(local) || panels.iter().any(|target| target.rect.contains(local)) {
@@ -578,6 +575,34 @@ mod tests {
             TabLanding::HeaderStrip {
                 panel: PanelId::new(1),
                 index: 2,
+            }
+        );
+
+        // A WRAPPED strip: the drop lands on the hovered row, counting the
+        // captions of the rows above it — the same rule the receiving panel
+        // applies to a drop it can sense itself.
+        let wrapped = [target(
+            2,
+            rect(500.0, 100.0, 200.0, 300.0),
+            rect(500.0, 100.0, 200.0, 46.0),
+            &[
+                rect(520.0, 102.0, 80.0, 20.0),
+                rect(608.0, 102.0, 80.0, 20.0),
+                rect(520.0, 126.0, 80.0, 20.0),
+            ],
+        )];
+        assert_eq!(
+            tab_landing(rect(0.0, 0.0, 1000.0, 800.0), &wrapped, Pos2::new(530.0, 136.0)),
+            TabLanding::HeaderStrip {
+                panel: PanelId::new(2),
+                index: 2,
+            }
+        );
+        assert_eq!(
+            tab_landing(rect(0.0, 0.0, 1000.0, 800.0), &wrapped, Pos2::new(690.0, 136.0)),
+            TabLanding::HeaderStrip {
+                panel: PanelId::new(2),
+                index: 3,
             }
         );
     }

@@ -78,7 +78,9 @@ positive contributors join the water-filling pool. Three consequences are contra
   fits after a single pass and re-solving a settled layout reproduces it (idempotence — without it
   one pixel of resize-grip drag SHRANK the panel);
 * a chain too WIDE for the area is shrunk exactly like a chain too tall, because a panel pushed out
-  sideways takes its resize grip with it and the user can no longer make it smaller.
+  sideways takes its resize grip with it and the user can no longer make it smaller (down to the panels'
+  floors only: caption-driven width floors that exceed the area together leave the far grip
+  outside it, see «Header rows»).
 
 Shrinking is also **tiered**. A panel carrying a `size_override` is the LAST to give: the deficit
 drains `SHRINK_PRIORITIES` in order, so every content-sized panel of the pool sits on its floor
@@ -133,7 +135,8 @@ twice per frame.
    declared `initial_size`, then its `min_size`, then `DEFAULT_PANEL_SIZE`.
 2. Each body is drawn inside a bounded `ScrollArea`; what the panel reports back is its own
    overhead plus the height its CONTENT measured, and so is the panel's own style-dependent
-   overhead (`PanelChrome`).
+   overhead: the ONE-ROW header (`PanelChrome`, one value for the whole dock) and what this
+   panel's header costs beyond it (`PanelHeaderMetrics`, per panel — see «Header rows»).
 3. A content height that differs from the height the drawn tab CONTRIBUTED to its panel's request
    by at least one point triggers `ctx.request_repaint()`, so the layout converges within a couple
    of frames.
@@ -199,6 +202,55 @@ Rules:
   nothing. Never inside a nested `ScrollArea` of the body: the free room is measured against the
   calling `Ui`'s `max_rect`.
 
+### Header rows
+Tab captions WRAP onto further rows when the panel is too narrow for one. The header is the
+collapse arrow and the drag grip, then a nested `horizontal_wrapped` block holding the captions:
+wrapped rows start at that block's left edge, i.e. UNDER THE FIRST CAPTION, and the arrow and
+the grip stay on the first row. egui never wraps the first item of a row, so a row always holds
+at least one caption. Rules:
+
+* **Captions never wrap their own text** (`Button::wrap_mode(TextWrapMode::Extend)`; a wrapping
+  layout would otherwise wrap a caption's text). A caption's width is therefore independent of
+  the panel width, and so is the panel's **caption-driven minimum width** — the lead in front of
+  the first caption (frame, arrow, grip) + the widest caption + the frame's trailing margin and
+  stroke, rounded up. The chain is width -> rows -> height and never back, so the one-frame lag
+  converges instead of oscillating (`solver.rs` test
+  `re_solving_with_a_settled_header_measurement_changes_nothing`, driver test
+  `a_panel_narrower_than_its_longest_caption_widens_once_and_settles`).
+* **Two measurements, two owners.** `PanelChrome` is measured from the FIRST row only, so a
+  one-row header reports exactly what the flat strip did and the value stays identical for every
+  panel of one style (pinned by `a_one_row_header_reports_the_flat_strips_chrome`). What wrapping
+  adds is `PanelHeaderMetrics { extra_height, min_width }`, reported per panel
+  (`CollapsiblePanelOutput::header`), cached per layout key and `PanelId` in
+  `PanelDockState::header_metrics` together with the tabs the panel showed, and fed to
+  `solve_with_headers` through `plan_frame` — only for a panel showing exactly those tabs, since
+  `PanelId`s are reused (`max + 1`). Entries of panels that left the layout are dropped at the end
+  of every drawn frame, and the whole key on «Сбросить раскладку». A change of at least
+  `MEASUREMENT_EPSILON` repaints; every captioned panel has `min_width > 0`, so its first draw per
+  key (and a caption text change, e.g. a language switch) costs one extra frame even when nothing
+  moves.
+* **A tab's stored height counts the header as ONE row.** The extra rows belong to the panel and
+  its current width, and only the active tab is re-measured, so `remember_measurement` stores
+  `measured - extra_height` and `plan_frame` adds the CURRENT panel's rows back (to measured
+  heights only; a declared `initial_size` / `min_size` is an outer size). Otherwise an inactive
+  tab would keep a widened panel a row too tall, and a moved tab would carry its old panel's rows. There `extra_height` is added to that panel's collapsed height, body
+  overhead and height floors (`PanelChrome::with_header`), and `min_width` joins
+  `PANEL_MIN_WIDTH` as the hard WIDTH floor: it raises the request and stops the horizontal
+  shrink, because the widget cannot draw a caption narrower than it is. The driver folds it into
+  the resize grip's `min_size` too. **Accepted consequence:** the floors of panels docked side by
+  side can sum past the area's width; the chain is then translated rather than shrunk further, so
+  its far panel — grip included — ends up partly outside the area (before, panels shrank to
+  `PANEL_MIN_WIDTH` and only their captions overflowed). `solve` is `solve_with_headers` with no metrics.
+* **Collapsed panels show the same rows**; their height is `chrome.with_header(header)`.
+* **Residual one-frame lags** (the dock's frame model): on the frame the row count changes the
+  panel is still solved with the old header, so the body budget shrinks for that frame — and a
+  COLLAPSED panel, which states no height, is drawn taller than its rect and may overlap the
+  neighbour below for one frame; a newly shown caption wider than the strip overflows it for one
+  frame until its `min_width` reaches the solver.
+* Caption ids are the wrapping block's auto ids — derived from the panel's id scope and the
+  caption's position, never from its localised text. A `push_id` scope around a caption would
+  start its own `max_rect` at the cursor and make wrapping impossible.
+
 ## Files and submodules
 - `mod.rs`: the public re-export surface, `PanelDockState`, `DockArea`, `PanelDock`,
   `PanelDockOutput`, and the three pure frame-planning helpers (`ensure_declared_tabs`,
@@ -207,8 +259,9 @@ Rules:
 - `model.rs`: `TabId`, `PanelId`, `HostId`, `DockEdge`, `PanelAnchor`, `PanelNode`, `DockLayout`,
   `MoveTabOutcome`, `DockModelError`. All layout mutations (insert, remove, re-anchor, move a tab)
   live here, together with `validate()` and `chains()`.
-- `solver.rs`: `PanelSizes` (sanitized input map), `PanelChrome` (measured header/frame overhead),
-  `solve()`, `SolvedPanel`, `SolvedLayout`, the per-chain shrink (`ChainContext`), and the layout
+- `solver.rs`: `PanelSizes` (sanitized input map), `PanelChrome` (measured ONE-ROW header/frame
+  overhead), `PanelHeaderMetrics` / `PanelHeaders` (per-panel extra header rows and caption-driven
+  minimum width), `solve_with_headers()` and its no-metrics form `solve()`, `SolvedPanel`, `SolvedLayout`, the per-chain shrink (`ChainContext`), and the layout
   constants `DOCK_GAP`, `COLLAPSED_PANEL_HEIGHT`, `PANEL_MIN_CONTENT_HEIGHT`, `PANEL_MIN_WIDTH`,
   `PANEL_MIN_BODY_HEIGHT`, `DEFAULT_PANEL_SIZE`.
 - `extras.rs`: `TabExtras` — the per-tab bag of named boolean flags the dock stores and persists.
@@ -218,7 +271,8 @@ Rules:
 - `elastic.rs`: `bottom_aligned` — a body's last section placed at the bottom of the viewport
   through a filler the panel excludes from its measurement (see «Bottom-aligned last section»),
   and the `open_body` / `close_body` bracket `panel.rs` draws the scroll body inside.
-- `panel.rs`: widget #2, `CollapsiblePanel` — draws ONE panel (header strip, active tab's body,
+- `panel.rs`: widget #2, `CollapsiblePanel` — draws ONE panel (header strip with wrapping caption
+  rows, active tab's body,
   resize grip, header drag handle, tab drop zone, and the two context menus) and reports what the
   user did through `CollapsiblePanelOutput` / `TabDrop` / `MoveTargetEntry`. It never touches the
   model and knows nothing about windows: the destinations of the «Переместить в окно →» submenu
@@ -242,7 +296,9 @@ Rules:
 - `drag.rs`: the reorganisation gestures. `DragSession` (a panel move in flight, owned by
   `PanelDockState`), `DraggedTab` (the drag-and-drop payload of a tab header), the snap search
   (`find_snap`, `panel_snap_candidates`, `SnapCandidate`, `SnapTargets`, `SNAP_DISTANCE`), the
-  sibling rule (`resolve_slot`), the two tab-drop questions (`insertion_index`,
+  sibling rule (`resolve_slot`), the caption-row grouping of a header (`header_rows`, the one owner
+  of "which row is this caption on"), the two tab-drop questions (`insertion_slot` — index AND
+  the row the marker goes on, for the widget's own strip and the cross-window drop alike —,
   `empty_space_drop`) and the three previews (`paint_snap_preview` for docking,
   `paint_detach_preview` for tearing out, `paint_insertion_marker` for a drop the receiving
   window could not sense). Everything but the painters is a pure function.
@@ -285,14 +341,15 @@ Three properties are contractual:
   "is this panel transparent this frame" — is taken by `plan_frame` (`PanelPlan::transparent`) and
   is asked of the tab the panel actually DRAWS, so a transparent tab that is hidden, or merely not
   the active one, leaves its panel opaque.
-* **It changes painting and NOTHING about geometry.** The header row is laid out identically in
+* **It changes painting and NOTHING about geometry.** The header rows are laid out identically in
   both states, `Frame::multiply_with_opacity` scales colours only (never the inner margin, never
   `stroke.width`), `faded_scroll_style` scales the six scroll-bar opacities and no size-bearing
   field of `ScrollStyle` — so `allocated_width()` stays `0.0` and the no-oscillation rule below
   holds unchanged — `HEADER_BODY_SPACING` is always applied, and every `Ui::interact` still runs. It
-  could not be otherwise: `PanelChrome` is ONE value for the whole `PanelDockState`, taken from the
-  last panel drawn, so a header that measured differently in one mode would move every panel of
-  every program tab and repaint forever — and `measured_size` is derived from the drawn frame minus
+  could not be otherwise: the one-row `PanelChrome` is ONE value for the whole `PanelDockState`,
+  taken from the last panel drawn, so a header that measured differently in one mode would move
+  every panel of every program tab and repaint forever (and its `PanelHeaderMetrics` would move
+  that panel) — and `measured_size` is derived from the drawn frame minus
   the body budget, so a changed header composition would land in the tab's stored measurement.
 * **An invisible panel still intercepts pointer input over its rect.** The `Area` keeps
   `Order::Foreground` and `interactable(true)`, which canvas input gating
@@ -329,13 +386,15 @@ dragged widget as hovered.
 Two gestures, both decided in `drag.rs` and applied by the driver through the model:
 
 * **Moving a panel.** The header strip reads, left to right: collapse arrow, drag grip, tab
-  captions, bare background. The panel is grabbed by the GRIP or by that BARE BACKGROUND — never by
-  a tab caption, the collapse button or the resize grip — and both zones also anchor the layout
-  context menu; only the grip is painted, so the strip shows one grip wherever it is grabbed. The
-  grip's slot is reserved with `Ui::add_space` BEFORE the first caption, so it survives captions
-  that fill the whole strip (a panel that cannot be grabbed cannot be reorganised at all) and it
-  cannot change the strip's height: in a left-to-right layout that call expands the row's x alone,
-  and the strip's height is the panel's measured `PanelChrome`. The gesture DETACHES the panel on
+  captions (wrapping onto further rows, «Header rows»), bare background. The panel is grabbed by
+  the GRIP — its slot over the FIRST row — or by the BARE BACKGROUND after the LAST row's last
+  caption — never by a tab caption, the collapse button or the resize grip; the room under the
+  arrow and the grip on wrapped rows and the ends of the other rows grab nothing — and both zones
+  also anchor the layout context menu; only the grip is painted, so the strip shows one grip
+  wherever it is grabbed. The grip's slot is reserved with `Ui::add_space` BEFORE the first caption,
+  so it survives captions that fill the whole strip (a panel that cannot be grabbed cannot be
+  reorganised at all) and it cannot change the first row's height: in a left-to-right layout that
+  call expands the row's x alone, and that height is the measured one-row `PanelChrome`. The gesture DETACHES the panel on
   the first frame (anchor `Free`,
   position taken from the rect it was solved at) and then recomputes its `pos` from the pointer at
   the START of every frame, before the solve, so the panel is laid out under the cursor in the
@@ -352,7 +411,9 @@ Two gestures, both decided in `drag.rs` and applied by the driver through the mo
   advance the row's auto-id counter and rename every caption after it for the duration of the drag.
   The copy is placed so the point the header was GRABBED at stays under the cursor (requirement 7),
   measured from `pointer.press_origin()` against the rect the header occupies this frame. A header
-  strip under the pointer shows an insertion marker and takes the drop at the hovered index; a
+  strip under the pointer — any of its rows — shows an insertion marker on the HOVERED ROW and
+  takes the drop at the index that row's captions give (`drag::insertion_slot`: the captions of the
+  rows above count first; past a row's last caption the marker stays at that row's end); a
   release on BARE dock area gives the tab a panel of its own at the cursor
   (`DockLayout::detach_tab`); a release over anything else cancels the move. A panel emptied by a
   drop is removed by `DockLayout::move_tab` itself.
@@ -790,9 +851,12 @@ content.
 - **`min_size` is a shrink floor, not a request.** A panel is laid out at the size its content
   measured; the declared minimum only stops the shrink step. Raising the request to it instead made
   a short panel reserve height it does not draw, leaving a hole between it and the panel docked
-  below. The only bound that does raise a request is the physical one — `PANEL_MIN_WIDTH` and one
-  measured header plus `PANEL_MIN_BODY_HEIGHT` — because `CollapsiblePanel` cannot draw a smaller
-  frame, and a solved rect smaller than the drawn panel would be overlapped by its own neighbour.
+  below. The only bound that does raise a request is the physical one — `PANEL_MIN_WIDTH` or the
+  panel's caption-driven minimum width, whichever is larger, and its own measured header (one-row
+  chrome plus its extra caption rows) plus `PANEL_MIN_BODY_HEIGHT` — because `CollapsiblePanel`
+  cannot draw a smaller frame, and a solved rect smaller than the drawn panel would be overlapped by
+  its own neighbour. Caption floors are never given up, so a side-by-side chain whose floors exceed
+  the area's width is translated and its far panel's grip leaves the area («Header rows»).
 - **A panel is as big as its LARGEST tab.** `plan_frame` requests the component-wise MAXIMUM over
   every tab the panel SHOWS this frame — its measurements, or what the caller declared for a tab
   that has never been drawn (`initial_size`, else `min_size`) — and takes the maximum of the
@@ -811,16 +875,23 @@ content.
   is compared: a width difference only ever means "the solver decided otherwise", and re-solving
   reproduces it.
 - **Geometry contracts.** `pos` is stored relative to the host area's top-left. `align` / `along`
-  are fractions in `0.0..=1.0` of the free travel along the shared side. `DockEdge` means "outside
+  are fractions in `0.0..=1.0` of the free travel along the shared side. The travel is signed: for a
+  `Panel` anchor whose panel is LONGER than the target's side it is negative and the fraction
+  addresses an overhang (`0.0` / `1.0` = starts / ends coincide), so the shorter side always lies
+  inside the longer one, whichever is the target. `drag.rs::fraction` must derive it from the same
+  signed travel `place_outside` places with — reading a negative travel as "none" pinned every
+  wider panel flush with its target's start. `DockEdge` means "outside
   the target, next to this side" for a `Panel` anchor and "inside the area, flush with this side"
   for `ViewportEdge`. Attached panels always sit exactly `DOCK_GAP` away.
 - **Sizes are outer sizes**, header and frame margins included. The header overhead is MEASURED,
-  not assumed: `CollapsiblePanel` reports a `PanelChrome` (collapsed outer height, and the overhead
-  an expanded panel spends before its body) on every drawn frame, the driver stores the latest one
-  in `PanelDockState`, and `solve` is given it. `COLLAPSED_PANEL_HEIGHT` is only the nominal
+  not assumed: `CollapsiblePanel` reports a one-row `PanelChrome` (collapsed outer height, and the
+  overhead an expanded panel spends before its body) and its own `PanelHeaderMetrics` on every
+  drawn frame, the driver stores the latest chrome in `PanelDockState` and the metrics per panel,
+  and `solve_with_headers` is given both. `COLLAPSED_PANEL_HEIGHT` is only the nominal
   fallback for the very first frame — the real header is style-dependent and roughly 12 pt taller,
   and a chain laid out on the nominal value overlaps its own panels. A collapsed panel is exactly
-  `chrome.collapsed_height` tall, never shrinks, and reports `body_max_height == 0.0`.
+  `chrome.with_header(header).collapsed_height` tall, never shrinks, and reports
+  `body_max_height == 0.0`.
   `CollapsiblePanel` still derives the body's own budget from the solved RECT minus the header it
   drew THIS frame **and minus the frame's border**, so a style change cannot make the drawn panel
   exceed the solved rect: `egui::Frame` places its stroke outside the inner margin, so a budget that
@@ -988,7 +1059,11 @@ content.
 - To change how big a panel asks to be (the maximum over its tabs, what an unmeasured tab
   contributes, which minimum applies), edit `plan_frame` / `tab_request` in `mod.rs`.
 - To change how a panel LOOKS (header, collapse arrow, scroll behaviour, resize grip), edit
-  `panel.rs`.
+  `panel.rs`. Header rows: the wrapping block and the two measurements are in
+  `CollapsiblePanel::contents` / `header_block`; which caption is on which row is
+  `drag::header_rows`; the per-panel cache and its repaint rule (`header_metrics_changed`) are in
+  `mod.rs`; how the solver charges them is `panel_hard_floor` / `PanelChrome::with_header` in
+  `solver.rs`.
 - To change WHEN a transparent-until-hover panel shows its chrome, edit `ChromeGate::shows_chrome`
   in `panel.rs`; to change WHAT fades with it, edit `CollapsiblePanel::chrome_opacity` /
   `caption_opacity` / `faded_scroll_style` / the `faded` call sites there. To change which panel is transparent at all,
@@ -1051,7 +1126,9 @@ content.
 - To change how a gesture DECIDES (snap distance, target priority, the sibling rule, where a
   dropped tab lands), edit `drag.rs`; every rule there is a pure function with a test. To change how
   a gesture is SENSED (which pixels grab the panel, what the insertion marker looks like), edit
-  `panel.rs`. To change when it is applied, edit `advance_panel_drag` / `begin_panel_drag` /
+  `panel.rs`. Where a dropped tab lands in a header strip, and where its marker goes, is ONE rule
+  (`drag::insertion_slot`) used by the widget, `cross_window::tab_landing` and
+  `paint_cross_window_feedback`; never re-derive it at a call site. To change when it is applied, edit `advance_panel_drag` / `begin_panel_drag` /
   `apply_panel_drop` / `apply_tab_drop` in `mod.rs`.
 - To change where a NEWLY DECLARED tab's panel lands — what the default is asked, how a slot that
   is already taken is answered, in which order the new panels are created — edit

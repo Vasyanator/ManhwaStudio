@@ -4,14 +4,19 @@ File: crates/ms-widgets/src/panel_dock/panel.rs
 Purpose:
 Widget #2 of the dockable-panel system: `CollapsiblePanel`, the drawing of ONE
 `PanelNode` at the geometry the solver produced for it. Header strip (collapse
-toggle + one clickable caption per visible tab), body of the active tab inside a
-bounded `ScrollArea` that scrolls on BOTH axes, and a bottom-right resize grip.
+toggle + one clickable caption per visible tab, the captions wrapping onto
+further rows when the panel is too narrow for one), body of the active tab
+inside a bounded `ScrollArea` that scrolls on BOTH axes, and a bottom-right
+resize grip.
 
 Main responsibilities:
 - draw one panel as an `Order::Foreground` `egui::Area` at a driver-supplied
   position, in the project's `Frame::popup` visual language;
 - report back what the user did (tab switch, collapse toggle, manual resize) and
-  what the content would like to be, without mutating the layout model itself.
+  what the content would like to be, without mutating the layout model itself;
+- report what its header measured: the shared one-row `PanelChrome` and this
+  panel's own `PanelHeaderMetrics` (extra caption rows, caption-driven minimum
+  width).
 
 Key structures:
 - `PanelTabHeader`: one header entry (stable id + already localised caption).
@@ -47,11 +52,17 @@ Notes:
   rule — it stops a window that merely still receives pointer events from
   claiming a drop the user made over a window floating above it.
 - The header strip reads, left to right: collapse arrow, drag grip, tab captions,
-  bare background. The panel is grabbed by the grip OR by that bare background,
-  and both carry the layout context menu; only the grip is painted. The grip's
-  slot is reserved with `Ui::add_space`, which in a left-to-right layout expands
-  the row's x and nothing else — the strip's height is this panel's measured
-  `PanelChrome`, so it must stay exactly what the button and the captions make it.
+  bare background. The captions sit in a nested `horizontal_wrapped` that starts
+  right of the grip, so wrapped rows line up under the FIRST caption while the
+  arrow and the grip stay on the first row; every caption is laid out with
+  `TextWrapMode::Extend`, so a caption never wraps its own text and its width —
+  hence the panel's caption-driven minimum width — does not depend on the panel
+  width (width -> rows -> height, never back). The panel is grabbed by the grip
+  OR by the bare background after the LAST row's last caption, and both carry
+  the layout context menu; only the grip is painted. The grip's slot is reserved
+  with `Ui::add_space`, which in a left-to-right layout expands the row's x and
+  nothing else — the first row's height is the shared one-row `PanelChrome`, so
+  it must stay exactly what the button and the captions make it.
 - Every gesture that starts on a widget which is ALSO a click target — a tab
   caption, the header handle — is sensed as `Sense::click_and_drag()` so egui
   postpones the click/drag verdict until the press is decidedly a drag. The two
@@ -76,11 +87,12 @@ Notes:
   is elsewhere (and its captions too, but only when it shows exactly one of
   them). Everything drawn AROUND the content is chrome; the content itself, and
   any scroll area of its own, never fades. The mode is
-  PAINTING ONLY: same header row, same `Frame` margins and stroke WIDTH, same
+  PAINTING ONLY: same header rows, same `Frame` margins and stroke WIDTH, same
   `Ui::interact` calls, same `Order::Foreground` `Area`. Nothing else is
-  possible — the dock's `PanelChrome` is one global value taken from the last
-  panel drawn, so a header that measured differently in one mode would move
-  every panel of every program tab and repaint forever. The corollary is that an
+  possible — the dock's one-row `PanelChrome` is one global value taken from the
+  last panel drawn, so a header that measured differently in one mode would move
+  every panel of every program tab and repaint forever (and the per-panel
+  header metrics would move that panel). The corollary is that an
   invisible panel still intercepts pointer input over its rect; that is the
   accepted cost of leaving the `Area` interactive, which the canvas' own input
   gating depends on.
@@ -109,11 +121,12 @@ Notes:
 use egui::scroll_area::ScrollBarVisibility;
 use egui::{Id, Pos2, Rect, Sense, Stroke, Vec2};
 
-use super::drag::{DraggedTab, SNAP_LINE_WIDTH, insertion_index};
+use super::drag::{DraggedTab, SNAP_LINE_WIDTH, header_rows, insertion_slot};
 use super::elastic;
 use super::model::{PanelId, TabId};
 use super::solver::{
-    COLLAPSED_PANEL_HEIGHT, PANEL_MIN_BODY_HEIGHT, PANEL_MIN_WIDTH, PanelChrome, SolvedPanel,
+    COLLAPSED_PANEL_HEIGHT, PANEL_MIN_BODY_HEIGHT, PANEL_MIN_WIDTH, PanelChrome,
+    PanelHeaderMetrics, SolvedPanel,
 };
 use super::window::MoveTarget;
 
@@ -289,10 +302,18 @@ pub struct CollapsiblePanelOutput {
     /// A filler drawn by [`super::elastic::bottom_aligned`] in the scroll body is
     /// NOT content and is left out of the height.
     pub measured_size: Option<Vec2>,
-    /// Style-dependent vertical overhead this panel actually drew, reported in
-    /// every state (collapsed included) so the solver stops guessing it from the
-    /// nominal [`COLLAPSED_PANEL_HEIGHT`].
+    /// Style-dependent vertical overhead this panel drew with its header's FIRST
+    /// row only, reported in every state (collapsed included) so the solver
+    /// stops guessing it from the nominal [`COLLAPSED_PANEL_HEIGHT`]. It is the
+    /// same for every panel of one style — wrapped caption rows are not in it,
+    /// they are in [`CollapsiblePanelOutput::header`] — which is what lets the
+    /// driver keep one value for the whole dock.
     pub chrome: PanelChrome,
+    /// What THIS panel's header measured beyond [`CollapsiblePanelOutput::chrome`]:
+    /// the height of the caption rows under the first one, and the narrowest
+    /// outer width at which every caption fits a row of its own. Reported in
+    /// every state; the driver feeds it to next frame's solve.
+    pub header: PanelHeaderMetrics,
     /// `true` on the frame a drag of the header background started. The driver
     /// turns it into a move session; the widget itself never moves the panel.
     pub drag_started: bool,
@@ -319,9 +340,11 @@ pub struct CollapsiblePanelOutput {
     /// started in, so the receiving window has no pointer to hit-test with and
     /// must be told what the cursor was over (`cross_window.rs`).
     pub header_strip: Rect,
-    /// Rects of the tab captions inside that strip, in strip order. Same reason
-    /// as [`CollapsiblePanelOutput::header_strip`]: they carry the insertion
-    /// index of a drop the widget itself could not sense.
+    /// Rects of the tab captions inside that strip, in strip order, over every
+    /// row they wrapped onto. Same reason as
+    /// [`CollapsiblePanelOutput::header_strip`]: they carry the insertion index
+    /// of a drop the widget itself could not sense
+    /// ([`super::drag::insertion_slot`]).
     pub header_rects: Vec<Rect>,
     /// Height, in points, the pinned bottom section drew this frame. `None` when
     /// the panel has no pinned bottom section or did not draw its body
@@ -436,11 +459,12 @@ impl<'a> CollapsiblePanel<'a> {
     /// out identically, [`egui::Frame`] keeps its inner margin and its stroke
     /// WIDTH, every `Ui::interact` still runs and the panel keeps its
     /// `Order::Foreground` `Area`, so an invisible panel occupies the same rect,
-    /// reports the same [`PanelChrome`] and the same measurement, and still
-    /// intercepts pointer input over its rect. That is a hard requirement, not a
-    /// simplification: `PanelChrome` is global to the whole dock state and taken
-    /// from the last panel drawn, so a panel whose header measured differently
-    /// would move every other panel of every program tab and repaint forever.
+    /// reports the same [`PanelChrome`], the same [`PanelHeaderMetrics`] and the
+    /// same measurement, and still intercepts pointer input over its rect. That
+    /// is a hard requirement, not a simplification: the one-row `PanelChrome` is
+    /// global to the whole dock state and taken from the last panel drawn, so a
+    /// panel whose header measured differently would move every other panel of
+    /// every program tab and repaint forever.
     ///
     /// The driver passes what the tab being DRAWN declared
     /// ([`super::PanelTab::transparent_until_hover`]).
@@ -532,6 +556,9 @@ impl<'a> CollapsiblePanel<'a> {
     /// [`COLLAPSED_PANEL_HEIGHT`] is used here as an absolute floor, not as an
     /// estimate of the header: a size pinned below the real header height is
     /// raised again by the solver, which knows the measured [`PanelChrome`].
+    /// The driver folds this panel's caption-driven minimum width
+    /// ([`PanelHeaderMetrics::min_width`]) into `min_size.x`, so a resize cannot
+    /// pin a width narrower than the widest caption.
     #[must_use]
     pub fn min_size(mut self, min_size: Vec2) -> Self {
         self.min_size = Vec2::new(
@@ -657,17 +684,19 @@ impl<'a> CollapsiblePanel<'a> {
         // Height of the pinned-mode body that lay below `body_bottom` and was
         // therefore kept out of the frame (`0.0` when it fitted).
         let mut clamped_overflow = 0.0_f32;
-        // Drawn height of the header strip alone, without the frame margins.
-        let mut header_height = 0.0_f32;
-        // Laid-out rect of the header row, and of every tab header inside it.
-        // Both are needed AFTER the frame closes: the row bounds the drag handle
-        // and the drop zone, the headers decide the insertion index.
-        let mut header_row: Option<Rect> = None;
+        // Laid-out rect of the whole header block (every caption row) and of
+        // the collapse arrow, and the rect of every tab header inside it. All
+        // are needed AFTER the frame closes: the rows bound the drag handle,
+        // the bare move zone and the drop zone and give the measurement, the
+        // headers decide the insertion index.
+        let mut header_row: Option<(Rect, Rect)> = None;
         let mut header_rects: Vec<Rect> = Vec::with_capacity(self.tabs.len());
         // Horizontal span `(left, right)` the drag handle reserved between the
         // collapse button and the first caption. Needed after the frame closes,
         // where the strip's vertical extent is finally known.
         let mut handle_span: Option<(f32, f32)> = None;
+        // Rect of the collapse arrow, written by the header row below.
+        let mut arrow_rect = Rect::NOTHING;
 
         let frame_response = frame.show(ui, |ui| {
             ui.set_width(inner_width);
@@ -682,12 +711,16 @@ impl<'a> CollapsiblePanel<'a> {
                 // The collapse arrow is chrome and fades with the frame. Faded,
                 // never hidden: it keeps its slot in the row, so the strip's
                 // height — this panel's `PanelChrome` — cannot depend on the
-                // mode.
-                if faded(ui, chrome_opacity, |ui| {
-                    ui.small_button(icon).on_hover_text(hint).clicked()
-                }) {
+                // mode. Allocated BEFORE the caption block, it is centred on the
+                // row's initial height and therefore stays on the first row
+                // however many rows the captions wrap onto.
+                let arrow = faded(ui, chrome_opacity, |ui| {
+                    ui.small_button(icon).on_hover_text(hint)
+                });
+                if arrow.clicked() {
                     toggle_collapsed = true;
                 }
+                arrow_rect = arrow.rect;
                 // Reserve the drag handle's slot right of the collapse button and
                 // LEFT of the first caption. Space is advanced, never allocated:
                 // in a left-to-right layout `Ui::add_space` expands the region's
@@ -705,19 +738,28 @@ impl<'a> CollapsiblePanel<'a> {
                 ui.add_space(HEADER_HANDLE_GAP);
                 handle_span = Some((handle_left, handle_right));
                 let captions = caption_opacity(self.tabs.len(), chrome_opacity);
-                faded(ui, captions, |ui| {
-                    for tab in self.tabs {
-                        header_rects.push(self.tab_header(
-                            ui,
-                            tab,
-                            &mut activated_tab,
-                            &mut move_tab,
-                        ));
-                    }
+                // The captions WRAP inside their own block, whose left edge is
+                // the first caption's: a new row starts at the block's left
+                // (`egui-0.36.2/src/layout.rs:516-526`), so wrapped rows line up
+                // under the first caption rather than under the arrow, and the
+                // first item of a row never wraps, so a row always holds at
+                // least one caption. A one-row block is laid out exactly like
+                // the flat row it replaced: same start, same item spacing, same
+                // row height.
+                ui.horizontal_wrapped(|ui| {
+                    faded(ui, captions, |ui| {
+                        for tab in self.tabs {
+                            header_rects.push(self.tab_header(
+                                ui,
+                                tab,
+                                &mut activated_tab,
+                                &mut move_tab,
+                            ));
+                        }
+                    });
                 });
             });
-            header_height = header.response.rect.height();
-            header_row = Some(header.response.rect);
+            header_row = Some((header.response.rect, arrow_rect));
 
             if self.collapsed {
                 return;
@@ -879,11 +921,12 @@ impl<'a> CollapsiblePanel<'a> {
         // Both gestures live in the header strip, which spans the frame's inner
         // width rather than only the width the header row happened to use.
         let content_right = frame_rect.right() - frame.inner_margin.rightf();
-        let header = match header_row.zip(handle_span) {
-            Some((row, span)) => self.header_handle(
+        let rows = header_row.map(|(block, arrow)| header_block(block, arrow, &header_rects));
+        let header = match rows.zip(handle_span) {
+            Some((rows, span)) => self.header_handle(
                 ui,
-                handle_zone(row, span, content_right),
-                spare_move_zone(row, content_right),
+                handle_zone(rows.first_row, span, content_right),
+                spare_move_zone(rows.last_row, content_right),
                 chrome_opacity,
             ),
             None => HeaderMenuOutcome::default(),
@@ -893,22 +936,41 @@ impl<'a> CollapsiblePanel<'a> {
             reset_layout,
             move_panel,
         } = header;
-        let header_strip = header_row.map_or(Rect::NOTHING, |row| {
-            header_strip_rect(row, content_right)
+        let header_strip = rows.map_or(Rect::NOTHING, |rows| {
+            header_strip_rect(rows.block, content_right)
         });
-        let tab_drop = header_row
-            .and_then(|row| self.tab_drop_zone(ui, row, content_right, &header_rects));
+        let tab_drop = rows
+            .and_then(|rows| self.tab_drop_zone(ui, rows.block, content_right, &header_rects));
         let size_override = self.resize_grip(ui, frame_rect, chrome_opacity);
         // What the solver has to assume next frame. `collapsed_height` is the
         // outer height a collapsed panel occupies (border + margins + header);
         // the expanded panel additionally spends `HEADER_BODY_SPACING` before
         // the body starts, which is exactly the budget `body_max_height` is
         // derived from above. Both are reported in EVERY state, so the estimate
-        // is already correct on the frame a panel is collapsed.
+        // is already correct on the frame a panel is collapsed. Only the FIRST
+        // row enters it: that is the part every panel of one style shares, and
+        // what wrapping adds is this panel's own `header` metric below.
+        let first_row_height = rows.map_or(0.0, |rows| rows.first_row.height());
         let chrome = PanelChrome::new(
-            margin.y + border + header_height,
-            margin.y + border + header_height + HEADER_BODY_SPACING,
+            margin.y + border + first_row_height,
+            margin.y + border + first_row_height + HEADER_BODY_SPACING,
         );
+        let header = rows.map_or_else(PanelHeaderMetrics::default, |rows| {
+            // Every caption must fit a row of its own at the panel's narrowest:
+            // the lead in front of the first caption (frame edge, arrow, grip),
+            // the widest caption, and what the frame keeps after the content
+            // (its right margin and its stroke, which `egui::Frame` draws
+            // outside the inner margin). Rounded UP, so the floor is never a
+            // fraction of a point short of what the wrap test needs; it is a
+            // function of the captions alone (they never wrap their own text),
+            // so rounding cannot make it chase the panel width.
+            let min_width = header_rects.first().map_or(0.0, |first| {
+                let lead = first.left() - frame_rect.left();
+                let widest = header_rects.iter().map(Rect::width).fold(0.0_f32, f32::max);
+                (lead + widest + frame.inner_margin.rightf() + frame.stroke.width).ceil()
+            });
+            PanelHeaderMetrics::new(rows.block.height() - rows.first_row.height(), min_width)
+        });
         let measured_size = if self.collapsed {
             None
         } else {
@@ -935,6 +997,7 @@ impl<'a> CollapsiblePanel<'a> {
             size_override,
             measured_size,
             chrome,
+            header,
             drag_started,
             tab_drop,
             reset_layout,
@@ -947,6 +1010,9 @@ impl<'a> CollapsiblePanel<'a> {
     }
 
     /// Draws one tab header and returns its laid-out rect.
+    ///
+    /// `ui` is the header's wrapping caption block: the caption is placed on the
+    /// current row, or starts the next one when it no longer fits.
     ///
     /// The header is BOTH a click target (activate the tab) and a drag source
     /// (move the tab to another panel), and it is ONE widget sensing both. That
@@ -979,13 +1045,22 @@ impl<'a> CollapsiblePanel<'a> {
         moved: &mut Option<(TabId, MoveTarget)>,
     ) -> Rect {
         let selected = self.active_tab == Some(tab.id);
-        // Salt the label with its stable tab key: the caption is localised, so
-        // an id derived from it would move on a language switch.
-        let caption = ui
-            .push_id(tab.id.as_str(), |ui| {
-                ui.selectable_label(selected, tab.title)
-            })
-            .inner;
+        // Added straight into the wrapping caption block. A `push_id` scope —
+        // what this used to be wrapped in — builds a child `Ui` whose
+        // `max_rect` starts at the parent's cursor (`egui-0.36.2/src/ui.rs:227`,
+        // `:2203-2215`), so the caption could never move to a new row inside
+        // it. The id is the block's auto id: derived from the panel's id scope
+        // and the caption's position, never from its localised text (the push
+        // salt never made it position-independent either — a child's unique id
+        // mixes in the parent's auto-id counter, `ui.rs:253-258`).
+        //
+        // `Extend`: inside a wrapping layout egui would otherwise lay the
+        // caption's TEXT out wrapped (`ui.rs:589-605`), and a caption whose
+        // width followed the panel's width would make the caption-driven
+        // minimum width chase the very width it bounds.
+        let caption = ui.add(
+            egui::Button::selectable(selected, tab.title).wrap_mode(egui::TextWrapMode::Extend),
+        );
         // Upgrading the caption's OWN widget keeps a single id for both roles:
         // the hover highlight, the click and the drag all belong to it, and the
         // hit-test can no longer route them to two different widgets.
@@ -1083,10 +1158,13 @@ impl<'a> CollapsiblePanel<'a> {
 
     /// Senses the panel's two move zones and paints the drag grip.
     ///
-    /// `handle` is the grip's own slot at the HEAD of the strip — between the
-    /// collapse button and the first caption — and `spare` is the bare header
-    /// background right of the last caption, absent when the captions reach the
-    /// strip's end. Both grab the panel and both anchor the layout context menu;
+    /// `handle` is the grip's own slot at the HEAD of the strip's first row —
+    /// between the collapse button and the first caption — and `spare` is the
+    /// bare header background right of the LAST row's last caption, absent when
+    /// the captions reach the strip's end. The room under the arrow and the grip
+    /// on wrapped rows, and the ends of rows that are not the last, grab
+    /// nothing: they still take a dropped tab, like the rest of the strip. Both
+    /// zones grab the panel and both anchor the layout context menu;
     /// only `handle` is painted, so the strip shows exactly one grip wherever the
     /// user happens to grab it.
     ///
@@ -1173,8 +1251,9 @@ impl<'a> CollapsiblePanel<'a> {
         response
     }
 
-    /// Senses the whole header strip as a drop zone for a dragged tab, painting
-    /// the insertion marker and reporting the tab released on it.
+    /// Senses the whole header strip — every caption row of it — as a drop zone
+    /// for a dragged tab, painting the insertion marker on the hovered row and
+    /// reporting the tab released on it.
     ///
     /// Hover is decided by `Response::contains_pointer` (through
     /// `dnd_hover_payload`), never by `hovered()`: while a drag is in flight egui
@@ -1202,33 +1281,28 @@ impl<'a> CollapsiblePanel<'a> {
             ui.id().with("ms_panel_dock_tab_strip"),
             Sense::hover(),
         );
-        let centers: Vec<f32> = headers.iter().map(|rect| rect.center().x).collect();
         // The pointer position is read for GEOMETRY only — whether the strip is
-        // under the pointer at all is decided by the response above.
-        let index = ui
+        // under the pointer at all is decided by the response above. The slot
+        // (index AND the caption row the marker goes on) is the one rule the
+        // cross-window drop uses as well.
+        let slot = ui
             .ctx()
             .input(|input| input.pointer.interact_pos())
-            .map_or(headers.len(), |pos| insertion_index(&centers, pos.x));
+            .map(|pos| insertion_slot(headers, rect, pos));
 
-        if response.dnd_hover_payload::<DraggedTab>().is_some() {
-            let x = headers
-                .get(index)
-                .map_or_else(|| headers.last().map_or(rect.left(), Rect::right), Rect::left);
+        if response.dnd_hover_payload::<DraggedTab>().is_some()
+            && let Some(slot) = slot
+        {
             let color = ui.visuals().selection.stroke.color;
-            ui.painter().line_segment(
-                [
-                    Pos2::new(x, rect.top()),
-                    Pos2::new(x, rect.bottom()),
-                ],
-                Stroke::new(SNAP_LINE_WIDTH, color),
-            );
+            ui.painter()
+                .line_segment(slot.marker(), Stroke::new(SNAP_LINE_WIDTH, color));
         }
 
         let dropped = response.dnd_release_payload::<DraggedTab>()?;
         Some(TabDrop {
             tab: dropped.tab,
             from: dropped.from,
-            index,
+            index: slot.map_or(headers.len(), |slot| slot.index),
         })
     }
 
@@ -1651,8 +1725,59 @@ fn move_to_window_submenu(
     chosen
 }
 
-/// Rect of the drag handle: the horizontal span it reserved inside the header
-/// row, over that row's full height, clamped to the frame's content edge.
+/// The drawn header block, split into the two rows the gesture zones and the
+/// measurement need.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct HeaderBlock {
+    /// The whole block: every caption row, plus the collapse arrow.
+    block: Rect,
+    /// The first row: the block's width, from its top to the bottom of the
+    /// first row (the arrow, the grip and the captions laid out beside them).
+    /// For a one-row header this is the block.
+    first_row: Rect,
+    /// The last row, from the block's left edge to its last caption's right
+    /// edge (the block's right edge without captions), over that row's height —
+    /// from the block's top when it is also the first row.
+    last_row: Rect,
+}
+
+/// Splits a drawn header `block` into its first and last row (see
+/// [`HeaderBlock`]), given the collapse `arrow`'s rect and the caption rects in
+/// strip order. Rows come from [`header_rows`], the one owner of that rule.
+#[must_use]
+fn header_block(block: Rect, arrow: Rect, captions: &[Rect]) -> HeaderBlock {
+    let rows = header_rows(captions);
+    let row_rects = |row: Option<&std::ops::Range<usize>>| {
+        row.and_then(|row| captions.get(row.clone())).unwrap_or_default()
+    };
+    let first = row_rects(rows.first());
+    // Clamped into the block: on a one-row header this IS the block's bottom,
+    // so the first row reproduces the flat strip exactly.
+    let first_bottom = first
+        .iter()
+        .map(Rect::bottom)
+        .fold(arrow.bottom(), f32::max)
+        .min(block.bottom())
+        .max(block.top());
+    let last = row_rects(rows.last());
+    let last_top = if rows.len() > 1 {
+        last.iter().map(Rect::top).fold(block.bottom(), f32::min).max(block.top())
+    } else {
+        block.top()
+    };
+    let last_right = last.last().map_or(block.right(), Rect::right);
+    HeaderBlock {
+        block,
+        first_row: Rect::from_min_max(block.min, Pos2::new(block.right(), first_bottom)),
+        last_row: Rect::from_min_max(
+            Pos2::new(block.left(), last_top),
+            Pos2::new(last_right.max(block.left()), block.bottom()),
+        ),
+    }
+}
+
+/// Rect of the drag handle: the horizontal span it reserved inside the header's
+/// FIRST row, over that row's full height, clamped to the frame's content edge.
 ///
 /// `span` is `(left, right)` as measured by the row's layout cursor. The clamp
 /// matters at the solver's [`PANEL_MIN_WIDTH`] floor, where the collapse button
@@ -1671,8 +1796,9 @@ fn handle_zone(row: Rect, span: (f32, f32), content_right: f32) -> Rect {
     )
 }
 
-/// Rect of the header strip: the header row stretched to the frame's content
-/// edge, which is what a dragged tab is dropped on.
+/// Rect of the header strip: the whole header block — every caption row —
+/// stretched to the frame's content edge, which is what a dragged tab is
+/// dropped on.
 ///
 /// The strip spans the frame's inner width rather than only the width the
 /// captions happened to use, so the empty space right of the last caption still
@@ -1689,8 +1815,10 @@ fn header_strip_rect(row: Rect, content_right: f32) -> Rect {
 /// Bare header background right of the last caption, kept [`HEADER_HANDLE_GAP`]
 /// clear of it so a click aimed at a tab cannot start a panel move.
 ///
-/// `content_right` is where the frame's inner content ends, which is further
-/// right than the row's own width whenever the captions do not fill the strip.
+/// `row` is the header's LAST row ([`HeaderBlock::last_row`]): its right edge is
+/// the last caption's, its vertical extent that row's. `content_right` is where
+/// the frame's inner content ends, which is further right than the row whenever
+/// the captions do not fill it.
 /// `None` when nothing is left — the captions reach the end, or overflow it —
 /// in which case the handle at the head of the strip is the only grab point, and
 /// that one is reserved before the captions and therefore always there.
@@ -1833,17 +1961,71 @@ mod tests {
         );
     }
 
-    /// The grip owns a slot at the HEAD of the strip and spans the row's full
-    /// height, so grabbing it anywhere between the collapse button and the first
-    /// caption moves the panel.
+    /// A two-row header block as the widget lays it out: arrow at 10..26, the
+    /// grip slot 28..44, captions 50..130 and 138..210 on the first row
+    /// (40..62) and 50..120 on the second (66..88), under the first caption.
+    fn two_row_block() -> (Rect, Rect, Vec<Rect>) {
+        let block = Rect::from_min_max(Pos2::new(10.0, 40.0), Pos2::new(210.0, 88.0));
+        let arrow = Rect::from_min_max(Pos2::new(10.0, 41.0), Pos2::new(26.0, 61.0));
+        let captions = vec![
+            Rect::from_min_max(Pos2::new(50.0, 40.0), Pos2::new(130.0, 62.0)),
+            Rect::from_min_max(Pos2::new(138.0, 40.0), Pos2::new(210.0, 62.0)),
+            Rect::from_min_max(Pos2::new(50.0, 66.0), Pos2::new(120.0, 88.0)),
+        ];
+        (block, arrow, captions)
+    }
+
+    /// One row: the first and the last row are the whole block, so every zone
+    /// is exactly what the flat strip gave before captions could wrap.
     #[test]
-    fn the_handle_zone_spans_its_slot_over_the_whole_row() {
+    fn a_one_row_block_is_its_own_first_and_last_row() {
+        let block = Rect::from_min_max(Pos2::new(10.0, 40.0), Pos2::new(210.0, 62.0));
+        let arrow = Rect::from_min_max(Pos2::new(10.0, 41.0), Pos2::new(26.0, 61.0));
+        let captions = [
+            Rect::from_min_max(Pos2::new(50.0, 40.0), Pos2::new(130.0, 62.0)),
+            Rect::from_min_max(Pos2::new(138.0, 40.0), Pos2::new(210.0, 62.0)),
+        ];
+        let rows = header_block(block, arrow, &captions);
+        assert_eq!(rows.block, block);
+        assert_eq!(rows.first_row, block);
+        assert_eq!(rows.last_row, block);
+        // No caption at all: one row, the arrow's — the block then IS the
+        // arrow's row.
+        let arrow_row = Rect::from_min_max(Pos2::new(10.0, 41.0), Pos2::new(44.0, 61.0));
+        let bare = header_block(arrow_row, arrow, &[]);
+        assert_eq!(bare.first_row, arrow_row);
+        assert_eq!(bare.last_row, arrow_row);
+    }
+
+    /// Wrapped rows: the first row ends with the arrow's row, the last row
+    /// covers the bottom row only and ends at ITS last caption — not at the
+    /// block's right edge, which the wider first row set.
+    #[test]
+    fn a_wrapped_block_splits_into_its_first_and_last_row() {
+        let (block, arrow, captions) = two_row_block();
+        let rows = header_block(block, arrow, &captions);
+        assert_eq!(rows.first_row, Rect::from_min_max(block.min, Pos2::new(210.0, 62.0)));
+        assert_eq!(rows.last_row, Rect::from_min_max(Pos2::new(10.0, 66.0), Pos2::new(120.0, 88.0)));
+    }
+
+    /// The grip owns a slot at the HEAD of the strip and spans the FIRST row's
+    /// full height, so grabbing it anywhere between the collapse button and the
+    /// first caption moves the panel — and on a wrapped header the room under it
+    /// belongs to the strip, not to the grip.
+    #[test]
+    fn the_handle_zone_spans_its_slot_over_the_first_row() {
         let row = Rect::from_min_max(Pos2::new(10.0, 40.0), Pos2::new(210.0, 62.0));
         let zone = handle_zone(row, (28.0, 44.0), 300.0);
         assert_eq!(zone.left(), 28.0);
         assert_eq!(zone.right(), 44.0);
         assert_eq!(zone.top(), row.top());
         assert_eq!(zone.bottom(), row.bottom());
+
+        let (block, arrow, captions) = two_row_block();
+        let wrapped = handle_zone(header_block(block, arrow, &captions).first_row, (28.0, 44.0), 300.0);
+        assert_eq!(wrapped.top(), 40.0);
+        assert_eq!(wrapped.bottom(), 62.0);
+        assert!(!wrapped.contains(Pos2::new(36.0, 77.0)));
     }
 
     /// The grip never senses past the frame's content edge — beyond it lies the
@@ -1879,6 +2061,24 @@ mod tests {
         assert!(!spare.contains(Pos2::new(120.0, 50.0)));
     }
 
+    /// On a wrapped header only the bare space after the LAST row's last
+    /// caption grabs the panel: the first row, which the captions fill, and the
+    /// room under the grip grab nothing.
+    #[test]
+    fn a_wrapped_header_grabs_only_after_its_last_row() {
+        let (block, arrow, captions) = two_row_block();
+        let rows = header_block(block, arrow, &captions);
+        let spare = spare_move_zone(rows.last_row, 300.0).expect("the last row ends early");
+        assert_eq!(spare.left(), 120.0 + HEADER_HANDLE_GAP);
+        assert_eq!(spare.right(), 300.0);
+        assert_eq!((spare.top(), spare.bottom()), (66.0, 88.0));
+        // The first row's end and every caption are not move zones.
+        assert!(!spare.contains(Pos2::new(250.0, 50.0)));
+        for caption in &captions {
+            assert!(!spare.contains(caption.center()));
+        }
+    }
+
     /// Captions that reach — or overrun — the content edge leave no bare space,
     /// and the widget must then sense none rather than an inverted rect.
     #[test]
@@ -1902,6 +2102,10 @@ mod tests {
         let clamped = header_strip_rect(row, 4.0);
         assert!(clamped.width() <= 0.0);
         assert!(!clamped.contains(Pos2::new(100.0, 50.0)));
+        // A wrapped header drops on every one of its rows.
+        let (block, _, _) = two_row_block();
+        let wrapped = header_strip_rect(block, 300.0);
+        assert_eq!((wrapped.top(), wrapped.bottom()), (40.0, 88.0));
     }
 
     /// An ordinary panel is never touched by the rule, whatever the other flags
@@ -2464,5 +2668,133 @@ mod tests {
         assert!((settled - plain).abs() < 0.5, "settled {settled} vs plain {plain}");
         let tall = frames[2].output.measured_size.expect("expanded panel").y;
         assert!(settled < tall - 100.0, "settled {settled} vs tall {tall}");
+    }
+
+    /// Draws one panel with the given captions at `width` headlessly, three
+    /// passes like [`probe`], and reports the last pass.
+    fn probe_header(width: f32, titles: &[&str], collapsed: bool) -> CollapsiblePanelOutput {
+        const IDS: [TabId; 4] = [TabId::new("wrap_a"), TabId::new("wrap_b"), TabId::new("wrap_c"), TabId::new("wrap_d")];
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::new(50.0, 40.0), Vec2::new(width, 300.0));
+        let mut last = None;
+        for _ in 0..3 {
+            // `FullOutput` carries this test's paint output only; nothing is
+            // rendered, so dropping it is the whole intent.
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                let headers: Vec<PanelTabHeader<'_>> = IDS
+                    .iter()
+                    .zip(titles)
+                    .map(|(id, title)| PanelTabHeader { id: *id, title })
+                    .collect();
+                last = Some(
+                    CollapsiblePanel::new(PanelId::new(0), "probe")
+                        .geometry(SolvedPanel { rect, body_max_height: rect.height(), shrunk: false })
+                        .collapsed(collapsed)
+                        .tabs(&headers, Some(IDS[0]))
+                        .show(ui.ctx(), |ui| {
+                            ui.allocate_exact_size(Vec2::new(10.0, 30.0), Sense::hover());
+                        }),
+                );
+            })
+            .drop_without_applying_deltas();
+        }
+        last.expect("the probe panel is drawn on every pass")
+    }
+
+    const WRAP_TITLES: [&str; 3] = ["Слои", "Действия", "Превью текста"];
+
+    /// THE compatibility contract of wrapping: a header that fits one row
+    /// reports exactly the `PanelChrome` the flat, non-wrapping strip reported.
+    /// `32.0` / `36.0` were measured on that strip (egui 0.36.2 default style,
+    /// headless) before the captions moved into a wrapping block; a change here
+    /// moves every panel of every program tab.
+    #[test]
+    fn a_one_row_header_reports_the_flat_strips_chrome() {
+        for titles in [&WRAP_TITLES[..1], &WRAP_TITLES[..]] {
+            let output = probe_header(300.0, titles, false);
+            assert_eq!(output.chrome, PanelChrome::new(32.0, 36.0), "{titles:?}");
+            assert_eq!(output.header.extra_height, 0.0, "{titles:?}");
+            // Same caption placement as the flat strip: the first caption starts
+            // 58.4 pt right of the frame's left edge, all on one row.
+            let first = output.header_rects.first().expect("a caption");
+            assert!((first.left() - 108.4).abs() < 0.05, "{first:?}");
+            assert!(output.header_rects.iter().all(|rect| rect.top() == first.top()));
+            assert_eq!(output.header_strip.height(), first.height());
+        }
+    }
+
+    /// Too narrow for one row: the captions wrap, the shared chrome stays the
+    /// one-row value, the panel reports the extra rows and the width at which
+    /// each caption still fits a row of its own, and the measured request grows
+    /// by exactly the extra rows.
+    #[test]
+    fn a_narrow_header_wraps_and_reports_its_extra_rows() {
+        let wide = probe_header(300.0, &WRAP_TITLES, false);
+        let narrow = probe_header(170.0, &WRAP_TITLES, false);
+        assert_eq!(narrow.chrome, wide.chrome);
+        let rows = header_rows(&narrow.header_rects);
+        assert!(rows.len() >= 2, "{:?}", narrow.header_rects);
+        assert!(narrow.header.extra_height > 0.0);
+        assert!(
+            (narrow.header_strip.height() - wide.header_strip.height() - narrow.header.extra_height).abs() < 0.01
+        );
+        // Wrapped rows start under the FIRST caption, not under the arrow.
+        let first_left = narrow.header_rects[0].left();
+        for row in &rows {
+            assert!((narrow.header_rects[row.start].left() - first_left).abs() < 0.01, "{rows:?}");
+        }
+        // The request carries the rows: the body is the same, so the measured
+        // height differs by exactly the extra header height.
+        let wide_request = wide.measured_size.expect("expanded").y;
+        let narrow_request = narrow.measured_size.expect("expanded").y;
+        assert!((narrow_request - wide_request - narrow.header.extra_height).abs() < 0.5);
+        // Minimum width: lead + widest caption + the frame's trailing margin and
+        // stroke, rounded up.
+        let widest = narrow.header_rects.iter().map(Rect::width).fold(0.0_f32, f32::max);
+        let lead = first_left - narrow.rect.left();
+        assert!(narrow.header.min_width >= lead + widest);
+        assert!(narrow.header.min_width <= lead + widest + 20.0);
+    }
+
+    /// A caption never wraps its own text: its width, and with it the panel's
+    /// minimum width, is the same at every panel width — the property that keeps
+    /// the floor from chasing the width it bounds.
+    #[test]
+    fn caption_widths_and_the_width_floor_do_not_depend_on_the_panel_width() {
+        let wide = probe_header(300.0, &WRAP_TITLES, false);
+        for width in [170.0, 90.0, 40.0] {
+            let narrow = probe_header(width, &WRAP_TITLES, false);
+            assert_eq!(narrow.header.min_width, wide.header.min_width, "width {width}");
+            for (a, b) in wide.header_rects.iter().zip(&narrow.header_rects) {
+                assert!((a.width() - b.width()).abs() < 0.01, "width {width}: {a:?} vs {b:?}");
+                assert!((a.height() - b.height()).abs() < 0.01, "width {width}: {a:?} vs {b:?}");
+            }
+        }
+    }
+
+    /// Drawn exactly at its minimum width, the panel shows one caption per row
+    /// at worst and none of them crosses the frame's content edge.
+    #[test]
+    fn at_its_minimum_width_every_caption_fits_inside_the_frame() {
+        let floor = probe_header(300.0, &WRAP_TITLES, false).header.min_width;
+        let tight = probe_header(floor, &WRAP_TITLES, false);
+        let content_right = tight.header_strip.right();
+        for caption in &tight.header_rects {
+            assert!(caption.right() <= content_right + 0.01, "{caption:?} past {content_right}");
+        }
+        assert!(header_rows(&tight.header_rects).len() <= WRAP_TITLES.len());
+    }
+
+    /// A collapsed panel shows the same rows and reports the same metrics, so
+    /// the solver gives it exactly its wrapped header's height.
+    #[test]
+    fn a_collapsed_panel_wraps_like_an_expanded_one() {
+        let expanded = probe_header(170.0, &WRAP_TITLES, false);
+        let collapsed = probe_header(170.0, &WRAP_TITLES, true);
+        assert_eq!(collapsed.chrome, expanded.chrome);
+        assert_eq!(collapsed.header, expanded.header);
+        assert_eq!(collapsed.measured_size, None);
+        let expected = collapsed.chrome.with_header(collapsed.header).collapsed_height;
+        assert!((collapsed.rect.height() - expected).abs() < 0.5, "{:?} vs {expected}", collapsed.rect);
     }
 }
