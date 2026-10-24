@@ -385,6 +385,11 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   max width when on). Far links stay roughly horizontal while the near column packs invisible spacers
   at far anchor heights so its cards spread and far links thread the gaps.
 - `bubble_on_top_ui.rs`: on-page bubble widgets, focus controls, move, and resize handling.
+- `bubble_index.rs`: the frame-scoped `id -> position in ProjectData::bubbles` index
+  (`FrameBubbleIndex` on `CanvasView`, reset at the start and end of `draw`, built on first use)
+  shared by the aside measure / draw passes and the on-top pass. Rebuilt per frame, never cached
+  across frames (the bubbles `Arc` is mutated in place and its address can be reused);
+  `BubblePositions::resolve` never returns a bubble with another id.
 - `settings.rs`: canvas settings snapshots and persistence worker. Its `user_config.json` half writes
   through `config::update_user_config_file` (the serialized read-modify-write boundary), never a bare
   `fs::write`: this worker runs off the GUI thread and an unlocked read-modify-write here could drop
@@ -616,7 +621,14 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   `widgets::paint_marks_on_bar`, then re-draws the handle on top so it stays visible. The
   `egui::ScrollArea::both` engine is untouched (both axes scroll natively). Tabs position marks in
   content space via `CanvasScrollbarContext::content_y` (`world_y * zoom` from
-  `scene.page_world_rects`); the canvas owns geometry, the tab owns mark content.
+  `scene.page_world_rects`); the canvas owns geometry, the tab owns mark content. The hook runs
+  every frame the bar exists, so a tab caches what it derives from the bubbles: the context gives
+  it the cache keys — `bubbles_key()` (`HookBubblesKey`: the `ProjectData::bubbles` allocation, held
+  and compared by `Arc::ptr_eq`, plus `hook_bubbles_revision`; a revision alone is not enough, the
+  model can move before the studio hands the canvas the new `ProjectData`) and `page_layout_key()`
+  (every page's world top and height) — and the zoom-independent `world_y` +
+  `content_y_from_world`, so a zoom does not invalidate world-space positions. Marks themselves
+  (`FnOnce` callbacks) are rebuilt per frame.
 - Bubble persistence is routed through `BubblesModel` saver tasks; canvas runtime should keep
   unsaved runtime edits explicit until they are flushed to the model.
 - The overlay autosave pass schedule is the project's `AutosaveGate` when one is passed to
@@ -663,6 +675,14 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   canvas whose tab is not active, each frame (a no-op once clean), and on all three — the active
   one LAST — before save-to-project, a page op and the non-discard teardown; DISCARD never flushes.
   `flush_pending_bubble_upserts_now` stays the regular flush for tab-internal calls.
+- A canvas whose tab is NOT drawn pulls the shared models only through
+  `sync_shared_models_while_hidden(project)` (the pull `draw` does first: clean overlays, bubbles,
+  canvas settings by revision, then the deferred remote updates). A tab calls it before applying
+  background results through its hidden canvas, and only when the canvas was not drawn in the
+  previous frame: it clears the stale per-draw focus marks first, because a bubble focused before
+  the tab switch would otherwise keep deferring remote updates and a later whole-record upsert of
+  it would carry stale fields over another tab's edit. The edits it is followed by are flushed by
+  the studio's per-frame flush of inactive canvases above. It never scrolls or re-anchors.
   `has_pending_bubble_edits()` answers whether a canvas still holds such an unflushed edit (queued
   or debounced upsert of a held bubble, queued delete; `false` without a model): the studio's
   close-time dirty check reads it, because the model's unsaved flag cannot see those edits yet.
@@ -701,8 +721,19 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   deleted ids never leak and a reused id cannot serve a stale fingerprint/preview.
 - Source page GPU residency is verified manually for now because `egui::TextureHandle` creation
   and eviction require a live GUI context; pure tests should target memory-manager policy instead.
-- Clean-overlay memory eviction may drop only reconstructable GPU texture pages. It must not drop
-  `overlay_images`, prepared worker payloads currently being uploaded, or shared model state.
+- Clean-overlay memory eviction may drop only reconstructable GPU texture pages (with their prepare
+  work). It must not drop `overlay_images`, the prepare work of a pinned (visible) page being
+  uploaded, or shared model state.
+- Pending clean-overlay GPU work (prepare in flight, prepared tiles, dirty tiles) progresses only
+  while its page is drawn (`draw_overlay_on_page`, in view with overlays enabled), so the canvas
+  requests a repaint only for pages drawn THIS frame (`OverlayRuntimeState::drawn_pages`); off-screen,
+  hidden or render-suppressed work never keeps the GUI repainting. That work is kept, not dropped
+  (a finished prepare is reused when the page returns) and resumes on the page's next draw, from
+  the current `overlay_images`, so an edit from another canvas or writer still shows. Its memory is
+  bounded by eviction: a non-pinned page is reconstructable even with prepare work, its snapshot
+  counts the prepared payload's bytes, and evicting it drops the texture together with its prepare
+  state and dirty tiles (the next draw re-prepares the whole page). Only a pinned (visible) page's
+  prepare in progress is protected.
 
 ## Editing map
 - To change clean overlay visibility, upload, tiling, or editing runtime, edit

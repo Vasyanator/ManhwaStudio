@@ -23,7 +23,8 @@ state, the tools' on-set restored from the dock (first frame), fired commands, b
 lazy settings load, the tools' per-frame preparation, per-frame canvas flags, then the canvas
 inside the root's `CentralPanel`), and implements `ms_studio_tab::StudioTab` —
 the tab's input declarations and contexts, the dock builder, GPU eviction (canvas clean overlay, then detector masks), the source-page window, NEAREST
-sampling and the exit-only `Canvas.translation_hint_collapsed` key.
+sampling, the background drain while hidden (`poll_background`) and the exit-only
+`Canvas.translation_hint_collapsed` key.
 
 `TranslationTabState` in `tab.rs` is the tab orchestrator and `CanvasHooks` implementation. It owns
 panel state, controller instances, footer metadata caches, text-detection storage, OCR selection
@@ -551,6 +552,17 @@ is an author note addressed to the translator, not a replica.
   reload stale peers, open folder, the MT transport save; all on workers, `poll` per frame) over
   the `ExtensionOps` seam; `tab/browser_extension/tests.rs` pins the mapping table and the job
   state machine with a fake.
+- `tab/background.rs` (child module of `tab`): `poll_background_work`, the off-draw drain the
+  host's `StudioTab::poll_background` runs while the tab was not drawn last frame
+  (`tab_hidden_last_frame` over `TranslationTab::last_drawn_frame`): only while a job is in flight
+  (`BackgroundWork`), it syncs the hidden canvas (`CanvasView::sync_shared_models_while_hidden`),
+  runs the draw's own detector / storage / OCR / MT polls and the next detector-OCR dispatch, and
+  re-polls after `BACKGROUND_POLL_INTERVAL` (workers do not wake the GUI); unit tests inline.
+- `tab/scrollbar_marks.rs` (child module of `tab`): the translation-status marks of
+  `canvas_scrollbar_marks` (hint exemption, `Marks` / `UntilNext`) and `ScrollbarStatusCache`, the
+  per-bubble world-space entries kept across frames under `(bubbles_key, page_layout_key)` from
+  `ms_canvas::CanvasScrollbarContext` (rebuilt on any bubble or vertical layout change, not on
+  zoom); unit tests inline.
 - `tab/tool_panels.rs` (child module of `tab`): the five tools — `TranslationTool`, `ToolToggles`,
   the toolbar and tool tab ids, restore / prepare / toggle / `apply_tool_dock_requests`, the
   toolbar body and its measured size, the router `draw_tool_body` with one `draw_*_tool_body` per
@@ -566,6 +578,13 @@ is an author note addressed to the translator, not a replica.
   through `canvas()` / `canvas_mut()` (view sync, bubble flush) and the `StudioTab` hooks.
 - OCR, detector, MT, storage load/save, crop preparation, and backend health work must not block
   the GUI thread.
+- Background results reach the shared models whether or not the tab is active: the hidden-tab
+  drain (`tab/background.rs`) and the draw (`draw_canvas_overlay_top_left`) call the SAME poll
+  methods, which consume their channels, so a result is applied exactly once whichever runs
+  first. A result that needs a drawn UI (canvas selection, advanced window, panels) stays in the
+  draw; a new background job whose results write a shared model must be added to
+  `BackgroundWork` and drained in both places. Toasts and the OCR clipboard copy may fire while
+  the tab is hidden (accepted).
 - Canvas integration must stay behind `CanvasHooks` or typed `CanvasView` APIs; do not duplicate
   canvas bubble/viewport state machines in translation code.
 - `draw_canvas_overlay_top_left` must reach its dock block on EVERY frame this tab is active: the
@@ -658,7 +677,7 @@ is an author note addressed to the translator, not a replica.
   persists `footer_no_character()` into `Bubble.extra` when the "И.П." checkbox is switched on for
   a bubble whose name is not in the list.
 - The chapter scan is kept off the per-frame path by `sync_footer_tracking`'s
-  `hook_bubbles_revision` gate and reuses the snapshot already taken there; inside the gate the
+  `hook_bubbles_key` gate (the `project.bubbles` allocation + `hook_bubbles_revision`) and reuses the snapshot already taken there; inside the gate the
   scan always runs and only the reassembly is skipped when the collected set is unchanged. The
   revision moves on every footer patch flush (~`FOOTER_PATCH_DEBOUNCE_SECS` while a name is being
   typed), so that scan must stay linear and allocation-light. The same debounce is why a name

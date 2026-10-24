@@ -21,6 +21,7 @@ Key functions:
 - flush_all_bubble_edits_now(): the persistence-point flush (debounced text and focused bubbles too)
 - has_pending_bubble_edits(): whether an edit has not reached the model yet (close-time dirty check)
 - sync_runtime_from_model_or_project()
+- sync_shared_models_while_hidden(): the same pull for a canvas that is not drawn (inactive tab)
 - apply_pending_actions()
 - is_runtime_bubble_hidden(): the SINGLE hidden-hint visibility gate; every runtime-bubble scan
   that feeds drawing, hit-testing, or layout must consult it
@@ -531,6 +532,28 @@ impl CanvasView {
             }
         }
         None
+    }
+
+    /// Pulls the shared models into a canvas that is NOT being drawn (its tab is inactive), so a
+    /// tab can apply background results through it (`apply_machine_translation_*`, bubble
+    /// creation) exactly as during `draw`: clean overlays, bubbles and canvas settings by revision
+    /// (`BubblesModel` / `CleanOverlaysModel`), then the deferred remote updates.
+    ///
+    /// Contract: call it only for a canvas that was not drawn in the previous frame, and before
+    /// the first edit of the batch. The per-draw focus marks (`focused_bubbles`,
+    /// `focused_text_input`) are stale for such a canvas — no widget of it is on screen — so they
+    /// are cleared first; otherwise the bubble focused before the tab switch would keep deferring
+    /// remote updates and a later whole-record upsert of it (an area translation, flushed by the
+    /// studio's per-frame flush of inactive canvases) would carry stale fields over another
+    /// tab's edit. After this call the runtime equals the model for every bubble not locked by a
+    /// pending text upsert or paste (the studio commits text upserts of inactive canvases every
+    /// frame). Cheap when nothing changed (revision checks under brief locks); no I/O.
+    pub fn sync_shared_models_while_hidden(&mut self, project: &ProjectData) {
+        self.bubble_runtime.focused_bubbles.clear();
+        self.bubble_runtime.focused_text_input = None;
+        self.overlay_runtime.sync_from_model();
+        self.sync_runtime_from_model_or_project(project);
+        self.apply_deferred_remote_updates();
     }
 
     pub fn flush_pending_bubble_upserts_now(&mut self, project: &ProjectData) {
@@ -3302,6 +3325,30 @@ mod tests {
                 && (committed.p2.y - expected.p2.y).abs() < 1e-4,
             "committed rect must equal the final on-screen rect: {committed:?} vs {expected:?}"
         );
+    }
+
+    #[test]
+    fn sync_while_hidden_pulls_a_foreign_edit_of_the_bubble_focused_before_the_tab_switch() {
+        // The bubble focused in the last draw before the tab switch must not keep deferring remote
+        // updates: a hidden canvas has no widget on screen, and a stale runtime copy would later be
+        // upserted as a whole record over the other tab's edit.
+        let project = empty_project();
+        let model = test_model(vec![text_bubble_record(1, 0, 0.40, 0.40, Side::Left)]);
+        let mut canvas = CanvasView::default();
+        canvas.set_bubbles_model(Arc::clone(&model));
+        canvas.sync_runtime_from_model_or_project(&project);
+        canvas.bubble_runtime.focused_bubbles.insert(1);
+        let mut foreign = text_bubble_record(1, 0, 0.40, 0.40, Side::Left);
+        foreign.text = "foreign".to_string();
+        model.lock().expect("lock model").create_or_replace(foreign).expect("foreign write");
+
+        canvas.sync_shared_models_while_hidden(&project);
+
+        assert_eq!(canvas.bubble_runtime.runtime_bubbles.get(&1).map(|b| b.text.as_str()), Some("foreign"));
+        assert!(canvas.bubble_runtime.deferred_remote_bubbles.is_empty());
+        assert!(canvas.bubble_runtime.focused_bubbles.is_empty());
+        let revision = model.lock().expect("lock model").revision();
+        assert_eq!(canvas.bubble_runtime.synced_bubbles_revision, revision);
     }
 
     #[test]

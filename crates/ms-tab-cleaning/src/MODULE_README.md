@@ -142,8 +142,13 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
 - `studio_tab.rs`: `impl ms_studio_tab::StudioTab for CleaningTabState` — the studio root's
   order-free per-tab hooks: the input declarations (`input::declarations`) and contexts (the
   canvas's plus the active tool's), the dock builder, GPU eviction (canvas clean overlay, then
-  detector-mask textures), the canvas source-page window / NEAREST sampling, and the
-  committed-tree rescan.
+  detector-mask textures), the canvas source-page window / NEAREST sampling, the
+  committed-tree rescan, and `poll_background`: the text-mask load and the quick text clean are
+  drained every frame whatever tab is active (`CleaningTabState::poll_background_jobs`, the same
+  polls `draw` runs), so their `TextMaskModel` / `CleanOverlaysModel` writes do not wait for the
+  user to come back and quick-clean page patches do not pile up in the channel; a 100 ms repaint
+  runs while one is in flight. The region-edit tools' jobs are still polled only while the tab
+  draws (their polls need the canvas and the open editor session).
 - `lib.rs`: module wiring and public re-export of `CleaningTabState`.
 
 ## Contracts and invariants

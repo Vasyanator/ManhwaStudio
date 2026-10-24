@@ -110,7 +110,8 @@ impl TypingTextOverlayLayer {
         if self.layout_editor.is_some() {
             return;
         }
-        self.ensure_raster_layers_for_page(page_idx);
+        // Non-blocking: a page whose layers are still decoding lists what is resident so far.
+        self.request_page_residency(ui.ctx(), page_idx);
 
         // ONE unified, interleaved row list (text + image overlays + rasters), top of the stack first,
         // in exactly the canvas composite order (`unified_layer_rows` -> the ordering owner).

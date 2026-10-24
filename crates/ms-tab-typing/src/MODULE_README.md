@@ -453,11 +453,16 @@ saving, and export.
     order-free per-tab hooks: dock builder, GPU eviction (canvas clean overlay, then the tab's own
     `evict_gpu_caches`), canvas source-page window / NEAREST sampling, the exit-only settings
     writer and the teardown flush of the two debounced user-global stores (per-font settings, then
-    the default local-preset set). Also owns the exit-only `user_config` keys
+    the default local-preset set), and `poll_background` (finished doc-first layer jobs applied while
+    another tab is active, see "Repaint and background polling"). Also owns the exit-only `user_config` keys
     (`load_exit_settings`) and the bottom-hint rows (`typing_hint_rows`) that `draw` sets every frame.
   - `doc_layers.rs`: shared `LayerDoc` sync, unified band-Z ordering, raster-layer projection, and the
     async whole-project page **preloader** (`all_pages_loaded` / `begin_preload_all_pages` /
     `preload_all_pages_active` / `preload_all_pages_progress` / `drive_page_preload`).
+  - `page_residency.rs`: one page's layer load split into a disk half (`load_page_from_disk`, any
+    thread) and an apply half (`apply_page_load`, GUI thread), shared by the blocking
+    `ensure_raster_layers_for_page` and the per-chapter background loader the canvas draw and the
+    «Слои» panel use (`request_page_residency` / `poll_page_residency_loads`).
   - `render_jobs.rs`: background edit/create/raster/shape-variant render jobs, loader/migration start.
   - `persist.rs`: text placement save / staging flush / save-to-project (`flush_text_layers`).
   - `create_upload.rs`: the create rectangle, text editor, status overlays, texture upload.
@@ -923,6 +928,21 @@ registry to `draw`. Everything is declared in `tab/input.rs` (ids are persistenc
   the horizontal param strips' wheel (`panel/ui_helpers.rs`), every TextEdit / Wheel widget.
 
 ## Contracts and invariants
+
+- **Repaint and background polling.** `TypingTabState::draw` requests the next frame at once only
+  while work is in flight or a gesture runs (`TypingTextOverlayLayer::wants_repaint`: job
+  receivers, pending uploads, layer / layout-editor drags, move session) or a mask worker runs
+  (`TypingMaskLayer::has_jobs_in_flight`); workers that wake the GUI themselves (the background page
+  loader, the editor-font resolve) need no entry. Open UI alone (mask panel, create editor, layout
+  editor) repaints nothing. Timed status lines (create error / warning toasts, the mask status) are
+  armed and expired at the START of `draw`, and the end of `draw` sleeps until the earliest
+  deadline (`request_repaint_after`, `create_upload.rs::timed_status_repaint_delay`). A create status
+  raised by an off-draw poll (`polling_off_draw`) is UNARMED (`f64::INFINITY`) until the next drawn
+  frame starts its display time, so it is never timed out unseen. `StudioTab::poll_background`
+  (every frame, any active tab) applies finished doc-first jobs — create overlay / raster, raster
+  effects, edit render, placement save — through the same `try_recv` polls `draw` runs
+  (`poll_doc_jobs_in_background`), so the PS editor sees them while Typing is hidden, and keeps a
+  100 ms repaint while one runs. The mask jobs, export, auto-typing and page loads stay draw-polled.
 - GUI code must not block on rendering, file I/O, image decode, mask save/load, mask
   flood fill, export, or auto-typing detection. Use worker threads and poll receivers
   from the frame loop.
@@ -1259,6 +1279,18 @@ registry to `draw`. Everything is declared in `tab/input.rs` (ids are persistenc
   units in helper APIs.
 - Overlay RGBA buffers must match `width * height * 4`; mask buffers must match
   `width * height`. Public helpers should reject invalid sizes instead of panicking.
+- Per-page residency (`tab/page_residency.rs`): the canvas draw and the «Слои» panel never read
+  or decode layer files on the GUI thread. `request_page_residency` projects a page the shared doc
+  already holds inline, and otherwise queues it on ONE background worker per chapter, which builds
+  the full page-size map once, decodes requested pages in order and wakes the GUI after each; the
+  page draws without its layers (and, on a migrated chapter, without its text) until
+  `poll_page_residency_loads` (every frame from `draw`) applies the result through the SAME
+  `apply_page_load` the blocking `ensure_raster_layers_for_page` uses. Every drop of a page
+  projection calls `invalidate_pending_page_loads` (a chapter reload `reset_page_residency_loader`):
+  a decode sent under an older `page_load_generation`, or for a page that became resident meanwhile,
+  is discarded. User actions that need a page at once (raster creation, the export / flatten
+  residency pass) keep the blocking load; a loader that cannot start or dies is logged and the
+  chapter falls back to blocking loads. No page load touches an in-flight edit render.
 - Whole-project async page preload (`doc_layers.rs`, Phase 1): per-page layer data loads LAZILY (only
   visited pages), so whole-project operations (export, save) that need EVERY page resident use the
   async preloader instead of a synchronous residency loop (which would block the GUI thread).

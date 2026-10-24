@@ -80,30 +80,13 @@ use super::types::{
 };
 use super::{CanvasHooks, CanvasView, input};
 use ms_widgets::bubble_status::paint_bubble_status_border;
-use ms_project::{Bubble, ProjectData, Side};
+use ms_project::{ProjectData, Side};
 use ms_widgets::{SpellcheckedTextEdit, misspelled_word_at_pointer};
 use eframe::egui;
 use egui::{Align, Color32, CornerRadius, Id, Pos2, Rect, Sense, Stroke};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
-
-/// Builds a per-frame `id -> &Bubble` index over `project.bubbles` so aside-draw passes can resolve
-/// the persisted bubble for a given id in O(1) instead of a linear scan per visible item.
-///
-/// The returned references borrow `project` immutably for the lifetime of the map; callers must not
-/// take a mutable borrow of `project` while the map is alive (`project` is a shared reference in the
-/// aside-draw path, so this holds naturally).
-fn build_project_bubble_index(project: &ProjectData) -> HashMap<i64, &Bubble> {
-    index_bubbles_by_id(&project.bubbles)
-}
-
-/// Maps a slice of bubbles into an `id -> &Bubble` lookup. Pure (no `ProjectData`/egui), so it is
-/// unit testable. Bubble ids are unique in a project; on a duplicate id the last entry wins, which
-/// matches the former `iter().find()` returning the first match only when ids are distinct.
-fn index_bubbles_by_id(bubbles: &[Bubble]) -> HashMap<i64, &Bubble> {
-    bubbles.iter().map(|b| (b.id, b)).collect()
-}
 
 /// egui temp-data id for the cross-frame aside crossing-minimization permutation cache.
 const ASIDE_PACK_PERM_CACHE_ID: &str = "canvas_aside_pack_perm_cache";
@@ -1099,10 +1082,9 @@ fn build_aside_desired_slots(
     let scale_factor = layout.scale_factor;
     let mut desired_slots: Vec<AsideDesiredSlot> = Vec::new();
 
-    // O(1) id -> persisted bubble lookup for this measure pass, replacing the former per-item
-    // linear `project.bubbles.iter().find()`. Built once per call so every item resolves its hook
-    // bubble in constant time. Borrows `project` immutably; `project` is never mutated here.
-    let project_bubbles_by_id = build_project_bubble_index(project);
+    // O(1) id -> persisted bubble lookup, built once per frame and shared with the draw pass and
+    // the on-top pass (`bubble_index.rs`).
+    let project_bubbles_by_id = canvas.bubble_index.get_or_build(&project.bubbles);
 
     // Resolve image-bubble preview textures before packing so layout reads the same `size_px` that
     // the draw pass will use this frame. Without this, the first frame (or the frame after a crop
@@ -1120,8 +1102,8 @@ fn build_aside_desired_slots(
                 continue;
             }
             let hook_bubble_fallback;
-            let hook_bubble = match project_bubbles_by_id.get(&bid) {
-                Some(project_bubble) => *project_bubble,
+            let hook_bubble = match project_bubbles_by_id.resolve(&project.bubbles, bid) {
+                Some(project_bubble) => project_bubble,
                 None => {
                     hook_bubble_fallback = canvas.hook_bubble_for_runtime(project, b);
                     &hook_bubble_fallback
@@ -1159,8 +1141,8 @@ fn build_aside_desired_slots(
         };
         let body_mode = aside_body_mode(canvas, bid, !b.text.trim().is_empty());
         let hook_bubble_fallback;
-        let hook_bubble = match project_bubbles_by_id.get(&bid) {
-            Some(project_bubble) => *project_bubble,
+        let hook_bubble = match project_bubbles_by_id.resolve(&project.bubbles, bid) {
+            Some(project_bubble) => project_bubble,
             None => {
                 hook_bubble_fallback = canvas.hook_bubble_for_runtime(project, b);
                 &hook_bubble_fallback
@@ -1538,12 +1520,8 @@ fn draw_aside_slots(
     let column_rect = layout.column_rect;
     let frame_inner_margin = layout.frame_inner_margin;
     let scaled_bubble_style = &layout.scaled_style;
-    // O(1) id -> persisted bubble lookup for this draw pass, replacing the former per-slot linear
-    // `project.bubbles.iter().find()`. Built once per call; borrows `project` immutably for the loop
-    // below, which never mutates `project`. (Same small map is rebuilt independently in
-    // `build_aside_desired_slots`, since the two passes are separate functions reached from
-    // different call sites in this file.)
-    let project_bubbles_by_id = build_project_bubble_index(project);
+    // O(1) id -> persisted bubble lookup: this frame's index, shared with the measure pass.
+    let project_bubbles_by_id = canvas.bubble_index.get_or_build(&project.bubbles);
 
     for slot in slots {
         let item = slot.item;
@@ -1556,8 +1534,8 @@ fn draw_aside_slots(
             continue;
         };
         let hook_bubble_fallback;
-        let hook_bubble = match project_bubbles_by_id.get(&bid) {
-            Some(project_bubble) => *project_bubble,
+        let hook_bubble = match project_bubbles_by_id.resolve(&project.bubbles, bid) {
+            Some(project_bubble) => project_bubble,
             None => {
                 hook_bubble_fallback = canvas.hook_bubble_for_runtime(project, &snapshot);
                 &hook_bubble_fallback
@@ -3055,29 +3033,13 @@ mod tests {
         PackedAsideSlot, apply_cached_permutation, aside_column_vertical_bounds,
         aside_slots_overlap, aside_two_column_active, aside_two_column_card_width,
         aside_two_column_rects, aside_visible_groups, cluster_crossing_fingerprint,
-        index_bubbles_by_id, pack_aside_slots, split_near_priority,
+        pack_aside_slots, split_near_priority,
     };
     use crate::types::AsideItem;
-    use ms_project::{Bubble, Side};
+    use ms_project::Side;
     use eframe::egui::{self, Rect};
-    use serde_json::Map;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
-
-    fn test_bubble(id: i64) -> Bubble {
-        Bubble {
-            id,
-            img_idx: 0,
-            img_u: 0.0,
-            img_v: 0.0,
-            side: None,
-            bubble_class: None,
-            bubble_type: None,
-            text: String::new(),
-            original_text: String::new(),
-            extra: Map::new(),
-        }
-    }
 
     // An editable hint card is the fixed one-line shape: no header, no original/translation
     // fields, the single-line hint field, delete WITHOUT translate, and the footer (which carries
@@ -3137,24 +3099,6 @@ mod tests {
             assert!(!groups.show_delete_action);
             assert!(!groups.show_footer);
         }
-    }
-
-    // The per-frame index must resolve present ids to the matching bubble and report `None` for
-    // absent ids, so the aside-draw fallback path behaves exactly as the former linear `find`.
-    #[test]
-    fn bubble_index_resolves_present_and_missing_ids() {
-        let bubbles = vec![test_bubble(7), test_bubble(3), test_bubble(42)];
-        let index = index_bubbles_by_id(&bubbles);
-        assert_eq!(index.len(), 3);
-        assert_eq!(index.get(&7).map(|b| b.id), Some(7));
-        assert_eq!(index.get(&3).map(|b| b.id), Some(3));
-        assert_eq!(index.get(&42).map(|b| b.id), Some(42));
-        assert!(!index.contains_key(&100));
-        // Resolved reference points at the actual slice element, not a copy.
-        assert_eq!(
-            index.get(&3).map(|b| std::ptr::eq(*b, &bubbles[1])),
-            Some(true)
-        );
     }
 
     // Two cards with a clear vertical gap must NOT merge into one cluster: their on-screen rows do

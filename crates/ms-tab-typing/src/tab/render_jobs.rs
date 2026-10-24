@@ -101,6 +101,8 @@ impl TypingTextOverlayLayer {
         self.raster_layers_by_page.clear();
         self.bands_by_page.clear();
         self.groups_by_page.clear();
+        // The background page loader reads the OUTGOING chapter's dirs and pages: end it.
+        self.reset_page_residency_loader();
 
         // Committed (non-staging) read source: migrated chapters have `text_info.json` under
         // `layers/`; older ones only under the legacy `text_images/` dir. Used as the save-time
@@ -293,6 +295,10 @@ impl TypingTextOverlayLayer {
                                 self.groups_by_page.remove(&page);
                                 self.raster_layers_by_page.remove(&page);
                             }
+                            // A background decode of a refreshed page may predate the migration.
+                            if !refreshed_pages.is_empty() {
+                                self.invalidate_pending_page_loads();
+                            }
                         }
                     }
                     Err(err) => ms_log::runtime_log::log_warn(format!(
@@ -464,6 +470,7 @@ impl TypingTextOverlayLayer {
         self.raster_layers_by_page.remove(&page_idx);
         self.bands_by_page.remove(&page_idx);
         self.groups_by_page.remove(&page_idx);
+        self.invalidate_pending_page_loads();
         if let Some(doc) = &self.layer_doc
             && let Ok(mut guard) = doc.lock()
         {
@@ -595,6 +602,7 @@ impl TypingTextOverlayLayer {
             self.raster_layers_by_page.remove(&page_idx);
             self.bands_by_page.remove(&page_idx);
             self.groups_by_page.remove(&page_idx);
+            self.invalidate_pending_page_loads();
         }
         self.ensure_raster_layers_for_page(page_idx);
         let node = LayerNode {

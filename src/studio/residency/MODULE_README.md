@@ -33,7 +33,8 @@ from `CleanOverlaysModel` (Settings and every canvas write it there), never from
   `page_center`, `loaded_pages_count`, `load_errors`, `background_loads_pending`,
   `overlays_loading`, `shutdown`), in-order promotion and the tiled upload; promotion tests over
   synthetic `LoaderEvent`s (no egui context).
-- `loader.rs`: the two worker pools, their event types, the look-ahead window
+- `loader.rs`: the two worker pools, their event types, the GUI wake-up (`GuiWaker`,
+  `WakingSender`, `WORKERS_WAKE_GUI`), the look-ahead window
   (`decode_idx_within_window`), worker count, initial page-cache seeding decision, the overlay
   "staged over committed" resolution (`loadable_clean_overlay`) and job lists from `ProjectData`.
 - `decode.rs`: worker-side decode (`decode_page` tiles, `decode_overlay`, `decode_page_rgba`), the
@@ -46,8 +47,16 @@ from `CleanOverlaysModel` (Settings and every canvas write it there), never from
   Overlays bypass promotion and are applied as they arrive.
 - The GUI thread only polls channels (bounded per frame) and uploads prepared tiles under
   `UPLOAD_TILE_BUDGET_PER_FRAME` / `UPLOAD_BYTES_BUDGET_PER_FRAME`; decode never runs on it.
+- Repaints are event-driven: every loader event goes through a `WakingSender`, which wakes the GUI
+  after each send and when dropped (after its channel disconnected). The GUI asks for frames itself
+  only while promoted pages wait for the budgeted upload; it never repaint-polls the workers
+  (except on wasm, where `WORKERS_WAKE_GUI` is off and the old per-frame polling stays; the web
+  build is inactive, `STATE.md` S-004). The waker is armed with the `egui::Context` by the first
+  `poll_decoded`, before it drains, so a result sent earlier is not lost. A new loader channel must
+  use a `WakingSender` too.
 - Deadlock freedom of the look-ahead window rests on the job sort order and on the GUI draining
-  both channels every frame (`spawn_loader_thread` comment). `DECODE_AHEAD_WINDOW` must be >= 1.
+  both channels on every frame, which every send causes (`spawn_loader_thread` comment).
+  `DECODE_AHEAD_WINDOW` must be >= 1.
 - `shutdown` must be called when the GUI stops draining (from `StudioApp::shutdown_blocking`,
   before the layer flush), or parked workers leak.
 - `Finished` is sent by each pool only after every worker returned; a worker panic is logged by

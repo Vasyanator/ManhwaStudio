@@ -52,6 +52,12 @@ window records what it drew (`HostRecord`) while something is being dragged, and
 point: the window a drop belongs to may have drawn before the window the gesture
 started in, and it can never hit-test the drop itself, because a held button keeps
 the pointer in the window the press started in.
+
+Sub-windows are immediate viewports while a program tab of the dock draws (they
+run its tab bodies) and DEFERRED viewports while none does
+(`PanelDockState::show_idle_sub_windows`): an idle window then repaints only on
+its own events instead of with every main-window frame, and hands its close
+button and geometry over through `window::IdleWindowReport`.
 */
 
 pub mod cross_window;
@@ -66,6 +72,7 @@ pub mod tab;
 pub mod window;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use egui::{Pos2, Rect, Vec2};
 
@@ -300,6 +307,14 @@ pub struct PanelDockState {
     /// given a start position only once: afterwards the window manager and the
     /// user own its placement, and re-asserting it every frame would fight them.
     opened_sub_windows: BTreeSet<u32>,
+    /// The report slot of every sub-window currently shown DEFERRED by
+    /// [`PanelDockState::show_idle_sub_windows`], shared with that window's
+    /// `'static` callback. An entry exists exactly while its window is idle: the
+    /// immediate path (`show_sub_windows`) takes every pending report and clears
+    /// the map, so a missing entry on an idle pass means "this window just became
+    /// idle", which is shown once immediate and empty before it turns deferred.
+    /// Runtime only, never persisted.
+    idle_windows: BTreeMap<u32, Arc<Mutex<window::IdleWindowReport>>>,
     /// `true` while a tab drag is in flight and the pointer has left every one of
     /// our windows. The primary, platform-independent detach signal (plan §4.8):
     /// `PointerGone` clears `latest_pos` without ending the drag.
@@ -580,6 +595,7 @@ impl PanelDockState {
         }
         self.sub_windows.retain(|node| node.index != index);
         self.opened_sub_windows.remove(&index);
+        self.idle_windows.remove(&index);
         self.dirty = true;
         runtime_log::log_info(format!(
             "[panel_dock] sub-window {index} closed; {returned} panel(s) returned to the main \
@@ -590,44 +606,92 @@ impl PanelDockState {
     /// Keeps this dock's sub-windows on screen on a frame where none of its
     /// program tabs draws (requirement 11).
     ///
-    /// An immediate viewport exists only while it is shown, every pass
-    /// (`egui-0.35.0/src/context.rs:3997`), so a frame that skips
-    /// [`PanelDock::end`] would close every detached window and the user would
-    /// lose them by switching program tabs. The windows are therefore shown here
-    /// EMPTY — the newly active program tab has nothing to put in them, and the
-    /// user's decision was that they stay open and grey rather than disappear.
+    /// A child viewport exists only while it is shown, every pass (an unused one
+    /// is removed in `end_pass`, fork `crates/egui/crates/egui/src/context.rs:2781-2790`),
+    /// so a frame that skips [`PanelDock::end`] would close every detached window
+    /// and the user would lose them by switching program tabs. The windows are
+    /// therefore shown here EMPTY — the newly active program tab has nothing to
+    /// put in them, and the user's decision was that they stay open and grey
+    /// rather than disappear.
+    ///
+    /// They are shown DEFERRED (`show_viewport_deferred`, `context.rs:4069`), with
+    /// the same `ViewportId` and builder as the immediate form, so eframe re-classes
+    /// the live window in place instead of recreating it — except on the FIRST idle
+    /// pass of a window (just idled, or new), which shows it immediate and empty
+    /// once so it is painted grey for sure (see the comment in the body). An idle
+    /// window then
+    /// repaints only on its own events, not with every main-window frame; its
+    /// `'static` callback draws the neutral background and records the close
+    /// button and geometry into its [`window::IdleWindowReport`], waking the main
+    /// window when there is something new, and the next call here (or the next
+    /// [`PanelDock::end`]) applies it — closing the window exactly like the
+    /// immediate path and storing its geometry, so persistence sees both.
     ///
     /// **Call it exactly once per frame, and only on a frame where no
-    /// [`PanelDock::end`] ran for this state**: showing one viewport twice in a
-    /// pass renders it twice. Closing and pruning still happen, so a window whose
-    /// close button is pressed while the tab is away is handled at once.
+    /// [`PanelDock::end`] ran for this state**: showing one viewport in both forms
+    /// in a pass would render and re-class it twice. Closing and pruning still
+    /// happen, so a window whose close button is pressed while the tab is away is
+    /// handled at once.
     pub fn show_idle_sub_windows(&mut self, ctx: &egui::Context) {
         // Before the emptiness check: in Embedded mode this re-docks every
         // sub-window, and the pass then shows none.
         self.apply_window_mode(crate::embedded_window::effective_mode(ctx));
         if self.sub_windows.is_empty() {
+            self.idle_windows.clear();
             return;
         }
         // No program tab of this dock draws, so no window runs `draw_host` and no
         // gesture can be in flight: the frame records nothing.
         self.begin_frame(ctx, false);
-        let mut entries: BTreeMap<TabId, TabEntry<'_, ()>> = BTreeMap::new();
-        let mut output = PanelDockOutput::default();
-        let mut unit = ();
-        let outcome = show_sub_windows(
-            ctx,
-            self,
-            FrameContext {
-                layout_key: None,
-                gesture_in_flight: false,
-            },
-            &BTreeMap::new(),
-            &mut entries,
-            &mut unit,
-            &mut output,
-        );
-        let mut needs_repaint = outcome.needs_repaint;
-        for index in &outcome.closed_windows {
+        let live: BTreeSet<u32> = self.sub_windows.iter().map(|node| node.index).collect();
+        self.idle_windows.retain(|index, _| live.contains(index));
+        let mut needs_repaint = false;
+        let mut closed = take_idle_window_reports(self);
+        let main_viewport = ctx.viewport_id();
+        let nodes: Vec<SubWindowNode> = self.sub_windows.clone();
+        for node in nodes {
+            if closed.contains(&node.index) {
+                continue;
+            }
+            // Same start-position rule as the immediate form: the stored position
+            // is applied once per window, whichever form shows it first.
+            let first_frame = self.opened_sub_windows.insert(node.index);
+            let title = window::sub_window_title(node.index);
+            let builder =
+                window::sub_window_builder(&node, &title, if first_frame { node.pos } else { None });
+            let viewport_id = window::sub_window_viewport_id(node.index);
+            match self.idle_windows.get(&node.index).map(Arc::clone) {
+                Some(report) => {
+                    ctx.show_viewport_deferred(viewport_id, builder, move |ui, _class| {
+                        idle_sub_window_pass(ui, &report, main_viewport);
+                    });
+                }
+                None => {
+                    // The window just became idle (or is new): it still shows the
+                    // panels of its last immediate frame (or nothing yet). Asking a
+                    // deferred viewport to repaint is not reliable here: egui forwards
+                    // `request_repaint_of` to eframe only when it shortens the
+                    // viewport's pending delay (fork `context.rs:159`), and a window
+                    // whose last immediate pass ended with a request keeps that delay
+                    // at zero until its next pass — which a deferred viewport only gets
+                    // when eframe is told; a brand-new window has no OS window yet
+                    // when the request is made. So this pass shows it the old way,
+                    // immediate and empty, which paints it grey for sure; from the next
+                    // pass on it is deferred with identical content.
+                    self.idle_windows.insert(node.index, Arc::default());
+                    let close_requested = ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
+                        let child = ui.ctx().clone();
+                        observe_sub_window_geometry(&child, self, node);
+                        egui::CentralPanel::default().show(ui, |_ui| {});
+                        child.input(|input| input.viewport().close_requested())
+                    });
+                    if close_requested {
+                        closed.push(node.index);
+                    }
+                }
+            }
+        }
+        for index in &closed {
             self.close_sub_window(*index);
             needs_repaint = true;
         }
@@ -652,6 +716,7 @@ impl PanelDockState {
         for index in &obsolete {
             self.sub_windows.retain(|node| node.index != *index);
             self.opened_sub_windows.remove(index);
+            self.idle_windows.remove(index);
             runtime_log::log_info(format!(
                 "[panel_dock] sub-window {index} lost its last panel and is closed"
             ));
@@ -1223,7 +1288,7 @@ impl<'ctx, 'frame, C> PanelDock<'ctx, 'frame, C> {
             ctx,
             state,
             FrameContext {
-                layout_key: Some(layout_key),
+                layout_key,
                 gesture_in_flight,
             },
             &decls,
@@ -1269,9 +1334,9 @@ struct HostFrame<'a> {
 /// What the frame as a whole tells every window it draws.
 #[derive(Copy, Clone, Debug)]
 struct FrameContext<'a> {
-    /// Program tab being drawn, or `None` on a frame where no tab of this dock
-    /// draws at all ([`PanelDockState::show_idle_sub_windows`]).
-    layout_key: Option<&'a str>,
+    /// Program tab being drawn. (A frame where no tab of this dock draws shows
+    /// its sub-windows through [`PanelDockState::show_idle_sub_windows`] instead.)
+    layout_key: &'a str,
     /// `true` while a tab or panel is being moved somewhere in this dock. See
     /// [`HostFrame::gesture_in_flight`] for why it is decided once per frame.
     gesture_in_flight: bool,
@@ -2153,23 +2218,25 @@ fn paint_cross_window_feedback(
     }
 }
 
-/// Draws one immediate child viewport per sub-window and, when a program tab of
-/// this dock is drawing, the panels that tab assigns to each of them.
-///
-/// `layout_key` is `None` on a frame where no program tab of this dock draws
-/// (`PanelDockState::show_idle_sub_windows`): the windows are then shown EMPTY
-/// rather than closed, which is requirement 11 — a sub-window follows the
-/// program's tabs and stays open and grey when the active one has nothing for it.
+/// Draws one immediate child viewport per sub-window and the panels the program
+/// tab being drawn assigns to each of them; a window it assigns nothing stays open
+/// and grey (requirement 11). A frame where no program tab of this dock draws
+/// shows the windows through `PanelDockState::show_idle_sub_windows` (deferred)
+/// instead; the reports those idle windows left behind are applied here first
+/// (close requests join `closed_windows`), and the idle slots are dropped because
+/// every window is immediate again from this pass on.
 ///
 /// In Embedded mode the list is always empty here: `apply_window_mode` re-docked
 /// every sub-window at the top of the pass, so no viewport is shown (egui would
 /// draw one as a window INSIDE the main one, which is no window of its own).
 ///
-/// Immediate, never deferred: the deferred form needs `Fn + Send + Sync +
-/// 'static` (`egui-0.35.0/src/context.rs:3960`), which the caller's tab bodies —
-/// borrowing the typing tab's hundred-field states — cannot satisfy. The price is
-/// that parent and child repaint together; that is the accepted cost of the
-/// feature and must not be "optimised" away.
+/// Immediate, never deferred, while a program tab draws: the deferred form needs
+/// `Fn + Send + Sync + 'static` (fork `crates/egui/crates/egui/src/context.rs:4069`),
+/// which the caller's tab bodies — borrowing the typing tab's hundred-field
+/// states — cannot satisfy. The price is that parent and child repaint together;
+/// for a window showing a program tab's panels that is the accepted cost of the
+/// feature and must not be "optimised" away. Only IDLE windows (nothing of the
+/// dock draws) are deferred.
 fn show_sub_windows<'frame, C>(
     ctx: &egui::Context,
     state: &mut PanelDockState,
@@ -2179,7 +2246,11 @@ fn show_sub_windows<'frame, C>(
     cx: &mut C,
     output: &mut PanelDockOutput,
 ) -> HostOutcome {
-    let mut outcome = HostOutcome::default();
+    let mut outcome = HostOutcome {
+        closed_windows: take_idle_window_reports(state),
+        ..HostOutcome::default()
+    };
+    state.idle_windows.clear();
     if state.sub_windows.is_empty() {
         return outcome;
     }
@@ -2212,22 +2283,20 @@ fn show_sub_windows<'frame, C>(
                 let area = egui::CentralPanel::default()
                     .show(ui, |ui| ui.max_rect())
                     .inner;
-                if let Some(layout_key) = frame.layout_key {
-                    outcome.merge(draw_host(
-                        &child,
-                        state,
-                        HostFrame {
-                            host: node.host(),
-                            area,
-                            layout_key,
-                            gesture_in_flight: frame.gesture_in_flight,
-                        },
-                        decls,
-                        entries,
-                        cx,
-                        output,
-                    ));
-                }
+                outcome.merge(draw_host(
+                    &child,
+                    state,
+                    HostFrame {
+                        host: node.host(),
+                        area,
+                        layout_key: frame.layout_key,
+                        gesture_in_flight: frame.gesture_in_flight,
+                    },
+                    decls,
+                    entries,
+                    cx,
+                    output,
+                ));
             },
         );
     }
@@ -2250,6 +2319,19 @@ fn observe_sub_window_geometry(
         let viewport = input.viewport();
         (viewport.outer_rect, viewport.inner_rect)
     });
+    apply_sub_window_geometry(state, node, outer, inner);
+}
+
+/// Folds one sub-window's reported `outer` / `inner` rects into its stored
+/// geometry and raises the dirty flag when it changed — the one rule both the
+/// immediate form (`observe_sub_window_geometry`) and an idle window's report
+/// (`take_idle_window_reports`) go through.
+fn apply_sub_window_geometry(
+    state: &mut PanelDockState,
+    node: SubWindowNode,
+    outer: Option<Rect>,
+    inner: Option<Rect>,
+) {
     // Sanitize FIRST and compare afterwards. Comparing the raw report against the
     // stored (already clamped) value would report a difference on every single
     // frame as soon as the window manager hands back a size below
@@ -2272,6 +2354,53 @@ fn observe_sub_window_geometry(
     };
     *stored = candidate;
     state.dirty = true;
+}
+
+/// Locks one idle window's report. A poisoned lock can only come from a panic
+/// inside `IdleWindowReport::record` / `take`, which do plain field writes; the
+/// value is still a consistent report, so it is used as is.
+fn lock_idle_report(report: &Mutex<window::IdleWindowReport>) -> std::sync::MutexGuard<'_, window::IdleWindowReport> {
+    report.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Applies what every idle (deferred) sub-window reported since the main
+/// window's last pass: a changed geometry is stored exactly as the immediate form
+/// stores it (`apply_sub_window_geometry`, dirty flag included), and the indices
+/// whose close button was pressed are returned for the caller to close.
+fn take_idle_window_reports(state: &mut PanelDockState) -> Vec<u32> {
+    let taken: Vec<(u32, window::IdleWindowTake)> = state
+        .idle_windows
+        .iter()
+        .map(|(index, report)| (*index, lock_idle_report(report).take()))
+        .collect();
+    let mut closed = Vec::new();
+    for (index, take) in taken {
+        if let Some((outer, inner)) = take.geometry
+            && let Some(node) = state.sub_windows.iter().find(|node| node.index == index).copied()
+        {
+            apply_sub_window_geometry(state, node, outer, inner);
+        }
+        if take.close_requested {
+            closed.push(index);
+        }
+    }
+    closed
+}
+
+/// One pass of an IDLE sub-window (a deferred viewport, run by eframe outside
+/// the main window's pass): records the close button and geometry into `report`,
+/// draws the neutral background, and wakes `main_viewport` when the report holds
+/// something new for it.
+fn idle_sub_window_pass(ui: &mut egui::Ui, report: &Mutex<window::IdleWindowReport>, main_viewport: egui::ViewportId) {
+    let (close_requested, outer, inner) = ui.ctx().input(|input| {
+        let viewport = input.viewport();
+        (viewport.close_requested(), viewport.outer_rect, viewport.inner_rect)
+    });
+    let wake = lock_idle_report(report).record(close_requested, outer, inner);
+    egui::CentralPanel::default().show(ui, |_ui| {});
+    if wake {
+        ui.ctx().request_repaint_of(main_viewport);
+    }
 }
 
 /// Applies the drops every window of this frame left unresolved, in the order

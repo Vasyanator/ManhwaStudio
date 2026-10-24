@@ -71,6 +71,35 @@ fn save_then_close_end(poll: SavePoll, save_pending: bool, still_unsaved: bool) 
     }
 }
 
+/// Seconds a timed status line stays visible after the app time it was set.
+const STATUS_LINE_SECONDS: f64 = 5.0;
+
+/// What [`ProjectSession::tick`] does with the status line this frame (`status_line_step`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusLineStep {
+    /// A timed status whose [`STATUS_LINE_SECONDS`] ran out: clear it.
+    Expire,
+    /// A timed status still visible: wake the GUI again (1 Hz) so it expires without input.
+    WakeToExpire,
+    /// A sticky status (set with timestamp `0.0`: a running save / cleanup, a refusal or a
+    /// worker-start error): it stays until a later status replaces it. Nothing on screen changes
+    /// until then, so it schedules no repaint; the jobs whose result replaces it keep their own
+    /// poll in `tick`, a refusal is replaced only after input.
+    Sticky,
+}
+
+/// Pure core of the status-line expiry: `set_at` is the app time (seconds) the status was set
+/// (`0.0` = sticky), `now` the current app time.
+fn status_line_step(set_at: f64, now: f64) -> StatusLineStep {
+    if set_at <= 0.0 {
+        StatusLineStep::Sticky
+    } else if now - set_at > STATUS_LINE_SECONDS {
+        StatusLineStep::Expire
+    } else {
+        StatusLineStep::WakeToExpire
+    }
+}
+
 /// The running DISCARD delete job (`discard.rs`) and the close it ends in.
 struct PendingExitCleanup {
     action: PendingCloseAction,
@@ -83,7 +112,7 @@ pub(in crate::studio) struct ProjectSession {
     /// Active "save to project" merge job.
     save_to_project_rx: Option<Receiver<Result<save::MergeDone, String>>>,
     /// Status text shown next to the "save to project" button, with the app time it was set
-    /// (`0.0` = keep until replaced).
+    /// (`0.0` = sticky: kept until replaced, without repaints; see `status_line_step`).
     save_to_project_status: Option<(String, f64)>,
     /// The close a "save then close" ends in, armed ONLY by an exit dialog's Save
     /// (`exit_dialog.rs`), cleared by its Cancel, and taken by `tick` when that save ends
@@ -208,13 +237,19 @@ impl ProjectSession {
         self.poll_page_op(ctx);
         self.poll_pending_exit_cleanup(now, parts);
         self.refresh_unsaved_changes_cache(now, parts);
-        // Expire old status messages (shown for 5 s).
+        // Expire a timed status line; a sticky one stays without waking the GUI (`status_line_step`).
         if let Some((_, ts)) = &self.save_to_project_status {
-            if *ts > 0.0 && now - ts > 5.0 {
-                self.save_to_project_status = None;
-            } else {
-                ctx.request_repaint_after(web_time::Duration::from_secs(1));
+            match status_line_step(*ts, now) {
+                StatusLineStep::Expire => self.save_to_project_status = None,
+                StatusLineStep::WakeToExpire => ctx.request_repaint_after(web_time::Duration::from_secs(1)),
+                StatusLineStep::Sticky => {}
             }
+        }
+        // The save merge and the DISCARD cleanup workers answer only through their channels and do
+        // not wake the GUI: poll them at 1 Hz while they run (their sticky «Saving…» / «Cleaning…»
+        // line schedules nothing by itself).
+        if self.save_to_project_rx.is_some() || self.pending_exit_cleanup.is_some() {
+            ctx.request_repaint_after(web_time::Duration::from_secs(1));
         }
 
         // A save-then-close armed by an exit dialog's Save ends with its save: close on a clean
@@ -334,7 +369,20 @@ impl ProjectSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProjectSession, SavePoll, SaveThenCloseEnd, save_then_close_end};
+    use super::{ProjectSession, STATUS_LINE_SECONDS, SavePoll, SaveThenCloseEnd, StatusLineStep, save_then_close_end, status_line_step};
+
+    /// A sticky status (timestamp `0.0`) never expires and never asks for a repaint, however late
+    /// it is; a timed one wakes the GUI until its time ran out, then expires.
+    #[test]
+    fn a_sticky_status_never_wakes_the_gui_and_a_timed_one_expires() {
+        for now in [0.0, 1.0, 1_000.0, 1.0e9] {
+            assert_eq!(status_line_step(0.0, now), StatusLineStep::Sticky, "now = {now}");
+        }
+        let set_at = 10.0;
+        assert_eq!(status_line_step(set_at, set_at), StatusLineStep::WakeToExpire);
+        assert_eq!(status_line_step(set_at, set_at + STATUS_LINE_SECONDS), StatusLineStep::WakeToExpire);
+        assert_eq!(status_line_step(set_at, set_at + STATUS_LINE_SECONDS + 0.01), StatusLineStep::Expire);
+    }
 
     /// The committed-tree latch is off for a freshly opened chapter, and a set latch is reported
     /// exactly once: `StudioApp::ui` drains it every frame, so one merge notifies the tabs once.

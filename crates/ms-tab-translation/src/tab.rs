@@ -105,6 +105,11 @@ Characters/footer sync:
 - `build_image_bubble_footer_controls`: image-class footer half (source type, paste/choose, crop).
 - `build_hint_bubble_footer_controls`: hint-class footer half (one visibility checkbox).
 - `build_bubble_header` (CanvasHooks): currently no-op hook.
+- `poll_background_work` (child module `tab/background.rs`): while the tab is hidden, drains OCR
+  inserts, MT results, detector pages / storage and dispatches the next detector-OCR request
+  through the same poll methods as the draw (host: `StudioTab::poll_background`).
+- `canvas_scrollbar_marks` (CanvasHooks): translation status on the canvas scrollbar, built by
+  child module `tab/scrollbar_marks.rs` from the cached `scrollbar_status_cache`.
 
 OCR flow:
 - `poll_ocr_events`: consumes OCR controller events, toasts, optional bubble insert, retry logic.
@@ -235,7 +240,7 @@ Key TranslationTabState field groups:
   this chapter's bubbles), `characters_loaded_for`,
   `characters_file_signature`, `character_names_watch_last_check_s`,
   `pending_characters_refresh`, `footer_bootstrapped`,
-  `footer_tracking_synced_revision`, `footer_known_ids`,
+  `footer_tracking_synced_key`, `footer_known_ids`,
   `footer_overrides`, `pending_footer_patches`, `pending_footer_patch_changed_at`,
   `footer_character_autocomplete`,
   `last_*` defaults.
@@ -246,7 +251,7 @@ Key TranslationTabState field groups:
 use ms_widgets::bubble_status::{BubbleBorderStyle, BubbleStatusContext, evaluate_bubble_status_rules};
 use ms_canvas::{
     BubbleAction, BubbleClass, CanvasHooks, CanvasScrollbarContext,
-    CanvasUiStatus, CanvasView, TranslationStatusDisplay,
+    CanvasUiStatus, CanvasView, HookBubblesKey,
 };
 use ms_input::{InputFrame, InputRegistry};
 use crate::input::{ContextFacts, TranslationInputLabels};
@@ -309,7 +314,7 @@ use crate::text_detector::{
 use ms_tools::MaskBrush;
 use ms_widgets::panel_dock::PanelDockState;
 use ms_widgets::{
-    AiRequirement, AutocompleteLine, MarkFill, ScrollMark, ScrollSpan, WheelComboBox, WheelSlider,
+    AiRequirement, AutocompleteLine, ScrollMark, WheelComboBox, WheelSlider,
     WheelSpinBox,
 };
 use eframe::egui;
@@ -340,6 +345,11 @@ mod route_inputs;
 mod dock;
 // The five tools: their vocabulary, the canvas tools bar, the tool window and one body per tool.
 mod tool_panels;
+// Translation-status marks on the canvas scrollbar and their cross-frame cache.
+mod scrollbar_marks;
+// Off-draw drain of OCR / MT / detector results while the tab is hidden.
+mod background;
+pub(crate) use background::tab_hidden_last_frame;
 // The MT panel's browser-extension block: its state and the bridge start / install workers
 // (`pub(crate)`: the MT panel draws its view types).
 pub(crate) mod browser_extension;
@@ -693,9 +703,11 @@ pub struct TranslationTabState {
     character_names_watch_last_check_s: f64,
     pending_characters_refresh: bool,
     footer_bootstrapped: bool,
-    // Last `CanvasView::hook_bubbles_revision()` for which `sync_footer_tracking` ran a full
-    // recompute. Used to skip the per-frame snapshot/clone/sort when the bubble set is unchanged.
-    footer_tracking_synced_revision: Option<u64>,
+    // Last `CanvasView::hook_bubbles_key` for which `sync_footer_tracking` ran a full recompute.
+    // Used to skip the per-frame snapshot/clone/sort when the bubble set is unchanged.
+    footer_tracking_synced_key: Option<HookBubblesKey>,
+    /// Scrollbar status entries, rebuilt only when the bubble set or the page layout changed.
+    scrollbar_status_cache: scrollbar_marks::ScrollbarStatusCache,
     footer_known_ids: HashSet<i64>,
     footer_overrides: HashMap<i64, BubbleFooterState>,
     /// The one open «choose file» dialog of an external image bubble, started by the canvas
@@ -845,7 +857,8 @@ impl TranslationTabState {
             character_names_watch_last_check_s: -10_000.0,
             pending_characters_refresh: false,
             footer_bootstrapped: false,
-            footer_tracking_synced_revision: None,
+            footer_tracking_synced_key: None,
+            scrollbar_status_cache: scrollbar_marks::ScrollbarStatusCache::default(),
             footer_known_ids: HashSet::new(),
             footer_overrides: HashMap::new(),
             image_bubble_pick: None,
@@ -1417,20 +1430,23 @@ impl TranslationTabState {
     ///
     /// Runs every frame from `draw_canvas_overlay_top_left`, so the expensive recompute (full
     /// bubble snapshot clone + id `HashSet` + recent-character history + chapter names) is gated on
-    /// `CanvasView::hook_bubbles_revision()`: when the revision is unchanged and footer tracking
-    /// was already bootstrapped, the call returns early and reuses the cached footer state. A
+    /// `CanvasView::hook_bubbles_key(project)`: when the key is unchanged and footer tracking was
+    /// already bootstrapped, the call returns early and reuses the cached footer state. The key is
+    /// the `project.bubbles` allocation plus `hook_bubbles_revision` — the revision alone could
+    /// cache a snapshot of a stale `project.bubbles` (the model moved earlier in the frame, the
+    /// studio hands over the new `ProjectData` next frame) and then never recompute. A
     /// newly-created bubble (even one living only in `runtime_bubbles`) bumps the revision, so the
     /// "apply defaults for new bubble" path still fires. The first call always recomputes.
     fn sync_footer_tracking(&mut self, canvas: &CanvasView, project: &ProjectData) {
-        let current_revision = canvas.hook_bubbles_revision();
+        let current_key = canvas.hook_bubbles_key(project);
         if !footer_tracking_should_recompute(
-            self.footer_tracking_synced_revision,
-            current_revision,
+            self.footer_tracking_synced_key.as_ref(),
+            &current_key,
             self.footer_bootstrapped,
         ) {
             return;
         }
-        self.footer_tracking_synced_revision = Some(current_revision);
+        self.footer_tracking_synced_key = Some(current_key);
 
         let live_bubbles = canvas.hook_bubbles_snapshot(project);
         // Reuse the snapshot that is already built here — it is the whole chapter plus the
@@ -4320,86 +4336,9 @@ impl CanvasHooks for TranslationTabState {
         self.input_labels().create_bubble_menu.clone()
     }
 
+    /// Translation status per bubble (`tab/scrollbar_marks.rs`), cached across frames.
     fn canvas_scrollbar_marks(&mut self, ctx: &CanvasScrollbarContext<'_>) -> Vec<ScrollMark> {
-        // Per-bubble translation status painted on the canvas scrollbar:
-        // red while a bubble's translation is empty, blue once it is filled.
-        // The display mode is a user setting on the ribbon settings tab.
-        let mode = ctx.translation_status_display();
-        if mode == TranslationStatusDisplay::None {
-            return Vec::new();
-        }
-
-        let bubbles = ctx.bubbles();
-        let mut entries: Vec<(f32, bool)> = bubbles
-            .iter()
-            // A hint is not a replica: its single line lives in `text` and is never a translation,
-            // so a status stripe for it would always read "translated". Same exemption as
-            // `bubble_status_style`.
-            .filter(|bubble| {
-                bubble.bubble_class.as_deref().map(BubbleClass::from_str) != Some(BubbleClass::Hint)
-            })
-            .filter_map(|bubble| {
-                ctx.content_y(bubble.img_idx, bubble.img_v)
-                    .map(|content_y| (content_y, !bubble.text.trim().is_empty()))
-            })
-            .collect();
-        if entries.is_empty() {
-            return Vec::new();
-        }
-        entries.sort_by(|a, b| a.0.total_cmp(&b.0));
-
-        let mark_color = |translated: bool| {
-            if translated {
-                egui::Color32::from_rgb(40, 132, 255)
-            } else {
-                egui::Color32::from_rgb(220, 60, 60)
-            }
-        };
-
-        if mode == TranslationStatusDisplay::Marks {
-            // Thin fixed-height stripe at each bubble's own position; it does not
-            // stretch down to the next bubble.
-            const MARK_HALF_HEIGHT_PX: f32 = 1.0;
-            return entries
-                .into_iter()
-                .map(|(start, translated)| {
-                    let color = mark_color(translated);
-                    ScrollMark::custom(ScrollSpan::pixel_at(start), move |painter, _geom, cell| {
-                        let center_y = cell.center().y;
-                        let rect = egui::Rect::from_min_max(
-                            egui::pos2(cell.left(), center_y - MARK_HALF_HEIGHT_PX),
-                            egui::pos2(cell.right(), center_y + MARK_HALF_HEIGHT_PX),
-                        );
-                        painter.rect_filled(rect, 0.0, color);
-                    })
-                })
-                .collect();
-        }
-
-        // TranslationStatusDisplay::UntilNext: each bubble paints a stripe from
-        // itself down to the next bubble vertically.
-        let content_end = ctx.content_size_y();
-        // The last bubble has no following bubble, so its mark would otherwise run
-        // to the very end of the content. Instead, let it extend just a couple
-        // percent of the scrollbar past the bubble, leaving the rest unpainted.
-        let tail_len = content_end * 0.02;
-        let mut marks = Vec::with_capacity(entries.len());
-        for index in 0..entries.len() {
-            let (start, translated) = entries[index];
-            // If another bubble follows, the mark runs down to it. The bottom-most
-            // bubble's mark gets only a short tail instead of reaching the end.
-            let end = entries
-                .get(index + 1)
-                .map_or_else(|| (start + tail_len).min(content_end), |next| next.0);
-            if end <= start {
-                continue;
-            }
-            marks.push(ScrollMark::fill(
-                ScrollSpan::ContentPixels { start, end },
-                MarkFill::Solid(mark_color(translated)),
-            ));
-        }
-        marks
+        scrollbar_marks::translation_status_marks(&mut self.scrollbar_status_cache, ctx)
     }
 
     fn draw_canvas_mask_overlay_on_page(
@@ -5326,14 +5265,14 @@ fn recent_character_entry_from_state(state: &BubbleFooterState) -> Option<Recent
 
 /// Decides whether `sync_footer_tracking` must run a full recompute this frame.
 ///
-/// `cached` is the revision the last recompute was performed for (`None` before the first
-/// recompute), `current` is the live `CanvasView::hook_bubbles_revision()` fingerprint, and
+/// `cached` is the bubble-set key the last recompute was performed for (`None` before the first
+/// recompute), `current` is the live key (`CanvasView::hook_bubbles_key` in production), and
 /// `bootstrapped` is whether footer tracking has already been initialized. Returns `true` when not
-/// yet bootstrapped (the first frame must always recompute and bootstrap) or when the revision
-/// differs from the cached one (the bubble set changed); returns `false` only when bootstrapped and
-/// the revision is unchanged, so the cached footer state can be reused.
+/// yet bootstrapped (the first frame must always recompute and bootstrap) or when the key differs
+/// from the cached one (the bubble set changed); returns `false` only when bootstrapped and the key
+/// is unchanged, so the cached footer state can be reused.
 #[must_use]
-fn footer_tracking_should_recompute(cached: Option<u64>, current: u64, bootstrapped: bool) -> bool {
+fn footer_tracking_should_recompute<K: PartialEq>(cached: Option<&K>, current: &K, bootstrapped: bool) -> bool {
     if !bootstrapped {
         return true;
     }
@@ -7083,21 +7022,22 @@ mod tests {
     #[test]
     fn footer_tracking_not_bootstrapped_always_recomputes() {
         // Before bootstrap the first frame must recompute regardless of the cached revision.
-        assert!(footer_tracking_should_recompute(None, 7, false));
-        assert!(footer_tracking_should_recompute(Some(7), 7, false));
+        assert!(footer_tracking_should_recompute(None, &7, false));
+        assert!(footer_tracking_should_recompute(Some(&7), &7, false));
     }
 
     #[test]
     fn footer_tracking_changed_revision_recomputes() {
-        // A new bubble bumps `hook_bubbles_revision`, so a differing revision forces a recompute.
-        assert!(footer_tracking_should_recompute(Some(7), 8, true));
-        assert!(footer_tracking_should_recompute(None, 8, true));
+        // A new bubble bumps `hook_bubbles_revision` (a new `project.bubbles` allocation changes
+        // the key too), so a differing key forces a recompute.
+        assert!(footer_tracking_should_recompute(Some(&7), &8, true));
+        assert!(footer_tracking_should_recompute(None, &8, true));
     }
 
     #[test]
     fn footer_tracking_equal_revision_when_bootstrapped_skips() {
         // Unchanged bubble set on a bootstrapped tab: skip the per-frame recompute.
-        assert!(!footer_tracking_should_recompute(Some(8), 8, true));
+        assert!(!footer_tracking_should_recompute(Some(&8), &8, true));
     }
 
     /// Builds a bubble carrying `character_name` in `extra`, the way the footer stores it.

@@ -14,11 +14,14 @@ Key items:
   - `default_dock_layout`: `cleaning_default_dock_layout` (the tab hosts the panel dock);
   - `evict_tab_gpu_caches`: the canvas clean-overlay cache, then the detector-mask textures;
   - `source_page_window` / `wants_nearest_source`: answered by the tab's canvas;
-  - `on_committed_tree_changed`: `request_orphan_clean_rescan`.
+  - `on_committed_tree_changed`: `request_orphan_clean_rescan`;
+  - `poll_background`: the text-mask load and quick text clean polls
+    (`CleaningTabState::poll_background_jobs`), with a slow repaint while one runs.
 
 Notes:
-- No background poll, exit-only setting or debounced store: those hooks keep their no-op
-  defaults. Cleaning has no bottom hint, so it writes no `Canvas.*_hint_collapsed` key.
+- No exit-only setting or debounced store: those hooks keep their no-op defaults. The region-edit
+  tools' jobs are polled only while the tab draws (their poll needs the canvas). Cleaning has
+  no bottom hint, so it writes no `Canvas.*_hint_collapsed` key.
 - Zoom is the shared `view.*` set, executed by the canvas or, over an open legacy editor window,
   by that window (its former `cleaning.canvas.zoom_*` overrides migrate to `view.*` in
   `ms_input::persist`).
@@ -26,12 +29,18 @@ Notes:
 
 use std::collections::HashSet;
 
+use eframe::egui;
 use ms_input::{ContextId, Declarations};
 use ms_memory::{CacheEvictionReport, CacheEvictionRequest};
+use ms_project::ProjectData;
 use ms_studio_tab::StudioTab;
 use ms_widgets::panel_dock::DockLayout;
 
 use crate::tab::{CleaningTabState, cleaning_default_dock_layout};
+
+/// How often `poll_background` re-polls while a background job runs and the tab may not be
+/// drawn.
+const BACKGROUND_JOB_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl StudioTab for CleaningTabState {
     /// Every action of the tab, its tools, the region frame and the legacy editor window
@@ -69,6 +78,16 @@ impl StudioTab for CleaningTabState {
     /// The canvas zoomed into pixel inspection draws NEAREST source tiles.
     fn wants_nearest_source(&self) -> bool {
         self.canvas().source_pixel_inspection_active()
+    }
+
+    /// Drains the text-mask load and the quick text clean while another tab is active
+    /// (`CleaningTabState::poll_background_jobs`), so their model writes are not held back until
+    /// the user returns; keeps a slow repaint going while one runs, because its worker wakes no
+    /// frame (the drawn tab repaints every frame meanwhile anyway).
+    fn poll_background(&mut self, ctx: &egui::Context, _project: &ProjectData) {
+        if self.poll_background_jobs() {
+            ctx.request_repaint_after(BACKGROUND_JOB_POLL_INTERVAL);
+        }
     }
 
     /// A save-to-project merge rewrote the committed clean folders: rescan the «Клин» status area.

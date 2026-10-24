@@ -22,6 +22,8 @@ Main types:
   zoom may be transferred.
 - `CanvasFrameParams`: per-frame viewport/interaction flags shared by scene + viewport passes.
 - `CanvasScenePageFrame`: geometry snapshot for one page row within the scene pass.
+- `CanvasScrollbarContext` / `HookBubblesKey`: what a tab's scrollbar-marks hook reads (bubbles,
+  world/content Y) plus the cache keys of the bubble set and the vertical page layout.
 - `OverlayUploadBudget`: per-frame clean-overlay upload budget used to keep GUI responsive.
 - `BubbleAction`: user actions emitted from bubble UI (`Translate`, `Delete`).
 - `BubbleClass`: per-bubble domain class (`Text`, `Image`).
@@ -218,7 +220,7 @@ Key CanvasView state groups (important fields):
   `last_strip_layout`.
 - Overlay runtime: `overlays_visible`, `overlay_images`, `overlay_textures`,
   `overlay_dirty_tiles`, `overlay_prepare_*`, `overlay_prepared_pages`,
-  `overlay_upload_min_interval_s`, `overlay_last_upload_s`.
+  `overlay_upload_min_interval_s`, `overlay_last_upload_s`, `drawn_pages` (repaint gate).
 - Shared-model bindings: `bubbles_model`, `overlays_model`, `synced_*_revision`.
 - Interaction gates: `view_locked_by_claim`, `zoom_drag_active`, `zoom_drag_last_x`,
   `pan_mode_active`, `overlay_render_suppressed`.
@@ -313,6 +315,7 @@ pub(crate) const BUBBLE_TRANSLATION_SPELLCHECK_DISABLED_KEY: &str =
 
 mod bubble_action;
 mod bubble_aside_ui;
+mod bubble_index;
 mod bubble_on_top_ui;
 mod bubble_runtime;
 mod helpers;
@@ -588,11 +591,86 @@ impl CanvasScrollbarContext<'_> {
     /// or `None` if that page was not laid out this frame.
     #[must_use]
     pub fn content_y(&self, img_idx: usize, v: f32) -> Option<f32> {
+        self.world_y(img_idx, v).map(|world_y| self.content_y_from_world(world_y))
+    }
+
+    /// Zoom-independent world-space Y (unscaled page points) for vertical fraction `v`
+    /// (`0.0..=1.0`) of page `img_idx`, or `None` if that page was not laid out this frame.
+    /// Equal [`Self::page_layout_key`]s give equal results, so a tab may cache it across frames.
+    #[must_use]
+    pub fn world_y(&self, img_idx: usize, v: f32) -> Option<f32> {
         let world_rect = self.canvas.scene.page_world_rects.get(img_idx)?;
         if world_rect.height() <= 0.0 {
             return None;
         }
-        Some((world_rect.top() + v.clamp(0.0, 1.0) * world_rect.height()) * self.canvas.state.zoom)
+        Some(world_rect.top() + v.clamp(0.0, 1.0) * world_rect.height())
+    }
+
+    /// Content-space Y of a [`Self::world_y`] value at this frame's zoom.
+    #[must_use]
+    pub fn content_y_from_world(&self, world_y: f32) -> f32 {
+        world_y * self.canvas.state.zoom
+    }
+
+    /// Fingerprint of this frame's vertical page layout (every page's world top and height): equal
+    /// keys mean [`Self::world_y`] returns the same value for every page and fraction. Zoom is not
+    /// part of it. O(pages), no allocation.
+    #[must_use]
+    pub fn page_layout_key(&self) -> u64 {
+        page_vertical_layout_key(&self.canvas.scene.page_world_rects)
+    }
+
+    /// Identity of the bubble set [`Self::bubbles`] returns, for caching data derived from it
+    /// across frames: see [`HookBubblesKey`]. Cheap (one brief model lock, one `Arc` clone).
+    #[must_use]
+    pub fn bubbles_key(&self) -> HookBubblesKey {
+        self.canvas.hook_bubbles_key(self.project)
+    }
+}
+
+/// Fingerprint of the vertical extent (top, height) of every page world rect, in order.
+fn page_vertical_layout_key(page_world_rects: &[Rect]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    page_world_rects.len().hash(&mut hasher);
+    for rect in page_world_rects {
+        rect.top().to_bits().hash(&mut hasher);
+        rect.height().to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Identity of the bubble set `CanvasView::hook_bubbles_snapshot` returns for a frame's
+/// `ProjectData` (see [`CanvasScrollbarContext::bubbles_key`]).
+///
+/// Two keys are equal when they hold the SAME `ProjectData::bubbles` allocation (`Arc::ptr_eq`)
+/// and the same [`CanvasView::hook_bubbles_revision`]. The allocation is held, not just its
+/// address, so a freed and reused address can never alias an old key, and an in-place
+/// `Arc::make_mut` on a shared allocation always yields a new one. The revision catches the
+/// runtime-only bubbles (created, not yet in the model). Residual: an edit to a runtime-only
+/// bubble that changes neither the model revision nor the runtime count / next id shows only once
+/// it reaches the model (the canvas flushes runtime edits to the model within the same or a
+/// debounced later frame).
+#[derive(Clone)]
+pub struct HookBubblesKey {
+    project_bubbles: Arc<Vec<Bubble>>,
+    revision: u64,
+}
+
+impl PartialEq for HookBubblesKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.project_bubbles, &other.project_bubbles) && self.revision == other.revision
+    }
+}
+
+impl Eq for HookBubblesKey {}
+
+impl std::fmt::Debug for HookBubblesKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookBubblesKey")
+            .field("project_bubbles", &Arc::as_ptr(&self.project_bubbles))
+            .field("revision", &self.revision)
+            .finish()
     }
 }
 
@@ -791,6 +869,9 @@ pub struct CanvasView {
     input_frame: Option<InputFrame>,
     /// Binding labels of the shortcuts chip, rebuilt on a registry revision or locale change.
     labels: CanvasLabels,
+    /// This frame's `id -> persisted bubble` index for the aside and on-top passes; reset at the
+    /// start and end of `draw`, built on first use.
+    bubble_index: bubble_index::FrameBubbleIndex,
 }
 
 impl Default for CanvasView {
@@ -811,6 +892,7 @@ impl Default for CanvasView {
             bottom_hint_collapsed: false,
             input_frame: None,
             labels: CanvasLabels::default(),
+            bubble_index: bubble_index::FrameBubbleIndex::default(),
         }
     }
 }
@@ -881,6 +963,15 @@ impl CanvasView {
 
     pub fn clean_overlays_model_handle(&self) -> Option<Arc<Mutex<CleanOverlaysModel>>> {
         self.overlay_runtime.model_handle()
+    }
+
+    /// The [`HookBubblesKey`] of `hook_bubbles_snapshot(project)` at this moment.
+    #[must_use]
+    pub fn hook_bubbles_key(&self, project: &ProjectData) -> HookBubblesKey {
+        HookBubblesKey {
+            project_bubbles: Arc::clone(&project.bubbles),
+            revision: self.hook_bubbles_revision(),
+        }
     }
 
     pub fn hook_bubbles_snapshot(&self, project: &ProjectData) -> Vec<Bubble> {
@@ -1448,6 +1539,7 @@ impl CanvasView {
         } = params;
         // Held for the whole draw: the scene and bubble passes resolve their gestures from it.
         self.input_frame = Some(input.clone());
+        self.bubble_index.reset();
         self.labels.refresh(input_registry);
         self.poll_overlay_prepare_results();
         self.sync_overlays_from_model();
@@ -1506,6 +1598,7 @@ impl CanvasView {
             tile_budget: OVERLAY_UPLOAD_TILE_BUDGET_PER_FRAME,
             bytes_budget: OVERLAY_UPLOAD_BYTES_BUDGET_PER_FRAME,
         };
+        self.overlay_runtime.begin_draw_tracking();
         let scroll_output = self.draw_canvas_scene(scene::CanvasSceneDrawParams {
             ctx,
             ui,
@@ -1560,10 +1653,13 @@ impl CanvasView {
         self.publish_touch_surface(ctx);
         self.publish_view_surface(ctx, canvas_rect);
         self.publish_canvas_settings(project);
+        // Only overlay work of pages drawn this frame can progress on the next frame; pending work
+        // of off-screen or hidden pages must not keep the GUI repainting.
         if self.has_pending_overlay_work() {
             ctx.request_repaint();
         }
         self.input_frame = None;
+        self.bubble_index.reset();
     }
 
     /// Draws the floating Hangul jamo keyboard and applies its insert into the sticky target.
@@ -3148,6 +3244,35 @@ fn image_bubble_crop_rect(bubble: &Bubble) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The marks cache key must change on any vertical layout change and ignore the horizontal one.
+    #[test]
+    fn page_vertical_layout_key_tracks_page_tops_and_heights_only() {
+        let rects = vec![
+            Rect::from_min_size(Pos2::new(0.0, 10.0), Vec2::new(100.0, 200.0)),
+            Rect::from_min_size(Pos2::new(0.0, 220.0), Vec2::new(100.0, 300.0)),
+        ];
+        let key = page_vertical_layout_key(&rects);
+        let mut shifted_x = rects.clone();
+        shifted_x[1] = shifted_x[1].translate(Vec2::new(40.0, 0.0));
+        assert_eq!(page_vertical_layout_key(&shifted_x), key);
+        let mut moved_down = rects.clone();
+        moved_down[1] = moved_down[1].translate(Vec2::new(0.0, 5.0));
+        assert_ne!(page_vertical_layout_key(&moved_down), key);
+        let mut taller = rects.clone();
+        taller[0].max.y += 1.0;
+        assert_ne!(page_vertical_layout_key(&taller), key);
+        assert_ne!(page_vertical_layout_key(&rects[..1]), key);
+    }
+
+    #[test]
+    fn hook_bubbles_key_compares_allocation_identity_and_revision() {
+        let bubbles = Arc::new(Vec::new());
+        let key = HookBubblesKey { project_bubbles: Arc::clone(&bubbles), revision: 3 };
+        assert_eq!(key, HookBubblesKey { project_bubbles: Arc::clone(&bubbles), revision: 3 });
+        assert_ne!(key, HookBubblesKey { project_bubbles: Arc::clone(&bubbles), revision: 4 });
+        assert_ne!(key, HookBubblesKey { project_bubbles: Arc::new(Vec::new()), revision: 3 }, "equal content in another allocation is a different key");
+    }
 
     /// The reserve keeps a right-anchored panel off the canvas' vertical
     /// scrollbar, and the rule must stay total: a canvas narrower than the

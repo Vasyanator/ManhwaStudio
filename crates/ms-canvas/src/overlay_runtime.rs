@@ -11,6 +11,7 @@ Main responsibilities:
 - выполнять replace/clear/commit операции над clean overlay;
 - рисовать tiled overlay поверх страницы без блокировки GUI.
 - report and evict reconstructable clean-overlay GPU tile caches under memory pressure.
+- keep pending GPU work from repainting the GUI for pages that are not drawn this frame.
 
 Key structures:
 - OverlayRuntimeState
@@ -23,7 +24,12 @@ Key functions:
 - OverlayRuntimeState::replace_overlay_region_px()
 - OverlayRuntimeState::sync_from_model() + plan_overlay_sync(): non-destructive per-canvas delta apply
 - write_own_change() / synced_revision_after_own_write(): own model writes never skip foreign changes
+- begin_draw_tracking() / has_pending_work(): the pending-work repaint rule
 Notes:
+- Pending work (prepare in flight, prepared tiles, dirty tiles) can only be uploaded while its page
+  is drawn, so only pages drawn this frame (`drawn_pages`) count as pending for the repaint request.
+  Pending work of an off-screen page is kept (a finished prepare is not thrown away) and resumes
+  when the page is drawn again; memory-pressure eviction may free it for any non-pinned page.
 - The synced revision is a per-canvas cursor into the shared, non-destructive
   `CleanOverlaysModel::delta_since`; own writes advance it only when the canvas was fully synced,
   and the read-only lazy load (`ensure_overlay_for_page_size`) never advances it. Own writes record
@@ -74,6 +80,10 @@ pub(super) struct OverlayRuntimeState {
     pub(super) overlay_prepared_pages: HashMap<usize, OverlayPreparedPage>,
     pub(super) overlay_prepare_next_job_id: u64,
     pub(super) overlay_render_suppressed: bool,
+    /// Pages whose overlay was drawn (in view, overlays enabled) in the current frame; cleared by
+    /// `begin_draw_tracking`, filled by `draw_overlay_on_page`. Only these pages' pending work
+    /// keeps the canvas repainting.
+    pub(super) drawn_pages: HashSet<usize>,
 }
 
 impl Default for OverlayRuntimeState {
@@ -99,6 +109,7 @@ impl Default for OverlayRuntimeState {
             overlay_prepared_pages: HashMap::new(),
             overlay_prepare_next_job_id: 1,
             overlay_render_suppressed: false,
+            drawn_pages: HashSet::new(),
         }
     }
 }
@@ -511,13 +522,34 @@ impl OverlayRuntimeState {
         }
     }
 
-    pub(super) fn has_pending_work(&self) -> bool {
-        !self.overlay_prepare_inflight.is_empty()
-            || !self.overlay_prepared_pages.is_empty()
+    /// Starts a frame's draw tracking: forgets which pages were drawn last frame. Called once per
+    /// `CanvasView::draw`, before the scene pass.
+    pub(super) fn begin_draw_tracking(&mut self) {
+        self.drawn_pages.clear();
+    }
+
+    /// Whether `page_idx` holds GPU work that only drawing it can finish: a prepare in flight,
+    /// prepared tiles not yet uploaded, or dirty tiles.
+    fn page_has_pending_work(&self, page_idx: usize) -> bool {
+        self.overlay_prepare_inflight.contains_key(&page_idx)
+            || self.overlay_prepared_pages.contains_key(&page_idx)
             || self
                 .overlay_dirty_tiles
-                .values()
-                .any(|dirty| !dirty.is_empty())
+                .get(&page_idx)
+                .is_some_and(|dirty| !dirty.is_empty())
+    }
+
+    /// Whether this frame drew a page that still has pending GPU work, i.e. whether the canvas
+    /// must request another frame to finish it.
+    ///
+    /// Pages not drawn this frame never count: their work can only progress while they are drawn
+    /// (off screen, overlays hidden or render-suppressed), so repainting for them would spin the
+    /// GUI at full frame rate without progress. Their dirty tiles are uploaded when they are next
+    /// drawn, which happens on whatever event brings them into view.
+    pub(super) fn has_pending_work(&self) -> bool {
+        self.drawn_pages
+            .iter()
+            .any(|&page_idx| self.page_has_pending_work(page_idx))
     }
 
     pub(super) fn memory_usage_snapshot(
@@ -527,7 +559,7 @@ impl OverlayRuntimeState {
         self.overlay_textures
             .iter()
             .map(|(page_idx, page_tex)| {
-                let estimated_bytes = page_tex
+                let texture_bytes = page_tex
                     .tiles
                     .iter()
                     .map(|tile| {
@@ -536,6 +568,15 @@ impl OverlayRuntimeState {
                             .saturating_mul(4)
                     })
                     .fold(0usize, usize::saturating_add);
+                // A prepared payload not yet uploaded is CPU memory of the same page: evicting the
+                // page frees it too, so it counts toward what the eviction frees.
+                let prepared_bytes = self
+                    .overlay_prepared_pages
+                    .get(page_idx)
+                    .map(|prepared| prepared.tiles.iter().map(|tile| tile.rgba.len()).fold(0usize, usize::saturating_add))
+                    .unwrap_or(0);
+                let estimated_bytes = texture_bytes.saturating_add(prepared_bytes);
+                let pinned = pinned_pages.contains(page_idx);
                 CacheResourceInfo {
                     id: format!("clean-overlay-gpu:{page_idx}"),
                     kind: CacheResourceKind::CleanOverlayGpu,
@@ -548,9 +589,12 @@ impl OverlayRuntimeState {
                         .unwrap_or(0),
                     reload_cost: CacheReloadCost::RebuildFromModel,
                     dirty: false,
-                    visible: pinned_pages.contains(page_idx),
-                    reconstructable: !self.overlay_prepare_inflight.contains_key(page_idx)
-                        && !self.overlay_prepared_pages.contains_key(page_idx),
+                    visible: pinned,
+                    // Everything here rebuilds from `overlay_images`. Only a pinned (visible)
+                    // page's prepare in progress is protected: it is being uploaded right now.
+                    reconstructable: !pinned
+                        || (!self.overlay_prepare_inflight.contains_key(page_idx)
+                            && !self.overlay_prepared_pages.contains_key(page_idx)),
                 }
             })
             .collect()
@@ -565,12 +609,17 @@ impl OverlayRuntimeState {
             let Some(page_idx) = resource.page_idx else {
                 continue;
             };
-            if self.overlay_prepare_inflight.contains_key(&page_idx)
-                || self.overlay_prepared_pages.contains_key(&page_idx)
-            {
+            let preparing = self.overlay_prepare_inflight.contains_key(&page_idx)
+                || self.overlay_prepared_pages.contains_key(&page_idx);
+            if preparing && request.pinned_pages.contains(&page_idx) {
                 continue;
             }
             if self.overlay_textures.remove(&page_idx).is_some() {
+                // The texture and its prepare work go together: drawing the page again finds no
+                // texture and re-prepares it from `overlay_images`, so no half-built texture and
+                // no orphaned payload remain. Its dirty tiles are covered by that full prepare.
+                self.reset_prepare_state(page_idx);
+                self.overlay_dirty_tiles.remove(&page_idx);
                 self.overlay_last_upload_s.remove(&page_idx);
                 self.overlay_texture_last_used_frame.remove(&page_idx);
                 freed = freed.saturating_add(resource.estimated_bytes);
@@ -818,6 +867,7 @@ impl OverlayRuntimeState {
         bytes_budget: &mut usize,
         pixel_sampling_nearest: bool,
     ) {
+        self.drawn_pages.insert(page_idx);
         let Some(ov_size) = self.overlay_images.get(&page_idx).map(|ov| ov.size) else {
             return;
         };
@@ -1002,6 +1052,7 @@ impl OverlayRuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::OverlayPreparedTile;
     use std::path::PathBuf;
 
     fn test_model() -> Arc<Mutex<CleanOverlaysModel>> {
@@ -1236,6 +1287,109 @@ mod tests {
         foreign_write(&model, 0);
         runtime.sync_from_model();
         assert_eq!(cached_pixel(&runtime, 0), Some(opaque_pixel().pixels[0]), "a foreign edit of the page is re-fetched");
+        runtime.shutdown();
+    }
+
+    fn prepared_page(size: [usize; 2]) -> OverlayPreparedPage {
+        OverlayPreparedPage { size, tiles: Vec::new(), next_upload_tile: 0 }
+    }
+
+    /// A GPU texture page of `size` holding `tiles` one-pixel tiles.
+    fn texture_page(ctx: &egui::Context, size: [usize; 2], tiles: usize) -> OverlayTexturePage {
+        OverlayTexturePage {
+            size,
+            texture_options: egui::TextureOptions::LINEAR,
+            tiles: (0..tiles)
+                .map(|tile_idx| OverlayTextureTile {
+                    texture: ctx.load_texture(format!("test-overlay-tile-{tile_idx}"), opaque_pixel(), egui::TextureOptions::LINEAR),
+                    origin_px: [0, 0],
+                    size_px: [1, 1],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn only_pages_drawn_this_frame_count_as_pending_work() {
+        let mut runtime = OverlayRuntimeState::default();
+        runtime.begin_draw_tracking();
+        runtime.overlay_prepared_pages.insert(3, prepared_page([1, 1]));
+        runtime.overlay_prepare_inflight.insert(4, 1);
+        runtime.overlay_dirty_tiles.insert(5, HashSet::from([0]));
+        runtime.overlay_dirty_tiles.insert(6, HashSet::new());
+        runtime.drawn_pages.insert(6);
+        assert!(!runtime.has_pending_work(), "off-screen work and empty dirty sets must not drive repaints");
+
+        for page_idx in [3, 4, 5] {
+            runtime.begin_draw_tracking();
+            runtime.drawn_pages.insert(page_idx);
+            assert!(runtime.has_pending_work(), "drawn page {page_idx} with pending work must drive repaints");
+        }
+
+        // A frame that drew nothing (overlays hidden or render-suppressed) never repaints for work.
+        runtime.begin_draw_tracking();
+        assert!(!runtime.has_pending_work());
+        runtime.shutdown();
+    }
+
+    fn eviction_request(pinned: &[usize]) -> CacheEvictionRequest {
+        CacheEvictionRequest {
+            profile: ms_memory::MemoryProfile::Medium,
+            pressure: ms_memory::MemoryPressure::Critical,
+            target_free_bytes: u64::MAX,
+            pinned_pages: pinned.iter().copied().collect(),
+        }
+    }
+
+    fn prepared_tile() -> OverlayPreparedTile {
+        OverlayPreparedTile { tile_idx: 0, origin_px: [0, 0], size_px: [1, 1], rgba: vec![0; 4] }
+    }
+
+    #[test]
+    fn off_screen_prepared_payloads_are_kept_and_never_drive_repaints() {
+        let ctx = egui::Context::default();
+        let mut runtime = OverlayRuntimeState::default();
+        runtime.overlay_images.insert(1, Arc::new(opaque_pixel()));
+        runtime.overlay_textures.insert(1, texture_page(&ctx, [1, 1], 0));
+        runtime.overlay_prepared_pages.insert(1, OverlayPreparedPage { size: [1, 1], tiles: vec![prepared_tile()], next_upload_tile: 0 });
+        runtime.begin_draw_tracking();
+        runtime.drawn_pages.insert(0);
+
+        assert!(!runtime.has_pending_work());
+        assert!(runtime.overlay_prepared_pages.contains_key(&1), "finished work of a page that left the view is kept");
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn eviction_frees_off_screen_prepare_work_with_its_texture_but_spares_pinned_uploads() {
+        let ctx = egui::Context::default();
+        let mut runtime = OverlayRuntimeState::default();
+        for page_idx in 0..3 {
+            runtime.overlay_images.insert(page_idx, Arc::new(opaque_pixel()));
+            runtime.overlay_textures.insert(page_idx, texture_page(&ctx, [1, 1], 0));
+        }
+        // 0: visible, upload in progress -> protected.
+        runtime.overlay_prepared_pages.insert(0, OverlayPreparedPage { size: [1, 1], tiles: vec![prepared_tile()], next_upload_tile: 0 });
+        // 1: off screen, finished payload -> freed with the texture.
+        runtime.overlay_prepared_pages.insert(1, OverlayPreparedPage { size: [1, 1], tiles: vec![prepared_tile()], next_upload_tile: 0 });
+        runtime.overlay_dirty_tiles.insert(1, HashSet::from([0]));
+        // 2: off screen, prepare in flight -> its result will be discarded.
+        runtime.overlay_prepare_inflight.insert(2, 5);
+
+        let snapshot = runtime.memory_usage_snapshot(&BTreeSet::from([0]));
+        let bytes_of = |page: usize| snapshot.iter().find(|r| r.page_idx == Some(page)).map(|r| (r.estimated_bytes, r.reconstructable));
+        assert_eq!(bytes_of(0), Some((4, false)));
+        assert_eq!(bytes_of(1), Some((4, true)), "the payload counts toward the freed bytes");
+        assert_eq!(bytes_of(2), Some((0, true)));
+
+        let report = runtime.evict_cache(&eviction_request(&[0]));
+
+        assert_eq!(report.resources.len(), 2);
+        assert!(runtime.overlay_prepared_pages.contains_key(&0) && runtime.overlay_textures.contains_key(&0));
+        assert!(!runtime.overlay_prepared_pages.contains_key(&1) && !runtime.overlay_textures.contains_key(&1));
+        assert!(!runtime.overlay_dirty_tiles.contains_key(&1), "a full re-prepare replaces the dirty tiles");
+        assert!(!runtime.overlay_prepare_inflight.contains_key(&2) && !runtime.overlay_textures.contains_key(&2));
+        assert!(runtime.overlay_images.contains_key(&1), "the CPU image stays: the page rebuilds when drawn");
         runtime.shutdown();
     }
 }

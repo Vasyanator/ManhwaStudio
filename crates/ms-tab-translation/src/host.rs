@@ -15,7 +15,8 @@ Key items:
   canvas draw inside the root's central panel (the dock, with the tools, runs in its hook).
 - `impl StudioTab for TranslationTab`: input declarations (`crate::input::declarations`) and
   contexts (the canvas's plus the tab's), dock builder, GPU eviction, source-page window,
-  NEAREST sampling, the exit-only hint-collapsed key.
+  NEAREST sampling, the background drain while hidden (`poll_background`, gated on
+  `last_drawn_frame`), the exit-only hint-collapsed key.
 - `hotkeys` (submodule): the execute arms of every fired command.
 
 Notes:
@@ -41,7 +42,7 @@ use ms_widgets::panel_dock::{DockLayout, PanelDockState};
 use serde_json::Value;
 
 use crate::panels::text_detector::detector_page_size;
-use crate::tab::{TranslationTabState, translation_default_dock_layout};
+use crate::tab::{TranslationTabState, tab_hidden_last_frame, translation_default_dock_layout};
 
 /// `user_config` key (under `Canvas`) of the Translation canvas' bottom-hint collapsed flag.
 /// Absent = `false` (expanded). Read once in [`TranslationTab::new`], written only on exit
@@ -57,6 +58,9 @@ pub struct TranslationTab {
     // Declared first: dropped before the state, the order the root's fields had.
     canvas: CanvasView,
     state: TranslationTabState,
+    /// `egui::Context::cumulative_frame_nr` of the last [`Self::draw`] (`None` before the first):
+    /// [`StudioTab::poll_background`] drains only while the tab was not drawn last frame.
+    last_drawn_frame: Option<u64>,
 }
 
 /// What [`TranslationTab::draw`] borrows from the root for one frame.
@@ -91,7 +95,7 @@ impl TranslationTab {
         canvas.set_bottom_hint_collapsed(ms_config::section_bool(user_settings, CANVAS_SECTION, TRANSLATION_HINT_COLLAPSED_KEY, false));
         canvas.set_scroll_area_id_salt(TRANSLATION_CANVAS_SCROLL_SALT);
         canvas.set_bubbles_model(bubbles_model);
-        Self { canvas, state }
+        Self { canvas, state, last_drawn_frame: None }
     }
 
     /// The tab's canvas (viewport snapshot, view sync, bubble flush).
@@ -125,13 +129,14 @@ impl TranslationTab {
     /// in the overlay hook), then the input copy is dropped.
     pub fn draw(&mut self, p: TranslationDrawParams<'_>) {
         let TranslationDrawParams { ctx, ui, project, page_infos, texture_cache, status, panel_dock, input, input_registry } = p;
+        self.last_drawn_frame = Some(ctx.cumulative_frame_nr());
         self.state.begin_input_frame(input, input_registry);
         self.state.restore_tool_toggles(panel_dock);
         self.run_fired_commands(ctx, project, input);
         if self.state.apply_brush_input(input) {
             ctx.request_repaint();
         }
-        let Self { canvas, state } = self;
+        let Self { canvas, state, .. } = self;
         canvas.set_bottom_hint(Some(CanvasBottomHint { rows: state.input_labels().hint_rows(state.lines_edit_active()) }));
         state.sync_with_project_settings(project);
         state.prepare_tool_frame(detector_page_size(page_infos.get(&canvas.current_page_idx())));
@@ -192,6 +197,17 @@ impl StudioTab for TranslationTab {
 
     fn wants_nearest_source(&self) -> bool {
         self.canvas.source_pixel_inspection_active()
+    }
+
+    /// While the tab is hidden (not drawn last frame), drains its background results into the
+    /// shared models through the canvas (`TranslationTabState::poll_background_work`); a tab drawn
+    /// last frame drains in its draw.
+    fn poll_background(&mut self, ctx: &egui::Context, project: &ProjectData) {
+        if !tab_hidden_last_frame(self.last_drawn_frame, ctx.cumulative_frame_nr()) {
+            return;
+        }
+        let Self { canvas, state, .. } = self;
+        state.poll_background_work(ctx, canvas, project);
     }
 
     /// Writes `Canvas.translation_hint_collapsed` (the canvas' current collapsed state).

@@ -79,12 +79,14 @@ pub(super) fn draw_on_top_for_page(
     hooks: &mut dyn CanvasHooks,
 ) {
     let scene_clip_rect = ui.clip_rect();
+    // O(1) id -> persisted bubble lookup: this frame's index, shared with the aside passes.
+    let project_bubbles_by_id = canvas.bubble_index.get_or_build(&project.bubbles);
     for bid in ids {
         let Some(snapshot) = canvas.bubble_runtime.runtime_bubbles.get(&bid).cloned() else {
             continue;
         };
         let hook_bubble_fallback;
-        let hook_bubble = match project.bubbles.iter().find(|bubble| bubble.id == bid) {
+        let hook_bubble = match project_bubbles_by_id.resolve(&project.bubbles, bid) {
             Some(project_bubble) => project_bubble,
             None => {
                 hook_bubble_fallback = canvas.hook_bubble_for_runtime(project, &snapshot);

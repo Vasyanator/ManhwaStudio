@@ -17,6 +17,11 @@ mid-drag commits too) and drops on a cancel. A click or a finger tap outside the
 editor commits it (`create_editor_commit_requested`): the click is egui's
 `Response::clicked_elsewhere` of the editor area — widget semantics, any button, not a binding.
 
+Status toasts: the create error / warning live `TEXT_EDITOR_STATUS_ERROR_SECONDS` of drawn time.
+`expire_create_statuses` (start of every typing frame) arms and drops them, and the frame end
+sleeps until the next deadline (`timed_status_repaint_delay`) instead of repainting continuously;
+a toast raised by an off-draw poll starts its time on the next drawn frame.
+
 Notes:
 Extracted verbatim from `tab.rs`. Methods are `pub(super)` so `tab.rs` and sibling
 submodules of `tab` can use them. `use super::*;` pulls in the parent module's
@@ -124,6 +129,42 @@ fn create_editor_commit_requested(clicked_outside: bool, tap: Option<Pos2>, edit
     clicked_outside || tap.is_some_and(|pos| !editor_rect.contains(pos))
 }
 
+/// Hide deadline of a timed status whose display time has not started yet: it was raised while
+/// the tab was not drawn, and [`expire_timed_status`] arms it on the first drawn frame.
+const STATUS_DEADLINE_UNARMED: f64 = f64::INFINITY;
+
+/// One frame of a timed status `(message, hide_at)` at frame time `now_s`: an unarmed deadline
+/// ([`STATUS_DEADLINE_UNARMED`], or any other non-finite value) becomes `now_s + ttl_s`, and a status whose deadline has passed
+/// is dropped.
+fn expire_timed_status(slot: &mut Option<(String, f64)>, now_s: f64, ttl_s: f64) {
+    if let Some((_, hide_at)) = slot.as_mut()
+        && !hide_at.is_finite()
+    {
+        *hide_at = now_s + ttl_s;
+    }
+    if slot.as_ref().is_some_and(|(_, hide_at)| now_s >= *hide_at) {
+        *slot = None;
+    }
+}
+
+/// How long the GUI may sleep before the earliest of `hide_at_s` (timed-status deadlines, in
+/// egui input time) needs a frame to take its status down; `None` when no status is shown.
+///
+/// An UNARMED deadline ([`STATUS_DEADLINE_UNARMED`]: raised off-draw after this frame's
+/// expiry pass, yet possibly already painted) and a deadline already reached both yield a zero
+/// delay: the next frame's expiry pass arms or drops them, so neither repeats.
+#[must_use]
+pub(super) fn timed_status_repaint_delay(now_s: f64, hide_at_s: impl IntoIterator<Item = f64>) -> Option<std::time::Duration> {
+    let mut earliest: Option<f64> = None;
+    for hide_at in hide_at_s {
+        if !hide_at.is_finite() {
+            return Some(std::time::Duration::ZERO);
+        }
+        earliest = Some(earliest.map_or(hide_at, |earliest| earliest.min(hide_at)));
+    }
+    std::time::Duration::try_from_secs_f64((earliest? - now_s).max(0.0)).ok()
+}
+
 impl TypingCreateTextEditor {
     /// Font size the FIELD is drawn at: the panel's size scaled to this editor's view of the
     /// page, so the glyphs being typed are already the size the render will put in this box.
@@ -165,22 +206,8 @@ impl TypingTextOverlayLayer {
         top_panel: &TypingTopPanelState,
         input: &InputFrame,
     ) {
-        let now_s = ctx.input(|i| i.time);
-        if self
-            .create_status_error
-            .as_ref()
-            .is_some_and(|(_, hide_at)| now_s >= *hide_at)
-        {
-            self.create_status_error = None;
-        }
-        if self
-            .create_status_warning
-            .as_ref()
-            .is_some_and(|(_, hide_at)| now_s >= *hide_at)
-        {
-            self.create_status_warning = None;
-        }
-
+        // The status toasts expire in `expire_create_statuses`, run at the start of every typing
+        // frame: this method is skipped while the mask panel or the layout editor is up.
         self.drive_create_selection(ctx, canvas, project, top_panel, input);
         self.draw_active_create_selection(ctx);
         self.draw_text_editor(ctx, project, top_panel, canvas.touch_tap());
@@ -507,6 +534,9 @@ impl TypingTextOverlayLayer {
                         {
                             output.response.request_focus();
                             editor.needs_focus = false;
+                            // The field was laid out unfocused this frame; nothing else schedules
+                            // the frame that shows the caret (and starts its blink frames).
+                            ctx.request_repaint();
                         }
                         editor.window_focused_last_frame = viewport_focused;
                     });
@@ -679,15 +709,45 @@ impl TypingTextOverlayLayer {
             });
     }
 
+    /// Shows `message` as the create error toast for `TEXT_EDITOR_STATUS_ERROR_SECONDS` of DRAWN
+    /// time: raised off-draw (`polling_off_draw`, the background poll of an inactive tab), its timer
+    /// starts on the first typing frame instead, so the user still gets to see it.
     pub(super) fn set_create_error(&mut self, ctx: &egui::Context, message: impl Into<String>) {
-        let now_s = ctx.input(|i| i.time);
-        self.create_status_error = Some((message.into(), now_s + TEXT_EDITOR_STATUS_ERROR_SECONDS));
+        let hide_at = self.new_create_status_deadline(ctx);
+        self.create_status_error = Some((message.into(), hide_at));
     }
 
+    /// The warning twin of [`Self::set_create_error`] (same display time and off-draw rule).
     pub(super) fn set_create_warning(&mut self, ctx: &egui::Context, message: impl Into<String>) {
-        let now_s = ctx.input(|i| i.time);
-        self.create_status_warning =
-            Some((message.into(), now_s + TEXT_EDITOR_STATUS_ERROR_SECONDS));
+        let hide_at = self.new_create_status_deadline(ctx);
+        self.create_status_warning = Some((message.into(), hide_at));
+    }
+
+    /// Hide deadline of a create status raised now: `now + TEXT_EDITOR_STATUS_ERROR_SECONDS`, or
+    /// [`STATUS_DEADLINE_UNARMED`] while the tab is polled off-draw.
+    fn new_create_status_deadline(&self, ctx: &egui::Context) -> f64 {
+        if self.polling_off_draw {
+            STATUS_DEADLINE_UNARMED
+        } else {
+            ctx.input(|i| i.time) + TEXT_EDITOR_STATUS_ERROR_SECONDS
+        }
+    }
+
+    /// Arms and expires the create status toasts at frame time `now_s` (`expire_timed_status`).
+    /// Run once at the START of every typing frame, before anything draws them, so an expired
+    /// toast is never painted and the delay `create_status_repaint_delay` reports afterwards is
+    /// always in the future (a zero delay with no expiry would re-wake the GUI forever).
+    pub(super) fn expire_create_statuses(&mut self, now_s: f64) {
+        expire_timed_status(&mut self.create_status_error, now_s, TEXT_EDITOR_STATUS_ERROR_SECONDS);
+        expire_timed_status(&mut self.create_status_warning, now_s, TEXT_EDITOR_STATUS_ERROR_SECONDS);
+    }
+
+    /// Hide deadlines of the shown create status toasts, for `timed_status_repaint_delay`.
+    pub(super) fn create_status_deadlines(&self) -> impl Iterator<Item = f64> + '_ {
+        [self.create_status_error.as_ref(), self.create_status_warning.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|(_, hide_at)| *hide_at)
     }
 
     pub(super) fn insert_runtime_overlay(&mut self, decoded: TypingOverlayDecoded) {
@@ -1457,5 +1517,63 @@ mod tests {
         step_create_selection(&mut slot, Some(&claim(GesturePhase::Started, origin)), on_page);
         assert!(step_create_selection(&mut slot, None, on_page).is_none());
         assert!(slot.is_none());
+    }
+
+    /// A shown status lives exactly its display time: kept before the deadline, dropped at it.
+    #[test]
+    fn a_timed_status_expires_at_its_deadline() {
+        let mut slot = Some(("boom".to_string(), 14.0));
+        expire_timed_status(&mut slot, 13.9, 4.0);
+        assert!(slot.is_some(), "still inside its display time");
+        expire_timed_status(&mut slot, 14.0, 4.0);
+        assert!(slot.is_none(), "dropped once the deadline is reached");
+        let mut empty: Option<(String, f64)> = None;
+        expire_timed_status(&mut empty, 100.0, 4.0);
+        assert!(empty.is_none());
+    }
+
+    /// A status raised off-draw is unarmed until the first drawn frame, which starts its full
+    /// display time — it is never dropped unseen, however long the tab stayed hidden.
+    #[test]
+    fn an_unarmed_status_starts_its_display_time_on_the_first_drawn_frame() {
+        let mut slot = Some(("raised while hidden".to_string(), STATUS_DEADLINE_UNARMED));
+        expire_timed_status(&mut slot, 500.0, 4.0);
+        assert_eq!(slot.as_ref().map(|(_, hide_at)| *hide_at), Some(504.0));
+        expire_timed_status(&mut slot, 503.0, 4.0);
+        assert!(slot.is_some());
+        expire_timed_status(&mut slot, 504.0, 4.0);
+        assert!(slot.is_none());
+    }
+
+    /// The wake-up delay is the time to the EARLIEST deadline; no status asks for no wake-up, an
+    /// unarmed one asks for the next frame (which arms it), and a passed deadline never yields a
+    /// negative delay.
+    #[test]
+    fn the_status_repaint_delay_targets_the_earliest_deadline() {
+        use std::time::Duration;
+        assert_eq!(timed_status_repaint_delay(10.0, []), None);
+        assert_eq!(timed_status_repaint_delay(10.0, [14.0, 12.5]), Some(Duration::from_millis(2500)));
+        assert_eq!(timed_status_repaint_delay(10.0, [14.0, STATUS_DEADLINE_UNARMED]), Some(Duration::ZERO));
+        assert_eq!(timed_status_repaint_delay(10.0, [9.0]), Some(Duration::ZERO));
+    }
+
+    /// A create error that a BACKGROUND poll (typing tab not drawn) applies is not timed out
+    /// unseen: its display time starts on the first drawn frame.
+    #[test]
+    fn a_create_error_applied_by_the_background_poll_waits_for_a_draw() {
+        let ctx = egui::Context::default();
+        let mut layer = TypingTextOverlayLayer::default();
+        let (tx, rx) = mpsc::channel::<Result<TypingOverlayDecoded, String>>();
+        layer.create_render_state = Some(TypingCreateRenderState { rx, scene_rect: None });
+        assert!(layer.poll_doc_jobs_in_background(&ctx), "a silent create render is still in flight");
+        tx.send(Err("render failed".to_string())).expect("the receiver is alive");
+        assert!(!layer.poll_doc_jobs_in_background(&ctx), "the result was applied");
+        assert!(!layer.polling_off_draw, "the off-draw flag never outlives the poll");
+        assert_eq!(layer.create_status_error.as_ref().map(|(_, hide_at)| *hide_at), Some(STATUS_DEADLINE_UNARMED));
+        layer.expire_create_statuses(50.0);
+        assert_eq!(
+            layer.create_status_error.as_ref().map(|(_, hide_at)| *hide_at),
+            Some(50.0 + TEXT_EDITOR_STATUS_ERROR_SECONDS)
+        );
     }
 }

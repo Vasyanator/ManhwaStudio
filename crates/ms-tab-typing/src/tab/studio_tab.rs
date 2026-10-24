@@ -19,7 +19,9 @@ Key items:
   - `write_exit_settings`: `Canvas.typing_hint_collapsed`, `TextTab.centering_assist_enabled`,
     `TextTab.centering_show_center`, `TextTab.psd_bundle_custom_fonts`;
   - `flush_debounced_stores_blocking`: the per-font settings store, then the default
-    local-preset set.
+    local-preset set;
+  - `poll_background`: applies finished doc-first layer jobs while the tab is not drawn
+    (`TypingTextOverlayLayer::poll_doc_jobs_in_background`) and keeps a slow repaint while one runs.
 
 Notes:
 - The exit-only keys and their defaults are persisted user data: absent `typing_hint_collapsed`
@@ -27,14 +29,16 @@ Notes:
   `centering_show_center` = shown (`true`), absent `psd_bundle_custom_fonts` = off (`false`). The
   bound-center KIND is session-only and has no key.
   They are written only at teardown, never per toggle.
-- No background poll and no committed-tree view: those hooks keep their no-op defaults.
+- No committed-tree view: that hook keeps its no-op default.
 - The canvas bottom-hint rows are built from the input registry's labels in `tab/input.rs`.
 */
 
 use std::collections::HashSet;
 
 use ms_config::{CANVAS_SECTION, TEXT_TAB_SECTION, section_bool, set_section_bool};
+use eframe::egui;
 use ms_memory::{CacheEvictionReport, CacheEvictionRequest};
+use ms_project::ProjectData;
 use ms_studio_tab::StudioTab;
 use ms_widgets::panel_dock::DockLayout;
 use serde_json::Value;
@@ -50,6 +54,9 @@ const TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY: &str = "centering_assist_enabled";
 const TEXT_TAB_CENTERING_SHOW_CENTER_KEY: &str = "centering_show_center";
 /// `TextTab` key of the PSD export's «Положить рядом кастомные шрифты» (absent = `false`, off).
 const TEXT_TAB_PSD_BUNDLE_CUSTOM_FONTS_KEY: &str = "psd_bundle_custom_fonts";
+/// How often `poll_background` re-polls while a doc-first job runs and the tab may not be drawn
+/// (the drawn tab repaints every frame meanwhile anyway, `wants_repaint`).
+const BACKGROUND_JOB_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl TypingTabState {
     /// Seeds the exit-only flags ONCE at construction from the merged startup `user_settings`:
@@ -110,6 +117,18 @@ impl StudioTab for TypingTabState {
     /// The canvas zoomed into pixel inspection draws NEAREST source tiles.
     fn wants_nearest_source(&self) -> bool {
         self.canvas.source_pixel_inspection_active()
+    }
+
+    /// Applies finished doc-first layer jobs even while another tab is active
+    /// (`TypingTextOverlayLayer::poll_doc_jobs_in_background`): their results write the shared
+    /// `LayerDoc`, which the PS editor reads, and the placement-save poll re-fires a parked write.
+    /// While one is still running it keeps a slow repaint going, because its worker wakes no
+    /// frame. `draw` runs the same `try_recv` polls, so whichever caller sees a result first
+    /// applies it, exactly once.
+    fn poll_background(&mut self, ctx: &egui::Context, _project: &ProjectData) {
+        if self.text_overlays.poll_doc_jobs_in_background(ctx) {
+            ctx.request_repaint_after(BACKGROUND_JOB_POLL_INTERVAL);
+        }
     }
 
     /// Writes the four exit-only flags; every other key of `root` and of both sections survives,

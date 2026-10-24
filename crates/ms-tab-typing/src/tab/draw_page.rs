@@ -205,10 +205,12 @@ impl TypingTextOverlayLayer {
         if !clip_rect.is_positive() {
             return Vec::new();
         }
-        // Ensure the read-only PS raster layers and unified Z bands for this page are loaded; the
-        // actual raster quads are now drawn interleaved with the text overlays (one ordered pass
-        // below) so a raster moved above a text group in the PS editor renders on top.
-        self.ensure_raster_layers_for_page(page_idx);
+        // Ask for the read-only PS raster layers and unified Z bands of this page; the raster quads
+        // are drawn interleaved with the text overlays (one ordered pass below) so a raster moved
+        // above a text group in the PS editor renders on top. The first visit decodes them on the
+        // background page loader, never here: until it lands the page draws without them (and,
+        // on a migrated chapter, without its text, which comes from the same doc payload).
+        self.request_page_residency(ctx, page_idx);
         let layout_editor_active = self.layout_editor.is_some();
         if !mask_panel_open && !layout_editor_active {
             // Centering assist: after the frame's input (the commands ran before the canvas drew),
@@ -1650,18 +1652,24 @@ impl TypingTextOverlayLayer {
         occluders
     }
 
+    /// Whether the next frame must follow at once: a background job is in flight (its worker
+    /// schedules no frame of its own, so only polling every frame picks the result up), textures
+    /// wait for upload, or a layer gesture / move session is running.
+    ///
+    /// Merely OPEN UI is deliberately absent, because egui already redraws on every input event:
+    /// the on-canvas create editor (its `TextEdit` schedules its own cursor-blink frames, and the
+    /// editor-font resolve requests frames while it is pending — `poll_editor_font_request`) and
+    /// the layout editor (its re-renders run through `edit_render_rx`; only its frame / point drags
+    /// count). The create status toasts expire on a timer, not here: `create_status_repaint_delay`.
     pub(super) fn wants_repaint(&self) -> bool {
         self.loading_rx.is_some()
             || self.create_selection.is_some()
-            || self.create_editor.is_some()
             || self.create_render_state.is_some()
             || self.create_raster_state.is_some()
             || self.raster_effects_state.is_some()
             || self.edit_render_rx.is_some()
             || self.auto_typing_job.is_some()
             || self.export_rx.is_some()
-            || self.create_status_error.is_some()
-            || self.create_status_warning.is_some()
             || self.save_rx.is_some()
             || !self.pending_upload_indices.is_empty()
             || self.drag_state.is_some()
@@ -1671,7 +1679,10 @@ impl TypingTextOverlayLayer {
             || self.move_session.is_some()
             || self.vector_transform_drag.is_some()
             || self.vector_transform_base_rx.is_some()
-            || self.layout_editor.is_some()
+            || self
+                .layout_editor
+                .as_ref()
+                .is_some_and(|editor| editor.frame_drag.is_some() || editor.line_drag.is_some())
     }
 
     pub(super) fn enforce_overlay_visibility_limit(

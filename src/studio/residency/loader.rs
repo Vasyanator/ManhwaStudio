@@ -10,6 +10,7 @@ pages AND clean overlays, and the follow-up page-cache loader. Also the pure loa
 Key structures:
 - `LoaderEvent` / `OverlayLoaderEvent` / `PageCacheLoaderEvent`: what each pool streams to the GUI.
 - `LoaderJob`: one unit of work of the unified pool (source page or its clean overlay).
+- `GuiWaker` / `WakingSender`: how a pool wakes the GUI thread after each result (no GUI polling).
 
 Key functions:
 - `spawn_loader_thread`: the unified pool, sorted by (page index, source-before-overlay), with the
@@ -21,6 +22,9 @@ Key functions:
 - `run_decode_pool`: starts and joins the workers of one pool (spawn failures handled here).
 
 Notes:
+Every event reaches the GUI through a `WakingSender`, which requests a repaint after each send and
+when it is dropped (so a `Finished` or a disconnect is never left unread until the next input), on
+every target where workers may wake the GUI (`WORKERS_WAKE_GUI`; not wasm, where the GUI polls).
 Both pool joiners send `Finished` only after every worker returned, so a `Finished` event means
 every job kind of that pool is done. A worker panic is logged by the joiner and does not stop the
 `Finished` event. Every thread goes through `ms_thread::Builder`: a pool thread the OS refuses is
@@ -39,8 +43,9 @@ use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Mutex};
+use eframe::egui;
+use std::sync::mpsc::{SendError, SyncSender};
+use std::sync::{Arc, Mutex, OnceLock};
 use web_time::Duration;
 
 /// Bounded capacity of every loader channel: the GUI-side back-pressure on the pools.
@@ -53,6 +58,79 @@ pub(super) const LOADER_QUEUE_CAPACITY: usize = 2;
 /// that unblocks promotion is always inside the window (otherwise the loader would deadlock).
 pub(super) const DECODE_AHEAD_WINDOW: usize = 8;
 const ENV_IMAGE_DECODE_THREADS: &str = "MF_IMAGE_DECODE_THREADS";
+
+/// Whether the loader workers wake the GUI thread themselves (`WakingSender`). Off on wasm: the web
+/// build is inactive (`STATE.md` S-004) and a `Context::request_repaint` from a Web Worker was never
+/// verified there, so on wasm the GUI keeps polling every frame while loads run, as it always did
+/// (`PageResidency::poll_decoded`, `PageResidency::background_loads_need_polling`).
+pub(super) const WORKERS_WAKE_GUI: bool = !cfg!(target_arch = "wasm32");
+
+/// The GUI-thread wake-up shared by every loader pool of one `PageResidency`. Empty until the GUI
+/// arms it with its `egui::Context` on its first poll (`PageResidency` is built without one); a
+/// result sent before that is still seen by that first poll, which arms BEFORE it drains.
+#[derive(Clone, Default)]
+pub(super) struct GuiWaker(Arc<OnceLock<egui::Context>>);
+
+impl GuiWaker {
+    /// Stores `ctx` for the workers on the first call; later calls are no-ops. Never arms when
+    /// [`WORKERS_WAKE_GUI`] is off, so no worker touches the context there.
+    pub(super) fn arm(&self, ctx: &egui::Context) {
+        if WORKERS_WAKE_GUI {
+            self.0.get_or_init(|| ctx.clone());
+        }
+    }
+
+    /// Requests a GUI repaint when armed (callable from any thread; eframe wakes the event loop).
+    fn wake(&self) {
+        if let Some(ctx) = self.0.get() {
+            ctx.request_repaint();
+        }
+    }
+}
+
+/// A loader channel sender that wakes the GUI after every successful send AND when dropped. The
+/// drop wake comes after the inner sender is dropped, so the frame it causes sees the disconnect of
+/// a pool that died without `Finished` (otherwise nothing would wake the GUI to notice it).
+pub(super) struct WakingSender<T> {
+    /// `Some` for the whole life of the value; taken only in `drop` (drop order: sender, then wake).
+    tx: Option<SyncSender<T>>,
+    waker: GuiWaker,
+}
+
+impl<T> WakingSender<T> {
+    pub(super) fn new(tx: SyncSender<T>, waker: GuiWaker) -> Self {
+        Self { tx: Some(tx), waker }
+    }
+
+    /// Sends `event` (blocking while the bounded channel is full) and wakes the GUI to drain it.
+    ///
+    /// # Errors
+    /// The GUI side dropped its receiver (the app was torn down); the event is handed back.
+    pub(super) fn send(&self, event: T) -> Result<(), SendError<T>> {
+        match &self.tx {
+            Some(tx) => {
+                tx.send(event)?;
+                self.waker.wake();
+                Ok(())
+            }
+            // Unreachable: `tx` is taken only in `drop`. Reported like a dropped receiver.
+            None => Err(SendError(event)),
+        }
+    }
+}
+
+impl<T> Clone for WakingSender<T> {
+    fn clone(&self) -> Self {
+        Self { tx: self.tx.clone(), waker: self.waker.clone() }
+    }
+}
+
+impl<T> Drop for WakingSender<T> {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        self.waker.wake();
+    }
+}
 
 /// Source-page results of the unified pool, promoted strictly in page order on the GUI thread.
 pub(super) enum LoaderEvent {
@@ -123,8 +201,8 @@ pub(super) enum PageCacheLoaderEvent {
 ///
 /// Decodes `pages` (`(page_idx, source_path)`) and the loadable overlays among
 /// `overlay_candidates` in a worker pool and streams each result to the GUI thread as a
-/// `LoaderEvent` over `tx` / an `OverlayLoaderEvent` over `overlay_tx` (bounded `SyncSender`s,
-/// which provide the GUI-side back-pressure). `cache_pages_immediately` requests seeding the
+/// `LoaderEvent` over `tx` / an `OverlayLoaderEvent` over `overlay_tx` (bounded channels, which
+/// provide the GUI-side back-pressure; every send wakes the GUI). `cache_pages_immediately` requests seeding the
 /// shared page RGBA cache during decode. `promotion_progress` is the GUI-updated frontier (next
 /// page index awaiting promotion); workers park while a job is more than `DECODE_AHEAD_WINDOW`
 /// pages ahead of it so decoded-but-unpromotable pages cannot pile up unbounded. The job queue is
@@ -138,8 +216,8 @@ pub(super) enum PageCacheLoaderEvent {
 pub(super) fn spawn_loader_thread(
     pages: Vec<(usize, PathBuf)>,
     overlay_candidates: Vec<(usize, PageCleanPaths, PathBuf)>,
-    tx: SyncSender<LoaderEvent>,
-    overlay_tx: SyncSender<OverlayLoaderEvent>,
+    tx: WakingSender<LoaderEvent>,
+    overlay_tx: WakingSender<OverlayLoaderEvent>,
     cache_pages_immediately: bool,
     promotion_progress: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
@@ -212,8 +290,9 @@ pub(super) fn spawn_loader_thread(
                     // order and the frontier's source job — always inside the window —
                     // precedes every job that can park. It was therefore popped before any
                     // worker parked, and it either completes or fails, letting the GUI
-                    // advance the frontier (the GUI drains both event channels every frame,
-                    // so a worker blocked on `send` also makes progress). The frontier thus
+                    // advance the frontier (every send wakes the GUI and the GUI drains both
+                    // event channels every frame, so a worker blocked on `send` also makes
+                    // progress). The frontier thus
                     // keeps advancing and every parked worker eventually re-enters the
                     // window; overlay jobs never gate promotion themselves. The `shutdown`
                     // check is the app-exit escape hatch: once the GUI stops draining the
@@ -435,14 +514,15 @@ pub(super) fn collect_missing_page_cache_jobs(
 }
 
 /// Spawns the page-cache loader: decodes `jobs` (`(page_idx, path)`) into plain RGBA in a worker
-/// pool and streams them over `tx`, then sends `Finished` once every worker returned.
+/// pool and streams them over `tx` (each send wakes the GUI), then sends `Finished` once every
+/// worker returned.
 ///
 /// # Errors
 /// Returns the OS error when the pool thread could not be started: nothing runs, `tx` is dropped
 /// and the caller gives the optional page cache up (`PageResidency::ensure_page_cache_loader_started`).
 pub(super) fn spawn_page_cache_loader_thread(
     jobs: Vec<(usize, PathBuf)>,
-    tx: SyncSender<PageCacheLoaderEvent>,
+    tx: WakingSender<PageCacheLoaderEvent>,
 ) -> std::io::Result<()> {
     // The handle is dropped: the pool thread is detached and answers only through `tx`.
     let _detached = thread::Builder::new().name("page-cache-loader-pool".to_owned()).spawn(move || {
@@ -492,10 +572,73 @@ pub(super) fn spawn_page_cache_loader_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::{DECODE_AHEAD_WINDOW, decode_idx_within_window, run_decode_pool, should_seed_page_cache_on_initial_load, spawn_decode_worker};
+    use super::{DECODE_AHEAD_WINDOW, GuiWaker, WORKERS_WAKE_GUI, WakingSender, decode_idx_within_window, run_decode_pool, should_seed_page_cache_on_initial_load, spawn_decode_worker};
     use crate::memory_manager::{MemoryBudget, MemoryProfile};
+    use eframe::egui;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{TryRecvError, sync_channel};
+
+    /// A fresh context and the number of repaint requests it forwarded to the integration. egui
+    /// forwards only a request that shortens the pending delay, i.e. the FIRST one before a pass
+    /// (fork `crates/egui/crates/egui/src/context.rs:156-170`), so each test checks one wake on a
+    /// fresh context. `has_requested_repaint` cannot be used: a fresh viewport starts with one
+    /// outstanding repaint (`ViewportRepaintInfo::default`, `context.rs:346-356`).
+    fn counting_context() -> (egui::Context, Arc<AtomicUsize>) {
+        let ctx = egui::Context::default();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&wakes);
+        ctx.set_request_repaint_callback(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        (ctx, wakes)
+    }
+
+    /// An unarmed waker wakes nobody; once armed, a successful send wakes the GUI.
+    #[test]
+    fn a_waking_sender_wakes_the_gui_after_a_send() -> Result<(), Box<dyn std::error::Error>> {
+        let (ctx, wakes) = counting_context();
+        let waker = GuiWaker::default();
+        let (tx, rx) = sync_channel(4);
+        let sender = WakingSender::new(tx, waker.clone());
+        sender.send(1_u8)?;
+        assert_eq!(wakes.load(Ordering::SeqCst), 0, "not armed yet");
+        waker.arm(&ctx);
+        sender.send(2)?;
+        assert_eq!(wakes.load(Ordering::SeqCst), usize::from(WORKERS_WAKE_GUI));
+        assert_eq!(rx.try_recv()?, 1);
+        assert_eq!(rx.try_recv()?, 2);
+        Ok(())
+    }
+
+    /// Dropping the last sender wakes the GUI, and by then the channel is already disconnected, so
+    /// the frame it causes sees the end of a pool that died without `Finished`.
+    #[test]
+    fn dropping_a_waking_sender_wakes_the_gui_after_the_disconnect() {
+        let (ctx, wakes) = counting_context();
+        let waker = GuiWaker::default();
+        waker.arm(&ctx);
+        let (tx, rx) = sync_channel::<u8>(1);
+        drop(WakingSender::new(tx, waker));
+        assert_eq!(wakes.load(Ordering::SeqCst), usize::from(WORKERS_WAKE_GUI));
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    /// A send to a dropped receiver hands the event back and wakes nobody (the drop wake still
+    /// fires afterwards: it does not know whether anyone listens).
+    #[test]
+    fn a_failed_send_does_not_wake_the_gui() {
+        let (ctx, wakes) = counting_context();
+        let waker = GuiWaker::default();
+        waker.arm(&ctx);
+        let (tx, rx) = sync_channel::<u8>(1);
+        drop(rx);
+        let sender = WakingSender::new(tx, waker);
+        assert!(sender.send(7).is_err());
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        drop(sender);
+        assert_eq!(wakes.load(Ordering::SeqCst), usize::from(WORKERS_WAKE_GUI));
+    }
 
     /// A worker that only counts how many times it ran.
     fn counting_worker(runs: &Arc<AtomicUsize>) -> impl FnOnce() + Send + 'static {

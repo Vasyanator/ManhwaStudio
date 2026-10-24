@@ -9,6 +9,8 @@ FILE HEADER (tabs/typing/mask.rs)
   - `TypingPageMask`: runtime-состояние маски страницы (0/255, tile-texture cache, dirty-tiles).
 - Ключевые методы:
   - `ensure_loader_started` + `poll_loader`: фоновая загрузка всех `mask_page_*.png`.
+  - `has_jobs_in_flight` / `status_error_hide_at`: what the tab's repaint rule needs — the mask
+    workers wake no frame, and the status line has a deadline; an open panel alone needs no frames.
   - `set_panel_open` + `draw_mask_tab_body`: открытие/закрытие маски и содержимое
     вкладки `typing.mask` панельного дока (кнопки, переключение режима заливки,
     слайдер допуска цвета). Саму панель — позицию, размер, сворачивание и заголовок
@@ -179,6 +181,21 @@ impl TypingMaskLayer {
 
     pub fn is_panel_open(&self) -> bool {
         self.panel_open
+    }
+
+    /// Whether a mask worker (chapter load, save or colour fill) is still running. Its worker
+    /// schedules no frame of its own, so the tab keeps frames coming while this is true and the
+    /// result is picked up by `poll_loader` / `poll_save_jobs` / `poll_fill_jobs`.
+    #[must_use]
+    pub fn has_jobs_in_flight(&self) -> bool {
+        self.loading_rx.is_some() || self.save_rx.is_some() || self.fill_job_rx.is_some()
+    }
+
+    /// Hide deadline (egui input time) of the panel's status line, if one is shown; the tab
+    /// wakes the GUI then so `expire_status_error` can take it down on time.
+    #[must_use]
+    pub fn status_error_hide_at(&self) -> Option<f64> {
+        self.status_error.as_ref().map(|(_, hide_at)| *hide_at)
     }
 
     /// Sets the binding texts the mask tab's hints show (`tab/input.rs`).

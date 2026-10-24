@@ -362,6 +362,10 @@ shared wiki view). The studio never references
   independent of each canvas' strip width.
 - Overlays upload tiled through a background prepare thread; the GUI thread never decodes or
   composes.
+- A canvas that is not drawn pulls the shared models only through
+  `CanvasView::sync_shared_models_while_hidden`, which its tab calls before applying background
+  results through that canvas (`StudioTab::poll_background`); the studio's per-frame flush of
+  inactive canvases writes the resulting edits.
 - Bubble text spellcheck follows the typesetting language, not the UI language. Bubble status
   borders: rules in `ms_config::bubble_status` (GUI-free), painting in `ms_widgets::bubble_status`.
 

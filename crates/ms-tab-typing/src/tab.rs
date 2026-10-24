@@ -164,7 +164,10 @@ use mesh_geometry::*;
 pub(crate) mod render_store;
 use render_store::*;
 mod create_upload;
+use create_upload::timed_status_repaint_delay;
 mod doc_layers;
+mod page_residency;
+use page_residency::load_page_from_disk;
 mod panels;
 mod persist;
 mod render_jobs;
@@ -1114,6 +1117,14 @@ impl TypingTabState {
         if self.mask_layer.is_panel_open() && self.mask_layer.apply_brush_input(input) {
             ctx.request_repaint();
         }
+        // Timed status lines (create toasts, the mask panel's status) are armed and expired FIRST,
+        // before anything can draw them; the end of this fn then sleeps until the next deadline
+        // instead of repainting every frame while one is shown.
+        let now_s = ctx.input(|i| i.time);
+        self.text_overlays.expire_create_statuses(now_s);
+        // Also runs while the «Маска» tab is closed (its body is the only reader), so an error
+        // raised right before closing it is not still waiting there minutes later.
+        self.mask_layer.expire_status_error(ctx);
         // The tab's bottom-hint rows and the binding texts of its panels: every binding text comes
         // from the registry (rebuilt on a rebinding or a language switch).
         self.refresh_input_labels(input_registry);
@@ -1135,6 +1146,9 @@ impl TypingTabState {
         // `begin_preload_all_pages`): applies decoded pages in bounded batches and keeps repainting
         // while active so it drains to completion.
         needs_repaint |= self.text_overlays.drive_page_preload();
+        // Pages the canvas or the «Слои» panel asked for (`request_page_residency`), decoded off the
+        // GUI thread; the worker wakes the GUI for the frame that applies them.
+        needs_repaint |= self.text_overlays.poll_page_residency_loads();
         // If an export was deferred behind the whole-project preload (Phase 2), run it now that the
         // preload pass has drained (and masks are ready and no save is busy). Checked right after
         // `drive_page_preload` so a completion this frame is picked up immediately.
@@ -1237,8 +1251,17 @@ impl TypingTabState {
         self.text_overlays.drive_layer_move_settle(ctx, input);
         self.text_overlays.drive_placement_save_debounce(ctx);
 
-        if needs_repaint || self.text_overlays.wants_repaint() || self.mask_layer.is_panel_open() {
+        // Continuous frames only while work is in flight or a gesture runs (`wants_repaint`; the
+        // mask workers wake nothing themselves). An open mask panel, create editor or layout editor
+        // alone is idle: egui redraws on their input events.
+        if needs_repaint || self.text_overlays.wants_repaint() || self.mask_layer.has_jobs_in_flight() {
             ctx.request_repaint();
+        }
+        if let Some(delay) = timed_status_repaint_delay(
+            now_s,
+            self.text_overlays.create_status_deadlines().chain(self.mask_layer.status_error_hide_at()),
+        ) {
+            ctx.request_repaint_after(delay);
         }
     }
 }
@@ -1768,9 +1791,7 @@ impl CanvasHooks for TypingHooks<'_> {
         // so the tab and the canvas agree within one frame; the sync itself is idempotent.
         let mask_panel_open = self.top_panel.is_mask_panel_open();
         self.mask_layer.set_panel_open(ctx, mask_panel_open);
-        // The mask status line has a TTL and must keep expiring while the panel is
-        // closed — the tab body only runs while it is open.
-        self.mask_layer.expire_status_error(ctx);
+        // (The mask status line's TTL is expired at the start of `TypingTabState::draw`.)
         let tabs_visible = TypingDockTabVisibility::resolve(
             self.top_panel.is_create_text_mode(),
             mask_panel_open,
@@ -3194,8 +3215,14 @@ pub(super) struct TypingTextOverlayLayer {
     /// lands and `poll_editor_font_request` registers it (registration itself needs the
     /// egui `Context` and therefore stays on the GUI thread).
     editor_font_request: Option<TypingEditorFontRequest>,
+    /// Create error / warning toast and its hide deadline in egui input time (`f64::INFINITY` =
+    /// raised off-draw, armed on the next drawn frame: `create_upload.rs::expire_timed_status`).
     create_status_error: Option<(String, f64)>,
     create_status_warning: Option<(String, f64)>,
+    /// True only while `poll_doc_sync_blockers` runs this layer's job polls outside a draw (the
+    /// background poll, the off-draw sync drivers); a create status raised then starts its display
+    /// time on the next drawn frame.
+    polling_off_draw: bool,
     overlays: Vec<TypingOverlayRuntime>,
     pending_upload_indices: VecDeque<usize>,
     pending_upload_set: HashSet<usize>,
@@ -3355,6 +3382,14 @@ pub(super) struct TypingTextOverlayLayer {
     /// while a preload is running; cleared on completion. Decode runs off the GUI thread; the per-frame
     /// `drive_page_preload` applies ready pages in bounded batches through the memoized doc path.
     preload_all_state: Option<TypingPreloadAllState>,
+    /// Background loader that makes single pages resident for the canvas draw and the «Слои» panel
+    /// (`tab/page_residency.rs`). Started on the first request of a chapter, dropped on reload.
+    page_residency_loader: Option<page_residency::TypingPageResidencyLoader>,
+    /// The loader could not be started or died for this chapter: pages load blocking instead.
+    page_residency_loader_failed: bool,
+    /// Bumped whenever a page projection is dropped; a background page load sent under an older
+    /// value is stale and discarded (`invalidate_pending_page_loads`).
+    page_load_generation: u64,
     /// Last computed `(done, total)` of the active/most-recent preload, refreshed each frame by
     /// `drive_page_preload` so `preload_all_pages_progress` is a cheap getter (no doc lock).
     preload_all_progress: (usize, usize),
@@ -3414,6 +3449,7 @@ impl Default for TypingTextOverlayLayer {
             editor_font_request: None,
             create_status_error: None,
             create_status_warning: None,
+            polling_off_draw: false,
             overlays: Vec::new(),
             pending_upload_indices: VecDeque::new(),
             pending_upload_set: HashSet::new(),
@@ -3471,6 +3507,9 @@ impl Default for TypingTextOverlayLayer {
             migration_rx: None,
             pending_migration: None,
             preload_all_state: None,
+            page_residency_loader: None,
+            page_residency_loader_failed: false,
+            page_load_generation: 0,
             preload_all_progress: (0, 0),
             pending_export_after_preload: None,
             centering_assist_enabled: false,

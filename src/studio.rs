@@ -1001,7 +1001,7 @@ impl eframe::App for StudioApp {
         // The session's own commands (the image set's save / save-as); tab commands are read by
         // the drawing tab from the same frame.
         self.session.run_fired_commands(ctx, input_frame);
-        if self.residency.background_loads_pending() {
+        if self.residency.background_loads_need_polling() {
             ctx.request_repaint();
         }
 
@@ -1074,7 +1074,7 @@ impl eframe::App for StudioApp {
         for request in requests {
             self.apply_app_request(request);
         }
-        // The dock's detached panel windows are immediate viewports: they exist only
+        // The dock's detached panel windows are child viewports: they exist only
         // while they are shown every pass, and `PanelDock::end` — which shows them —
         // ran above only if the tab that DREW this pass hosts the dock. Requirement 11
         // of `dev-docs/dockable_panels_plan.md` says they stay open and empty
@@ -1138,9 +1138,9 @@ struct ComicTypeSave {
 
 /// What one `StudioApp::ui` pass did with the panel dock, decided BEFORE the active tab draws.
 ///
-/// The dock's detached sub-windows are immediate viewports and must be shown exactly once per
-/// pass: `PanelDock::end` shows them while a dock host draws, and `show_idle_sub_windows` covers
-/// every other pass. Which of the two applies is a fact about the tab that DREW, and that tab is
+/// The dock's detached sub-windows are child viewports and must be shown exactly once per pass:
+/// `PanelDock::end` shows them (immediate) while a dock host draws, and `show_idle_sub_windows`
+/// covers every other pass (deferred: an idle window then repaints only on its own events). Which of the two applies is a fact about the tab that DREW, and that tab is
 /// not `StudioApp::active_tab` at the end of the pass — the page manager's «open in tab» and the
 /// typing tab's settings deep link both switch tabs right after the draw (`AppRequest::OpenPage`,
 /// `AppRequest::NavigateSettings`), before the idle pass runs. Capturing the verdict up

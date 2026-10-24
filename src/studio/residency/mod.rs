@@ -17,8 +17,8 @@ Key structures:
 Key functions:
 - `PageResidency::spawn`: builds the page metadata and starts the unified loader pool (a refused
   loader thread fails every page, `fail_unstarted_loader`).
-- `PageResidency::poll_decoded`: drains source events (in-order promotion), uploads tiles under the
-  per-frame budget, applies overlays as they arrive.
+- `PageResidency::poll_decoded`: arms the workers' GUI waker, drains source events (in-order
+  promotion), uploads tiles under the per-frame budget, applies overlays as they arrive.
 - `PageResidency::poll_page_cache`: starts the page-cache loader once everything is loaded, drains it.
 - `PageResidency::lend_mut` / `page_infos`: the per-frame loan to the drawing tab.
 - `PageResidency::shutdown`: releases decode workers parked on the look-ahead window.
@@ -35,7 +35,7 @@ mod memory;
 
 use self::decode::{DecodedPage, DecodedTile};
 use self::loader::{
-    LOADER_QUEUE_CAPACITY, LoaderEvent, OverlayLoaderEvent, PageCacheLoaderEvent,
+    GuiWaker, LOADER_QUEUE_CAPACITY, LoaderEvent, OverlayLoaderEvent, PageCacheLoaderEvent, WORKERS_WAKE_GUI, WakingSender,
     collect_missing_page_cache_jobs, collect_overlay_job_candidates,
     should_seed_page_cache_on_initial_load, spawn_loader_thread, spawn_page_cache_loader_thread,
 };
@@ -100,6 +100,9 @@ pub(in crate::studio) struct PageResidency {
     page_cache_loader_rx: Option<Receiver<PageCacheLoaderEvent>>,
     page_cache_loader_started: bool,
     page_cache_loader_finished: bool,
+    /// The GUI wake-up every loader pool sends through (`loader::WakingSender`); armed with the
+    /// context by the first [`PageResidency::poll_decoded`].
+    waker: GuiWaker,
 }
 
 /// Incremental GPU upload of one promoted page: tiles `0..next_tile` are already textures.
@@ -147,8 +150,8 @@ impl PageResidency {
         if let Err(err) = spawn_loader_thread(
             pages,
             collect_overlay_job_candidates(project),
-            tx,
-            overlay_tx,
+            WakingSender::new(tx, residency.waker.clone()),
+            WakingSender::new(overlay_tx, residency.waker.clone()),
             cache_pages_on_initial_load,
             Arc::clone(&residency.decode_promotion_progress),
             Arc::clone(&residency.loader_shutdown),
@@ -206,13 +209,18 @@ impl PageResidency {
             page_cache_loader_rx: None,
             page_cache_loader_started: false,
             page_cache_loader_finished: false,
+            waker: GuiWaker::default(),
         }
     }
 
     /// Per-frame drain of the unified pool, in this order: source events (strict in-order
     /// promotion), the budgeted tile upload, then overlay events (applied to `overlays` as they
-    /// arrive, no promotion). Requests a repaint while source work remains.
+    /// arrive, no promotion). Requests a repaint while promoted pages still wait for the budgeted
+    /// upload; the decode workers wake the GUI themselves when a result arrives (the first call arms
+    /// their waker with `ctx`, before anything is drained), so waiting on them costs no frames
+    /// (except on wasm, see `loader::WORKERS_WAKE_GUI`).
     pub(in crate::studio) fn poll_decoded(&mut self, ctx: &egui::Context, overlays: &Arc<Mutex<CleanOverlaysModel>>) {
+        self.waker.arm(ctx);
         self.poll_loader_events(overlays);
         self.upload_textures_incremental(ctx);
         self.poll_overlay_loader_events(overlays);
@@ -228,11 +236,13 @@ impl PageResidency {
         self.poll_page_cache_loader_events(overlays);
     }
 
-    /// Whether the overlay loader or a started page-cache loader still has work (the caller keeps
-    /// repainting while it does).
-    pub(in crate::studio) fn background_loads_pending(&self) -> bool {
-        !self.overlay_loader_finished
-            || (self.page_cache_loader_started && !self.page_cache_loader_finished)
+    /// Whether the caller must keep repainting to poll the overlay loader or a started page-cache
+    /// loader: only while one still has work AND its workers cannot wake the GUI themselves
+    /// (`loader::WORKERS_WAKE_GUI`, off on wasm); natively their results wake the GUI.
+    pub(in crate::studio) fn background_loads_need_polling(&self) -> bool {
+        let pending = !self.overlay_loader_finished
+            || (self.page_cache_loader_started && !self.page_cache_loader_finished);
+        pending && !WORKERS_WAKE_GUI
     }
 
     /// Whether clean overlays are still being delivered (a late delivery would overwrite a clean
@@ -410,11 +420,9 @@ impl PageResidency {
             }
         }
 
-        if !self.loader_finished
-            || !self.decoded_queue.is_empty()
-            || !self.decoded_pending_by_idx.is_empty()
-            || self.upload_task.is_some()
-        {
+        let upload_pending = !self.decoded_queue.is_empty() || self.upload_task.is_some();
+        let awaiting_workers = !self.loader_finished || !self.decoded_pending_by_idx.is_empty();
+        if source_pipeline_needs_repaint(upload_pending, awaiting_workers, WORKERS_WAKE_GUI) {
             ctx.request_repaint();
         }
     }
@@ -462,7 +470,7 @@ impl PageResidency {
         }
         self.page_cache_loader_started = true;
         let (tx, rx) = sync_channel(LOADER_QUEUE_CAPACITY);
-        match spawn_page_cache_loader_thread(jobs, tx) {
+        match spawn_page_cache_loader_thread(jobs, WakingSender::new(tx, self.waker.clone())) {
             Ok(()) => self.page_cache_loader_rx = Some(rx),
             Err(err) => {
                 // Optional accelerator: give it up for the session (started AND finished), as for
@@ -544,6 +552,15 @@ impl PageResidency {
     }
 }
 
+/// Whether the source pipeline asks for another frame at once. `upload_pending`: promoted pages
+/// wait for the frame-budgeted GPU upload, which only a frame advances, so it always repaints.
+/// `awaiting_workers`: the decode pool has not finished, or decoded pages wait for an earlier one;
+/// that needs a frame only when the workers cannot wake the GUI themselves (`workers_wake_gui`
+/// off, wasm) — otherwise their next result (or their disconnect) wakes it.
+fn source_pipeline_needs_repaint(upload_pending: bool, awaiting_workers: bool, workers_wake_gui: bool) -> bool {
+    upload_pending || (awaiting_workers && !workers_wake_gui)
+}
+
 /// Seeds the shared page RGBA cache of `overlays` from a decoded page that carries its full image.
 fn store_decoded_page_cache(page: &DecodedPage, overlays: &Arc<Mutex<CleanOverlaysModel>>) {
     let Some(image) = page.cache_rgba.as_ref() else {
@@ -565,7 +582,7 @@ fn store_decoded_page_cache(page: &DecodedPage, overlays: &Arc<Mutex<CleanOverla
 
 #[cfg(test)]
 mod tests {
-    use super::{LoaderEvent, PageResidency};
+    use super::{LoaderEvent, PageResidency, source_pipeline_needs_repaint};
     use super::decode::DecodedPage;
     use crate::memory_manager::{MemoryManager, MemoryProfile};
     use crate::models::clean_overlays_model::CleanOverlaysModel;
@@ -665,6 +682,20 @@ mod tests {
         assert!(residency.loader_finished && residency.overlay_loader_finished);
         assert_eq!(residency.decode_promotion_progress.load(Ordering::Acquire), 3);
         assert!(residency.main_pages_fully_loaded());
+    }
+
+    /// The budgeted upload always asks for the next frame; waiting on the decode workers asks for
+    /// one only when they cannot wake the GUI themselves; an idle pipeline never does.
+    #[test]
+    fn the_source_pipeline_repaints_only_for_uploads_or_unwakeable_workers() {
+        for workers_wake_gui in [false, true] {
+            for awaiting_workers in [false, true] {
+                assert!(source_pipeline_needs_repaint(true, awaiting_workers, workers_wake_gui));
+            }
+            assert!(!source_pipeline_needs_repaint(false, false, workers_wake_gui), "idle pipeline");
+        }
+        assert!(!source_pipeline_needs_repaint(false, true, true), "workers wake the GUI themselves");
+        assert!(source_pipeline_needs_repaint(false, true, false), "workers cannot wake: poll");
     }
 
     /// A dropped loader (disconnected channel) counts as finished, so a crashed pool cannot keep

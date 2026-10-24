@@ -44,6 +44,8 @@ FILE HEADER (tabs/cleaning/tab.rs)
     после `canvas.draw` в том же порядке, в каком это делали снесённые плавающие поверхности.
   - `active_cursor_occluder`: вычисляет scene-область активного курсора кисти для скрытия on_top/aside пузырей.
   - `start_text_mask_load_job_if_needed/poll_text_mask_load_job`: фоновые загрузка и применение масок.
+  - `poll_background_jobs`: the `StudioTab::poll_background` body — the text-mask load and quick
+    text clean polls, run every frame whatever tab is active.
   - `start_quick_text_clean_job/poll_quick_text_clean_job`: многопоточная обработка страниц по маске текста
     с прогрессом и применением patch-ов в `CleanOverlaysModel`; pixel-level autoclean algorithm lives in
     `autoclean.rs`.
@@ -1288,6 +1290,18 @@ impl CleaningTabState {
         thread::spawn(move || {
             let _ = tx.send(load_text_masks_from_storage(&storage_dir, &missing_indices));
         });
+    }
+
+    /// The tab's `StudioTab::poll_background` body: drains the text-mask load and the quick text
+    /// clean even while another tab is active, so their results reach `TextMaskModel` /
+    /// `CleanOverlaysModel` (which other tabs read) instead of piling up in the channel — every
+    /// quick-clean page event carries a whole-page patch. The same polls `draw` runs (no `Ui`
+    /// involved), so whichever caller sees an event first applies it, exactly once. Returns
+    /// whether either job is still running: their workers wake no frame.
+    pub(crate) fn poll_background_jobs(&mut self) -> bool {
+        self.poll_text_mask_load_job();
+        self.poll_quick_text_clean_job();
+        self.text_mask_load_in_progress || self.quick_clean_job_in_progress
     }
 
     fn poll_text_mask_load_job(&mut self) {
@@ -3597,6 +3611,23 @@ mod tests {
         assert_eq!(scale_edge_to_i32(f64::from(i32::MIN) - 1.0, false), None);
         assert_eq!(scale_edge_to_i32(2.3, false), Some(2));
         assert_eq!(scale_edge_to_i32(2.3, true), Some(3));
+    }
+
+    /// The background poll applies the quick text clean's events without a draw: it reports the
+    /// job as running while its worker is silent and as done once the finish event was applied.
+    #[test]
+    fn the_background_poll_drains_the_quick_clean_job_without_a_draw() {
+        let mut state = CleaningTabState::default();
+        assert!(!state.poll_background_jobs(), "no job, nothing to keep polling");
+        let (tx, rx) = std::sync::mpsc::channel::<super::QuickTextCleanJobEvent>();
+        state.quick_clean_job_rx = Some(rx);
+        state.quick_clean_job_in_progress = true;
+        assert!(state.poll_background_jobs(), "a silent running job keeps the poll going");
+        tx.send(super::QuickTextCleanJobEvent::Started { total_pages: 3 }).expect("the receiver is alive");
+        tx.send(super::QuickTextCleanJobEvent::Finished).expect("the receiver is alive");
+        assert!(!state.poll_background_jobs(), "the finish event ends the job");
+        assert!(state.quick_clean_job_rx.is_none());
+        assert_eq!(state.quick_clean_progress.total_pages, 3);
     }
 }
 

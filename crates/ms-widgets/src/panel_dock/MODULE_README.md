@@ -290,7 +290,8 @@ at least one caption. Rules:
   Embedded-mode re-dock (`sub_windows_to_redock`), the lifecycle questions (`next_sub_window_index`,
   `obsolete_sub_windows`, `geometry_changed`), the menu destinations (`MoveTarget`,
   `move_targets`) and the window NAMES the menu and the OS title bar share (`sub_window_name`,
-  `sub_window_title`, `move_target_label`), plus the two egui plumbing helpers
+  `sub_window_title`, `move_target_label`), the idle-window hand-over (`IdleWindowReport`,
+  `IdleWindowTake`), plus the two egui plumbing helpers
   (`sub_window_viewport_id`, `sub_window_builder`). Everything but the last two is pure; the
   naming helpers are pure apart from the catalog lookup.
 - `drag.rs`: the reorganisation gestures. `DragSession` (a panel move in flight, owned by
@@ -463,10 +464,36 @@ differently at the same place on screen.
 ### Sub-windows (plan §4.9)
 A tab (or a whole panel) can be moved into a real OS window. The panel's `HostId` becomes
 `SubWindow(index)`, and `PanelDock::end` draws one `ctx.show_viewport_immediate` per window,
-EVERY frame — an immediate viewport exists only while it is shown. Immediate, never deferred:
-the deferred form needs `Fn + Send + Sync + 'static`, which the caller's tab bodies (borrowing
-the typing tab's hundred-field states) cannot satisfy. Parent and child therefore repaint
-together; that is the accepted price and must not be "optimised" away.
+EVERY frame — a child viewport exists only while it is shown. Immediate while a program tab of
+the dock draws: the deferred form needs `Fn + Send + Sync + 'static`, which the caller's tab
+bodies (borrowing the typing tab's hundred-field states) cannot satisfy. Parent and child
+therefore repaint together; for a window showing a program tab's panels that is the accepted
+price and must not be "optimised" away.
+
+**Idle windows are deferred.** On a frame where no program tab of the dock draws,
+`PanelDockState::show_idle_sub_windows` shows every window with `show_viewport_deferred`: a
+`'static` callback that draws only the neutral background, so an idle window repaints on its own
+events (resize, move, close, pointer) and not with every main-window frame. Contracts:
+* the SAME `ViewportId` (`sub_window_viewport_id`) and builder (`sub_window_builder`, start
+  position applied once through `opened_sub_windows`) in both forms: eframe re-classes a live
+  viewport in place in both directions and recreates the OS window only when the builder asks for
+  it (fork `crates/egui/crates/eframe/src/native/glow_integration.rs:1813-1837`);
+* what the idle window observes — its close button and `outer_rect` / `inner_rect` — goes into its
+  `window::IdleWindowReport` (shared `Arc<Mutex<…>>`, slot in `PanelDockState::idle_windows`); the
+  callback wakes the main window only when the report holds something new, and the next
+  `show_idle_sub_windows` or `PanelDock::end` takes it: a close goes through `close_sub_window`, a
+  geometry through the same sanitize-then-compare rule as the immediate form, so both reach
+  persistence exactly as before;
+* the slot map exists only while windows are idle: `show_sub_windows` takes every report and clears
+  it. A window's FIRST idle pass (just idled, or new) is shown immediate and empty, the old way,
+  which paints it grey for sure; it turns deferred from the next pass. A `request_repaint_of` would
+  not do: egui forwards it only when it shortens the viewport's pending delay, which a just-idled
+  window may keep at zero from its last immediate pass (fork `crates/egui/crates/egui/src/context.rs:159`),
+  and a new window has no OS window yet when the request is made;
+* the callback holds only its report slot and the main `ViewportId`, never the dock state or a
+  caller's data. A window stops existing on the first main-window pass that does not show it
+  (egui drops the viewport and its callback), so a closed, re-docked or torn-down studio leaves
+  nothing alive — the same lifetime rule as the immediate form.
 
 **Only in Separate mode.** Whether the dock may open sub-windows at all is decided by
 `ms_widgets::embedded_window::effective_mode(ctx)` — the one owner of the secondary-window

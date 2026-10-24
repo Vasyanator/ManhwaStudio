@@ -28,6 +28,7 @@ Key structures:
 - `DetachTrigger`: which rule decided that a drag left the window.
 - `DragEndContext`: everything a detach verdict is allowed to look at.
 - `MoveTarget`: one destination of the «Переместить в окно →» submenu.
+- `IdleWindowReport`: what an IDLE (deferred) sub-window observed in its own pass.
 
 Key functions:
 - `drag_tension`, `detach_trigger`, `detach_verdict`
@@ -35,6 +36,7 @@ Key functions:
 - `next_sub_window_index`, `obsolete_sub_windows`
 - `move_targets`, `move_target_label`, `sub_window_name`, `sub_window_title`
 - `sub_window_viewport_id`, `sub_window_builder`
+- `IdleWindowReport::record` / `take`: the hand-over from an idle window's pass to the main one
 
 Notes:
 NO GLOBAL CURSOR POSITION EXISTS. egui exposes none at all, and on Wayland
@@ -46,13 +48,20 @@ the pointer left the window while a button was held (`PointerGone` clears
 `egui-0.35.0/src/input_state/mod.rs:1200-1210`), and how far outside the dock
 area the pointer is — the only "how far out" a window can measure at all.
 
-IMMEDIATE, NOT DEFERRED. `Context::show_viewport_immediate` takes an `FnMut` with
-no `Send`/`Sync`/`'static` bound (`egui-0.35.0/src/context.rs:4014`), which is the
-only reason a sub-window can run the caller's tab bodies at all: the deferred form
-(`context.rs:3960`) requires `Fn + Send + Sync + 'static` and would force an
-`Arc<Mutex<…>>` around the typing tab's hundred-field states. The price is that
-parent and child repaint together (`egui-0.35.0/src/viewport.rs:29-32`); that is
-accepted and must not be "optimised" into the deferred form.
+IMMEDIATE WHILE IT HOLDS PANELS, DEFERRED WHILE IDLE. `Context::show_viewport_immediate`
+takes an `FnMut` with no `Send`/`Sync`/`'static` bound (fork
+`crates/egui/crates/egui/src/context.rs:4123`), which is the only reason a sub-window
+can run the caller's tab bodies at all: the deferred form (`context.rs:4069`)
+requires `Fn + Send + Sync + 'static` and would force an `Arc<Mutex<…>>` around the
+typing tab's hundred-field states. The price is that parent and child repaint
+together (`egui/src/viewport.rs:27-31`); for a window drawing a program tab's panels
+that is accepted and must not be "optimised" into the deferred form. An IDLE window
+(no program tab of the dock draws: `PanelDockState::show_idle_sub_windows`) draws
+nothing but the neutral background, so it IS shown deferred: it then repaints only on
+its own events, and what it observes (close button, geometry) reaches the main
+window through an `IdleWindowReport`. Both forms use the same `ViewportId` and
+builder, and eframe re-classes an existing viewport in place without recreating the
+OS window (fork `crates/egui/crates/eframe/src/native/glow_integration.rs:1813-1837`).
 */
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -519,6 +528,68 @@ pub fn geometry_changed(stored: &SubWindowNode, pos: Option<Pos2>, size: Vec2) -
     moved || resized
 }
 
+/// What an IDLE sub-window — shown deferred, repainting on its own events only —
+/// observed in its own passes and the main window has not applied yet.
+///
+/// Shared between the window's `'static` callback (which records) and
+/// `PanelDockState` (which takes it on the main window's next pass) through an
+/// `Arc<Mutex<…>>`: a deferred viewport's pass runs outside the main window's, so
+/// this is the only way its close button and geometry reach the layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct IdleWindowReport {
+    /// The window's close button was pressed and the main window has not taken it yet.
+    close_requested: bool,
+    /// The window's last reported `ViewportInfo::outer_rect` (`None` on Wayland).
+    outer: Option<Rect>,
+    /// The window's last reported `ViewportInfo::inner_rect` (`None` on Wayland).
+    inner: Option<Rect>,
+    /// `outer` / `inner` changed since the main window last took them.
+    geometry_pending: bool,
+}
+
+/// One take of an [`IdleWindowReport`]: what the main window must apply.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct IdleWindowTake {
+    /// Close the window (its panels return to the main window).
+    pub close_requested: bool,
+    /// New `(outer_rect, inner_rect)` to fold into the stored geometry, if any.
+    pub geometry: Option<(Option<Rect>, Option<Rect>)>,
+}
+
+impl IdleWindowReport {
+    /// Records one pass of the idle window. Returns `true` when the main window
+    /// must be woken to apply it: a close request it has not seen yet, or a
+    /// geometry that differs from the last one recorded. A pass that observed
+    /// nothing new returns `false`, so an idle window repainting on its own costs
+    /// the main window nothing.
+    pub fn record(&mut self, close_requested: bool, outer: Option<Rect>, inner: Option<Rect>) -> bool {
+        let mut wake = false;
+        if close_requested && !self.close_requested {
+            self.close_requested = true;
+            wake = true;
+        }
+        if (outer, inner) != (self.outer, self.inner) {
+            self.outer = outer;
+            self.inner = inner;
+            self.geometry_pending = true;
+            wake = true;
+        }
+        wake
+    }
+
+    /// Takes what is pending and resets it; the last geometry stays recorded so
+    /// an unchanged report does not wake the main window again.
+    pub fn take(&mut self) -> IdleWindowTake {
+        let take = IdleWindowTake {
+            close_requested: self.close_requested,
+            geometry: self.geometry_pending.then_some((self.outer, self.inner)),
+        };
+        self.close_requested = false;
+        self.geometry_pending = false;
+        take
+    }
+}
+
 /// Stable viewport id of one sub-window.
 ///
 /// Derived from a literal salt plus the window's index — never from the localised
@@ -955,5 +1026,35 @@ mod tests {
     fn the_viewport_id_depends_only_on_the_index() {
         assert_eq!(sub_window_viewport_id(2), sub_window_viewport_id(2));
         assert_ne!(sub_window_viewport_id(2), sub_window_viewport_id(3));
+    }
+
+    /// An idle window wakes the main window only for something new: the first
+    /// close request and each changed geometry; a repeated report does not.
+    #[test]
+    fn an_idle_report_wakes_the_main_window_only_for_news() {
+        let mut report = IdleWindowReport::default();
+        assert!(!report.record(false, None, None), "nothing observed");
+        let outer = Some(Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(300.0, 200.0)));
+        let inner = Some(Rect::from_min_size(Pos2::new(12.0, 40.0), Vec2::new(296.0, 178.0)));
+        assert!(report.record(false, outer, inner), "a new geometry");
+        assert!(!report.record(false, outer, inner), "the same geometry again");
+        assert!(report.record(true, outer, inner), "the close button");
+        assert!(!report.record(true, outer, inner), "a close already pending");
+    }
+
+    /// A take hands over exactly what is pending and resets it; the recorded
+    /// geometry survives the take, so an unchanged window stays quiet afterwards,
+    /// and a later close is reported again.
+    #[test]
+    fn an_idle_report_take_resets_what_was_pending() {
+        let mut report = IdleWindowReport::default();
+        assert_eq!(report.take(), IdleWindowTake::default());
+        let inner = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, 240.0)));
+        assert!(report.record(true, None, inner));
+        assert_eq!(report.take(), IdleWindowTake { close_requested: true, geometry: Some((None, inner)) });
+        assert_eq!(report.take(), IdleWindowTake::default());
+        assert!(!report.record(false, None, inner));
+        assert!(report.record(true, None, inner), "a new close after the take");
+        assert_eq!(report.take(), IdleWindowTake { close_requested: true, geometry: None });
     }
 }

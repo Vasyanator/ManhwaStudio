@@ -278,6 +278,7 @@ impl TypingTextOverlayLayer {
                 if !routed {
                     // No doc wired / page not resident: drop the raster cache too so it reloads.
                     self.raster_layers_by_page.remove(&page_idx);
+                    self.invalidate_pending_page_loads();
                 }
             }
             Err(e) => ms_log::runtime_log::log_warn(format!(
@@ -479,8 +480,10 @@ impl TypingTextOverlayLayer {
 
     /// Polls every in-flight job that makes [`Self::maybe_reproject_from_doc_version`] back off
     /// (placement save, create / effects / edit renders) — the same non-blocking `try_recv` polls
-    /// `draw` runs — for the off-draw sync drivers above.
+    /// `draw` runs — for the off-draw sync drivers above. A create status raised by one of them
+    /// starts its display time on the next drawn frame (`polling_off_draw`).
     fn poll_doc_sync_blockers(&mut self, ctx: &egui::Context) {
+        self.polling_off_draw = true;
         // The "did anything change" flags only drive `draw`'s repaint; every off-draw caller requests
         // a repaint itself while it is not ready.
         self.poll_save_jobs(ctx);
@@ -488,6 +491,23 @@ impl TypingTextOverlayLayer {
         self.poll_create_raster_jobs(ctx);
         self.poll_raster_effects_jobs(ctx);
         self.poll_edit_overlay_jobs(ctx);
+        self.polling_off_draw = false;
+    }
+
+    /// The tab's `StudioTab::poll_background` body: applies finished doc-first jobs (create
+    /// overlay / raster, raster effects, edit renders — each writes the shared `LayerDoc` when
+    /// polled — and the placement save, whose poll re-fires a parked save) even while the typing
+    /// tab is not drawn, so the PS editor sees them and a parked write is not stranded until the
+    /// user returns. Polling only, no re-projection (that stays with `draw` and the explicit
+    /// off-draw drivers). Returns whether any of those jobs is still in flight: their workers wake
+    /// no frame, so the caller keeps a slow repaint going meanwhile.
+    pub(super) fn poll_doc_jobs_in_background(&mut self, ctx: &egui::Context) -> bool {
+        self.poll_doc_sync_blockers(ctx);
+        self.save_rx.is_some()
+            || self.create_render_state.is_some()
+            || self.create_raster_state.is_some()
+            || self.raster_effects_state.is_some()
+            || self.edit_render_rx.is_some()
     }
 
     /// Page pixel size `[w, h]` for `page_idx`, resolved lazily from the cached page image path
@@ -519,125 +539,26 @@ impl TypingTextOverlayLayer {
         out
     }
 
-    /// (Re)loads the PS raster layers for `page_idx` if not already cached for it.
+    /// (Re)loads the PS raster layers for `page_idx` if not already cached for it, BLOCKING on the
+    /// disk read and decode (`page_residency::load_page_from_disk`). For actions that need the page
+    /// resident at once (raster creation, the export / flatten residency pass); the canvas draw and
+    /// the «Слои» panel use the non-blocking `request_page_residency` instead.
     ///
     /// With a shared `LayerDoc`, decodes the full page payload before acquiring the doc lock, then
     /// inserts it with a brief lock and projects the doc-authoritative state. If that decode cannot
-    /// produce a resident doc page, falls back to the disk-backed cache for doc-less callers.
+    /// produce a resident doc page, falls back to the disk-backed cache (`apply_page_load`).
     pub(super) fn ensure_raster_layers_for_page(&mut self, page_idx: usize) {
         if self.raster_layers_by_page.contains_key(&page_idx) {
             return;
         }
-        let Some(primary) = self.layers_primary_dir.clone() else {
-            // An empty projection not taken from the doc: no page revision describes it.
-            self.projected_page_revision.remove(&page_idx);
-            self.raster_layers_by_page.insert(page_idx, Vec::new());
-            self.bands_by_page.insert(page_idx, Vec::new());
-            self.groups_by_page.insert(page_idx, Vec::new());
+        let Some(request) = self.page_load_request(page_idx) else {
+            self.insert_empty_page_projection(page_idx);
             return;
         };
-        let fallback = self.layers_fallback_dir.clone();
-        // The shared doc is the source of truth. Decode its owned payload before locking it: this
-        // performs all disk I/O and PNG decoding, while insertion below is only a cheap move.
-        let populated_from_doc = if let Some(doc) = self.layer_doc.clone() {
-            // The legacy ribbon migration requires every page's aspect ratio, not just this page.
-            let page_sizes = self.page_sizes_map();
-            match ms_models::layer_model::layer_doc::LayerDoc::decode_page_payload(
-                page_idx,
-                &primary,
-                fallback.as_deref(),
-                self.doc_legacy_text_dir.as_deref(),
-                &page_sizes,
-            ) {
-                Ok(payload) => {
-                    if let Ok(mut doc_guard) = doc.lock() {
-                        doc_guard.insert_decoded_page(page_idx, payload);
-                        self.sync_from_doc(page_idx, &doc_guard);
-                        true
-                    } else {
-                        false
-                    }
-                }
-                Err(err) => {
-                    ms_log::runtime_log::log_warn(format!(
-                        "[typing] layer payload decode for page {page_idx} failed: {err}"
-                    ));
-                    // A resident page remains valid after a disk decode failure, so preserve its live
-                    // edits by projecting it instead of replacing it with disk-loaded state.
-                    if let Ok(doc_guard) = doc.lock()
-                        && doc_guard.page(page_idx).is_some()
-                    {
-                        self.sync_from_doc(page_idx, &doc_guard);
-                        true
-                    } else {
-                        false
-                    }
-                }
-            }
-        } else {
-            false
-        };
-
-        if !populated_from_doc {
-            // Without a resident shared-doc page, the disk cache remains the source of truth. No doc
-            // revision describes this projection, so the page reads as possibly stale until the doc
-            // path re-projects (or adopts) it.
-            self.projected_page_revision.remove(&page_idx);
-            let bands = ms_models::layer_model::persist::load_page_bands(
-                &primary,
-                fallback.as_deref(),
-                page_idx,
-            );
-            self.bands_by_page.insert(page_idx, bands);
-            let (groups, layers) = match ms_models::layer_model::persist::load_page_rasters(
-                &primary,
-                fallback.as_deref(),
-                page_idx,
-            ) {
-                Ok(page) => (page.groups, page
-                    .layers
-                    .into_iter()
-                    .map(|l| TypingRasterLayer {
-                        uid: l.uid,
-                        name: l.name,
-                        visible: l.visible,
-                        opacity: l.opacity,
-                        transform: l.transform,
-                        image: l.image,
-                        base_file: l.base_file,
-                        effects: l.effects,
-                        deform: l.deform,
-                        mask_clip_enabled: l.mask_clip.unwrap_or(false),
-                        group_uid: l.group_uid,
-                        clipped_image: None,
-                        texture: None,
-                    })
-                    .collect()),
-                Err(err) => {
-                    ms_log::runtime_log::log_warn(format!(
-                        "[typing] load PS raster layers for page {page_idx} failed: {err}"
-                    ));
-                    (Vec::new(), Vec::new())
-                }
-            };
-            self.groups_by_page.insert(page_idx, groups);
-            self.raster_layers_by_page.insert(page_idx, layers);
-        }
-
-        // A just-created raster is selected from the final source-of-truth projection, whether that
-        // was the shared doc or the disk fallback.
-        if let Some((pending_page, uid)) = self.pending_select_raster_uid.clone()
-            && pending_page == page_idx
-            && let Some(idx) = self
-                .raster_layers_by_page
-                .get(&page_idx)
-                .and_then(|layers| layers.iter().position(|layer| layer.uid == uid))
-        {
-            self.selected_raster_idx = Some(idx);
-            self.selected_raster_page = Some(page_idx);
-            self.selected_overlay_idx = None;
-            self.pending_select_raster_uid = None;
-        }
+        // The legacy ribbon migration requires every page's aspect ratio, not just this page.
+        let page_sizes = if request.with_doc { self.page_sizes_map() } else { HashMap::new() };
+        let outcome = load_page_from_disk(&request, &page_sizes);
+        self.apply_page_load(&request, outcome);
     }
 
     /// Rebuilds the per-page projections (`raster_layers_by_page`, `overlays`, `bands_by_page`) for
