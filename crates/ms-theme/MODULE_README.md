@@ -31,7 +31,8 @@ included); it depends on no workspace crate.
 - `src/lib.rs`: crate root, `base_style`, `install`, `apply`, `with_scoped_global_style`,
   re-export of `Severity`.
 - `src/status.rs`: `Severity` (`Info`/`Success`/`Warning`/`Error`) and its `color()`; the
-  panel-text constants `ERROR`, `WARNING`, `SUCCESS`, `INFO`, plus `DESTRUCTIVE_ARMED_FILL` and
+  panel-text constants `ERROR`, `WARNING`, `SUCCESS`, `INFO`, plus the two-step destructive
+  button fills `DESTRUCTIVE_IDLE_FILL` (at rest) / `DESTRUCTIVE_ARMED_FILL` (armed) and
   `ON_STATUS_FILL` (a glyph painted on an `ERROR`/`WARNING` fill, e.g. a "!" badge).
 - `src/canvas.rs`: chrome drawn over content — selection accent, neutral border, outline
   backing, crop frame/shade, split line/handle/grip, refused/occupied tool state, mask tint,

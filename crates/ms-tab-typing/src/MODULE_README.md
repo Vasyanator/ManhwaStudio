@@ -616,7 +616,8 @@ saving, and export.
   - `create_state.rs`: `TypingCreatePanelState` construction, focus/eyedropper tracking, font-group
     management and font-index lookup.
   - `create_render_data.rs`: render-data/effects/font-profile/shape-layout JSON building + profile sync.
-  - `create_presets.rs`: global create-preset UI (apply, create, rename, save, delete) and the
+  - `create_presets.rs`: global create-preset UI (drawn by `ms_widgets::PresetPicker`; this file
+    owns what apply, create, rename, save and delete do) and the
     formula-preset apply/save UI, font-combo binding, face-index clamp.
     Also owns the preset SIDE of `fonts/presets.json`: the OFF-THREAD seed
     (`spawn_presets_seed` -> `read_presets_seed`), the deferred one-shot migration out of

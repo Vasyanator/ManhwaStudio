@@ -154,7 +154,7 @@ impl Shared {
 pub(crate) fn allocate_request_id(counter: &AtomicU64, pending: &HashMap<u64, Pending>) -> u64 {
     loop {
         // The closure always returns `Some`, so both arms carry the previous value.
-        let (Ok(id) | Err(id)) = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| Some(if id >= MAX_WIRE_ID { 1 } else { id + 1 }));
+        let (Ok(id) | Err(id)) = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |id| Some(if id >= MAX_WIRE_ID { 1 } else { id + 1 }));
         // A counter that was ever set out of range is brought back into it.
         let id = if (1..=MAX_WIRE_ID).contains(&id) { id } else { 1 };
         if !pending.contains_key(&id) {

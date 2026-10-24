@@ -60,7 +60,7 @@ use ms_config::single_image::{IMAGE_SET_CONFIRM_COUNT, IMAGE_SET_CONFIRM_DECODED
 use ms_log::runtime_log;
 use serde_json::Value;
 
-use crate::{ComicType, PixelDigest, ProjectData, SessionKind, SingleImageSession, SkippedSource, SourceImageFacts, SourceImageFormat};
+use crate::{PixelDigest, ProjectData, SessionKind, SingleImageSession, SkippedSource, SourceImageFacts, SourceImageFormat};
 
 /// Title directory name inside a session root.
 const SCRATCH_TITLE_DIR: &str = "title";
@@ -726,10 +726,12 @@ pub fn open_image_set(
         return Err(SingleImageError::Cancelled);
     }
 
-    // D4: seed `comic_type` so the load yields `Some(Pages)` and no comic-type prompt opens.
+    // D4: seed `comic_type` so the load yields `Some(Pages)` and no comic-type prompt opens, and
+    // the per-title layout marker so the whole layout comes from the «Pages» preset instead of the
+    // user's legacy global values.
     let settings_file = scratch.root().join(SCRATCH_TITLE_DIR).join(ms_config::PROJECT_SETTINGS_FILE);
-    crate::save_comic_type_to_project_file(&settings_file, ComicType::Pages, ms_docstore::Durability::Contents)
-        .map_err(|err| io_error("seed scratch comic type", &settings_file, io::Error::other(err)))?;
+    crate::seed_image_set_title(&settings_file, ms_docstore::Durability::Contents)
+        .map_err(|err| io_error("seed scratch title settings", &settings_file, io::Error::other(err)))?;
 
     let mut data = ProjectData::load(&chapter_dir, user_settings).map_err(|err| SingleImageError::ProjectLoad { reason: format!("{err:#}") })?;
     check_loaded_pages(&data, opened.len(), &chapter_dir)?;

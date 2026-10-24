@@ -12,6 +12,13 @@ Main types:
   `SettingsTabState::from_seed` and `set_canvas_settings_binding` perform no I/O. A later
   dictionary change (words revision bump) re-reads `SpellcheckWordsSeed` on a short-lived
   worker (`SpellcheckWordsReload`, polled by `refresh_spellcheck_words_if_needed`).
+- `TitleLayoutSeed`: the bound title's layout preset selection and kind plus the app-wide layout
+  preset store, passed to the binding. The pane's title-kind row hands a changed kind to the studio
+  through `take_title_kind_change`; the first-open prompt's choice comes in through
+  `apply_title_kind_layout`. The preset picker itself is `canvas_layout_presets.rs`.
+- The canvas pane re-reads `BubblesModel`'s canvas snapshot whenever its canvas revision moved
+  (`refresh_canvas_settings_from_model`), so a value a canvas changed itself (the ribbon dock
+  tab's «show bubbles» / opacity) is never overwritten by the pane's next publish.
 
 Section identity is the cross-surface `crate::settings_shared::SettingsSectionId`; the
 tab bar and studio section order come from `settings_shared::sections_for(Studio)` and
@@ -29,6 +36,7 @@ Flow:
   `crate::ai_backend_supervisor` (owned by `startup::run_native`, not by this tab).
 */
 
+mod canvas_layout_presets;
 mod canvas_ribbon;
 mod general;
 mod hotkeys;
@@ -45,7 +53,10 @@ use crate::memory_manager::{MemoryManager, MemoryProfile};
 use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings};
 use crate::models::SessionCapabilities;
 use crate::models::clean_overlays_model::CleanOverlaysModel;
-use crate::project::{ComicType, save_comic_type_to_project_file};
+use crate::project::{
+    BuiltinLayoutPreset, CanvasLayout, CanvasLayoutPresets, ComicType, LayoutPresetSelection,
+    save_comic_type_to_project_file, save_layout_preset_selection,
+};
 use crate::runtime_log;
 use crate::settings_shared::{
     SettingsDeepLink, SettingsSectionId, SettingsSurface, SharedSettingsPanels,
@@ -109,18 +120,23 @@ pub(super) struct WordListSaveFailure {
 #[derive(Debug, Clone)]
 pub(super) struct CanvasSettingsSaveRequest {
     pub(super) snapshot: SharedCanvasSettings,
-    pub(super) comic_type: ComicType,
+    /// The title's selected layout preset (`canvas.layout_preset`), written with every save.
+    pub(super) layout_preset: LayoutPresetSelection,
+    /// A title kind chosen in the pane since the previous request (`comic_type`); `None` = the
+    /// kind did not change, nothing to write.
+    pub(super) title_kind: Option<ComicType>,
     pub(super) custom_spellcheck_words: Option<String>,
     pub(super) project_spellcheck_words: Option<String>,
 }
 
 impl CanvasSettingsSaveRequest {
-    /// Coalesces a queued request with a `newer` one: the newer snapshot wins, and a word
-    /// list the newer request does not carry keeps this request's pending edit.
+    /// Coalesces a queued request with a `newer` one: the newer snapshot and selection win, and a
+    /// title kind or word list the newer request does not carry keeps this request's pending edit.
     fn absorb_newer(self, newer: Self) -> Self {
         Self {
             snapshot: newer.snapshot,
-            comic_type: newer.comic_type,
+            layout_preset: newer.layout_preset,
+            title_kind: newer.title_kind.or(self.title_kind),
             custom_spellcheck_words: newer.custom_spellcheck_words.or(self.custom_spellcheck_words),
             project_spellcheck_words: newer.project_spellcheck_words.or(self.project_spellcheck_words),
         }
@@ -136,6 +152,90 @@ fn words_to_send(current: &str, synced: &mut Option<String>) -> Option<String> {
     }
     *synced = Some(current.to_owned());
     Some(current.to_owned())
+}
+
+/// The bound title's layout preset selection and kind as loaded
+/// (`CanvasSettings::layout_preset`, `ProjectData::comic_type`) and the app-wide layout preset
+/// store decoded from the pre-read `user_config` (`CanvasLayoutPresets::from_user_config`), handed
+/// to [`SettingsTabState::set_canvas_settings_binding`].
+#[derive(Debug, Clone, Default)]
+pub struct TitleLayoutSeed {
+    /// The selected layout preset (`canvas.layout_preset`).
+    pub layout_preset: LayoutPresetSelection,
+    /// The title kind (`comic_type`); `None` until the first-open prompt is answered.
+    pub kind: Option<ComicType>,
+    /// The app-wide layout presets (`user_config` `Canvas.layout_presets`).
+    pub layout_presets: CanvasLayoutPresets,
+    /// The `user_config` document preset operations persist to; `None` keeps them in memory
+    /// (every test construction: a test must never write the real `user_config`).
+    pub layout_preset_store: Option<PathBuf>,
+}
+
+/// The bound title's kind and layout preset selection as the canvas pane edits them, with the
+/// two hand-offs of a kind chosen in the pane (one save request, one studio pickup). Pure state.
+#[derive(Debug, Default)]
+pub(super) struct TitleLayoutState {
+    /// The selected layout preset (`canvas.layout_preset`), saved with every canvas-settings save.
+    pub(super) layout_preset: LayoutPresetSelection,
+    /// The title kind (`comic_type`) the «Тип тайтла» row shows.
+    pub(super) kind: Option<ComicType>,
+    /// A kind chosen in the pane and not yet handed to a save request.
+    kind_unsaved: Option<ComicType>,
+    /// A kind chosen in the pane and not yet taken by the studio.
+    kind_change: Option<ComicType>,
+}
+
+impl TitleLayoutState {
+    /// The state of a freshly bound title with `layout_preset` selected and kind `kind`: nothing
+    /// pending.
+    fn bound(layout_preset: LayoutPresetSelection, kind: Option<ComicType>) -> Self {
+        Self { layout_preset, kind, kind_unsaved: None, kind_change: None }
+    }
+
+    /// Records a kind chosen in the «Тип тайтла» row for one save and one studio pickup; the
+    /// layout is not touched (kind and layout preset are independent). Returns whether it changed.
+    pub(super) fn choose_kind(&mut self, kind: ComicType) -> bool {
+        if self.kind == Some(kind) {
+            return false;
+        }
+        self.kind = Some(kind);
+        self.kind_unsaved = Some(kind);
+        self.kind_change = Some(kind);
+        true
+    }
+
+    /// Records the first-open prompt's kind (saved and picked up by the studio already) and
+    /// returns its built-in preset (`None` for `Custom`).
+    fn record_prompt_kind(&mut self, kind: ComicType) -> Option<BuiltinLayoutPreset> {
+        self.kind = Some(kind);
+        BuiltinLayoutPreset::for_kind(Some(kind))
+    }
+
+    /// Copies `layout` (the effective values of `preset`) into `settings` and selects `preset`.
+    fn select_builtin(&mut self, preset: BuiltinLayoutPreset, layout: &CanvasLayout, settings: &mut SharedCanvasSettings) {
+        settings.apply_layout(layout);
+        self.layout_preset = LayoutPresetSelection::Builtin(preset);
+    }
+
+    /// The kind waiting for a save request, taken once.
+    fn take_unsaved_kind(&mut self) -> Option<ComicType> {
+        self.kind_unsaved.take()
+    }
+
+    /// The kind waiting for the studio, taken once.
+    fn take_kind_change(&mut self) -> Option<ComicType> {
+        self.kind_change.take()
+    }
+}
+
+/// Copies `model`'s canvas snapshot into `settings` when the model's canvas revision differs from
+/// `*seen` (the revision `settings` was last read at or written with), and records the revision.
+fn adopt_newer_model_canvas(model: &BubblesModel, settings: &mut SharedCanvasSettings, seen: &mut u64) {
+    let revision = model.canvas_revision();
+    if revision != *seen {
+        *settings = model.canvas_snapshot();
+        *seen = revision;
+    }
 }
 
 /// Reacts to a failed write of `failed`: when it is still the baseline (no newer text was
@@ -164,6 +264,14 @@ pub struct SettingsTabState {
     saved_hanging_punctuation: String,
     project_settings_file: PathBuf,
     canvas_settings: SharedCanvasSettings,
+    /// The bound title's kind and layout preset selection (not part of `SharedCanvasSettings`:
+    /// only this pane edits them).
+    title_layout: TitleLayoutState,
+    /// The layout preset picker and the app-wide preset store (`canvas_layout_presets.rs`).
+    layout_presets: canvas_layout_presets::LayoutPresetsPane,
+    /// `BubblesModel::canvas_revision` of `canvas_settings` (0 = never read: the first draw pulls
+    /// the model's snapshot).
+    canvas_revision_seen: u64,
     bubbles_model: Option<Arc<Mutex<BubblesModel>>>,
     clean_overlays_model: Option<Arc<Mutex<CleanOverlaysModel>>>,
     canvas_settings_runtime: Option<CanvasSettingsRuntime>,
@@ -321,6 +429,9 @@ impl SettingsTabState {
             saved_hanging_punctuation: hanging_punctuation,
             project_settings_file: PathBuf::new(),
             canvas_settings: SharedCanvasSettings::default(),
+            title_layout: TitleLayoutState::default(),
+            layout_presets: canvas_layout_presets::LayoutPresetsPane::default(),
+            canvas_revision_seen: 0,
             bubbles_model: None,
             clean_overlays_model: None,
             canvas_settings_runtime: None,
@@ -365,14 +476,16 @@ impl SettingsTabState {
 
 impl SettingsTabState {
     /// Binds the canvas pane to a project: its settings document `project_settings_file`, the
-    /// starting canvas settings, the two shared models, and the spellcheck word lists `words`
-    /// pre-read for that same document ([`SpellcheckWordsSeed::read_blocking`]). Sets the
-    /// process-global project spellcheck target and (re)starts the canvas-settings saver thread;
-    /// no file or document read here.
+    /// starting canvas settings, the title's selected layout preset and kind plus the app-wide
+    /// preset store and where its operations persist (`title`), the two
+    /// shared models, and the spellcheck word lists `words` pre-read for that same document
+    /// ([`SpellcheckWordsSeed::read_blocking`]). Sets the process-global project spellcheck target
+    /// and (re)starts the canvas-settings saver thread; no file or document read here.
     pub fn set_canvas_settings_binding(
         &mut self,
         project_settings_file: PathBuf,
         initial_canvas_settings: SharedCanvasSettings,
+        title: TitleLayoutSeed,
         bubbles_model: Arc<Mutex<BubblesModel>>,
         clean_overlays_model: Arc<Mutex<CleanOverlaysModel>>,
         words: SpellcheckWordsSeed,
@@ -384,6 +497,11 @@ impl SettingsTabState {
 
         self.project_settings_file = project_settings_file.clone();
         self.canvas_settings = initial_canvas_settings;
+        // Re-read from the model on the first draw (its revision is unknown here).
+        self.canvas_revision_seen = 0;
+        let TitleLayoutSeed { layout_preset, kind, layout_presets, layout_preset_store } = title;
+        self.title_layout = TitleLayoutState::bound(layout_preset, kind);
+        self.layout_presets.rebind(layout_presets, layout_preset_store, &mut self.title_layout.layout_preset);
         set_project_spellcheck_settings_file(Some(project_settings_file.clone()));
         // A re-read still running was asked for the previous binding's settings file.
         self.spellcheck_words_reload = None;
@@ -502,15 +620,17 @@ impl SettingsTabState {
 }
 
 impl SettingsTabState {
+    /// Publishes the pane's canvas settings: into `BubblesModel` (adopting its new canvas revision,
+    /// so the pane does not re-read its own write), the page-cache flag into `CleanOverlaysModel`,
+    /// and a save request (values, layout preset selection, a pending kind, changed word lists)
+    /// to the saver thread.
     fn publish_canvas_settings(&mut self) {
-        let comic_type = ComicType::from_canvas_preset_fields(
-            &self.canvas_settings.aside_compact_mode,
-            self.canvas_settings.separate_pages,
-        );
-
         if let Some(model) = self.bubbles_model.as_ref() {
             match model.lock() {
-                Ok(mut guard) => guard.set_canvas_settings(self.canvas_settings.clone()),
+                Ok(mut guard) => {
+                    guard.set_canvas_settings(self.canvas_settings.clone());
+                    self.canvas_revision_seen = guard.canvas_revision();
+                }
                 Err(_) => runtime_log::log_warn(
                     "[settings] failed to lock BubblesModel while publishing canvas settings",
                 ),
@@ -537,7 +657,8 @@ impl SettingsTabState {
             }
             let request = CanvasSettingsSaveRequest {
                 snapshot: self.canvas_settings.clone(),
-                comic_type,
+                layout_preset: self.title_layout.layout_preset.clone(),
+                title_kind: self.title_layout.take_unsaved_kind(),
                 custom_spellcheck_words: words_to_send(&self.spellcheck_custom_words, &mut self.spellcheck_custom_words_synced),
                 project_spellcheck_words: words_to_send(&self.project_spellcheck_custom_words, &mut self.project_spellcheck_words_synced),
             };
@@ -547,12 +668,41 @@ impl SettingsTabState {
         }
     }
 
-    pub fn replace_canvas_settings_from_snapshot(&mut self, snapshot: SharedCanvasSettings) {
-        self.canvas_settings = snapshot;
+    /// Re-reads `BubblesModel`'s canvas snapshot into the pane when the model's canvas revision
+    /// moved since the pane last read or wrote it: every canvas publishes its own edits there (the
+    /// ribbon dock tab's «show bubbles» and opacity, the canvas' normalization), and the pane
+    /// publishes its WHOLE snapshot, so a stale copy would overwrite them. Call before any pane
+    /// edit. A poisoned lock keeps the pane's copy (logged). GUI thread, no I/O, one short lock.
+    fn refresh_canvas_settings_from_model(&mut self) {
+        let Some(model) = self.bubbles_model.as_ref() else {
+            return;
+        };
+        match model.lock() {
+            Ok(guard) => adopt_newer_model_canvas(&guard, &mut self.canvas_settings, &mut self.canvas_revision_seen),
+            Err(_) => runtime_log::log_warn("[settings] failed to lock BubblesModel while refreshing the canvas settings; the pane keeps its own copy"),
+        }
     }
 
-    pub fn persist_canvas_settings(&mut self) {
+    /// The comic-type prompt's choice `kind`, already saved as the title kind: applies the kind's
+    /// built-in layout preset — its EFFECTIVE values, the user's override included — to the
+    /// shared canvas settings (refreshed from `BubblesModel` first), selects that preset and
+    /// publishes the result (model, overlays, saver). `Custom` has no preset: only the kind is
+    /// recorded. GUI thread, no I/O.
+    pub fn apply_title_kind_layout(&mut self, kind: ComicType) {
+        let Some(preset) = self.title_layout.record_prompt_kind(kind) else {
+            return;
+        };
+        self.refresh_canvas_settings_from_model();
+        let layout = self.layout_presets.effective_builtin(preset);
+        self.title_layout.select_builtin(preset, &layout, &mut self.canvas_settings);
+        self.layout_presets.sync_picker(&self.title_layout.layout_preset);
         self.publish_canvas_settings();
+    }
+
+    /// The title kind chosen in this pane since the last call, for the studio to record in its
+    /// in-memory project (NeuroLate's automatic type and the PDF re-pagination default read it).
+    pub fn take_title_kind_change(&mut self) -> Option<ComicType> {
+        self.title_layout.take_kind_change()
     }
 
     pub(super) fn apply_memory_profile_to_runtime(&self, profile: MemoryProfile) {
@@ -706,11 +856,21 @@ fn spawn_canvas_settings_save_worker(
                 }
 
                 if let Err(err) =
-                    save_comic_type_to_project_file(&project_settings_file, latest.comic_type, ms_docstore::Durability::Contents)
+                    save_layout_preset_selection(&project_settings_file, &latest.layout_preset, ms_docstore::Durability::Contents)
                 {
                     runtime_log::log_error(format!(
-                        "[settings] failed to persist comic_type='{}' to {}; error={err}",
-                        latest.comic_type.as_config_str(),
+                        "[settings] failed to persist the layout preset selection {:?} to {}; error={err}",
+                        latest.layout_preset,
+                        project_settings_file.display()
+                    ));
+                }
+
+                if let Some(kind) = latest.title_kind
+                    && let Err(err) = save_comic_type_to_project_file(&project_settings_file, kind, ms_docstore::Durability::Contents)
+                {
+                    runtime_log::log_error(format!(
+                        "[settings] failed to persist comic_type='{}' to {}; the in-session kind is kept, the title reopens with its previous kind; error={err}",
+                        kind.as_config_str(),
                         project_settings_file.display()
                     ));
                 }
@@ -1154,7 +1314,8 @@ mod spellcheck_words_save_tests {
     fn request(custom: Option<&str>, project: Option<&str>) -> CanvasSettingsSaveRequest {
         CanvasSettingsSaveRequest {
             snapshot: SharedCanvasSettings::default(),
-            comic_type: ComicType::from_canvas_preset_fields("none", false),
+            layout_preset: LayoutPresetSelection::None,
+            title_kind: None,
             custom_spellcheck_words: custom.map(str::to_owned),
             project_spellcheck_words: project.map(str::to_owned),
         }
@@ -1177,6 +1338,79 @@ mod spellcheck_words_save_tests {
         assert_eq!(words_to_send("alpha\ngamma", &mut synced).as_deref(), Some("alpha\ngamma"));
         assert_eq!(synced.as_deref(), Some("alpha\ngamma"));
         assert_eq!(words_to_send("alpha\ngamma", &mut synced), None, "a second save of the same text is not re-sent");
+    }
+
+    /// A title kind chosen once survives coalescing with later requests that carry none, a newer
+    /// kind wins, and the newest selection wins.
+    #[test]
+    fn coalescing_keeps_a_pending_title_kind() {
+        let with = |kind: Option<ComicType>, preset: LayoutPresetSelection| CanvasSettingsSaveRequest { title_kind: kind, layout_preset: preset, ..request(None, None) };
+        let merged = with(Some(ComicType::Ribbon), LayoutPresetSelection::None).absorb_newer(with(None, LayoutPresetSelection::Builtin(BuiltinLayoutPreset::Pages)));
+        assert_eq!(merged.title_kind, Some(ComicType::Ribbon));
+        assert_eq!(merged.layout_preset, LayoutPresetSelection::Builtin(BuiltinLayoutPreset::Pages));
+        let newer = with(Some(ComicType::Ribbon), LayoutPresetSelection::None).absorb_newer(with(Some(ComicType::Pages), LayoutPresetSelection::None));
+        assert_eq!(newer.title_kind, Some(ComicType::Pages));
+    }
+
+    /// Choosing a kind marks it for one save and one studio hand-off; re-choosing it is a no-op.
+    #[test]
+    fn choosing_a_title_kind_is_saved_and_handed_over_once() {
+        let mut state = TitleLayoutState::bound(LayoutPresetSelection::None, Some(ComicType::Pages));
+        assert!(!state.choose_kind(ComicType::Pages));
+        assert!(state.choose_kind(ComicType::Ribbon));
+        assert!(!state.choose_kind(ComicType::Ribbon));
+        assert_eq!(state.take_kind_change(), Some(ComicType::Ribbon));
+        assert_eq!(state.take_kind_change(), None);
+        assert_eq!(state.take_unsaved_kind(), Some(ComicType::Ribbon));
+        assert_eq!(state.take_unsaved_kind(), None);
+        assert_eq!(state.layout_preset, LayoutPresetSelection::None, "the kind does not touch the selection");
+    }
+
+    /// The prompt's kind is recorded without a hand-off and names its preset; selecting a
+    /// built-in copies the values it is given (its effective values).
+    #[test]
+    fn the_prompt_kind_selects_its_preset() {
+        let mut state = TitleLayoutState::default();
+        let mut settings = SharedCanvasSettings::default();
+        let Some(preset) = state.record_prompt_kind(ComicType::Ribbon) else {
+            panic!("ribbon has a preset");
+        };
+        let edited = CanvasLayout { page_spacing_px: 12, ..preset.factory() };
+        state.select_builtin(preset, &edited, &mut settings);
+        assert_eq!(settings.layout(), edited);
+        assert_eq!(state.layout_preset, LayoutPresetSelection::Builtin(BuiltinLayoutPreset::Webtoon));
+        assert_eq!(state.kind, Some(ComicType::Ribbon));
+        assert_eq!(state.record_prompt_kind(ComicType::Custom), None);
+        assert_eq!(state.kind, Some(ComicType::Custom));
+        assert_eq!((state.take_kind_change(), state.take_unsaved_kind()), (None, None), "the prompt saves and hands over the kind itself");
+    }
+
+    /// A value a canvas published itself (the ribbon dock tab's «show bubbles») reaches the pane's
+    /// copy before the pane's next edit, and the pane's own write is not re-read.
+    #[test]
+    fn the_pane_adopts_canvas_edits_before_its_next_publish() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut model = BubblesModel::new_with_staging_probe(Vec::new(), dir.path().join("bubbles.json"), dir.path().join("unsaved_bubbles.json"), SharedCanvasSettings::default(), None, false);
+        let mut pane = SharedCanvasSettings::default();
+        let mut seen = 0;
+        adopt_newer_model_canvas(&model, &mut pane, &mut seen);
+        assert_eq!(seen, model.canvas_revision());
+
+        // A canvas hides the bubbles and publishes.
+        let mut canvas = model.canvas_snapshot();
+        canvas.show_bubbles = false;
+        model.set_canvas_settings(canvas);
+        adopt_newer_model_canvas(&model, &mut pane, &mut seen);
+        assert!(!pane.show_bubbles, "the canvas edit is adopted");
+
+        // The pane edits and publishes; its write is not read back over a newer local edit.
+        pane.aside_scale_pct = 150;
+        model.set_canvas_settings(pane.clone());
+        seen = model.canvas_revision();
+        pane.aside_scale_pct = 160;
+        adopt_newer_model_canvas(&model, &mut pane, &mut seen);
+        assert_eq!(pane.aside_scale_pct, 160);
+        assert!(!pane.show_bubbles);
     }
 
     #[test]

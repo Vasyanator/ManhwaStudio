@@ -92,7 +92,9 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   `user_config` semantics) bumps `PROTOCOL_VERSION` in BOTH
   `crates/ms-backend-ipc/src/protocol.rs` and `modules/ai_backend/ipc/protocol.py`; never judge
   whether it is "breaking".
-- One owner each, never duplicate: custom-font synthesis, recipe key and compiled-face naming
+- One owner each, never duplicate: canvas layout presets — the preset-owned field set, factory
+  values, the layout's JSON codec and per-title migration, the app-wide preset store and what a
+  built-in means after a user edit (`ms_project::canvas_layout`, `CanvasLayoutPresets::effective_builtin`), custom-font synthesis, recipe key and compiled-face naming
   (`ms-custom-fonts`; `RecipeKey::full_face_post_script_name`), custom-font identities (saved /
   ad-hoc / render names: `ms-tab-typing` `custom_fonts::identity`), polygon rasterizer (`ms_raster::fill_polygon_spans`,
   re-exported as `ms_tools::fill_polygon_spans`; sole named exception: the Paddle glyph mask in

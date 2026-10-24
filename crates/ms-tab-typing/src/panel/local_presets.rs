@@ -1229,7 +1229,7 @@ mod tests {
         // Creation is what mints a global preset now; the name field renames the one that is
         // selected, and the save commits both halves.
         state.create_global_preset();
-        state.preset_name_input = "Локальный".to_string();
+        state.global_preset_picker.set_name("Локальный".to_string());
 
         state.save_current_preset();
 
@@ -1273,7 +1273,7 @@ mod tests {
         state.identity_mode = ParamIdentityMode::Font;
         state.font_size_px = 17.0;
         state.create_global_preset();
-        state.preset_name_input = "Шрифтовой".to_string();
+        state.global_preset_picker.set_name("Шрифтовой".to_string());
 
         state.save_current_preset();
 

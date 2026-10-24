@@ -78,6 +78,20 @@ joined onto a chapter or title directory.
   every `list_titles` title, (d) user_config LAST and only after a clean (b)+(c) — user_config
   is the startup sentinel. Idempotent, per-document failures collected; chapters are never
   touched. Blocking; the only caller is `ms-settings-ui`'s process-wide job (worker thread).
+- `canvas_layout.rs`: the canvas LAYOUT presets — `CanvasLayout` (the 13 preset-owned fields of
+  `CanvasSettings` in persisted vocabulary, `JSON_KEYS`, `of` / `apply_to` / `normalized`),
+  `BuiltinLayoutPreset` (`Pages` / `Webtoon`: `factory()` is THE table, persistence `id`,
+  `for_kind` / `fallback_for_kind`, `display_name`) and `BASE_BUILTIN`; the JSON codec
+  (`from_json_object` / `write_json_object`), the per-title read `read_title_layout` with the
+  legacy migration rule, `LayoutPresetSelection`, and two `settings.json` writers
+  (`save_layout_preset_selection`, `seed_image_set_title`); the app-wide preset store
+  `CanvasLayoutPresets` (`user_config` `Canvas.layout_presets`: built-in overrides + user presets,
+  lenient decode, `effective_builtin` / `fallback_for_kind` / `effective`), its operations
+  `LayoutPresetOp` and their writer (`apply_layout_preset_op_to_user_config` pure,
+  `apply_layout_preset_op` one `ms_config::update_user_config_file` RMW). Re-exported from `lib.rs`.
+- `canvas_settings_tests.rs`: tests of the canvas-settings reader (`canvas_settings_from_config`):
+  characterization of the legacy per-field document precedence, root fallbacks and clamps, plus
+  the per-title (marker) read and the kind-dependent migration parts.
 - `lib.rs`: the rest of the crate. `Bubble`, `CanvasSettings`, `ComicType`, `Side`,
   `ProjectData` and its load/reconcile/normalize passes, `LegacyRibbonGeometry`
   (migration of the very old absolute-coordinate Tkinter ribbon bubbles), the
@@ -114,18 +128,45 @@ joined onto a chapter or title directory.
   before the virtual layer applies.
 - **Never on the GUI thread.** Every entry point here performs blocking I/O, and the
   JPEG conversion additionally fans out over the global rayon pool.
-- **Canvas defaults are mirrored in three places** (`CanvasSettings::default` here,
-  `SharedCanvasSettings::default` in `ms-models`, `CanvasState::default` in `ms-canvas`) plus the
-  JSON copies in `ms_config`. The test that guards their agreement
-  (`canvas_defaults_agree_across_the_three_mirrors`) lives in `crates/ms-canvas/src/types.rs`,
-  the only crate that sees all three.
+- **One layout table, stored per title.** The 13 preset-owned layout fields (`CanvasLayout`), the
+  factory values of the built-in presets «Pages» / «Webtoon» (`BuiltinLayoutPreset::factory`), the
+  layout's JSON codec, the per-title read with its migration rule (`read_title_layout`) and the
+  preset selection (`LayoutPresetSelection`, `canvas.layout_preset`) are owned by
+  `canvas_layout.rs`. The three canvas defaults (`CanvasSettings::default` here,
+  `SharedCanvasSettings::default` in `ms-models`, `CanvasState::default` in `ms-canvas`) take their
+  layout fields from `BASE_BUILTIN` and spell only the non-layout fields themselves; the
+  `ms_config` default trees carry NO layout key (a backfill would write stale values into every
+  title), guarded by `defaults_trees_carry_no_layout_key`. The agreement test
+  (`canvas_defaults_agree_across_the_three_mirrors`) lives in `crates/ms-canvas/src/types.rs`, the
+  only crate that sees all three.
+- **Built-in overrides.** The user may edit «Pages» / «Webtoon»; the store keeps an override only
+  while it differs from the factory row (saving the factory values or `ResetBuiltin` removes it).
+  Every APPLY of a built-in — the reader's fallback for what a title does not store (so new titles
+  and image sets follow an edited preset), the first-open prompt, the Settings picker — goes
+  through `CanvasLayoutPresets::effective_builtin`; the factory row is used only by a revert and
+  by the legacy compact-mode recovery of `read_title_layout` (exact old-build derivation). The
+  store writer edits only the touched entries (malformed and unknown entries survive) and refuses
+  every write to a store whose `version` it does not know (a newer build's), leaving it untouched.
+- **Per-title layout and its migration.** A title whose `canvas.layout_per_title` is `true` reads
+  its whole layout from its own `canvas` object (missing keys: its kind's preset, override-aware). A title without
+  the marker was last saved by an older build that kept six fields in `user_config` `Canvas.*`: it
+  reads what that build showed, except the compaction of a `pages` / `ribbon` title, which comes
+  from its kind's factory preset (see `read_title_layout`). The project canvas writer
+  (`ms-canvas`) sets the marker on every save, so the migration happens once, on the first draw.
+  An older build re-saving a migrated title drops three of the keys again; the new build then
+  fills them from the kind's preset.
+- **`comic_type` is the KIND, never derived.** It is written only by the first-open prompt, the
+  Settings «Тип тайтла» row (both through `save_comic_type_to_project_file`) and the image-set
+  seed (`seed_image_set_title`, which also sets the layout marker, so an image set takes the
+  «Pages» values). `Custom` is a legacy value: readable, never written.
 - **Owned documents.** `settings.json` (`DocKind::ProjectSettings`) and the bubbles document
   (`DocKind::Bubbles`) are read/written through `ms_docstore`, never the seam directly:
   `load_bubbles` reads, `persist_migrated_bubbles` writes (its `*_legacy_xy.json` backup is a
   plain seam file, not an owned document: a byte copy of a `.json` source, the pretty JSON of
   a `.db` source's value; backup + rewrite run in one `ms_docstore::with_lock` section), `save_comic_type_to_project_file` is ONE
   `ms_docstore::update` that edits only `comic_type` and returns an error — leaving the file
-  untouched — when `settings.json` is malformed.
+  untouched — when `settings.json` is malformed; `save_layout_preset_selection` and
+  `seed_image_set_title` follow the same rule.
 - Legacy formats are read FOREVER. A reconcile or migration pass may only act on an
   unambiguous match, and `persist_migrated_bubbles` backs the original up to
   `*_legacy_xy.json` before rewriting.
@@ -149,5 +190,10 @@ joined onto a chapter or title directory.
   `load_bubbles` and `LegacyRibbonGeometry`.
 - To change which global/title documents a storage-mode switch converts, or its order, see
   `storage_mode.rs` (keep user_config last: it is the sentinel `ms-config`'s startup probe reads).
-- To change canvas presets or defaults, see `CanvasSettings` / `ComicType` here AND
-  the two mirrors named above — the test will fail if they drift.
+- To change a layout preset's values, the preset-owned field set, the per-title migration rule,
+  the selection's JSON shape or the preset store's format and override rules, edit
+  `canvas_layout.rs` only (a new layout field is a compile
+  error at every mapping that destructures `CanvasLayout`); the reader that applies it is
+  `canvas_settings_from_config` in `lib.rs`;
+  non-layout canvas defaults are `CanvasSettings::default` here AND the two mirrors named above —
+  the test will fail if they drift.

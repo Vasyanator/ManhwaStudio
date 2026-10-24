@@ -97,7 +97,15 @@ use serde_json::{Map, Value, json};
 /// warming-up form); new
 /// `user_config` keys `General.torch_flavour` / `General.torch_rocm_gfx` (the installer's
 /// recorded torch choice, written by the installer, never read by the backend).
-pub const PROTOCOL_VERSION: u32 = 18;
+/// 19: `user_config` `Canvas.{aside_compact_mode, aside_side_mode, aside_second_column,
+/// scale_bubbles, aside_min_width_px, aside_max_width_px, spellcheck_original,
+/// spellcheck_translation}` are no longer written (the canvas layout is per title; the six layout
+/// keys are read only as the migration source of titles without `canvas.layout_per_title`; the
+/// two spellcheck copies were never read); new keys `Canvas.layout_presets` (the app-wide layout
+/// preset store, written by the Settings pane) and `TranslarionTab.composition_presets` (the
+/// composition panel's app-wide presets, written by the Translation tab). The backend reads none
+/// of them.
+pub const PROTOCOL_VERSION: u32 = 19;
 
 // ============================================================================
 // FRAME SIZE GUARDS

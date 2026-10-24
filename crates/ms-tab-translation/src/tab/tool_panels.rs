@@ -648,6 +648,7 @@ impl TranslationTabState {
             project,
             &mut self.composition_panel_state,
             &mut self.composition_panel_options,
+            &mut self.composition_presets,
         );
         if actions.options_changed {
             self.composition_settings_dirty = true;

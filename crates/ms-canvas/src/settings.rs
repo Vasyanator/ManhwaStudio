@@ -26,11 +26,13 @@ Key functions:
 Notes:
 - Actual filesystem writes are executed by the background saver worker from `workers.rs`.
 - The title `settings.json` is written ONLY through `ms_docstore::update` (serialized,
-  atomic, malformed file never overwritten); this module edits only its own keys there.
+  atomic, malformed file never overwritten); this module edits only its own keys there. The
+  project writer stores the whole per-title layout plus `canvas.layout_per_title` (the per-title
+  marker, `ms_project::canvas_layout`); the user writer stores only the cross-title preferences.
 - This module keeps settings-specific logic out of the main canvas facade.
 */
 
-use super::types::CanvasSettingsSaveRequest;
+use super::types::{CanvasSettingsSaveRequest, pixel_setting_to_f32};
 use super::workers::spawn_canvas_settings_saver_thread;
 use super::{
     AsideBubbleCompactMode, AsideBubbleSideMode, BubbleMode, BubbleType, CanvasState, CanvasView,
@@ -38,7 +40,8 @@ use super::{
 };
 use ms_config as config;
 use ms_models::bubbles_model::SharedCanvasSettings;
-use ms_project::{CanvasSettings, ProjectData};
+use ms_project::canvas_layout::LAYOUT_PER_TITLE_KEY;
+use ms_project::{CanvasLayout, CanvasSettings, ProjectData};
 use ms_docstore::{DocKind, DocRef, WriteOptions};
 use ms_log::runtime_log;
 use serde_json::{Map, Value};
@@ -66,15 +69,6 @@ impl Default for CanvasSettingsRuntime {
     }
 }
 
-/// A project's pixel-valued canvas setting as the canvas' `f32` world units.
-///
-/// Rounds to the nearest representable `f32` (exact for |v| <= 2^24, far beyond any meaningful
-/// pixel length); the open path has always converted these fields this way, so the conversion is
-/// kept bit-identical rather than rejecting or clamping large values.
-fn pixel_setting_to_f32(value: i32) -> f32 {
-    value as f32
-}
-
 /// The `CanvasState` a canvas opened on a project starts from, built from its `CanvasSettings`.
 ///
 /// Every persisted field is taken from `settings`; view-only fields (`zoom`) keep their
@@ -85,16 +79,13 @@ fn pixel_setting_to_f32(value: i32) -> f32 {
 /// `CanvasView::apply_canvas_snapshot`), so the values reach the shared model as stored.
 #[must_use]
 pub fn canvas_state_from_project(settings: &CanvasSettings) -> CanvasState {
-    let loaded_bubble_mode = BubbleMode::from_str(&settings.bubble_type);
-    let hybrid_editable_bubble_type = match loaded_bubble_mode {
-        BubbleMode::Aside => BubbleType::Aside,
-        BubbleMode::OnTop => BubbleType::OnTop,
-        BubbleMode::Hybrid => BubbleType::from_str(&settings.editable_bubble_type).resolved(BubbleType::OnTop),
-    };
-    let hybrid_readonly_bubble_type = match loaded_bubble_mode {
-        BubbleMode::Aside => BubbleType::Aside,
-        BubbleMode::OnTop => BubbleType::OnTop,
-        BubbleMode::Hybrid => BubbleType::from_str(&settings.readonly_bubble_type).resolved(BubbleType::Aside),
+    // The 13 layout fields go through the one layout -> state mapping; the legacy mode pin
+    // below then overrides the two display types it decides.
+    let base = CanvasState::with_layout(&CanvasLayout::of(settings));
+    let (hybrid_editable_bubble_type, hybrid_readonly_bubble_type) = match BubbleMode::from_str(&settings.bubble_type) {
+        BubbleMode::Aside => (BubbleType::Aside, BubbleType::Aside),
+        BubbleMode::OnTop => (BubbleType::OnTop, BubbleType::OnTop),
+        BubbleMode::Hybrid => (base.hybrid_editable_bubble_type, base.hybrid_readonly_bubble_type),
     };
     CanvasState {
         bubble_mode: BubbleMode::Hybrid,
@@ -104,18 +95,7 @@ pub fn canvas_state_from_project(settings: &CanvasSettings) -> CanvasState {
         show_bubble_status: settings.show_bubble_status,
         bubble_status_rules: settings.bubble_status_rules.clone(),
         bubble_opacity: settings.bubble_opacity,
-        bubble_min_width: pixel_setting_to_f32(settings.aside_min_width_px),
-        bubble_max_width: pixel_setting_to_f32(settings.aside_max_width_px),
-        aside_compact_mode: AsideBubbleCompactMode::from_str(&settings.aside_compact_mode),
-        aside_side_mode: AsideBubbleSideMode::from_str(&settings.aside_side_mode),
-        aside_second_column: settings.aside_second_column,
-        on_top_focus_mode: OnTopFocusMode::from_str(&settings.on_top_focus_mode),
-        scale_bubbles: settings.scale_bubbles,
-        page_spacing: pixel_setting_to_f32(settings.page_spacing_px),
-        separate_pages: settings.separate_pages,
-        edge_margin: pixel_setting_to_f32(settings.vertical_edge_margin_px),
         side_margin: pixel_setting_to_f32(settings.side_margin_px),
-        aside_scale_pct: settings.aside_scale_pct,
         auto_insert_last_character: settings.auto_insert_last_character,
         spellcheck_original: settings.spellcheck_original,
         spellcheck_translation: settings.spellcheck_translation,
@@ -123,7 +103,7 @@ pub fn canvas_state_from_project(settings: &CanvasSettings) -> CanvasState {
         cache_pages: settings.cache_pages,
         translation_status_display: TranslationStatusDisplay::from_str(&settings.translation_status_display),
         hint_show_outside_default: settings.hint_show_outside_default,
-        ..CanvasState::default()
+        ..base
     }
 }
 
@@ -294,8 +274,9 @@ impl CanvasView {
 /// Persists the project-scoped canvas subset into the title's `settings.json` through the
 /// serialized `ms_docstore::update` read-modify-write.
 ///
-/// The mutator edits ONLY the keys this writer owns (`canvas.*` fields of the snapshot, the
-/// four top-level bubble/focus keys and the listed legacy removals); every other section
+/// The mutator edits ONLY the keys this writer owns (`canvas.*` fields of the snapshot including
+/// the whole layout and the per-title marker, the four top-level legacy bubble/focus mirrors and
+/// the listed retired-key removals); every other section
 /// (`OCR`, `canvas.project_custom_spellcheck_words`, ...) is kept as found, and the document
 /// lock serializes this writer against the other `settings.json` writers.
 ///
@@ -322,30 +303,24 @@ pub fn save_canvas_settings_to_project_file(
     .map_err(|err| format!("failed to save project canvas settings file '{}': {err}", settings_file.display()))
 }
 
-/// Writes the project-scoped canvas keys of `snapshot` into the `settings.json` root object.
+/// Writes the project-scoped canvas keys of `snapshot` into the `settings.json` root object: the
+/// whole layout (`CanvasLayout::write_json_object` of `snapshot.layout()`) plus the per-title marker
+/// `canvas.layout_per_title = true`, the other project-scoped fields, and, for older builds, the
+/// legacy root mirror of the bubble mode, the two display types and the on-top focus. Removes a
+/// few retired keys; every other key is kept.
 fn apply_project_canvas_snapshot(root_obj: &mut Map<String, Value>, snapshot: &SharedCanvasSettings) {
-
+    let layout = snapshot.layout();
     let mut canvas_obj = root_obj
         .get("canvas")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
 
+    CanvasLayout::write_json_object(&layout, &mut canvas_obj);
+    canvas_obj.insert(LAYOUT_PER_TITLE_KEY.to_string(), Value::Bool(true));
     canvas_obj.insert(
         "bubble_type".to_string(),
         Value::String(snapshot.bubble_type.clone()),
-    );
-    canvas_obj.insert(
-        "editable_bubble_type".to_string(),
-        Value::String(snapshot.editable_bubble_type.clone()),
-    );
-    canvas_obj.insert(
-        "readonly_bubble_type".to_string(),
-        Value::String(snapshot.readonly_bubble_type.clone()),
-    );
-    canvas_obj.insert(
-        "on_top_focus_mode".to_string(),
-        Value::String(snapshot.on_top_focus_mode.clone()),
     );
     canvas_obj.insert(
         "show_bubbles".to_string(),
@@ -360,27 +335,8 @@ fn apply_project_canvas_snapshot(root_obj: &mut Map<String, Value>, snapshot: &S
         Value::from(snapshot.bubble_opacity.clamp(0.0, 1.0) as f64),
     );
     canvas_obj.insert(
-        "page_spacing_px".to_string(),
-        Value::from(snapshot.page_spacing.max(0.0).round() as i64),
-    );
-    canvas_obj.insert(
-        "separate_pages".to_string(),
-        Value::Bool(snapshot.separate_pages),
-    );
-    canvas_obj.insert(
-        "vertical_edge_margin_px".to_string(),
-        Value::from(snapshot.edge_margin.max(0.0).round() as i64),
-    );
-    canvas_obj.insert(
         "side_margin_px".to_string(),
         Value::from(snapshot.side_margin.max(0.0).round() as i64),
-    );
-    canvas_obj.remove("aside_min_width_px");
-    canvas_obj.remove("aside_max_width_px");
-    canvas_obj.remove("scale_bubbles");
-    canvas_obj.insert(
-        "aside_scale_pct".to_string(),
-        Value::from(snapshot.aside_scale_pct.clamp(25, 300)),
     );
     canvas_obj.remove("load_all_bubbles");
     canvas_obj.remove("visible_page_radius");
@@ -414,21 +370,22 @@ fn apply_project_canvas_snapshot(root_obj: &mut Map<String, Value>, snapshot: &S
     canvas_obj.remove("paste_into_field");
     root_obj.insert("canvas".to_string(), Value::Object(canvas_obj));
 
+    // Legacy root mirror: builds before the per-title layout read these root keys as a fallback.
     root_obj.insert(
         "bubble_type".to_string(),
         Value::String(snapshot.bubble_type.clone()),
     );
     root_obj.insert(
         "editable_bubble_type".to_string(),
-        Value::String(snapshot.editable_bubble_type.clone()),
+        Value::String(layout.editable_bubble_type.clone()),
     );
     root_obj.insert(
         "readonly_bubble_type".to_string(),
-        Value::String(snapshot.readonly_bubble_type.clone()),
+        Value::String(layout.readonly_bubble_type.clone()),
     );
     root_obj.insert(
         "on_top_focus_mode".to_string(),
-        Value::String(snapshot.on_top_focus_mode.clone()),
+        Value::String(layout.on_top_focus_mode),
     );
     root_obj.remove("copy_from_field");
     root_obj.remove("paste_into_field");
@@ -436,7 +393,10 @@ fn apply_project_canvas_snapshot(root_obj: &mut Map<String, Value>, snapshot: &S
     root_obj.remove("bubble_load_delay_ms");
 }
 
-/// Persists the shared canvas subset through the serialized user-config RMW boundary.
+/// Persists the cross-title canvas preferences (`bubble_status_rules`, `cache_pages`,
+/// `translation_status_display`, `hint_show_outside_default`) into `user_config` `Canvas` through
+/// the serialized user-config RMW boundary. Nothing of the per-title layout or the per-title
+/// spellcheck toggles is written there (older builds did; those keys are left as found).
 ///
 /// The process-wide lock is acquired inside [`config::update_user_config_file`] and
 /// remains held from the initial read through the full-file write, preventing a stale
@@ -458,55 +418,19 @@ pub fn save_canvas_settings_to_user_file(
             .cloned()
             .unwrap_or_default();
 
-    canvas_obj.insert(
-        "bubble_status_rules".to_string(),
-        ms_widgets::bubble_status::bubble_status_rules_to_value(&snapshot.bubble_status_rules),
-    );
-    canvas_obj.insert(
-        "aside_compact_mode".to_string(),
-        Value::String(snapshot.aside_compact_mode.clone()),
-    );
-    canvas_obj.insert(
-        "aside_side_mode".to_string(),
-        Value::String(snapshot.aside_side_mode.clone()),
-    );
-    canvas_obj.insert(
-        "aside_second_column".to_string(),
-        Value::Bool(snapshot.aside_second_column),
-    );
-    canvas_obj.insert(
-        "scale_bubbles".to_string(),
-        Value::Bool(snapshot.scale_bubbles),
-    );
-    canvas_obj.insert(
-        "aside_min_width_px".to_string(),
-        Value::from(snapshot.bubble_min_width.max(40.0).round() as i64),
-    );
-    canvas_obj.insert(
-        "aside_max_width_px".to_string(),
-        Value::from(snapshot.bubble_max_width.max(40.0).round() as i64),
-    );
-    canvas_obj.insert(
-        "aside_compact_mode".to_string(),
-        Value::String(snapshot.aside_compact_mode.clone()),
-    );
-    canvas_obj.insert(
-        "spellcheck_original".to_string(),
-        Value::Bool(snapshot.spellcheck_original),
-    );
-    canvas_obj.insert(
-        "spellcheck_translation".to_string(),
-        Value::Bool(snapshot.spellcheck_translation),
-    );
-    canvas_obj.insert("cache_pages".to_string(), Value::Bool(snapshot.cache_pages));
-    canvas_obj.insert(
-        "translation_status_display".to_string(),
-        Value::String(snapshot.translation_status_display.clone()),
-    );
-    canvas_obj.insert(
-        "hint_show_outside_default".to_string(),
-        Value::Bool(snapshot.hint_show_outside_default),
-    );
+        canvas_obj.insert(
+            "bubble_status_rules".to_string(),
+            ms_widgets::bubble_status::bubble_status_rules_to_value(&snapshot.bubble_status_rules),
+        );
+        canvas_obj.insert("cache_pages".to_string(), Value::Bool(snapshot.cache_pages));
+        canvas_obj.insert(
+            "translation_status_display".to_string(),
+            Value::String(snapshot.translation_status_display.clone()),
+        );
+        canvas_obj.insert(
+            "hint_show_outside_default".to_string(),
+            Value::Bool(snapshot.hint_show_outside_default),
+        );
         root_obj.insert("Canvas".to_string(), Value::Object(canvas_obj));
         Ok(())
     })
@@ -608,6 +532,7 @@ mod tests {
             cache_pages: false,
             translation_status_display: "until_next".to_string(),
             hint_show_outside_default: true,
+            layout_preset: ms_project::LayoutPresetSelection::None,
         }
     }
 
@@ -672,13 +597,10 @@ mod tests {
                 s.page_spacing_px = -16_777_219;
             }),
         ];
-        for comic_type in [ms_project::ComicType::Pages, ms_project::ComicType::Ribbon] {
-            if let Some((aside_compact_mode, separate_pages)) = comic_type.canvas_preset() {
-                let mut settings = non_default_settings();
-                settings.aside_compact_mode = aside_compact_mode.to_string();
-                settings.separate_pages = separate_pages;
-                cases.push((comic_type.as_config_str(), settings));
-            }
+        for preset in ms_project::BuiltinLayoutPreset::ALL {
+            let mut settings = non_default_settings();
+            preset.factory().apply_to(&mut settings);
+            cases.push((preset.id(), settings));
         }
         cases
     }
@@ -691,12 +613,13 @@ mod tests {
         }
     }
 
-    /// Both comic presets are among the oracle cases (a vanished preset would silently shrink it).
+    /// Both built-in layout presets are among the oracle cases (a vanished preset would silently
+    /// shrink it).
     #[test]
-    fn oracle_cases_cover_both_comic_presets() {
+    fn oracle_cases_cover_both_layout_presets() {
         let labels: Vec<&str> = oracle_cases().into_iter().map(|(label, _)| label).collect();
         assert!(labels.contains(&"pages"), "{labels:?}");
-        assert!(labels.contains(&"ribbon"), "{labels:?}");
+        assert!(labels.contains(&"webtoon"), "{labels:?}");
     }
 
     /// The legacy `bubble_type` modes pin both display types; the result is always `hybrid`.
@@ -752,10 +675,80 @@ mod tests {
         assert_eq!(root["OCR"]["engine"], "paddle");
         assert_eq!(root["canvas"]["project_custom_spellcheck_words"], "a\nb");
         assert_eq!(root["canvas"]["bubble_type"], "hybrid");
-        assert!(root["canvas"].get("scale_bubbles").is_none());
+        assert_eq!(root["canvas"]["scale_bubbles"], SharedCanvasSettings::default().scale_bubbles);
+        assert_eq!(root["canvas"]["layout_per_title"], true);
         assert_eq!(root["bubble_type"], "hybrid");
         assert!(!raw.ends_with('\n'));
         Ok(())
+    }
+
+    /// Sorted keys of the JSON object at `pointer` in `root` (empty when absent).
+    fn object_keys(root: &Value, pointer: &str) -> Vec<String> {
+        let mut keys: Vec<String> = root.pointer(pointer).and_then(Value::as_object).map(|obj| obj.keys().cloned().collect()).unwrap_or_default();
+        keys.sort();
+        keys
+    }
+
+    /// The project writer's key set: the exact `canvas.*` and root keys it leaves in a
+    /// `settings.json` that held every key it removes, plus one foreign key each. The canvas set is
+    /// the whole layout (`CanvasLayout::JSON_KEYS`), the per-title marker and the other fields.
+    #[test]
+    fn project_writer_key_set() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let path = dir.path().join("settings.json");
+        let removed_canvas = ["load_all_bubbles", "visible_page_radius", "bubble_load_delay_ms", "copy_from_field", "paste_into_field"];
+        let removed_root = ["copy_from_field", "paste_into_field", "visible_page_radius", "bubble_load_delay_ms"];
+        let mut canvas = Map::new();
+        for key in removed_canvas.iter().chain(["foreign_canvas"].iter()) {
+            canvas.insert((*key).to_string(), Value::from(1));
+        }
+        let mut root = Map::new();
+        for key in removed_root.iter().chain(["foreign_root"].iter()) {
+            root.insert((*key).to_string(), Value::from(1));
+        }
+        root.insert("canvas".to_string(), Value::Object(canvas));
+        std::fs::write(&path, Value::Object(root).to_string()).map_err(|err| err.to_string())?;
+        save_canvas_settings_to_project_file(&path, &SharedCanvasSettings::default())?;
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|err| err.to_string())?).map_err(|err| err.to_string())?;
+        let mut expected_canvas: Vec<String> = ["layout_per_title", "bubble_type", "show_bubbles", "show_bubble_status", "bubble_opacity", "side_margin_px", "tabs_autosync_enabled", "auto_insert_last_character", "spellcheck_original", "spellcheck_translation", "cache_pages", "translation_status_display", "hint_show_outside_default", "foreign_canvas"].iter().chain(CanvasLayout::JSON_KEYS.iter()).map(|key| (*key).to_string()).collect();
+        expected_canvas.sort();
+        assert_eq!(object_keys(&written, "/canvas"), expected_canvas);
+        let mut expected_root: Vec<String> = ["canvas", "bubble_type", "editable_bubble_type", "readonly_bubble_type", "on_top_focus_mode", "foreign_root"].iter().map(|key| (*key).to_string()).collect();
+        expected_root.sort();
+        assert_eq!(object_keys(&written, ""), expected_root);
+        Ok(())
+    }
+
+    /// The user writer's key set: only the cross-title preferences, with a foreign key in that
+    /// section, a legacy layout key and a foreign section kept as found.
+    #[test]
+    fn user_writer_key_set() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let path = dir.path().join("user_config.json");
+        std::fs::write(&path, r#"{"General":{"x":1},"Canvas":{"foreign_canvas":1,"aside_min_width_px":600}}"#).map_err(|err| err.to_string())?;
+        save_canvas_settings_to_user_file(&path, &SharedCanvasSettings::default())?;
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|err| err.to_string())?).map_err(|err| err.to_string())?;
+        let mut expected: Vec<String> = ["bubble_status_rules", "cache_pages", "translation_status_display", "hint_show_outside_default", "foreign_canvas", "aside_min_width_px"].iter().map(|key| (*key).to_string()).collect();
+        expected.sort();
+        assert_eq!(object_keys(&written, "/Canvas"), expected);
+        assert_eq!(written["Canvas"]["aside_min_width_px"], 600, "a legacy global layout value is left as found");
+        assert_eq!(written["General"]["x"], 1);
+        Ok(())
+    }
+
+    /// What the project writer stores is read back as the same layout by the title reader (the
+    /// per-title marker makes the reader ignore the user config).
+    #[test]
+    fn project_writer_round_trips_the_layout() {
+        let mut snapshot = SharedCanvasSettings::default();
+        snapshot.apply_layout(&ms_project::BuiltinLayoutPreset::Webtoon.factory());
+        snapshot.bubble_min_width = 333.0;
+        let mut root = Map::new();
+        apply_project_canvas_snapshot(&mut root, &snapshot);
+        let Some(canvas) = root.get("canvas").and_then(Value::as_object) else {
+            panic!("the writer stores a canvas object");
+        };
+        assert_eq!(CanvasLayout::from_json_object(canvas, &ms_project::BASE_BUILTIN.factory()), snapshot.layout());
     }
 
     /// A malformed or non-object `settings.json` is reported and left byte-identical.

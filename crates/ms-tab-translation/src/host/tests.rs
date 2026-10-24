@@ -21,7 +21,7 @@ use crate::tab::{TranslationTabState, translation_default_dock_layout};
 /// live under `dir`, with `user_settings` as the startup config.
 fn host_in(dir: &Path, user_settings: &Value) -> TranslationTab {
     let model = BubblesModel::new_with_staging_probe(Vec::new(), dir.join("bubbles.json"), dir.join("unsaved_bubbles.json"), SharedCanvasSettings::default(), None, false);
-    TranslationTab::new(TranslationTabState::default(), Arc::new(Mutex::new(model)), user_settings)
+    TranslationTab::new(TranslationTabState::default(), Arc::new(Mutex::new(model)), user_settings, None)
 }
 
 /// A minimal `ProjectData` whose every path is `dir` (nothing here reads or writes it).

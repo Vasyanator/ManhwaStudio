@@ -81,7 +81,7 @@ mod native {
 
         /// Takes a slot, or `None` when `cap` flights are already out.
         fn acquire(&'static self) -> Option<FlightSlot> {
-            self.in_flight.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| (count < self.cap).then_some(count + 1)).ok().map(|_| FlightSlot(self))
+            self.in_flight.try_update(Ordering::AcqRel, Ordering::Acquire, |count| (count < self.cap).then_some(count + 1)).ok().map(|_| FlightSlot(self))
         }
 
         /// How many flights are out.

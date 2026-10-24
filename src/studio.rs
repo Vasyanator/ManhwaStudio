@@ -38,9 +38,12 @@ App/frame flow:
 - Persistence busy gates (page op, save, save button, typing export, page manager, veil):
   named predicates over `persistence_activity()` in `studio/busy.rs`.
 - Modal prompts (comic type, AI device selection): `ComicTypePrompt` / `AiDevicePrompt` in
-  `studio/prompts.rs`; a chosen comic type is written to the project settings on a worker
-  (`start_comic_type_save` -> `ComicTypeSave`, polled by `poll_comic_type_save`) and applied here
-  once that write succeeded (`apply_comic_type_preset`).
+  `studio/prompts.rs`; a chosen comic type (the title KIND) is written to the project settings on a
+  worker (`start_comic_type_save` -> `ComicTypeSave`, polled by `poll_comic_type_save`) and applied
+  once that write succeeded (`apply_comic_type_choice`: the kind into the in-memory project, the
+  kind's layout preset through the Settings tab, `SettingsTabState::apply_title_kind_layout`).
+  A kind changed later in Settings › «Лента и пузыри» reaches the in-memory project through
+  `SettingsTabState::take_title_kind_change` after the tab draw (`record_title_kind`).
 - Close: the close intent (exit dialog, close request, received-images question) is `CloseFlow`
   in `studio/close_flow.rs`; `request_os_close` and the dialogs record a `PendingCloseAction` that
   the window host takes through `take_outputs`; `StudioApp` never sends a root `Close` or `Title`,
@@ -324,7 +327,7 @@ impl StudioApp {
         translation_state.set_text_mask_model(Arc::clone(&text_mask_model));
         // The host owns the Translation canvas (scroll salt, bubbles model, its bottom-hint
         // collapsed flag from `user_settings`); the shared view starts from that canvas' viewport.
-        let mut translation_tab = TranslationTab::new(translation_state, Arc::clone(&bubbles_model), &user_settings);
+        let mut translation_tab = TranslationTab::new(translation_state, Arc::clone(&bubbles_model), &user_settings, Some(crate::config::user_config_path()));
         let shared_canvas_viewport = translation_tab.canvas().viewport_snapshot();
         let mut cleaning_tab = CleaningTabState::default();
         cleaning_tab.set_canvas_scroll_area_id_salt("cleaning_canvas_scroll");
@@ -393,6 +396,13 @@ impl StudioApp {
                     ));
                     Default::default()
                 }
+            },
+            crate::tabs::settings::TitleLayoutSeed {
+                layout_preset: project.canvas_settings.layout_preset.clone(),
+                kind: project.comic_type,
+                // Decoded from the pre-read `user_config` (no I/O); the preset picker writes it back.
+                layout_presets: crate::project::CanvasLayoutPresets::from_user_config(&user_settings),
+                layout_preset_store: Some(crate::config::user_config_path()),
             },
             Arc::clone(&bubbles_model),
             Arc::clone(&clean_overlays_model),
@@ -608,7 +618,7 @@ impl StudioApp {
     }
 
     /// Takes the running comic-type write's result: on success applies the choice
-    /// ([`Self::apply_comic_type_preset`], which closes the prompt); on a failed write or a lost
+    /// ([`Self::apply_comic_type_choice`], which closes the prompt); on a failed write or a lost
     /// worker shows the error in the prompt (which stays open for another try) and logs it, with
     /// the project and the canvas settings unchanged. GUI thread, no I/O.
     fn poll_comic_type_save(&mut self) {
@@ -619,7 +629,7 @@ impl StudioApp {
         let error = match save.rx.try_recv() {
             Ok(Ok(())) => {
                 self.comic_type_save = None;
-                self.apply_comic_type_preset(comic_type);
+                self.apply_comic_type_choice(comic_type);
                 return;
             }
             Ok(Err(err)) => err,
@@ -642,57 +652,26 @@ impl StudioApp {
     }
 
     /// Applies a comic type whose project-settings write already succeeded
-    /// ([`Self::poll_comic_type_save`]): records it in the in-memory project, then applies its
-    /// canvas preset to the shared canvas settings — the `BubblesModel` snapshot, through
-    /// `SharedCanvasSettings::apply_comic_type_preset`, the one preset owner — and pushes the result
-    /// to `BubblesModel` (every canvas pulls it), to `CleanOverlaysModel` (`cache_pages`) and to the
-    /// Settings tab (whose saver also persists it), in that order, then closes the prompt. No I/O.
-    fn apply_comic_type_preset(&mut self, comic_type: ComicType) {
-        self.project.comic_type = Some(comic_type);
+    /// ([`Self::poll_comic_type_save`]): records it as the title kind ([`Self::record_title_kind`]),
+    /// then lets the Settings tab apply the kind's layout preset to the shared canvas settings and
+    /// publish it (`BubblesModel`, `CleanOverlaysModel`, its saver), and closes the prompt. No I/O.
+    fn apply_comic_type_choice(&mut self, comic_type: ComicType) {
+        self.record_title_kind(comic_type);
+        self.tabs.settings.apply_title_kind_layout(comic_type);
+        self.comic_type_prompt.resolve();
+    }
+
+    /// Records `kind` as the title kind of the in-memory project (`ProjectData::comic_type` and its
+    /// `settings_data` copy), which the kind's consumers (NeuroLate's automatic type, the PDF
+    /// re-pagination default) read every frame. The file write is the caller's. No I/O.
+    fn record_title_kind(&mut self, kind: ComicType) {
+        self.project.comic_type = Some(kind);
         if let Some(root) = self.project.settings_data.as_object_mut() {
             root.insert(
                 "comic_type".to_string(),
-                serde_json::Value::String(comic_type.as_config_str().to_string()),
+                serde_json::Value::String(kind.as_config_str().to_string()),
             );
         }
-        if let Some((aside_compact_mode, separate_pages)) = comic_type.canvas_preset() {
-            self.project.canvas_settings.aside_compact_mode = aside_compact_mode.to_string();
-            self.project.canvas_settings.separate_pages = separate_pages;
-        }
-
-        // The preset goes onto the shared settings every canvas pulls from (one lock: read, apply,
-        // write back). Without that lock there is no current snapshot to apply it to: the project
-        // file already holds the comic type, the live settings keep their values.
-        let snapshot = match self.bubbles_model.lock() {
-            Ok(mut bubbles_model) => {
-                let mut snapshot = bubbles_model.canvas_snapshot();
-                snapshot.apply_comic_type_preset(comic_type);
-                bubbles_model.set_canvas_settings(snapshot.clone());
-                snapshot
-            }
-            Err(err) => {
-                runtime_log::log_warn(format!(
-                    "[app] failed to lock BubblesModel while applying comic_type preset; comic_type='{}' saved to the project file, canvas settings unchanged; error={err}",
-                    comic_type.as_config_str()
-                ));
-                eprintln!("WARN app::apply_comic_type_preset: failed to lock BubblesModel");
-                self.comic_type_prompt.resolve();
-                return;
-            }
-        };
-        if let Ok(mut overlays_model) = self.clean_overlays_model.lock() {
-            overlays_model.set_cache_pages_enabled(snapshot.cache_pages);
-        } else {
-            runtime_log::log_warn(
-                "[app] failed to lock CleanOverlaysModel while applying comic_type preset",
-            );
-            eprintln!("WARN app::apply_comic_type_preset: failed to lock CleanOverlaysModel");
-        }
-        self.tabs.settings
-            .replace_canvas_settings_from_snapshot(snapshot.clone());
-        self.tabs.settings.persist_canvas_settings();
-
-        self.comic_type_prompt.resolve();
     }
 
     /// Refreshes the per-frame AI backend health cache from the shared probe state.
@@ -1074,6 +1053,10 @@ impl eframe::App for StudioApp {
         for request in requests {
             self.apply_app_request(request);
         }
+        // A title kind chosen in Settings › «Лента и пузыри» (its saver writes the file).
+        if let Some(kind) = self.tabs.settings.take_title_kind_change() {
+            self.record_title_kind(kind);
+        }
         // The dock's detached panel windows are child viewports: they exist only
         // while they are shown every pass, and `PanelDock::end` — which shows them —
         // ran above only if the tab that DREW this pass hosts the dock. Requirement 11
@@ -1335,7 +1318,8 @@ mod tests {
     fn translation_and_cleaning() -> (TranslationTab, CleaningTabState) {
         let model_dir = std::env::temp_dir().join(format!("ms_input_golden_{}", std::process::id()));
         let model = BubblesModel::new_with_staging_probe(Vec::new(), model_dir.join("bubbles.json"), model_dir.join("unsaved_bubbles.json"), SharedCanvasSettings::default(), None, false);
-        let translation = TranslationTab::new(TranslationTabState::default(), Arc::new(Mutex::new(model)), &json!({}));
+        // No preset store: a test never writes the real `user_config`.
+        let translation = TranslationTab::new(TranslationTabState::default(), Arc::new(Mutex::new(model)), &json!({}), None);
         (translation, CleaningTabState::default())
     }
 

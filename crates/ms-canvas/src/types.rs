@@ -25,10 +25,13 @@ Key structures:
 Notes:
 - Типы, которые используются только внутри canvas runtime, помечены как `pub(crate)`.
 - Поведение ограничено небольшими helper-методами без побочных эффектов.
+- `CanvasState::with_layout` is the one `ms_project::CanvasLayout` -> `CanvasState` mapping;
+  `CanvasState::default` is it applied to `ms_project::BASE_BUILTIN` (the layout table), and
+  `settings::canvas_state_from_project` builds on it.
 */
 
 use ms_widgets::bubble_status::{BubbleStatusRule, default_bubble_status_rules};
-use ms_project::{ProjectData, Side};
+use ms_project::{BASE_BUILTIN, CanvasLayout, ProjectData, Side};
 use eframe::egui;
 use egui::{Pos2, Rect, Vec2};
 use serde_json::{Map, Value};
@@ -894,28 +897,56 @@ pub struct CanvasState {
 }
 
 impl Default for CanvasState {
+    /// [`CanvasState::with_layout`] of `ms_project::BASE_BUILTIN`, the one layout table.
     fn default() -> Self {
+        Self::with_layout(&BASE_BUILTIN.factory())
+    }
+}
+
+impl CanvasState {
+    /// The default view state with the 13 layout fields taken from `layout` — the one
+    /// `CanvasLayout` -> `CanvasState` mapping (also the base of `canvas_state_from_project`).
+    ///
+    /// Modes parse through each enum's total `from_str`; the display types resolve `default`
+    /// with the `on_top` (editable) / `aside` (readonly) fallbacks; px become world units
+    /// through `pixel_setting_to_f32`. Nothing is clamped. Every other field is a fixed default.
+    pub(crate) fn with_layout(layout: &CanvasLayout) -> Self {
+        let CanvasLayout {
+            separate_pages,
+            page_spacing_px,
+            vertical_edge_margin_px,
+            aside_compact_mode,
+            aside_min_width_px,
+            aside_max_width_px,
+            aside_scale_pct,
+            aside_side_mode,
+            scale_bubbles,
+            aside_second_column,
+            editable_bubble_type,
+            readonly_bubble_type,
+            on_top_focus_mode,
+        } = layout;
         Self {
             zoom: 1.0,
             bubble_mode: BubbleMode::Hybrid,
-            hybrid_editable_bubble_type: BubbleType::OnTop,
-            hybrid_readonly_bubble_type: BubbleType::Aside,
+            hybrid_editable_bubble_type: BubbleType::from_str(editable_bubble_type).resolved(BubbleType::OnTop),
+            hybrid_readonly_bubble_type: BubbleType::from_str(readonly_bubble_type).resolved(BubbleType::Aside),
             show_bubbles: true,
             show_bubble_status: false,
             bubble_status_rules: default_bubble_status_rules(),
             bubble_opacity: 1.0,
-            page_spacing: 200.0,
-            separate_pages: true,
-            edge_margin: 200.0,
+            page_spacing: pixel_setting_to_f32(*page_spacing_px),
+            separate_pages: *separate_pages,
+            edge_margin: pixel_setting_to_f32(*vertical_edge_margin_px),
             side_margin: 20.0,
-            bubble_min_width: 500.0,
-            bubble_max_width: 550.0,
-            aside_compact_mode: AsideBubbleCompactMode::None,
-            aside_side_mode: AsideBubbleSideMode::Auto,
-            aside_second_column: true,
-            on_top_focus_mode: OnTopFocusMode::Around,
-            scale_bubbles: true,
-            aside_scale_pct: 100,
+            bubble_min_width: pixel_setting_to_f32(*aside_min_width_px),
+            bubble_max_width: pixel_setting_to_f32(*aside_max_width_px),
+            aside_compact_mode: AsideBubbleCompactMode::from_str(aside_compact_mode),
+            aside_side_mode: AsideBubbleSideMode::from_str(aside_side_mode),
+            aside_second_column: *aside_second_column,
+            on_top_focus_mode: OnTopFocusMode::from_str(on_top_focus_mode),
+            scale_bubbles: *scale_bubbles,
+            aside_scale_pct: *aside_scale_pct,
             auto_insert_last_character: true,
             spellcheck_original: false,
             spellcheck_translation: true,
@@ -930,6 +961,15 @@ impl Default for CanvasState {
     }
 }
 
+/// A project's pixel-valued canvas setting as the canvas' `f32` world units.
+///
+/// Rounds to the nearest representable `f32` (exact for |v| <= 2^24, far beyond any meaningful
+/// pixel length); the open path has always converted these fields this way, so the conversion is
+/// kept bit-identical rather than rejecting or clamping large values.
+pub(crate) fn pixel_setting_to_f32(value: i32) -> f32 {
+    value as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::CanvasState;
@@ -938,11 +978,13 @@ mod tests {
     ///
     /// `project::CanvasSettings::default` (`crates/ms-project`), `SharedCanvasSettings::default`
     /// (`crates/ms-models/src/bubbles_model.rs`) and `CanvasState::default` (this file) each
-    /// spell out the same user-facing values in a different representation, so a change to one
-    /// silently drifts from the others and shows up only as a wrong value on a fresh install or
-    /// a flicker before the project loads. The JSON copies in `config::user_config_defaults` /
-    /// `project_config_defaults` are covered too.
-    /// Only the fields this test names are guarded; extend it when you touch another one.
+    /// spell out the same user-facing values in a different representation. Their 13 layout
+    /// fields all come from `ms_project::BASE_BUILTIN` (the layout table) and are compared in
+    /// full here; of the other fields, the shared settings and the canvas state are compared in
+    /// full too, and the project settings on the fields this test names (extend it when you
+    /// touch another one). The JSON copies in `config::user_config_defaults` /
+    /// `project_config_defaults` are checked on the named non-layout field; they carry no layout
+    /// key (the layout is per title).
     ///
     /// It lives next to the third mirror because that is the only one of the three that is
     /// still reachable from here: `ms-models` sits BELOW the canvas and cannot name
@@ -952,6 +994,13 @@ mod tests {
         let project = ms_project::CanvasSettings::default();
         let shared = ms_models::bubbles_model::SharedCanvasSettings::default();
         let state = CanvasState::default();
+        let state_shared = crate::settings::shared_settings_from_state(&state);
+
+        let base = ms_project::BASE_BUILTIN.factory();
+        assert_eq!(ms_project::CanvasLayout::of(&project), base);
+        assert_eq!(shared.layout(), base);
+        assert_eq!(state_shared.layout(), base);
+        assert_eq!(state_shared, shared);
 
         assert_eq!(project.translation_status_display, "marks");
         assert_eq!(shared.translation_status_display, project.translation_status_display);
@@ -976,10 +1025,9 @@ mod tests {
                 canvas.get("translation_status_display").and_then(|v| v.as_str()),
                 Some(project.translation_status_display.as_str())
             );
-            assert_eq!(
-                canvas.get("aside_second_column").and_then(|v| v.as_bool()),
-                Some(project.aside_second_column)
-            );
+            // Layout keys are not defaulted in the trees at all (per-title layout; guarded in
+            // full by `ms-project` `defaults_trees_carry_no_layout_key`).
+            assert!(canvas.get("aside_second_column").is_none());
         }
     }
 }

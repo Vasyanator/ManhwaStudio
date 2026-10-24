@@ -3,14 +3,14 @@ File: crates/ms-theme/src/status.rs
 
 Purpose:
 Status (severity) colours of studio TEXT and labels on dark panels: error, warning, success and
-in-progress messages, toasts and status lines; plus the fill of an armed destructive button and
-the colour of a glyph painted on an error/warning fill (badges).
+in-progress messages, toasts and status lines; plus the fills of a destructive button at rest and
+once armed, and the colour of a glyph painted on an error/warning fill (badges).
 
 Key structures:
 - Severity
 
 Key constants:
-- ERROR, WARNING, SUCCESS, INFO, DESTRUCTIVE_ARMED_FILL, ON_STATUS_FILL
+- ERROR, WARNING, SUCCESS, INFO, DESTRUCTIVE_IDLE_FILL, DESTRUCTIVE_ARMED_FILL, ON_STATUS_FILL
 
 Notes:
 These are panel-text shades, deliberately softer than the canvas chrome in `canvas.rs`, which must
@@ -34,6 +34,12 @@ pub const SUCCESS: Color32 = Color32::from_rgb(42, 168, 88);
 /// Taken from the only existing use (`Color32::GOLD`); it sits close to [`WARNING`] and is the
 /// first candidate for retuning.
 pub const INFO: Color32 = Color32::from_rgb(255, 215, 0);
+
+/// Fill of a two-step destructive button AT REST, before its first click arms it.
+///
+/// Red already, because the action is destructive whether or not the confirm step has been
+/// reached; muted, so [`DESTRUCTIVE_ARMED_FILL`] still reads as an escalation.
+pub const DESTRUCTIVE_IDLE_FILL: Color32 = Color32::from_rgb(105, 38, 38);
 
 /// Fill of a destructive button once it is ARMED (second click confirms the deletion).
 pub const DESTRUCTIVE_ARMED_FILL: Color32 = Color32::from_rgb(150, 40, 40);

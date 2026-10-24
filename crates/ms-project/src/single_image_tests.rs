@@ -14,6 +14,7 @@ stands in for the user's folder, another for the scratch base. Nothing touches t
 */
 
 use super::*;
+use crate::{BuiltinLayoutPreset, CanvasLayout, ComicType, LayoutPresetSelection};
 use image::codecs::gif::GifEncoder;
 use image::codecs::jpeg::JpegEncoder;
 use image::{Delay, Frame, ImageEncoder, Rgb, RgbImage, Rgba, RgbaImage};
@@ -379,6 +380,21 @@ fn one_image_set_loads_one_page_inside_the_scratch() {
     assert!(session.skipped().is_empty());
     assert_eq!(data.pages[0].path.file_name().and_then(|name| name.to_str()), Some("000.png"));
     assert_eq!(snapshot(&fixture.user_dir()), before, "the user's folder must not change");
+    scratch.remove().expect("remove");
+}
+
+/// An image set takes the whole layout from the «Pages» preset: a legacy global layout value in
+/// the user config (which an unmigrated title would still read) does not reach it.
+#[test]
+fn image_set_layout_is_the_pages_preset() {
+    let fixture = Fixture::new();
+    let path = fixture.user_file("page.png", &solid_png(40));
+    let scratch = SingleImageScratch::reserve(&fixture.scratch_base()).expect("reserve");
+    let user_settings = serde_json::json!({"Canvas": {"aside_min_width_px": 600, "aside_compact_mode": "strong", "scale_bubbles": false}});
+    let data = open_image_set(std::slice::from_ref(&path), Vec::new(), &scratch, &user_settings, &mut |_, _| {}, &AtomicBool::new(false)).expect("open");
+    assert_eq!(data.comic_type, Some(ComicType::Pages));
+    assert_eq!(CanvasLayout::of(&data.canvas_settings), BuiltinLayoutPreset::Pages.factory());
+    assert_eq!(data.canvas_settings.layout_preset, LayoutPresetSelection::Builtin(BuiltinLayoutPreset::Pages));
     scratch.remove().expect("remove");
 }
 
