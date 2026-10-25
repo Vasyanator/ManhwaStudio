@@ -132,7 +132,7 @@ replaces the PyTorch build the Torch stage chose.
   logged, user-visible error; nothing is retried and the proven-wrong staged bytes are
   discarded. uv downloads keep the GitHub-digest pin (uv publishes no such manifest).
   Retries are shown as stage progress ("network error, retrying in N s (k/n)"), not as errors.
-- Cross-run resume: `<file>.identity.json` records the `{url, size, digest}` the staged files
+- Cross-run resume: `<file>.identity.json` (replaced atomically through `ms_atomic_file`) records the `{url, size, digest}` the staged files
   (`<file>.part`, the verified `<file>.download`) belong to; when it is missing, unreadable or
   names another asset, the staged files are deleted before the transfer, so bytes of another
   release are never resumed. A matching sidecar is necessary, not sufficient: `fetch_verified`

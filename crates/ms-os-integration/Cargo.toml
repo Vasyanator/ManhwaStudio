@@ -25,6 +25,9 @@ ms-config = { path = "../ms-config" }
 # Diagnostics of the registry probes and of the entries left in place on uninstall
 # (`ms_log::runtime_log`).
 ms-log = { path = "../ms-log" }
+# The atomic file-replace recipe of the Linux desktop entry and icon (`linux::xdg`; that
+# module also compiles in every native test build, hence the native table).
+ms-atomic-file = { path = "../ms-atomic-file" }
 # `IntegrationError::user_message` renders the SAME `installer.utils.*` catalog texts the
 # installer showed before the extraction; the macros are mounted crate-wide via
 # `#[macro_use] extern crate ms_i18n;` in `lib.rs`.

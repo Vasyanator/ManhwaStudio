@@ -116,6 +116,10 @@ libloading.workspace = true
 # The waifu2x package download (`new_project/waifu2x.rs`, `fetch_verified`): pinned size +
 # sha256, retry with capped backoff, `.part` resume, cancel.
 ms-download = { path = "../ms-download" }
+# The waifu2x `active` generation marker is replaced through the one atomic-write owner
+# (`write_atomic`), and the published trees' directories are fsynced with its
+# `sync_directory`. A level-0 leaf (std + thiserror).
+ms-atomic-file = { path = "../ms-atomic-file" }
 # The system UI-locale probe that preselects a language in the first-run modal.
 sys-locale.workspace = true
 # The System info tab (`pages/system_info/`): the native ONNX runtime's hardware facts and
@@ -139,3 +143,5 @@ ms-config = { path = "../ms-config", features = ["test-support"] }
 ms-platform = { path = "../ms-platform", features = ["test-support"] }
 # `test_support::ScriptedFetcher`: the in-memory server of the waifu2x download tests.
 ms-download = { path = "../ms-download", features = ["test-support"] }
+# `test-support` exposes `arm_fault`: the waifu2x publish test fails the marker switch there.
+ms-atomic-file = { path = "../ms-atomic-file", features = ["test-support"] }

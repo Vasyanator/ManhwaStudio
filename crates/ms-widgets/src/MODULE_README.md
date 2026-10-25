@@ -87,7 +87,7 @@ crate's `[dev-dependencies]`, so no production build carries them.
   (`download_attempted: HashSet<TextLanguage>`), so a failed download of one language never blocks
   another. The download goes through `ms_download::fetch_small` (retry with capped backoff,
   `Range` resume, timeouts, 32 MiB cap); both bodies are fetched first, then each file is written
-  temp + fsync + rename with `.dic` last, so discovery never pairs an incomplete download. It has no
+  through `ms_atomic_file` (hidden `.tmp` sibling, fsync, rename, directory fsync) with `.dic` last, so discovery never pairs an incomplete download. It has no
   cancel: the spellcheck worker lives for the whole process. If that worker dies anyway (a panic),
   its exit guard (`SpellWorkerExit`) closes the request channel, marks the service dead and resolves
   every still-pending word as unchecked (unmarked); it is not restarted. Per-word matching is language-first, script-second: a word in the active language's own

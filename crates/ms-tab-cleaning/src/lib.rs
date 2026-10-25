@@ -11,9 +11,8 @@ The TOP of the library stack — above the canvas, the models, the tooling primi
 widgets, `ms-local-ai` (AI backend health) and `ms-tab-translation` (it drives the text
 detector and the MT service through that crate), and below only `studio.rs`, which calls
 `CleaningTabState::draw`. It must never name `studio` or `launcher`.
-It does NOT depend on `ms-tab-typing` and must not start to: the one thing the two share is
-the atomic document-write RECIPE that `tools/watermark_library.rs` documents and reimplements,
-because `ms-tab-typing`'s `panel/doc_store.rs` is crate-private and unreachable from here.
+It does NOT depend on `ms-tab-typing` and must not start to. Atomic file writes (the
+watermark library, the engines' settings files) go through the level-0 owner `ms-atomic-file`.
 
 Modules:
 - `tab`: tab state, `CanvasHooks` implementation and the dock arrangement.

@@ -59,7 +59,8 @@ Callers own the threading: nothing here spawns a worker for you.
   looks present. LaMa-MPE is the one pinned file (`LAMA_MPE_SIZE` / `LAMA_MPE_SHA256`):
   `ensure_lama_mpe` repairs a wrong file and trusts a correct one without hashing only
   through its `<file>.verified.json` marker (unix: size + dev + inode + mtime + ctime + pin;
-  other platforms hash on every call).
+  other platforms hash on every call; the marker is always rewritten through `ms_atomic_file`,
+  never skipped as identical, because its own mtime is part of the trust check).
   One download per file per process (busy id `ai-models:<absolute local path>`; a second
   caller waits, cancellable, then finds the file). Every `ensure_*` takes an `EnsureCtx`: the
   caller's cancel flag (`ModelEnsureError::Cancelled`, staged bytes kept) and a progress sink

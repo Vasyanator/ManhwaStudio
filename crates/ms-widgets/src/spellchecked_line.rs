@@ -27,7 +27,8 @@ Notes:
 - Словари читаются из app-local папки `spell_check`; GUI-поток не делает
   файловых и сетевых операций.
 - Downloads use `ms_download::fetch_small` (retry, `Range` resume, timeouts,
-  size cap) and publish each file temp + fsync + rename, `.dic` last; no cancel,
+  size cap) and publish each file through `ms_atomic_file` (temp + fsync + rename
+  + directory fsync), `.dic` last; no cancel,
   because the worker lives for the whole process.
 - Активный словарь следует за ЯЗЫКОМ ВЁРСТКИ (как переносы и покрытие шрифта), а
   не за языком интерфейса. Воркер сравнивает `text_language()` каждый батч
@@ -60,7 +61,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::Hash;
 use ms_thread as thread;
-use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1220,38 +1220,18 @@ fn write_text_file(path: &Path, content: &str) -> Result<(), String> {
     fs::write(path, content).map_err(|err| format!("failed to write '{}': {err}", path.display()))
 }
 
-/// Publishes `content` at `path` atomically: written to `<path>.tmp` (an extension
-/// discovery ignores), fsynced, renamed over `path`, and on unix the directory is
-/// fsynced so the rename survives a crash. A failed attempt removes its temp file.
+/// Publishes `content` at `path` atomically through `ms_atomic_file` with
+/// `Durability::ContentsAndDirectory`: written to the hidden sibling `.<name>.<pid>.tmp`
+/// (its extension is `tmp`, so `discover_dictionary_files` never pairs it), fsynced, renamed
+/// over `path`, and on unix the directory is fsynced so the rename survives a crash. A failed
+/// attempt removes its temp file; the parent directory must exist. A file that already holds
+/// exactly `content` is kept (fsynced, not rewritten).
 ///
 /// # Errors
 /// The failed step with the path and the I/O error.
 fn write_text_file_atomic(path: &Path, content: &str) -> Result<(), String> {
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp_path = PathBuf::from(tmp_name);
-    let written = fs::File::create(&tmp_path).and_then(|mut file| {
-        file.write_all(content.as_bytes())?;
-        file.sync_all()
-    });
-    if let Err(err) = written.and_then(|()| fs::rename(&tmp_path, path)) {
-        if let Err(remove_err) = fs::remove_file(&tmp_path)
-            && remove_err.kind() != std::io::ErrorKind::NotFound
-        {
-            runtime_log::log_warn(format!(
-                "[widgets::spellchecked_line] failed to remove temp file '{}': {remove_err}",
-                tmp_path.display()
-            ));
-        }
-        return Err(format!("failed to write '{}': {err}", path.display()));
-    }
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|err| format!("failed to fsync '{}': {err}", parent.display()))?;
-    }
-    Ok(())
+    ms_atomic_file::write_atomic(path, content.as_bytes(), ms_atomic_file::Durability::ContentsAndDirectory)
+        .map_err(|err| format!("failed to write '{}': {err}", path.display()))
 }
 
 fn project_spellcheck_settings_slot() -> &'static Mutex<Option<PathBuf>> {
@@ -1804,7 +1784,10 @@ mod tests {
         std::fs::write(&dic, "old").map_err(|err| err.to_string())?;
         write_text_file_atomic(&dic, "1\nword\n")?;
         assert_eq!(std::fs::read_to_string(&dic).map_err(|err| err.to_string())?, "1\nword\n");
-        assert!(!dir.path().join("xx_XX.dic.tmp").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).map_err(|err| err.to_string())?.filter_map(Result::ok).map(|entry| entry.path()).filter(|path| ms_atomic_file::is_temp_artifact(path)).collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+        // A crash leftover of the write (hidden `.tmp` sibling) is never paired as a dictionary.
+        std::fs::write(dir.path().join(format!(".xx_XX.dic.{}.tmp", std::process::id())), "1\nword\n").map_err(|err| err.to_string())?;
         // A lone `.aff` (the state between the two renames) is not a dictionary.
         std::fs::remove_file(&dic).map_err(|err| err.to_string())?;
         write_text_file_atomic(&dir.path().join("xx_XX.aff"), "SET UTF-8\n")?;

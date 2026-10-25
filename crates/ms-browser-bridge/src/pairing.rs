@@ -26,17 +26,19 @@ Notes:
   non-regular file (symlink) is replaced with a fresh secret (it is the bridge's own file, never a
   user document).
 - The file is rewritten only when its content changes (port fallback, new secret, protocol).
-- Writes: temp file in the same folder (mode 0600 on unix, also forced on a reused temp) -> fsync
-  -> rename over the target. Every start then checks the FINAL file on unix: owned by the current
+- Writes: `ms_atomic_file::write_atomic_with` (temp `.bridge.json.{pid}.tmp` in the same folder,
+  created mode 0600 on unix and also forced on a reused temp before the secret is written ->
+  fsync -> rename over the target). Every start then checks the FINAL file on unix: owned by the current
   user, mode 0600 (a wider mode left by a copy / restore is repaired), else `PairingIo`.
 - Never log the secret or the file content.
 */
 
 use std::fs::{self, File, TryLockError};
-use std::io::{self, Write};
+use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::{Path, PathBuf};
 
+use ms_atomic_file::{AtomicWriteOptions, Durability, write_atomic_with};
 use ms_log::runtime_log;
 
 use crate::auth::Secret;
@@ -123,47 +125,23 @@ pub(crate) fn read_bridge_file(path: &Path) -> Result<Option<BridgeFile>, Bridge
     }
 }
 
-/// Writes `file` to `path` atomically (temp in the same folder, fsync, rename).
+/// Writes `file` to `path` atomically through the workspace's one recipe
+/// (`ms_atomic_file::write_atomic_with`): the folder is created when missing, the temp file in
+/// the same folder is created with mode 0600 on unix (also forced on a reused temp, before the
+/// secret is written), fsynced and renamed over `path`. The rename always replaces the
+/// directory entry (no identical-bytes shortcut): `bind_paired` calls this only when the
+/// content changed or the old entry is untrusted (a symlink, a foreign owner), and such an
+/// entry must never be kept.
 ///
 /// # Errors
 /// `BridgeError::PairingIo` when the folder cannot be created or any write step fails; the
-/// temp file is removed on failure.
+/// temp file is removed on failure (best effort, by the recipe).
 pub(crate) fn write_bridge_file(path: &Path, file: &BridgeFile) -> Result<(), BridgeError> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(dir).map_err(|err| pairing_error(dir, &err))?;
     let bytes = serde_json::to_vec_pretty(file).map_err(|err| BridgeError::PairingIo { path: path.to_path_buf(), detail: err.to_string() })?;
-    let tmp = dir.join(format!(".{CONFIG_FILE_NAME}.tmp-{}", std::process::id()));
-    let written = write_synced(&tmp, &bytes).and_then(|()| fs::rename(&tmp, path));
-    if let Err(err) = written {
-        if let Err(cleanup) = fs::remove_file(&tmp)
-            && cleanup.kind() != io::ErrorKind::NotFound
-        {
-            runtime_log::log_warn(format!("[browser_bridge] could not remove temp file {}: {cleanup}", tmp.display()));
-        }
-        return Err(pairing_error(path, &err));
-    }
-    Ok(())
-}
-
-fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
     // The secret is readable by the current user only (the browser runs as that user).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut out = options.open(path)?;
-    // `mode` applies only when the file is created: a leftover temp of a crashed run keeps its
-    // old mode, so the mode is forced on the handle before the secret is written.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        out.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    out.write_all(bytes)?;
-    out.sync_all()
+    let options = AtomicWriteOptions { create_parent: true, unix_mode: Some(0o600), skip_if_identical: false, ..AtomicWriteOptions::new(Durability::Contents) };
+    // The recipe's error names the directory, temp file or target it failed on.
+    write_atomic_with(path, &bytes, &options).map_err(|err| BridgeError::PairingIo { path: path.to_path_buf(), detail: err.to_string() })
 }
 
 fn pairing_error(path: &Path, err: &io::Error) -> BridgeError {
@@ -387,6 +365,24 @@ mod tests {
         assert_eq!(second.secret, first.secret, "the content is reused");
         assert_eq!(second.port, port, "nothing changed, so the file was not rewritten");
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_leftover_temp_never_carries_the_secret_with_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("pairing-leftover-temp");
+        let path = bridge_file_path(dir.path());
+        // A crashed run's temp with a wide mode: the recipe reuses its name, so the 0600 mode
+        // must be forced on the handle before the secret is written (no ensure_private here).
+        let leftover = ms_atomic_file::temp_path_for(&path);
+        fs::write(&leftover, b"stale").unwrap();
+        fs::set_permissions(&leftover, fs::Permissions::from_mode(0o644)).unwrap();
+        let file = BridgeFile { protocol: PROTOCOL_VERSION, port: 1, secret: "cd".repeat(32) };
+        write_bridge_file(&path, &file).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(read_bridge_file(&path).unwrap(), Some(file));
+        assert!(!leftover.exists(), "the temp was renamed into place");
     }
 
     #[cfg(unix)]

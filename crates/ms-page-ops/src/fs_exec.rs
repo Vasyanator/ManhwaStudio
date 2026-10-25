@@ -45,8 +45,9 @@ Notes:
 Uses `std::fs` directly (not the `ms_storage::global` seam): the transaction needs
 fsync and same-volume renames, which the seam does not model. The page manager
 is a native-desktop feature; on wasm the journal never exists and `recover` is
-an inert no-op. Directory fsync is best-effort and Unix-only, mirroring
-`tabs/settings/mod.rs::fsync_parent_dir_best_effort`.
+an inert no-op. Whole-file writes (journals, trash archives, plain JSON documents)
+go through `ms_atomic_file`; directory fsync is best-effort and Unix-only
+(`ms_atomic_file::sync_directory`, a logged warning on failure).
 The two OWNED chapter documents (`layers/layers`, the bubbles document) exist as
 `.json` OR `.db`. The scan resolves each one under the store's document lock (which
 finishes an interrupted conversion, rule B.4) and records the ACTUAL format with the
@@ -1626,90 +1627,37 @@ fn current_trash_id() -> u128 {
         .map_or(0, |d| d.as_millis())
 }
 
-/// Writes `bytes` to `path` atomically: sibling temp file, fsync, rename. If a
-/// stale destination blocks the rename (Windows), it is removed and the rename
-/// retried — callers guarantee the destination is either absent or a
-/// previous-attempt artifact of this same write.
+/// Writes `bytes` to `path` atomically through the owner recipe
+/// (`ms_atomic_file::write_atomic_with`): the parent directory is created, a
+/// sibling hidden temp (`ms_atomic_file::temp_path_for`) is written and fsynced,
+/// then renamed over `path` (retried on Windows sharing violations). The old file
+/// is never deleted first, and the temp is removed on every failure. The directory
+/// entry is NOT fsynced here: callers follow with [`fsync_dir_best_effort`] where
+/// the transaction needs it. Runs on the page-op worker, never the GUI thread.
+///
+/// # Errors
+/// [`PageOpError::Io`] carrying the failing path, the OS reason and its kind.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), PageOpError> {
-    let parent = path.parent().ok_or_else(|| {
-        PageOpError::Journal(format!("'{}' has no parent directory", path.display()))
-    })?;
-    fs::create_dir_all(parent)
-        .map_err(|err| io_ctx(&err, format!("create dir {}", parent.display())))?;
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| {
-            PageOpError::Journal(format!("'{}' has no usable file name", path.display()))
-        })?;
-    let temp = parent.join(format!("{file_name}.pageop-write.tmp"));
-    {
-        let mut file = fs::File::create(&temp)
-            .map_err(|err| io_ctx(&err, format!("create {}", temp.display())))?;
-        file.write_all(bytes)
-            .map_err(|err| io_ctx(&err, format!("write {}", temp.display())))?;
-        file.sync_all()
-            .map_err(|err| io_ctx(&err, format!("fsync {}", temp.display())))?;
-    }
-    if let Err(first_err) = fs::rename(&temp, path) {
-        if path.exists() {
-            fs::remove_file(path).map_err(|err| {
-                io_ctx(&err, format!("replace stale {}", path.display()))
-            })?;
-            fs::rename(&temp, path).map_err(|err| {
-                io_ctx(
-                    &err,
-                    format!("rename '{}' -> '{}'", temp.display(), path.display()),
-                )
-            })?;
-        } else {
-            return Err(io_ctx(
-                &first_err,
-                format!("rename '{}' -> '{}'", temp.display(), path.display()),
-            ));
-        }
-    }
-    Ok(())
+    let options = ms_atomic_file::AtomicWriteOptions { create_parent: true, ..ms_atomic_file::AtomicWriteOptions::new(ms_atomic_file::Durability::Contents) };
+    ms_atomic_file::write_atomic_with(path, bytes, &options).map_err(|err| PageOpError::Io(err.into()))
 }
 
-/// Reopens `path` and fsyncs its contents (precedent:
-/// `tabs/settings/mod.rs::write_ort_load_state`).
+/// Reopens `path` and fsyncs its contents (a staged file produced by `fs::copy`
+/// or an image encoder, which leave the data in the page cache).
 fn fsync_file(path: &Path) -> std::io::Result<()> {
     fs::OpenOptions::new().write(true).open(path)?.sync_all()
 }
 
 /// Best-effort directory fsync so renamed/created directory entries are
-/// durable. Unix-only: std cannot fsync a directory handle on Windows
-/// (mirrors `tabs/settings/mod.rs::fsync_parent_dir_best_effort`).
+/// durable: `ms_atomic_file::sync_directory` (Unix; a no-op where std cannot
+/// fsync a directory handle, e.g. Windows), with a failure logged instead of
+/// failing the transaction step.
 fn fsync_dir_best_effort(dir: Option<&Path>) {
-    #[cfg(unix)]
-    {
-        let Some(dir) = dir else {
-            return;
-        };
-        if dir.as_os_str().is_empty() {
-            return;
-        }
-        match fs::File::open(dir) {
-            Ok(handle) => {
-                if let Err(err) = handle.sync_all() {
-                    runtime_log::log_warn(format!(
-                        "[page-ops] directory fsync failed for {} ({err})",
-                        dir.display()
-                    ));
-                }
-            }
-            Err(err) => runtime_log::log_warn(format!(
-                "[page-ops] could not open directory {} for fsync ({err})",
-                dir.display()
-            )),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // No portable directory fsync outside Unix; the journal file itself is
-        // still fsync'd and recovery tolerates lost directory entries.
-        let _ = dir;
+    let Some(dir) = dir.filter(|dir| !dir.as_os_str().is_empty()) else {
+        return;
+    };
+    if let Err(err) = ms_atomic_file::sync_directory(dir) {
+        runtime_log::log_warn(format!("[page-ops] directory fsync failed ({err})"));
     }
 }
 
@@ -2028,7 +1976,7 @@ mod tests {
         for (rel, _) in walk(title) {
             assert!(
                 !rel.contains(super::super::plan::TEMP_PREFIX)
-                    && !rel.contains(".pageop-write.tmp")
+                    && !ms_atomic_file::is_temp_artifact(Path::new(&rel))
                     && !rel.ends_with(JOURNAL_FILE_NAME)
                     && !rel.ends_with(JOURNAL_B_FILE_NAME),
                 "leftover transaction artifact: {rel}"

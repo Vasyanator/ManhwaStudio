@@ -527,17 +527,17 @@ impl VerifiedMarker {
         expected.ctime < written_at && recorded == Some(expected)
     }
 
-    /// Writes the marker for the just-verified `file` (temp file + rename). On a platform
-    /// without a cheap identity it writes nothing (`Ok`): the file is hashed on every call.
+    /// Writes the marker for the just-verified `file` through the owner recipe
+    /// (`ms_atomic_file`: hidden sibling temp, contents fsynced, rename; the temp is removed on
+    /// failure). On a platform without a cheap identity it writes nothing (`Ok`): the file is
+    /// hashed on every call. The identical-bytes skip is OFF: [`Self::confirms`] trusts a
+    /// marker only when its OWN mtime is newer than the file's ctime, so an unchanged marker
+    /// left from a racy stamp must still be rewritten to get a fresh mtime. Worker thread only.
     fn record(file: &Path, size: u64, sha256: &str) -> Result<(), String> {
         let Some(marker) = Self::describe(file, size, sha256) else { return Ok(()) };
         let bytes = serde_json::to_vec(&marker).map_err(|err| err.to_string())?;
-        let target = Self::path_for(file);
-        let mut tmp_name = target.as_os_str().to_os_string();
-        tmp_name.push(".tmp");
-        let tmp = PathBuf::from(tmp_name);
-        fs::write(&tmp, bytes).map_err(|err| format!("{}: {err}", tmp.display()))?;
-        fs::rename(&tmp, &target).map_err(|err| format!("{}: {err}", target.display()))
+        let options = ms_atomic_file::AtomicWriteOptions { skip_if_identical: false, ..ms_atomic_file::AtomicWriteOptions::new(ms_atomic_file::Durability::Contents) };
+        ms_atomic_file::write_atomic_with(&Self::path_for(file), &bytes, &options).map_err(|err| err.to_string())
     }
 }
 

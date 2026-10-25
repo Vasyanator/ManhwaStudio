@@ -32,7 +32,7 @@ listener thread (non-blocking accept) ──> one thread per connection (server/
   `RequestOptions`, `BridgeEvent`, `ReloadTarget`, the routing rule `select_peer`.
 - `errors.rs`: `BridgeError` (localized `browser_bridge.*`), `remote_code_text`.
 - `pairing.rs`: the folder's inter-process owner lock (`.ms-bridge.lock`), `bridge.json` read /
-  atomic write, trust check (regular file of the current user), mode 0600, secret reuse, port
+  atomic write (`ms_atomic_file`, temp created 0600), trust check (regular file of the current user), mode 0600, secret reuse, port
   reuse with fallback.
 - `server/mod.rs`: `BridgeServer` (start, status, request, reload, shutdown), listener loop.
 - `server/connection.rs`: per-connection thread: upgrade guard, handshake decision, frame loop.

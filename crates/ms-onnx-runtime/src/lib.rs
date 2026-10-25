@@ -965,21 +965,14 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().flat_map(|byte| [DIGITS[usize::from(byte >> 4)], DIGITS[usize::from(byte & 0x0f)]]).map(char::from).collect()
 }
 
-/// Fsyncs directory `dir` so the renames / removals inside it are durable (unix; a no-op
-/// elsewhere, where directory handles cannot be fsynced).
+/// Fsyncs directory `dir` so the renames / removals inside it are durable
+/// (`ms_atomic_file::sync_directory`: unix; a documented no-op elsewhere, where directory
+/// handles cannot be fsynced).
+///
+/// # Errors
+/// [`OrtRuntimeError::Io`] naming `dir` when the fsync fails.
 fn sync_dir(dir: &Path) -> Result<(), OrtRuntimeError> {
-    #[cfg(unix)]
-    {
-        File::open(dir).and_then(|handle| handle.sync_all()).map_err(|err| {
-            OrtRuntimeError::Io(tf!("onnx_runtime.download.save_error", path = dir.display(), err = err))
-        })?;
-    }
-    #[cfg(not(unix))]
-    {
-        // Infallible: only unix fsyncs directory handles, so `dir` is otherwise unused.
-        let _ = dir;
-    }
-    Ok(())
+    ms_atomic_file::sync_directory(dir).map_err(|err| OrtRuntimeError::Io(tf!("onnx_runtime.download.save_error", path = dir.display(), err = err)))
 }
 
 /// File name of a build cache directory's completion marker.
@@ -1075,25 +1068,21 @@ fn invalidate_cache_marker(dir: &Path) -> Result<(), OrtRuntimeError> {
     sync_dir(dir)
 }
 
-/// Publishes the completion marker `text` atomically: `<marker>.tmp`, fsync, rename,
-/// fsync of `dir`.
+/// Publishes the completion marker `text` atomically through `ms_atomic_file` with
+/// `Durability::ContentsAndDirectory`: hidden sibling temp, fsync, rename (retried on Windows
+/// sharing violations), fsync of `dir`; the temp is removed on failure.
 ///
 /// # Errors
 /// [`OrtRuntimeError::Io`] on any write, rename or fsync failure (the cache then stays
 /// untrusted and the next call rebuilds it).
 fn write_cache_marker(dir: &Path, text: &str) -> Result<(), OrtRuntimeError> {
     let marker_path = dir.join(CACHE_MARKER);
-    let staged = staging_path(&marker_path);
-    let write = || -> std::io::Result<()> {
-        let mut file = File::create(&staged)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()
-    };
-    write().map_err(|err| OrtRuntimeError::Io(tf!("onnx_runtime.download.write_error", path = staged.display(), err = err)))?;
-    fs::rename(&staged, &marker_path).map_err(|err| {
-        OrtRuntimeError::Io(tf!("onnx_runtime.download.publish_member_error", from = staged.display(), to = marker_path.display(), err = err))
-    })?;
-    sync_dir(dir)
+    ms_atomic_file::write_atomic(&marker_path, text.as_bytes(), ms_atomic_file::Durability::ContentsAndDirectory).map_err(|err| match err {
+        ms_atomic_file::AtomicWriteError::TempWrite { .. } | ms_atomic_file::AtomicWriteError::Rename { .. } => {
+            OrtRuntimeError::Io(tf!("onnx_runtime.download.write_error", path = marker_path.display(), err = err))
+        }
+        ms_atomic_file::AtomicWriteError::DirSync { .. } => OrtRuntimeError::Io(tf!("onnx_runtime.download.save_error", path = dir.display(), err = err)),
+    })
 }
 
 /// The onnxruntime library filename to place and return for this build target.

@@ -16,8 +16,8 @@ Main responsibilities:
   (reserved with `create_new`, never replacing an earlier copy) and defaults, unreadable or
   unquarantinable -> defaults with saving BLOCKED (`SettingsProblem`);
 - write a document as pretty JSON, creating the directory, and replace the file ATOMICALLY
-  (unique sibling temp `.<name>.<pid>.<n>.tmp`, synced, renamed over it; `write_settings_json`,
-  typed `SettingsWriteError`);
+  through `ms_atomic_file` (unique sibling temp `.<name>.<pid>.<n>.tmp`, synced, renamed over
+  it; `write_settings_json`, typed `SettingsWriteError`);
 - drive the save from an engine's `poll`: at most one writer, never before the load landed,
   never while blocked, only after `SETTINGS_SAVE_DEBOUNCE` (700 ms) without a change (detected
   by value), a failed write restores `dirty` and retries after 2 s doubling to 60 s, and the
@@ -48,7 +48,6 @@ use serde::Serialize;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use web_time::{Duration, Instant};
 
@@ -207,66 +206,30 @@ pub(in crate::tools) enum SettingsWriteError {
 }
 
 /// Writes `document` to `path` as pretty JSON, creating the parent directory first, and
-/// REPLACES the file atomically: the bytes go to a fresh sibling temp file
-/// ([`settings_temp_path`]), are synced, and only then is the temp renamed over `path`. A
-/// crash or a full disk mid-write therefore leaves the previous complete file (or the new
-/// complete one), never a truncated document the next load would have to quarantine. Runs on
-/// a worker thread.
+/// REPLACES the file atomically through `ms_atomic_file`: the bytes go to a sibling temp file
+/// whose name is unique to this call (`.<name>.<pid>.<serial>.tmp`, opened with `create_new`,
+/// because two engines or an exit flush behind a write may target one path without a shared
+/// lock), are synced, and only then is the temp renamed over `path` (retried on Windows
+/// sharing violations). A crash or a full disk mid-write therefore leaves the previous complete
+/// file (or the new complete one), never a truncated document the next load would have to
+/// quarantine. A file that already holds exactly these bytes is kept (fsynced, not rewritten).
+/// Runs on a worker thread.
 ///
-/// The rename replaces an existing file on every target: `rename(2)` on unix, and on Windows
-/// `std::fs::rename` is `MoveFileExW(.., MOVEFILE_REPLACE_EXISTING)` (std
-/// `sys/fs/windows.rs` `rename`). The directory entry itself is not synced: after a power
-/// loss either the old or the new complete file is there, both readable.
+/// The temp name can never be taken for a settings document or a quarantine copy: settings
+/// files are opened by their exact name, aside copies are `<stem>.malformed-*.json`, and the
+/// temp starts with a dot and ends in `.tmp`. The directory entry itself is not synced: after
+/// a power loss either the old or the new complete file is there, both readable.
 ///
 /// # Errors
 /// [`SettingsWriteError`] naming the step that failed. On a failed write, sync or rename the
-/// temp file is removed (a failed removal is logged) and `path` is left exactly as it was.
+/// temp file is removed and `path` is left exactly as it was.
 pub(in crate::tools) fn write_settings_json<T: Serialize>(path: &Path, document: &T) -> Result<(), SettingsWriteError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(SettingsWriteError::CreateDir)?;
     }
     let raw = serde_json::to_string_pretty(document).map_err(SettingsWriteError::Serialize)?;
-    replace_file_atomically(path, raw.as_bytes()).map_err(SettingsWriteError::Write)
-}
-
-/// Process-wide counter that makes every temp name of [`settings_temp_path`] unique, so two
-/// writers (two engines, or an exit flush behind a write) never share a temp file.
-static SETTINGS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// The `serial`-th temp name for a write of `path`: `<dir>/.<file name>.<pid>.<serial>.tmp`.
-///
-/// It can never be taken for a settings document or a quarantine copy: settings files are
-/// opened by their exact name, aside copies are `<stem>.malformed-*.json`, and this name
-/// starts with a dot and ends in `.tmp`.
-#[must_use]
-fn settings_temp_path(path: &Path, serial: u64) -> PathBuf {
-    let name = path.file_name().map_or_else(|| "settings".into(), |name| name.to_string_lossy());
-    path.with_file_name(format!(".{name}.{}.{serial}.tmp", std::process::id()))
-}
-
-/// Writes `bytes` into a fresh temp file beside `path` (reserved with `create_new`), syncs it
-/// and renames it over `path`.
-///
-/// # Errors
-/// The I/O error of the step that failed; the temp file is removed first, so nothing is left
-/// behind and `path` is untouched.
-fn replace_file_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let temp = settings_temp_path(path, SETTINGS_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed));
-    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
-    // Closed before the rename: Windows refuses to rename a file that is still open.
-    drop(file);
-    if let Err(err) = written.and_then(|()| fs::rename(&temp, path)) {
-        if let Err(cleanup) = fs::remove_file(&temp) {
-            ms_log::runtime_log::log_warn(format!(
-                "[cleaning] could not remove the settings temp file {} ({cleanup})",
-                temp.display()
-            ));
-        }
-        return Err(err);
-    }
-    Ok(())
+    let options = ms_atomic_file::AtomicWriteOptions { unique_temp: true, ..ms_atomic_file::AtomicWriteOptions::new(ms_atomic_file::Durability::Contents) };
+    ms_atomic_file::write_atomic_with(path, raw.as_bytes(), &options).map_err(|err| SettingsWriteError::Write(err.into()))
 }
 
 /// How long to wait before retrying the settings write after `failures` consecutive
@@ -641,18 +604,6 @@ mod tests {
         let entries: Vec<_> = std::fs::read_dir(dir.join("nested")).expect("list the dir").map(|entry| entry.expect("an entry").file_name()).collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("engine_settings.json")], "no temp file left behind");
         std::fs::remove_dir_all(&dir).expect("remove the scratch dir");
-    }
-
-    /// The temp name can never be read as a settings file or an aside copy.
-    #[test]
-    fn the_temp_name_is_neither_a_settings_file_nor_an_aside_copy() {
-        let path = Path::new("/home/u/data/flux2_klein_settings.json");
-        let temp = settings_temp_path(path, 7);
-        let name = temp.file_name().and_then(|name| name.to_str()).expect("a UTF-8 name");
-        assert_eq!(temp.parent(), path.parent(), "a sibling, so the rename stays on one filesystem");
-        assert_eq!(name, format!(".flux2_klein_settings.json.{}.7.tmp", std::process::id()));
-        assert!(name.starts_with('.') && !name.ends_with(".json") && !name.contains(".malformed-"));
-        assert_ne!(settings_temp_path(path, 8), temp, "every write gets its own temp");
     }
 
     /// A failed replacement leaves the target exactly as it was and no temp behind: here the

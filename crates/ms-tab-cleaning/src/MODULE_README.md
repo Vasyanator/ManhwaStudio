@@ -13,9 +13,8 @@ This directory is the crate root of `ms-tab-cleaning`, re-exported by the binary
 dilation), `ms-ai-api` (the cloud image-edit layer of «ИИ редактирование (API)») and
 `ms-tab-translation` (the text detector and the MT service), `ms-local-ai` (backend health), and below only `studio.rs`, which calls
 `CleaningTabState::draw`. It must never name `studio` or `launcher`. There is NO dependency on
-`ms-tab-typing`: the only thing shared with it is the atomic document-write RECIPE that
-`tools/watermark_library.rs` reimplements, because that crate's `panel/doc_store.rs` is
-crate-private and unreachable from here.
+`ms-tab-typing`. Atomic file writes (the watermark library, the hosted engines' settings
+files) go through the level-0 owner `ms-atomic-file`, never a private temp + rename copy.
 
 ## Architecture
 `CleaningTabState` owns a dedicated `CanvasView`, the active `CleaningTool`, cleaning UI state,

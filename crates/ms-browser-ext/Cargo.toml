@@ -6,10 +6,14 @@ build = "build.rs"
 
 # The ManhwaStudio browser extension as an embedded bundle: its pinned Chromium id, the
 # bundle built from `browser-extension/` at build time (when node/npm exist) and the atomic,
-# version-stamped unpack into the app's data folder. GUI-free, no i18n, no logging; the only
-# crate of the workspace whose build script runs npm (see `src/MODULE_README.md`).
+# version-stamped unpack into the app's data folder. GUI-free, no i18n, no logging; its only
+# `ms-*` dependency is the level-0 `ms-atomic-file`. The only crate of the workspace whose
+# build script runs npm (see `src/MODULE_README.md`).
 
 [dependencies]
+# The one atomic-replace recipe (temp + fsync + rename) and directory fsync for the unpack
+# (`install.rs`). Also level 0 (std + thiserror), so this crate stays at level 0.
+ms-atomic-file = { path = "../ms-atomic-file" }
 # Stamp `ms-extension-stamp.json` (de)serialization.
 serde.workspace = true
 serde_json.workspace = true

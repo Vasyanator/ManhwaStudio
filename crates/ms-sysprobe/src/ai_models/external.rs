@@ -595,7 +595,7 @@ fn run_download(
     if spec.layout == DirLayout::Exclusive {
         remove_stale_files(&dir, &staging, spec)?;
     }
-    write_json_atomically(&marker, &staging.join("complete.json.tmp"), &Marker::for_spec(spec))?;
+    write_json_atomically(&marker, &Marker::for_spec(spec))?;
     // The marker is written, so the model IS installed: a leftover staging directory (e.g. a
     // Windows sharing violation) is not a failed download. The next download into this
     // directory reuses the leftover staging and removes it when it completes.
@@ -1030,7 +1030,7 @@ fn prepare_staging(staging: &Path, spec: &ExternalModelSpec) -> Result<(), Exter
             removed.map_err(|source| io_error(&path, source))?;
         }
     }
-    write_json_atomically(&in_progress, &staging.join("in_progress.json.tmp"), &identity)
+    write_json_atomically(&in_progress, &identity)
 }
 
 /// Merges the file paths of a discarded foreign in-progress identity into
@@ -1042,7 +1042,7 @@ fn record_abandoned_files(staging: &Path, foreign: &Marker) -> Result<(), Extern
     abandoned.paths.extend(foreign.files.iter().map(|file| file.path.clone()));
     abandoned.paths.sort_unstable();
     abandoned.paths.dedup();
-    write_json_atomically(&path, &staging.join("abandoned_files.json.tmp"), &abandoned)
+    write_json_atomically(&path, &abandoned)
 }
 
 /// Deletes the files listed by the retired marker or by an abandoned in-progress identity
@@ -1068,17 +1068,15 @@ fn remove_stale_files(dir: &Path, staging: &Path, spec: &ExternalModelSpec) -> R
     Ok(())
 }
 
-/// Serializes `value` to `tmp`, fsyncs it and renames it onto `target`.
+/// Serializes `value` and replaces `target` with it through the owner recipe
+/// (`ms_atomic_file::write_atomic`: hidden sibling temp `.{name}.{pid}.tmp` in `target`'s own
+/// directory, contents fsynced, rename; the temp is removed on every failure). The parent must
+/// exist. Identical bytes are kept as they are (only re-fsynced): every record here is read for
+/// its contents only. Worker thread only.
 #[cfg(not(target_arch = "wasm32"))]
-fn write_json_atomically<T: Serialize>(target: &Path, tmp: &Path, value: &T) -> Result<(), ExternalModelError> {
-    use std::io::Write;
-
+fn write_json_atomically<T: Serialize>(target: &Path, value: &T) -> Result<(), ExternalModelError> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|err| ExternalModelError::InvalidSpec(format!("marker serialization failed: {err}")))?;
-    let mut handle = std::fs::File::create(tmp).map_err(|source| io_error(tmp, source))?;
-    handle.write_all(&bytes).map_err(|source| io_error(tmp, source))?;
-    handle.sync_all().map_err(|source| io_error(tmp, source))?;
-    drop(handle);
-    std::fs::rename(tmp, target).map_err(|source| io_error(target, source))
+    ms_atomic_file::write_atomic(target, &bytes, ms_atomic_file::Durability::Contents).map_err(|err| io_error(target, err.into()))
 }
 
 #[cfg(not(target_arch = "wasm32"))]

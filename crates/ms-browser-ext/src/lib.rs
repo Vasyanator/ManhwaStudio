@@ -4,7 +4,8 @@ File: crates/ms-browser-ext/src/lib.rs
 Purpose:
 Crate root of `ms-browser-ext`: the ManhwaStudio browser extension as part of the app — its
 pinned Chromium id, the bundle embedded at build time and the unpack into the app's data
-folder. Level 0 of the workspace (no `ms-*` dependencies); GUI-free, no i18n, no logging.
+folder. Level 0 of the workspace (its only `ms-*` dependency is the level-0 `ms-atomic-file`);
+GUI-free, no i18n, no logging.
 
 Main responsibilities:
 - `CHROMIUM_EXTENSION_ID` / `chromium_origin()`: the id derived at build time from

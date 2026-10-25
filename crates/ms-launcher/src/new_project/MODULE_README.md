@@ -120,7 +120,7 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
   `fetch_verified` (size + sha256 pins, retry shown as the `download_waifu2x_retry` progress stage,
   `.part` resumed across runs, cancelled by the window close via `shutdown`). Install never touches
   the active generation: the new tree is renamed into its own `gen-<sha>/` folder, the `active`
-  marker is replaced atomically, and only then old generations / legacy `Lin`/`Win` folders are
+  marker is replaced atomically (`ms_atomic_file`), and only then old generations / legacy `Lin`/`Win` folders are
   removed; the probe reports available only for the generation the marker names (a legacy
   unmarked install is reinstalled once).
 - Reline processing depends on an externally running AI backend reached through `crate::backend_ipc`

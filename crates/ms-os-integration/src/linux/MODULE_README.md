@@ -14,7 +14,7 @@ read-only registration probe.
   and the escaping helpers.
 - `xdg.rs` (`target_os = "linux"`): `DesktopDirs` (`$XDG_DATA_HOME` / `$XDG_DATA_DIRS`, pure over an
   env closure), `entry_path_under` / `icon_path_under`, `same_executable`, `ensure_at_startup`
-  (atomic writes), `resolve_program_in_process_path` (the production resolver), `write_entry`
+  (atomic writes through `ms_atomic_file`), `resolve_program_in_process_path` (the production resolver), `write_entry`
   (the unconditional write of this copy's entry + icon for the
   registration actions; no refresh) and `refresh_linux_desktop_database`.
 - `probe.rs`: `evaluate_desktop_entry` (pure judge over `EntryOracles` -> `[StartMenu, OpenWith]` rows) and the

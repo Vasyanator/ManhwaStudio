@@ -3509,6 +3509,7 @@ dependencies = [
  "hex",
  "hmac",
  "libc",
+ "ms-atomic-file",
  "ms-browser-ext",
  "ms-i18n",
  "ms-log",
@@ -3525,6 +3526,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "hex",
+ "ms-atomic-file",
  "serde",
  "serde_json",
  "sha2",
@@ -3566,6 +3568,7 @@ name = "ms-config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ms-atomic-file",
  "ms-docstore",
  "ms-i18n",
  "ms-log",
@@ -3668,6 +3671,7 @@ dependencies = [
  "flate2",
  "image 0.25.10",
  "libc",
+ "ms-atomic-file",
  "ms-config",
  "ms-docstore",
  "ms-download",
@@ -3703,6 +3707,7 @@ dependencies = [
  "flate2",
  "image 0.25.10",
  "libloading 0.8.9",
+ "ms-atomic-file",
  "ms-backend-ipc",
  "ms-config",
  "ms-docstore",
@@ -3834,6 +3839,7 @@ name = "ms-onnx-runtime"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "ms-atomic-file",
  "ms-config",
  "ms-download",
  "ms-i18n",
@@ -3853,6 +3859,7 @@ dependencies = [
 name = "ms-os-integration"
 version = "0.1.0"
 dependencies = [
+ "ms-atomic-file",
  "ms-config",
  "ms-i18n",
  "ms-log",
@@ -3868,6 +3875,7 @@ name = "ms-page-ops"
 version = "0.1.0"
 dependencies = [
  "image 0.25.10",
+ "ms-atomic-file",
  "ms-config",
  "ms-docstore",
  "ms-log",
@@ -3994,6 +4002,7 @@ dependencies = [
  "image 0.25.10",
  "keyring",
  "libc",
+ "ms-atomic-file",
  "ms-config",
  "ms-download",
  "ms-i18n",
@@ -4018,6 +4027,7 @@ dependencies = [
  "egui",
  "image 0.25.10",
  "ms-ai-api",
+ "ms-atomic-file",
  "ms-backend-ipc",
  "ms-canvas",
  "ms-config",
@@ -4293,6 +4303,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "egui",
+ "ms-atomic-file",
  "ms-config",
  "ms-docstore",
  "ms-download",

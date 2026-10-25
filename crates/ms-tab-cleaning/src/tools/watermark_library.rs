@@ -42,10 +42,9 @@ Notes:
   only — the card's mark-on-white icon — because that costs two small PNG decodes per entry
   whatever the sample count, while a refit costs one decode per crop plus the fit. Anything
   that needs the model itself still refits.
-- Every write goes through `write_atomic_bytes`: sibling temp in the SAME directory,
-  `write_all` + `sync_all`, CLOSE, `rename`, then an fsync of the containing directory.
-  This is the house recipe of `ms-tab-typing`'s `panel/doc_store.rs`, which is not reachable
-  from here (it is crate-private to `ms-tab-typing`), so the recipe — not the code — is reused.
+- Every write goes through `write_atomic_bytes`, a thin adapter over the one atomic-write
+  owner `ms_atomic_file` (sibling temp in the SAME directory, `write_all` + `sync_all`, CLOSE,
+  `rename`), followed by a best-effort fsync of the containing directory (`sync_directory`).
 - An ENTRY is more than one file, so file atomicity is not enough on its own: `save_entry`
   builds the whole new directory in a staging sibling (`stage_entry`) and swaps it in at the
   end (`commit_entry_dir`). A rewrite that fails — or a process that dies — therefore leaves
@@ -1312,71 +1311,38 @@ where
     Ok(cursor.into_inner())
 }
 
-/// Replaces `path` crash-safely: sibling temp file in the SAME directory, `write_all`,
-/// `sync_all`, CLOSE the handle, `rename`, then fsync the containing directory.
-///
-/// The recipe is the one `ms-tab-typing`'s `panel/doc_store.rs` documents; that module is
-/// crate-private to `ms-tab-typing` and therefore not reachable from here, so the recipe is
-/// reused rather than the code. The temp name carries the process id so two instances of
-/// the application never collide on it, and the handle is dropped before any rename or
-/// cleanup (deleting an open file fails on Windows).
+/// Replaces `path` crash-safely through `ms_atomic_file` (parent created when needed, sibling
+/// temp `.{name}.{pid}.tmp` in the SAME directory, `write_all`, `sync_all`, CLOSE, `rename`
+/// retried on Windows sharing violations, temp removed on failure), then fsyncs the containing
+/// directory best-effort ([`sync_directory`]). Identical bytes already on disk are kept as they
+/// are (fsynced, not rewritten): every caller writes a whole file whose content is the
+/// contract, never its mtime.
 ///
 /// # Errors
 /// A user-facing message when the parent directory cannot be created, the temp file cannot
 /// be written or fsynced, or the rename fails.
 fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .map_err(|err| tf!("cleaning.settings_io.create_dir_error", err = err))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("entry");
-    let temp = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    let written = (|| -> std::io::Result<()> {
-        let mut file = fs::File::create(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()
-        // The handle is dropped here, BEFORE the rename below.
-    })();
-    if let Err(err) = written {
-        let _ = fs::remove_file(&temp);
-        return Err(tf!(
+    let options = ms_atomic_file::AtomicWriteOptions { create_parent: true, ..ms_atomic_file::AtomicWriteOptions::new(ms_atomic_file::Durability::Contents) };
+    ms_atomic_file::write_atomic_with(path, bytes, &options).map_err(|err| {
+        tf!(
             "cleaning.tools.watermark.chapter.library_write_error",
             err = err
-        ));
-    }
-    if let Err(err) = fs::rename(&temp, path) {
-        let _ = fs::remove_file(&temp);
-        return Err(tf!(
-            "cleaning.tools.watermark.chapter.library_write_error",
-            err = err
-        ));
-    }
-    sync_directory(parent);
+        )
+    })?;
+    sync_directory(path.parent().unwrap_or_else(|| Path::new(".")));
     Ok(())
 }
 
-/// Fsyncs `dir` so the rename inside it is on stable storage.
+/// Fsyncs `dir` so the renames inside it are on stable storage (`ms_atomic_file::sync_directory`:
+/// Unix only, a documented no-op elsewhere).
 ///
 /// Best effort: a failure is logged and not propagated, because the data is already
 /// renamed into place and refusing the write afterwards would be a lie.
-#[cfg(unix)]
 fn sync_directory(dir: &Path) {
-    match fs::File::open(dir).and_then(|handle| handle.sync_all()) {
-        Ok(()) => {}
-        Err(err) => ms_log::runtime_log::log_warn(format!(
-            "[cleaning] watermark library: cannot fsync {}: {err}",
-            dir.display()
-        )),
+    if let Err(err) = ms_atomic_file::sync_directory(dir) {
+        ms_log::runtime_log::log_warn(format!("[cleaning] watermark library: {err}"));
     }
 }
-
-/// Windows/wasm: opening a directory handle needs `FILE_FLAG_BACKUP_SEMANTICS`, which
-/// `std::fs` does not expose, so the rename's durability rests on the filesystem. Documented
-/// no-op, exactly as in `doc_store.rs`.
-#[cfg(not(unix))]
-fn sync_directory(_dir: &Path) {}
 
 /// Resolves one entry-relative member path, refusing anything that leaves the entry.
 ///

@@ -50,7 +50,7 @@ use ms_download::resumable::{RangeFetcher, ResumableFetch, RetryPolicy, StreamEv
 #[cfg(not(target_arch = "wasm32"))]
 use ms_download::{DownloadError, Expected, FileEvent, FileRequest, fetch_verified};
 #[cfg(not(target_arch = "wasm32"))]
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -736,7 +736,8 @@ fn waifu2x_root() -> PathBuf {
 }
 
 /// Name of the marker file in the waifu2x root that names the ACTIVE generation folder. It is
-/// replaced atomically (temp + fsync + rename), so it always names one complete generation.
+/// replaced atomically (`ms_atomic_file`: temp + fsync + rename + directory fsync), so it
+/// always names one complete generation.
 const ACTIVE_MARKER: &str = "active";
 
 /// The generation folder of `package`: `gen-<first 16 hex digits of its sha256>`. A new pin
@@ -1017,7 +1018,8 @@ fn extract_waifu2x_package(
     publish_generation(&staging, root, generation, &|from, to| fs::rename(from, to))
 }
 
-/// The rename step of [`publish_generation`], injectable so tests can make it fail.
+/// The tree rename (step 2) of [`publish_generation`], injectable so tests can make it fail;
+/// the marker switch (step 3) is `ms_atomic_file`'s own rename (tests use its `arm_fault`).
 #[cfg(not(target_arch = "wasm32"))]
 type RenameFn<'a> = &'a dyn Fn(&Path, &Path) -> io::Result<()>;
 
@@ -1028,8 +1030,8 @@ type RenameFn<'a> = &'a dyn Fn(&Path, &Path) -> io::Result<()>;
 ///    tree of the same pin) is removed;
 /// 2. `staging` is renamed to `<root>/<generation>` (one directory rename) and `root` is
 ///    fsynced;
-/// 3. the [`ACTIVE_MARKER`] is replaced atomically (temp + fsync + rename) to name it, and
-///    `root` is fsynced: this is the switch;
+/// 3. the [`ACTIVE_MARKER`] is replaced atomically through `ms_atomic_file` (hidden temp,
+///    fsync, rename, `root` fsynced) to name it: this is the switch;
 /// 4. only then other generations and legacy unversioned package folders are removed
 ///    (failures are logged; they only cost disk space).
 ///
@@ -1056,15 +1058,8 @@ fn publish_generation(staging: &Path, root: &Path, generation: &str, rename: Ren
     sync_dir(root).map_err(|err| publish_error(root, err))?;
 
     let marker = root.join(ACTIVE_MARKER);
-    let marker_tmp = root.join(format!("{ACTIVE_MARKER}.tmp"));
-    File::create(&marker_tmp)
-        .and_then(|mut file| {
-            file.write_all(format!("{generation}\n").as_bytes())?;
-            file.sync_all()
-        })
-        .and_then(|()| rename(&marker_tmp, &marker))
-        .and_then(|()| sync_dir(root))
-        .map_err(|err| publish_error(&marker, err))?;
+    ms_atomic_file::write_atomic(&marker, format!("{generation}\n").as_bytes(), ms_atomic_file::Durability::ContentsAndDirectory)
+        .map_err(|err| publish_error(&marker, err.into()))?;
     ms_log::runtime_log::log_info(format!("[new-project] waifu2x generation '{generation}' is active in '{}'", root.display()));
 
     remove_stale_generations(root, generation);
@@ -1072,7 +1067,8 @@ fn publish_generation(staging: &Path, root: &Path, generation: &str, rename: Ren
 }
 
 /// Removes every generation folder other than `active` and the legacy unversioned package
-/// folders (`Lin`, `Win`, `Mac`) of `root`. Runs only after the switch; failures are logged.
+/// folders (`Lin`, `Win`, `Mac`) of `root`, plus crash leftovers of the marker switch
+/// ([`is_stale_marker_temp`]). Runs only after the switch; failures are logged.
 #[cfg(not(target_arch = "wasm32"))]
 fn remove_stale_generations(root: &Path, active: &str) {
     let entries = match fs::read_dir(root) {
@@ -1094,6 +1090,15 @@ fn remove_stale_generations(root: &Path, active: &str) {
         let Some(name) = name.to_str() else {
             continue;
         };
+        if is_stale_marker_temp(name) && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            if let Err(err) = fs::remove_file(entry.path()) {
+                ms_log::runtime_log::log_warn(format!(
+                    "[new-project] failed to remove the leftover waifu2x marker temp '{}': {err}",
+                    entry.path().display()
+                ));
+            }
+            continue;
+        }
         let stale = (name.starts_with("gen-") && name != active) || matches!(name, "Lin" | "Win" | "Mac");
         if !stale || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
@@ -1105,6 +1110,15 @@ fn remove_stale_generations(root: &Path, active: &str) {
             ));
         }
     }
+}
+
+/// Whether `name` (an entry of the waifu2x root) is a crash leftover of an [`ACTIVE_MARKER`]
+/// write: the hidden `ms_atomic_file` temp `.active.<pid>[.<serial>].tmp`, or the fixed
+/// `active.tmp` older builds staged the marker in. Only the marker is written into the root
+/// through a temp, so such a file is never data.
+#[cfg(not(target_arch = "wasm32"))]
+fn is_stale_marker_temp(name: &str) -> bool {
+    name == format!("{ACTIVE_MARKER}.tmp") || (name.starts_with(&format!(".{ACTIVE_MARKER}.")) && ms_atomic_file::is_temp_artifact(Path::new(name)))
 }
 
 /// fsyncs every directory of the tree under `dir` (children first), so the entries the
@@ -1120,14 +1134,11 @@ fn sync_tree(dir: &Path) -> io::Result<()> {
     sync_dir(dir)
 }
 
-/// fsyncs the directory `dir` (unix: makes renames and creations inside it durable).
+/// fsyncs the directory `dir` through `ms_atomic_file::sync_directory` (unix: makes renames
+/// and creations inside it durable; a documented no-op elsewhere).
 #[cfg(not(target_arch = "wasm32"))]
 fn sync_dir(dir: &Path) -> io::Result<()> {
-    // Windows cannot open a directory as a `File`; NTFS journals the rename itself.
-    if cfg!(unix) {
-        File::open(dir)?.sync_all()?;
-    }
-    Ok(())
+    ms_atomic_file::sync_directory(dir).map_err(io::Error::from)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1595,6 +1606,11 @@ mod tests {
         fs::create_dir_all(root.path().join(".staging/Lin")).expect("stale staging");
         fs::write(root.path().join(".staging/Lin/junk"), b"junk").expect("stale staging file");
         fs::create_dir_all(root.path().join("Lin")).expect("legacy tree");
+        // Crash leftovers of earlier marker switches (old fixed name and the hidden temp) and
+        // an unrelated file that must survive.
+        fs::write(root.path().join("active.tmp"), b"gen-old\n").expect("old marker temp");
+        fs::write(root.path().join(".active.4242.tmp"), b"gen-old\n").expect("hidden marker temp");
+        fs::write(root.path().join("notes.tmp"), b"keep").expect("unrelated file");
         let archive = package_zip(root.path());
         let (tx, _rx) = mpsc::channel();
         extract_waifu2x_package(&archive, root.path(), &generation_name(&new), &AtomicBool::new(false), &tx).expect("extract");
@@ -1608,7 +1624,10 @@ mod tests {
         assert!(!root.path().join(generation_name(&old)).exists());
         assert!(!root.path().join("Lin").exists());
         assert!(!root.path().join(".staging").exists());
-        assert!(!root.path().join("active.tmp").exists());
+        let leftovers: Vec<_> = fs::read_dir(root.path()).expect("list root").filter_map(Result::ok).map(|entry| entry.path()).filter(|path| ms_atomic_file::is_temp_artifact(path)).collect();
+        assert!(leftovers.is_empty(), "leftover marker temp: {leftovers:?}");
+        assert!(!root.path().join("active.tmp").exists(), "the old fixed marker temp is swept");
+        assert!(root.path().join("notes.tmp").is_file(), "only marker temps are swept");
     }
 
     #[test]
@@ -1634,11 +1653,12 @@ mod tests {
         assert!(probe_package(root.path(), &old).is_available());
         assert!(!probe_package(root.path(), &new).is_available());
 
-        // Step 3 (marker switch) fails: the new tree exists but is not active.
-        let fail_marker = |from: &Path, to: &Path| {
-            if to.ends_with(ACTIVE_MARKER) { Err(io::Error::other("injected marker failure")) } else { fs::rename(from, to) }
-        };
-        assert!(publish_generation(&staging, root.path(), &generation_name(&new), &fail_marker).is_err());
+        // Step 3 (marker switch) fails: the new tree exists but is not active. The marker write
+        // is `ms_atomic_file`'s, so the failure is injected there (this thread only).
+        ms_atomic_file::arm_fault(Some(ms_atomic_file::FaultPoint::TempWrite));
+        let marker_switch = publish_generation(&staging, root.path(), &generation_name(&new), &|from, to| fs::rename(from, to));
+        ms_atomic_file::arm_fault(None);
+        assert!(marker_switch.is_err());
         assert!(root.path().join(generation_name(&new)).join("Lin/lib.so").is_file());
         assert!(probe_package(root.path(), &old).is_available());
         assert!(!probe_package(root.path(), &new).is_available());

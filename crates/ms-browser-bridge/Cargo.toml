@@ -35,6 +35,9 @@ thiserror.workspace = true
 # Native-only: the listener / connection threads and the OS randomness for the secret and the
 # nonces. The web build has no loopback server; `lib.rs` compiles those modules out there.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The one atomic-replace recipe (temp + fsync + rename, mode 0600 forced on the temp) for
+# `bridge.json` (`pairing.rs`). Level 0, so no layering question.
+ms-atomic-file = { path = "../ms-atomic-file" }
 tungstenite.workspace = true
 # 0.3 is the copy tungstenite already pulls in (through rand 0.9): no new crate in the graph.
 getrandom = "0.3"

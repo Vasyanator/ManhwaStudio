@@ -56,7 +56,8 @@ Download flow for one spec (`<side_models>/<spec.dir>`; marker and staging per `
    `<staging>/<archive>`, `zip_member_atomic` the member onto its path (size + sha256 pin),
    delete the archive;
 5. `Exclusive` only: delete files the previous marker or the abandoned list names and this
-   spec does not; write the completion marker (temp + fsync + rename); remove the staging
+   spec does not; write the completion marker (`ms_atomic_file`: hidden sibling temp + fsync +
+   rename; the staging records use the same writer); remove the staging
    directory (and an empty shared `.download/`; a failure here is only a logged warning: the
    model is installed).
 

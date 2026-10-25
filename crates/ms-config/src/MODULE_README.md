@@ -184,6 +184,7 @@ that defines the type.
   succeed or fall back to the embedded catalog — the same rule, for settings checks). It
   belongs to this layer because that tag comes out of `user_config.json`; on wasm there is no
   folder next to an executable and `web_entry.rs` installs the embedded catalog directly.
+  Catalog files are replaced through `ms_atomic_file::write_atomic` (contents fsynced).
 
 Two items in those files are TEST-ONLY and are gated `#[cfg(any(test, feature = "test-support"))]`
 rather than `#[cfg(test)]`: `config_saver::test_harness` and `locale_store::GLOBAL_LOCALE_LOCK`.

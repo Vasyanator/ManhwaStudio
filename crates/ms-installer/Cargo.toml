@@ -64,6 +64,8 @@ eframe.workspace = true
 # Release metadata (`fetch_small`) and release-asset downloads (`fetch_verified`): retry with
 # capped backoff, `Range` resume, size / sha256 verification, cancel (`src/download.rs`).
 ms-download = { path = "../ms-download" }
+# The atomic file-replace recipe of the download identity sidecar (`download.rs`).
+ms-atomic-file = { path = "../ms-atomic-file" }
 # sha256 of a small asset fetched into memory (`download.rs::fetch_small_asset`: the
 # `SHA256SUMS` manifest against its GitHub digest); file downloads hash inside `ms-download`.
 sha2.workspace = true

@@ -3,7 +3,8 @@
 ## Purpose
 The ManhwaStudio browser extension as part of the app: its pinned Chromium id, the extension
 bundle embedded at build time, and the atomic, version-stamped unpack into the app's data
-folder. Level 0 of the workspace (no `ms-*` dependencies). GUI-free, no i18n, no logging,
+folder. Level 0 of the workspace (its only `ms-*` dependency is the level-0 `ms-atomic-file`,
+the one atomic-replace recipe). GUI-free, no i18n, no logging,
 typed errors; callers (the bridge wiring, the translation tab) own threads and user text.
 
 ## Architecture
@@ -39,8 +40,10 @@ runtime
   NOT a compatibility gate (decision D1: only the wire `PROTOCOL_VERSION` is); it decides
   re-unpack and extension reload.
 - A bundle never contains `bridge.json`, `build-info.json` from the TS build, or the stamp.
-- `install` is crash-safe: every file is temp + fsync + rename, the stamp is written last
-  (after a directory fsync on unix), so "stamp `build_id` == bundle `build_id`" means complete.
+- `install` is crash-safe: every file is temp + fsync + rename (`ms_atomic_file`, temp name
+  `.{name}.{pid}.tmp`; a crash leftover matches `ms_atomic_file::is_temp_artifact` and is
+  overwritten by the next write of that file), each touched folder is fsynced once, the stamp is
+  written last (after a directory fsync on unix), so "stamp `build_id` == bundle `build_id`" means complete.
   It deletes only files the previous stamp listed (and only valid relative paths), so
   `bridge.json` and user files survive. Blocking I/O: worker threads only.
 - One install per folder at a time, across processes: `install` holds an exclusive advisory

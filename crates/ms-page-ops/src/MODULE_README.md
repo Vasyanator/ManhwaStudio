@@ -517,7 +517,9 @@ Deliberately NOT touched (each with the reason):
   records the ACTUAL format in `TreeSnapshot::{layers_manifest,bubbles}_format`.
   The plan discards that actual file and journals `PlannedJsonWrite { target,
   format, content }` with `content` = the LOGICAL JSON body; phase B writes a
-  `.json` with `atomic_write` and a `.db` with `ms_docstore::write_whole_atomic`
+  `.json` with `atomic_write` (`ms_atomic_file::write_atomic_with`, parent created,
+  contents fsynced; the journals and trash archives use it too) and a `.db` with
+  `ms_docstore::write_whole_atomic`
   (whole rebuild, validated temp, stale `-journal` removed, atomic rename).
   `validate_plan` refuses a `.db` write to any other file name.
 - The store keeps no connection open between calls, and the scan's reads
@@ -532,8 +534,8 @@ Deliberately NOT touched (each with the reason):
   the journals and the trash archives (`deleted_*.json`).
 - Windows: phase-B rename targets are guaranteed free (phase A vacated them),
   and A -> B uses distinct journal names, so no rename-over-existing is relied
-  upon. Directory fsync is Unix-only best-effort (same policy as
-  `tabs/settings`); each phase-A rename and staged create requests it before B.
+  upon. Directory fsync is Unix-only best-effort (`ms_atomic_file::sync_directory`,
+  a failure is logged); each phase-A rename and staged create requests it before B.
 - Same-volume assumption: temps live in their file's own directory and the
   trash lives inside the chapter dir, so every rename stays on one filesystem
   (`_unsaved` is a sibling of the chapter under the same title dir).

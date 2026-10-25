@@ -112,6 +112,10 @@ zip.workspace = true
 # the watermark library's import/export controls. Compiled on every target: a platform
 # without a dialog answers with a typed error.
 ms-platform = { path = "../ms-platform" }
+# The one atomic-write owner: the watermark library's files and every hosted engine's settings
+# file are replaced through it (`write_atomic_with`), and the library's directory publishes
+# fsync with its `sync_directory`. A level-0 leaf (std + thiserror).
+ms-atomic-file = { path = "../ms-atomic-file" }
 
 [dev-dependencies]
 # Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for test

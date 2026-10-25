@@ -59,7 +59,7 @@ fn fresh_install_writes_every_file_and_the_stamp() {
     assert!(!report.previous_stamp_corrupt);
     assert_eq!(read(&dir.join("icons").join("icon-16.png")), b"png16");
     assert_eq!(installed_build_id(&dir).unwrap_or_else(|err| panic!("{err:?}")).as_deref(), Some(OLD.build_id));
-    let leftovers: Vec<_> = fs::read_dir(&dir).unwrap_or_else(|err| panic!("{err:?}")).filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().ends_with(".ms-tmp")).collect();
+    let leftovers: Vec<_> = fs::read_dir(&dir).unwrap_or_else(|err| panic!("{err:?}")).filter_map(Result::ok).filter(|e| ms_atomic_file::is_temp_artifact(&e.path())).collect();
     assert!(leftovers.is_empty(), "no temporary file survives");
 }
 

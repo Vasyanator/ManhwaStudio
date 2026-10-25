@@ -435,9 +435,9 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   engine, and no report may call such an entry measured. The calibration crops are the reconstruction
   source — a loaded entry is refitted from them — and the plane PNGs are an inspection and
   interchange artifact.
-- Every library write is ATOMIC at the FILE level (sibling temp + `write_all` + `sync_all` +
-  close + rename + directory fsync, the `tabs/typing/panel/doc_store.rs` recipe, which is not
-  reachable from here) and at the DIRECTORY level: an entry is several files, so `save_entry`
+- Every library write is ATOMIC at the FILE level (`ms_atomic_file`: sibling temp +
+  `write_all` + `sync_all` + close + rename, then a best-effort directory fsync) and at the
+  DIRECTORY level: an entry is several files, so `save_entry`
   builds the whole new directory in a staging sibling and swaps it in at the end. A failed or
   interrupted rewrite therefore leaves the previous entry intact and valid instead of metadata
   naming crops a `samples/` wipe already removed. It also keeps two guards: a document of a NEWER schema is never overwritten, and a document changed

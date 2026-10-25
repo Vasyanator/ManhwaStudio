@@ -119,7 +119,7 @@ shared wiki view). The studio never references
 - `ms-browser-ext` — the ManhwaStudio browser extension as part of the app: its pinned Chromium
   id (from the manifest `key`), the bundle its build script builds from `browser-extension/`
   with npm (absent when node/npm are missing; `NotIncluded` says why) and the atomic, stamped
-  unpack into `<data_dir>/browser_extension/chromium`. No `ms-*` dependencies; GUI-free.
+  unpack into `<data_dir>/browser_extension/chromium`. Its only `ms-*` dependency is the level-0 `ms-atomic-file`; GUI-free.
 - `ms-browser-bridge` — the feature-agnostic loopback WebSocket bridge to that extension:
   `bridge.json` pairing, mutual HMAC-SHA256 handshake, module capabilities, blocking
   request / cancel / events for worker threads, reload; `app` is the one place that builds the

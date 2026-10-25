@@ -32,6 +32,9 @@ ms-theme = { path = "../ms-theme" }
 # Owned-document access: `spellchecked_line.rs` reads/updates/probes the title
 # `settings.json` through it.
 ms-docstore = { path = "../ms-docstore" }
+# The one atomic-write owner: `spellchecked_line.rs` publishes a downloaded dictionary file
+# through `write_atomic`. A level-0 leaf (std + thiserror); compiles on every target.
+ms-atomic-file = { path = "../ms-atomic-file" }
 # `spellchecked_line.rs` picks its dictionary by the typesetting language
 # (`ms_text_util::language`); `hangul_keyboard.rs` uses `ms_text_util::hangul`.
 ms-text-util = { path = "../ms-text-util" }

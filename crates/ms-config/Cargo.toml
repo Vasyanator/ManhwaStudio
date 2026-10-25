@@ -22,6 +22,9 @@ ms-memory = { path = "../ms-memory" }
 # the `ms-storage` seam on every target, so the web build still serves `user_config.json`
 # from its in-memory/IndexedDB store.
 ms-docstore = { path = "../ms-docstore" }
+# The atomic file-replace recipe (`ms_atomic_file::write_atomic`) for the editable
+# `locale/` catalog files, which are plain files, not docstore documents.
+ms-atomic-file = { path = "../ms-atomic-file" }
 # `TextTab` defaults name `text_punctuation::DEFAULT_HANGING_PUNCTUATION` and
 # `language::TextLanguage::Ru.tag()`.
 ms-text-util = { path = "../ms-text-util" }

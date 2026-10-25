@@ -20,8 +20,8 @@ Notes:
 Blocking filesystem and process I/O: callers run `ensure_at_startup` on a worker thread (the
 binary's `install_linux_desktop_integration_async`). The decision itself is
 `desktop_entry::decide_startup` (pure); this file only reads, writes and refreshes. Files are
-written atomically (temporary sibling + rename) so a desktop shell never reads a half-written
-entry.
+written atomically (`ms_atomic_file`: temporary sibling + rename) so a desktop shell never reads
+a half-written entry.
 */
 
 use std::ffi::OsString;
@@ -225,31 +225,16 @@ fn ensure_icon(icon_path: &Path) -> Result<(), DesktopEntryError> {
     write_atomically(icon_path, APP_ICON_PNG)
 }
 
-/// Writes `bytes` to a hidden temporary sibling of `path` and renames it over `path`, creating
-/// the parent directory first. The temporary name never ends in `.desktop`, so a directory scan
-/// cannot pick it up; it is removed when the rename fails.
+/// Creates the parent directory, then replaces `path` with `bytes` through the owner recipe
+/// (`ms_atomic_file::write_atomic`: hidden sibling temp `.{name}.{pid}.tmp`, contents fsynced,
+/// rename; the temp is removed on every failure). The temporary name never ends in `.desktop`,
+/// so a directory scan cannot pick it up. Blocking: callers are on worker threads.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), DesktopEntryError> {
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-        return Err(DesktopEntryError::Write { path: path.to_path_buf(), source: io::Error::new(io::ErrorKind::InvalidInput, "path has no parent or file name") });
+    let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
+        return Err(DesktopEntryError::Write { path: path.to_path_buf(), source: io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory") });
     };
     fs::create_dir_all(parent).map_err(|source| DesktopEntryError::CreateDir { path: parent.to_path_buf(), source })?;
-    let mut temp_name = OsString::from(".");
-    temp_name.push(name);
-    temp_name.push(format!(".tmp-{}", std::process::id()));
-    let temp_path = parent.join(temp_name);
-    let written = fs::write(&temp_path, bytes).and_then(|()| fs::rename(&temp_path, path));
-    if let Err(source) = written {
-        if let Err(remove_err) = fs::remove_file(&temp_path)
-            && remove_err.kind() != io::ErrorKind::NotFound
-        {
-            runtime_log::log_warn(format!(
-                "[desktop-integration] could not remove the temporary file '{}': {remove_err}",
-                temp_path.display()
-            ));
-        }
-        return Err(DesktopEntryError::Write { path: path.to_path_buf(), source });
-    }
-    Ok(())
+    ms_atomic_file::write_atomic(path, bytes, ms_atomic_file::Durability::Contents).map_err(|err| DesktopEntryError::Write { path: path.to_path_buf(), source: err.into() })
 }
 
 /// Runs `update-desktop-database <apps_dir>` so the entry's `MimeType=` list shows up in "Open

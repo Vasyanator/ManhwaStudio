@@ -17,7 +17,7 @@ Key items:
   (`fetch_small`), its length checked against the listed size and its bytes against GitHub's
   sha256 digest when one is listed.
 - `AssetIdentity`: the sidecar `<file>.identity.json` that decides whether the staged files
-  left by an earlier run may be reused.
+  left by an earlier run may be reused (written atomically through `ms_atomic_file`).
 
 Notes:
 - Cross-run resume: the staged files (`<file>.part`, the verified `<file>.download`) are reused
@@ -294,7 +294,8 @@ fn sibling_path(dst_path: &Path, suffix: &str) -> Result<PathBuf, String> {
 /// `identity`; otherwise deletes them and records `identity`, so the transfer that follows
 /// starts from zero for this asset. A missing or unreadable sidecar counts as a mismatch:
 /// nothing proves those bytes belong to this asset. The published destination is never
-/// touched here.
+/// touched here. The sidecar is replaced atomically (`ms_atomic_file`); blocking, worker
+/// thread only (like the transfer it guards).
 ///
 /// # Errors
 /// A localized message when a stale file cannot be removed or the sidecar cannot be written.
@@ -314,7 +315,10 @@ fn reconcile_identity(identity: &AssetIdentity, identity_path: &Path, staged: &[
     if let Some(parent) = identity_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|err| tf!("installer.utils.create_dst_path_error", dst_path = parent.display(), e = err))?;
     }
-    std::fs::write(identity_path, bytes).map_err(|err| tf!("installer.utils.write_dst_path_error", dst_path = identity_path.display(), e = err))
+    // Atomic (owner recipe, contents fsynced): a torn sidecar would read as a mismatch and
+    // throw away staged bytes; a crash mid-write now leaves either the old or the new one.
+    ms_atomic_file::write_atomic(identity_path, &bytes, ms_atomic_file::Durability::Contents)
+        .map_err(|err| tf!("installer.utils.write_dst_path_error", dst_path = identity_path.display(), e = err))
 }
 
 /// Renames the verified `staged` file onto `dst_path` (replacing an existing one; `rename`

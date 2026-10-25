@@ -9,8 +9,9 @@ app updates (the path never changes, only its files).
 Key items:
 - install_dir() — `<data_dir>/browser_extension/chromium`, the one owner of the folder name
 - installed_build_id() — the stamp's `build_id`, `None` when nothing complete is installed
-- install() — write every bundle file (temp + fsync + rename), drop files the OLD stamp listed
-  that the new bundle lacks, write the new stamp LAST
+- install() — write every bundle file (temp + fsync + rename through `ms_atomic_file`), drop
+  files the OLD stamp listed that the new bundle lacks, sync each touched folder once, write the
+  new stamp LAST
 - InstallReport, InstallError
 
 Contracts:
@@ -28,9 +29,10 @@ Contracts:
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
 
+use ms_atomic_file::{AtomicWriteOptions, Durability, sync_directory, write_atomic_with};
 use serde::{Deserialize, Serialize};
 
 use crate::bundle::Bundle;
@@ -87,19 +89,6 @@ pub enum InstallError {
         /// The OS error.
         #[source]
         source: io::Error,
-    },
-    /// Writing `path` failed AND its temporary file could not be removed afterwards.
-    #[error("writing {} failed: {source}; the temporary file {} could not be removed: {cleanup}", path.display(), temp.display())]
-    TempLeftover {
-        /// Destination file.
-        path: PathBuf,
-        /// The write failure.
-        #[source]
-        source: io::Error,
-        /// Leftover temporary file.
-        temp: PathBuf,
-        /// Why removing it failed.
-        cleanup: io::Error,
     },
     /// The new stamp could not be serialized (not expected for plain strings; kept typed).
     #[error("the extension stamp could not be encoded: {0}")]
@@ -182,37 +171,22 @@ fn target_path(dir: &Path, relative: &str) -> PathBuf {
     relative.split('/').fold(dir.to_path_buf(), |acc, part| acc.join(part))
 }
 
-/// Writes `bytes` to `path` via a sibling temporary file: write, fsync, rename over `path`.
+/// Writes `bytes` to `path` through the workspace's one atomic recipe
+/// (`ms_atomic_file::write_atomic`): sibling temp `.{name}.{pid}.tmp`, write, fsync, rename over
+/// `path`; the temp is removed (best effort) on failure. The parent must exist. No
+/// identical-bytes shortcut: `install` classifies identical files itself (`is_identical`) for
+/// its report, so a file reaching this call always differs. The directory is NOT fsynced here:
+/// `install` syncs each touched folder once (`sync_dir`).
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), InstallError> {
-    // Callers pass validated file paths, which always end in a file name.
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let temp = path.with_file_name(format!(".{name}.{}.ms-tmp", std::process::id()));
-    let written = File::create(&temp).and_then(|mut file| {
-        file.write_all(bytes)?;
-        file.sync_all()
-    });
-    let result = written.and_then(|()| fs::rename(&temp, path));
-    match result {
-        Ok(()) => Ok(()),
-        Err(source) => match fs::remove_file(&temp) {
-            Ok(()) => Err(InstallError::Io { op: "write", path: path.to_path_buf(), source }),
-            Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => Err(InstallError::Io { op: "write", path: path.to_path_buf(), source }),
-            Err(cleanup) => Err(InstallError::TempLeftover { path: path.to_path_buf(), source, temp, cleanup }),
-        },
-    }
+    let options = AtomicWriteOptions { skip_if_identical: false, ..AtomicWriteOptions::new(Durability::Contents) };
+    write_atomic_with(path, bytes, &options).map_err(|err| InstallError::Io { op: "write", path: path.to_path_buf(), source: io::Error::from(err) })
 }
 
-/// Makes the renames inside `dir` durable before the stamp is written.
-#[cfg(unix)]
+/// Makes the renames inside `dir` durable before the stamp is written
+/// (`ms_atomic_file::sync_directory`: an fsync on unix, a documented no-op on Windows, where
+/// the filesystem journals the rename).
 fn sync_dir(dir: &Path) -> Result<(), InstallError> {
-    File::open(dir).and_then(|handle| handle.sync_all()).map_err(io_error("sync directory", dir))
-}
-
-/// No-op off unix: Windows cannot open a directory as a file, and NTFS journals the rename.
-#[cfg(not(unix))]
-#[expect(clippy::unnecessary_wraps, reason = "same signature as the unix variant")]
-fn sync_dir(_dir: &Path) -> Result<(), InstallError> {
-    Ok(())
+    sync_directory(dir).map_err(|err| InstallError::Io { op: "sync directory", path: dir.to_path_buf(), source: io::Error::from(err) })
 }
 
 /// Holds the folder's install lock; released on drop (closing the handle releases it as well).
@@ -256,7 +230,7 @@ fn is_identical(path: &Path, bytes: &[u8]) -> Result<bool, InstallError> {
 ///
 /// # Errors
 /// `InvalidBundlePath` before anything is touched; `Io` for the lock file (open / lock);
-/// `Io` / `TempLeftover` for a failed write, rename, delete or directory sync — the stamp is then
+/// `Io` for a failed write, rename, delete or directory sync — the stamp is then
 /// NOT updated, so the folder reads as outdated and a retry repairs it.
 pub fn install(bundle: &Bundle, dir: &Path) -> Result<InstallReport, InstallError> {
     validate_bundle(bundle)?;

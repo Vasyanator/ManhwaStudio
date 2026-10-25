@@ -37,8 +37,8 @@ manifest lookup_build (os, arch, build) -> (miss) NoManifestEntry, no network
             -> extract wanted members to <dest>.tmp (fsync), all found? rename each
                (primary library last), fsync dir; else remove the temporaries
             -> delete the archive
-    -> write the marker (recipe + `member <name> <size> <sha256>` lines) via .tmp,
-       fsync, rename, fsync dir
+    -> write the marker (recipe + `member <name> <size> <sha256>` lines) through
+       `ms_atomic_file` (hidden temp, fsync, rename, fsync dir)
     -> return primary dylib path
 ```
 

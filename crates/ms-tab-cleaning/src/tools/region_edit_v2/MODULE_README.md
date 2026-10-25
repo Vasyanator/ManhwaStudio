@@ -89,8 +89,9 @@ that owns the context, the canvas and the project at once:
   tools: `ai_editor/engines/*` through `shared`'s re-export, and `ai_api_editor/`):
   `read_settings_file` (missing -> first run; damaged -> moved aside to the first free
   `<stem>.malformed-<unix_secs>[-<n>].json`, reserved with `create_new`; unreadable or
-  unquarantinable -> saving BLOCKED), `write_settings_json` (atomic: a unique sibling temp
-  `.<name>.<pid>.<n>.tmp`, synced, renamed over the file; typed `SettingsWriteError`),
+  unquarantinable -> saving BLOCKED), `write_settings_json` (atomic through `ms_atomic_file` with
+  `unique_temp`: a sibling temp `.<name>.<pid>.<n>.tmp`, synced, renamed over the file; typed
+  `SettingsWriteError`),
   `SettingsSaver` + `SaveGate` (one writer, never before the load, never while blocked; a change
   is written only after `SETTINGS_SAVE_DEBOUNCE` = 700 ms of quiet, detected BY VALUE so the
   settings type is `PartialEq`; `wake_after(now)` says when the engine must be polled again; a

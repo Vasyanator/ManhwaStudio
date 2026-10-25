@@ -198,43 +198,24 @@ fn serialize_locale_map(map: &Map<String, Value>) -> Result<String, serde_json::
     Ok(text)
 }
 
-/// Atomically replaces `path` with `contents`: write a sibling temp file, then
-/// `rename` it over the target (an atomic replace on both Unix and Windows).
-///
-/// The temp file lives in the SAME directory as `path` so the final `rename` never
-/// crosses a filesystem boundary.
+/// Atomically replaces `path` with `contents` through the owner recipe
+/// (`ms_atomic_file::write_atomic`: sibling hidden temp, contents fsynced, rename;
+/// the temp is removed on every failure). The parent directory must exist
+/// (`reconcile_dir_at` creates it). Runs only pre-window at startup, so the fsync is
+/// never on the GUI thread.
 ///
 /// # Errors
 /// [`LocaleStoreError::File`] if the temp write or the rename fails, carrying the
-/// path, the failed operation, and the OS error.
+/// path, the failed operation, and the OS error (its kind kept).
 fn write_atomic(path: &Path, contents: &str) -> Result<(), LocaleStoreError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_stem = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "locale".to_owned());
-    // Per-process temp name keeps two concurrent processes from colliding on the
-    // same temp path; a `.` prefix hides it from casual directory listings.
-    let temp = parent.join(format!(".{file_stem}.{}.tmp", std::process::id()));
-
-    fs::write(&temp, contents).map_err(|source| LocaleStoreError::File {
-        path: temp.clone(),
-        operation: "write temporary file",
-        source,
-    })?;
-
-    fs::rename(&temp, path).map_err(|source| {
-        // Best-effort cleanup of the orphaned temp file on the error path; the
-        // rename failure below is the error we actually report. Justified ignore
-        // per CLAUDE.md §7 (a failed cleanup cannot mask the real error).
-        let _ = fs::remove_file(&temp);
-        LocaleStoreError::File {
-            path: path.to_path_buf(),
-            operation: "rename temporary file over target",
-            source,
-        }
-    })?;
-    Ok(())
+    ms_atomic_file::write_atomic(path, contents.as_bytes(), ms_atomic_file::Durability::Contents).map_err(|err| {
+        let (failed_path, operation) = match &err {
+            ms_atomic_file::AtomicWriteError::TempWrite { path: temp, .. } => (temp.clone(), "write temporary file"),
+            ms_atomic_file::AtomicWriteError::Rename { .. } => (path.to_path_buf(), "rename temporary file over target"),
+            ms_atomic_file::AtomicWriteError::DirSync { dir, .. } => (dir.clone(), "fsync directory"),
+        };
+        LocaleStoreError::File { path: failed_path, operation, source: err.into() }
+    })
 }
 
 /// Parses a JSON source string into its top-level object map.
