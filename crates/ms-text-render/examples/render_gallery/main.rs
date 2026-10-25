@@ -45,7 +45,7 @@ use std::sync::Arc;
 use ms_text_render::render_text_to_image;
 use ms_text_render::{CustomKerningTable, FontContent, FontContentSet, font_content_id};
 use ms_text_render::types::{
-    AntiAliasingMode, HorizontalAlign, KerningMode, RenderedTextImage, TextDrawnLinesLayoutParams,
+    AntiAliasingMode, FauxBoldParams, HorizontalAlign, KerningMode, RenderedTextImage, TextDrawnLinesLayoutParams,
     TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams, TextShape,
     TextVectorLine, TextVectorLineDistanceMode, TextVectorLineTextDirection, TextVectorLinesLayoutParams,
     TextVectorPoint, TextWrapMode, VerticalLineDirection,
@@ -421,9 +421,10 @@ fn kern_cases() -> Vec<KernCase> {
         cases.push(KernCase { name, params, font: TrackedFont::NotoSans, pairs: KERN_PAIRS });
     }
 
-    // Right-to-left: an override is mirrored onto the run axis (`kern_override_rtl`), while
-    // `Fixed` WITHOUT an override is not (`kern_fixed_rtl`, the preserved quirk that
-    // behaviour change B2 flips — that case is EXPECTED to change then).
+    // Right-to-left: every step walks leftwards on the advance of the glyph that spans it
+    // (the visually left one) — with an override (`kern_override_rtl`), under un-overridden
+    // `Fixed` (`kern_fixed_rtl`) and `Optical` (`kern_optical_rtl`), and with faux bold
+    // (`kern_faux_rtl`).
     let mut rtl = base_params();
     rtl.font_name = KERN_FONT_NAME.to_string();
     rtl.text = KERN_RTL_TEXT.to_string();
@@ -435,11 +436,37 @@ fn kern_cases() -> Vec<KernCase> {
         font: TrackedFont::NotoSansHebrew,
         pairs: KERN_RTL_PAIRS,
     });
-    let mut fixed_rtl = rtl;
+    let mut fixed_rtl = rtl.clone();
     fixed_rtl.kerning_mode = KerningMode::Fixed;
     cases.push(KernCase {
         name: "kern_fixed_rtl",
         params: fixed_rtl,
+        font: TrackedFont::NotoSansHebrew,
+        pairs: &[],
+    });
+    // Un-overridden `Optical` on the same right-to-left text: walks leftwards from the
+    // spanning (visually left) glyph's advance, measuring the facing sides of each pair.
+    let mut optical_rtl = rtl.clone();
+    optical_rtl.kerning_mode = KerningMode::Optical;
+    cases.push(KernCase {
+        name: "kern_optical_rtl",
+        params: optical_rtl,
+        font: TrackedFont::NotoSansHebrew,
+        pairs: &[],
+    });
+    // Faux bold on the same right-to-left text: each step grows by the spanning glyph's
+    // faux extra, signed onto the run axis (the pair widens, as left-to-right).
+    let mut faux_rtl = rtl;
+    faux_rtl.force_bold = true;
+    faux_rtl.faux_bold = Some(FauxBoldParams {
+        thicken_percent: 10.0,
+        expand_percent: 5.0,
+        sharp_corners: true,
+        outward_only: false,
+    });
+    cases.push(KernCase {
+        name: "kern_faux_rtl",
+        params: faux_rtl,
         font: TrackedFont::NotoSansHebrew,
         pairs: &[],
     });

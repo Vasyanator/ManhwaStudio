@@ -102,8 +102,8 @@ use super::glyph_blit::{
 use super::glyph_contour::PlacedContour;
 use super::layout::{VerticalRasterRequest, render_vertical_text};
 use super::pair_advance::{
-    KerningSettings, PairAdvanceModel, PairGlyph, PairStep, StepDirection, TrackingBasis,
-    effective_spacing_percent,
+    KerningSettings, PairAdvanceModel, PairGlyph, PairStep, RunOrientation, StepDirection,
+    TrackingBasis, effective_spacing_percent,
 };
 use super::optical::{
     OPTICAL_CONTOUR_SIMPLIFY_TOLERANCE_PX, OpticalAxis, OpticalContourCache, median_of_gaps,
@@ -2338,8 +2338,10 @@ fn faux_floored_advance(base_advance: f32, faux_extra: f32) -> f32 {
 /// (delta 0) rather than an error.
 ///
 /// Faux bold: on the metric branches (`Auto`/`Fixed`, and the `Optical`
-/// fallback) each pen step additionally grows by the previous glyph's
-/// `2*d + expand_px` (`faux_advance_extra_px_for_glyph`), and `line_width_px`
+/// fallback) each pen step additionally grows by the SPANNING glyph's
+/// `2*d + expand_px` (`faux_advance_extra_px_for_glyph`; the previous glyph
+/// left-to-right, the current one right-to-left, signed onto the run axis so the
+/// pair always widens), and `line_width_px`
 /// includes each glyph's own extra so the trailing faux glyph is part of the
 /// logical (alignment) width; a run with any faux glyph never takes the
 /// byte-identical shaped-position fast path. BOTH places combine the two terms
@@ -2496,7 +2498,11 @@ fn horizontal_run_layout(
         // Note: `prev.w == metric_advance` in cosmic-text (pair kerning is baked
         // into the advance), so the nominal metrics advance is the actual lever.
         //
-        // A USER-AUTHORED pair overrides all three: the step becomes the left
+        // In a right-to-left run the step is spanned by `glyph` (cosmic-text puts it
+        // at `prev.x - glyph.w`), so `Fixed` and an override take THAT glyph's own
+        // advance and walk leftwards (`pair_advance::RunOrientation`).
+        //
+        // A USER-AUTHORED pair overrides all three: the step becomes the spanning
         // glyph's raw `hmtx` advance plus the authored delta, so the font's own
         // pair value is dropped and the user's value takes its place verbatim.
         // That is what makes an authored pair behave exactly like a built-in one.
@@ -2517,11 +2523,18 @@ fn horizontal_run_layout(
             prev_w_px: prev.w,
             default_advance_px: default_advance,
         };
-        // Faux-bold growth of the PREVIOUS glyph's advance (0.0 when off),
-        // floored so a thinning delta wider than that glyph's own advance cannot
-        // step the pen backwards. Manual tracking stays OUTSIDE the floor: a
-        // negative letter-spacing is an explicit request for overlap.
-        let effective_advance = faux_floored_advance(base_advance, faux_extras[idx - 1]);
+        // Faux-bold growth of the glyph that SPANS this step (0.0 when off): the
+        // previous glyph left-to-right, the current one right-to-left (cosmic-text
+        // places it at `prev.x - cur.w`), signed onto the run axis so thickening
+        // always widens the pair. Floored so a thinning delta wider than that
+        // glyph's own advance cannot step the pen backwards. Manual tracking stays
+        // OUTSIDE the floor: a negative letter-spacing is an explicit request for
+        // overlap.
+        let faux_extra = match RunOrientation::of_step(metric_advance, prev) {
+            RunOrientation::LeftToRight => faux_extras[idx - 1],
+            RunOrientation::RightToLeft => -faux_extras[idx],
+        };
+        let effective_advance = faux_floored_advance(base_advance, faux_extra);
         current_x += effective_advance + pair_kerning.tracking_px(tracking_basis);
         glyph_xs.push(current_x);
     }
@@ -2559,8 +2572,10 @@ fn horizontal_run_layout(
 /// known limitation of the horizontal optical path.
 ///
 /// Algorithm (spec Phase 1):
-/// 1. Base advance is each glyph's OWN shaped advance (`prev.w`), falling back to
-///    the metric advance `cur.x - prev.x` when `prev.w` is not positive/finite.
+/// 1. Base advance is the SPANNING glyph's own shaped advance (`prev.w`
+///    left-to-right, `cur.w` right-to-left), falling back to `|cur.x - prev.x|`
+///    when it is not positive/finite, signed onto the run axis
+///    (`pair_advance::RunOrientation`), so a right-to-left run walks leftwards.
 /// 2. For every adjacent inked pair the MINIMUM DIRECTIONAL horizontal whitespace
 ///    is measured (`optical_pair_gap`, `OpticalAxis::Horizontal` — an adapter over
 ///    the owner `pair_gap::directional_pair_gap`): the smallest
@@ -2578,7 +2593,7 @@ fn horizontal_run_layout(
 ///    applied ON TOP of the base advance and any manual tracking
 ///    (`extra_spacing_px`), with the same `spacing_basis` as the metric branch.
 /// 5. A pair listed in the glyph font's `CustomKerningTable` skips steps 1/2/4
-///    entirely and steps by `nominal_glyph_advance_px(prev) + authored delta`: an
+///    entirely and steps by the spanning glyph's `nominal_glyph_advance_px` + authored delta: an
 ///    override is an explicit instruction about that one distance, so normalizing
 ///    it toward the run's median gap would discard the value the user typed. The
 ///    remaining pairs of the run are still optical.
@@ -2646,13 +2661,23 @@ fn optical_horizontal_run_layout(
     // gaps[idx] is the minimum directional projected whitespace of the pair
     // (idx-1, idx) — the closest facing points; index 0 has no pair. The gap is
     // x-translation invariant (rotation 0), so both glyphs are placed relative to
-    // a shared baseline: prev at pen 0, cur at pen prev.w. `f32::INFINITY` marks a
+    // a shared baseline: prev at pen 0, cur at pen prev.w (right-to-left: at
+    // -cur.w, measuring cur's right against prev's left). `f32::INFINITY` marks a
     // non-kernable pair (first glyph / space / empty / no overlap).
     let mut gaps: Vec<f32> = Vec::with_capacity(glyph_count);
     gaps.push(f32::INFINITY);
     for idx in 1..glyph_count {
         let prev = &run.glyphs[idx - 1];
         let cur = &run.glyphs[idx];
+        // Left-to-right `cur` sits right of `prev` (at pen `prev.w`); right-to-left it
+        // sits LEFT of it (at pen `-cur.w`, where cosmic-text puts it), and the facing
+        // sides are `cur`'s right and `prev`'s left. Measuring the left-to-right
+        // placement there would compare two sides that never face each other.
+        let orientation = RunOrientation::of_step(cur.x - prev.x, prev);
+        let cur_pen_x = match orientation {
+            RunOrientation::LeftToRight => prev.w,
+            RunOrientation::RightToLeft => -cur.w,
+        };
         let prev_placed = place_optical_horizontal_contour(
             prev,
             0.0,
@@ -2665,7 +2690,7 @@ fn optical_horizontal_run_layout(
         );
         let cur_placed = place_optical_horizontal_contour(
             cur,
-            prev.w,
+            cur_pen_x,
             glyph_scales[idx],
             glyph_fauxes[idx],
             font_system,
@@ -2673,8 +2698,13 @@ fn optical_horizontal_run_layout(
             outline_cache,
             contour_cache,
         );
-        let gap = match (prev_placed, cur_placed) {
-            (Some(p), Some(c)) => optical_pair_gap(&p, &c, OpticalAxis::Horizontal),
+        let gap = match (prev_placed, cur_placed, orientation) {
+            (Some(p), Some(c), RunOrientation::LeftToRight) => {
+                optical_pair_gap(&p, &c, OpticalAxis::Horizontal)
+            }
+            (Some(p), Some(c), RunOrientation::RightToLeft) => {
+                optical_pair_gap(&c, &p, OpticalAxis::Horizontal)
+            }
             // Space / empty / outline-less glyph on either side: not kernable.
             _ => f32::INFINITY,
         };
@@ -2718,9 +2748,16 @@ fn optical_horizontal_run_layout(
             // `OwnAdvance` is unreachable here (the owner returns it only for `Fixed`,
             // and this branch always asks with `Optical`); it is listed so the match
             // stays exhaustive and would take the optical step if that ever changed.
+            // The optical step: the spanning glyph's own advance (`prev` left-to-right,
+            // `cur` right-to-left) plus the normalization delta, signed onto the run
+            // axis exactly like an override.
             PairStep::Shaped { .. } | PairStep::OwnAdvance { .. } => {
-                optical_base_advance(prev.w, metric_advance)
-                    + optical_delta(gaps[idx], target, font_size_px)
+                let orientation = RunOrientation::of_step(metric_advance, prev);
+                let spanning = orientation.spanning_glyph(prev, cur);
+                orientation.sign(
+                    optical_base_advance(spanning.w, metric_advance.abs())
+                        + optical_delta(gaps[idx], target, font_size_px),
+                )
             }
         };
         current_x += step + glyph_kernings[idx].tracking_px(tracking_basis);
@@ -7947,6 +7984,39 @@ mod tests {
             "-100 / 0 / +100 per mille must sit exactly 10 px apart at em 100; got \
              {tightened_gap}, {neutral_gap}, {widened_gap}"
         );
+
+        // The ANCHOR, not just the differences: an RTL step is spanned by the visually
+        // LEFT glyph (`cur`), so a `0.0` entry on a pair the font does not kern must land
+        // EXACTLY on the shaped pen, and -100 per mille exactly 10 px tighter than it. The
+        // tracked Hebrew font has no alef -> bet kerning and alef / bet differ in width,
+        // so anchoring on the wrong glyph is visible here.
+        let mut hebrew = crate::characterization::TrackedFont::Hebrew.load();
+        let (shaped_xs, _) = tracked_font_run_layout(&mut hebrew, RTL_PAIR, &params, &[]);
+        let (cancelled_xs, _) = tracked_font_run_layout(
+            &mut hebrew,
+            RTL_PAIR,
+            &params,
+            &[('\u{05D0}', '\u{05D1}', 0.0)],
+        );
+        for (cancelled_x, shaped_x) in cancelled_xs.iter().zip(shaped_xs.iter()) {
+            assert!(
+                (cancelled_x - shaped_x).abs() < 1e-3,
+                "a 0.0 entry on an un-kerned RTL pair is a no-op: {cancelled_xs:?} vs {shaped_xs:?}"
+            );
+        }
+        let (tight_xs, _) = tracked_font_run_layout(
+            &mut hebrew,
+            RTL_PAIR,
+            &params,
+            &[('\u{05D0}', '\u{05D1}', -100.0)],
+        );
+        let natural_gap = (shaped_xs[1] - shaped_xs[0]).abs();
+        let tight_gap = (tight_xs[1] - tight_xs[0]).abs();
+        assert!(
+            (natural_gap - tight_gap - 10.0).abs() < 1e-3,
+            "-100 per mille must tighten the natural RTL step by exactly 10 px: {natural_gap} -> \
+             {tight_gap}"
+        );
     }
 
     /// `Optical` re-spaces pairs by measured ink, which would otherwise overwrite the
@@ -8091,71 +8161,106 @@ mod tests {
         );
     }
 
-    /// PRESERVED QUIRK, pinned on purpose: `KerningMode::Fixed` WITHOUT an override steps
-    /// by the UNSIGNED nominal advance, so an un-overridden right-to-left pair is walked
-    /// RIGHTWARDS (`xs[1] > xs[0]`) while `Auto` walks it leftwards. Behaviour change B2
-    /// (approved) mirrors `Fixed` onto the run axis: when it lands, this test FLIPS to
-    /// `xs[1] < xs[0]` and is renamed accordingly — that flip is the intended diff.
+    /// `KerningMode::Fixed` WITHOUT an override follows a right-to-left run like an override
+    /// does: leftwards, by the own advance of the glyph that SPANS the step (the visually
+    /// left one). The tracked Hebrew font has no kerning anywhere in this text, so the
+    /// un-kerned `Fixed` pen must land exactly on the shaped `Auto` pen.
     #[test]
-    fn quirk_fixed_mode_does_not_mirror_an_unoverridden_rtl_pair() {
+    fn fixed_mode_walks_an_unoverridden_rtl_run_leftwards_on_the_spanning_advance() {
         use crate::characterization::TrackedFont;
 
-        const RTL_PAIR: &str = "\u{05D0}\u{05D1}";
+        const RTL_TEXT: &str = "\u{05D0}\u{05D1}\u{05D2}";
         let mut hebrew = TrackedFont::Hebrew.load();
         let mut params = base_params();
-        params.text = RTL_PAIR.to_string();
+        params.text = RTL_TEXT.to_string();
         params.font_size_px = 100.0;
 
         params.kerning_mode = KerningMode::Auto;
-        let (auto_xs, _) = tracked_font_run_layout(&mut hebrew, RTL_PAIR, &params, &[]);
-        assert_eq!(auto_xs.len(), 2, "the fixture must shape the pair as two glyphs");
+        let (auto_xs, auto_width) = tracked_font_run_layout(&mut hebrew, RTL_TEXT, &params, &[]);
+        assert_eq!(auto_xs.len(), 3, "the fixture must shape three glyphs");
         assert!(
-            auto_xs[1] < auto_xs[0],
+            auto_xs[2] < auto_xs[1] && auto_xs[1] < auto_xs[0],
             "precondition: cosmic-text lays this run out right-to-left; got {auto_xs:?}"
         );
 
         params.kerning_mode = KerningMode::Fixed;
-        let (fixed_xs, _) = tracked_font_run_layout(&mut hebrew, RTL_PAIR, &params, &[]);
-        assert!(
-            fixed_xs[1] > fixed_xs[0],
-            "quirk: un-overridden Fixed steps an RTL pair rightwards (B2 flips this); got \
-             {fixed_xs:?}"
-        );
-
-        // An OVERRIDE under `Fixed` already follows the run (leftwards) — only the
-        // un-overridden step carries the quirk.
-        let (overridden_xs, _) = tracked_font_run_layout(
-            &mut hebrew,
-            RTL_PAIR,
-            &params,
-            &[('\u{05D0}', '\u{05D1}', 0.0)],
-        );
-        assert!(
-            overridden_xs[1] < overridden_xs[0],
-            "an overridden RTL pair walks leftwards under Fixed too; got {overridden_xs:?}"
-        );
+        let (fixed_xs, fixed_width) = tracked_font_run_layout(&mut hebrew, RTL_TEXT, &params, &[]);
+        // Equal up to float rounding: the hmtx advance and the shaped advance are the
+        // same number reached through different scalings.
+        for (fixed_x, auto_x) in fixed_xs.iter().zip(auto_xs.iter()) {
+            assert!(
+                (fixed_x - auto_x).abs() < 1e-3,
+                "Fixed must walk leftwards on the spanning advance: {fixed_xs:?} vs {auto_xs:?}"
+            );
+        }
+        assert!((fixed_width - auto_width).abs() < 1e-3);
     }
 
-    /// PRESERVED QUIRK, pinned on purpose: un-overridden `KerningMode::Optical` steps an
-    /// RTL pair by `optical_base_advance(prev.w, ..)` + the ink delta, and `prev.w` is
-    /// UNSIGNED, so the optical pen walks a right-to-left run RIGHTWARDS too. Unlike the
-    /// `Fixed` quirk this one is not covered by behaviour change B2 (which mirrors `Fixed`
-    /// only); whoever changes it flips this test and says so.
+    /// Un-overridden `KerningMode::Optical` follows a right-to-left run too: leftwards, from
+    /// the spanning glyph's advance, with the ink gap measured between the sides that
+    /// actually FACE each other (`cur`'s right, `prev`'s left).
     #[test]
-    fn quirk_optical_mode_does_not_mirror_an_unoverridden_rtl_pair() {
+    fn optical_mode_walks_an_unoverridden_rtl_run_leftwards() {
         use crate::characterization::TrackedFont;
 
-        const RTL_PAIR: &str = "\u{05D0}\u{05D1}";
+        const RTL_TEXT: &str = "\u{05D0}\u{05D1}\u{05D2}";
         let mut hebrew = TrackedFont::Hebrew.load();
         let mut params = base_params();
-        params.text = RTL_PAIR.to_string();
+        params.text = RTL_TEXT.to_string();
         params.font_size_px = 100.0;
+        params.kerning_mode = KerningMode::Auto;
+        let (auto_xs, _) = tracked_font_run_layout(&mut hebrew, RTL_TEXT, &params, &[]);
         params.kerning_mode = KerningMode::Optical;
-        let (optical_xs, _) = tracked_font_run_layout(&mut hebrew, RTL_PAIR, &params, &[]);
-        assert_eq!(optical_xs.len(), 2, "the fixture must shape the pair as two glyphs");
+        let (optical_xs, _) = tracked_font_run_layout(&mut hebrew, RTL_TEXT, &params, &[]);
+        assert_eq!(optical_xs.len(), 3);
         assert!(
-            optical_xs[1] > optical_xs[0],
-            "quirk: un-overridden Optical steps an RTL pair rightwards; got {optical_xs:?}"
+            optical_xs[2] < optical_xs[1] && optical_xs[1] < optical_xs[0],
+            "Optical must walk an RTL run leftwards; got {optical_xs:?}"
+        );
+        // The normalization nudges pairs; it never moves one by anything near a glyph
+        // width (it is clamped well inside the em), so each step stays close to the
+        // shaped one.
+        for idx in 1..3 {
+            let optical_step = optical_xs[idx] - optical_xs[idx - 1];
+            let auto_step = auto_xs[idx] - auto_xs[idx - 1];
+            assert!(
+                (optical_step - auto_step).abs() < 25.0,
+                "pair {idx}: optical step {optical_step} vs shaped {auto_step}"
+            );
+        }
+    }
+
+    /// Faux bold widens a right-to-left pair the way it widens a left-to-right one: the
+    /// growth is the spanning glyph's extra, signed onto the run axis, so every step gets
+    /// LONGER (more negative), never shorter.
+    #[test]
+    fn faux_bold_growth_widens_an_rtl_pair_like_an_ltr_pair() {
+        use crate::characterization::TrackedFont;
+
+        let step_growth = |font: TrackedFont, text: &str| -> f32 {
+            let mut loaded = font.load();
+            let mut params = base_params();
+            params.text = text.to_string();
+            params.font_size_px = 100.0;
+            params.kerning_mode = KerningMode::Auto;
+            let (plain_xs, _) = tracked_font_run_layout(&mut loaded, text, &params, &[]);
+            // Forced, and not `outward_only`: the extra is then the same for every glyph,
+            // so LTR and RTL growth are directly comparable.
+            params.force_bold = true;
+            params.faux_bold = Some(FauxBoldParams {
+                outward_only: false,
+                ..test_faux_bold(10.0, 5.0)
+            });
+            let (bold_xs, _) = tracked_font_run_layout(&mut loaded, text, &params, &[]);
+            assert_eq!(plain_xs.len(), 2, "{text}: two glyphs");
+            (bold_xs[1] - bold_xs[0]).abs() - (plain_xs[1] - plain_xs[0]).abs()
+        };
+        let ltr_growth = step_growth(TrackedFont::Latin, "HH");
+        let rtl_growth = step_growth(TrackedFont::Hebrew, "\u{05D4}\u{05D4}");
+        assert!(ltr_growth > 0.0, "precondition: faux bold widens an LTR step: {ltr_growth}");
+        assert!(
+            (rtl_growth - ltr_growth).abs() < 1e-3,
+            "an RTL step must grow by the same faux extra as an LTR one: {rtl_growth} vs {ltr_growth}"
         );
     }
 

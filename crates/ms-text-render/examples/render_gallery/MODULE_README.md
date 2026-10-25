@@ -29,8 +29,9 @@ links it (`ms_text_render::render_text_to_image` + `::types::*`). It needs no
   fonts of the `fonts/ui` stack (Noto Sans, Noto Sans Hebrew), each case with its OWN
   `FontContentSet` because a user-authored `CustomKerningTable` travels on the
   `FontContent`. They pin the advance between two adjacent glyphs: overrides under every
-  mode, right-to-left mirroring (`kern_override_rtl`) and its absence for un-overridden
-  `Fixed` (`kern_fixed_rtl`, EXPECTED to change when `Fixed` is mirrored), overrides on
+  mode, right-to-left steps anchored on the spanning (visually left) glyph for an
+  override (`kern_override_rtl`), un-overridden `Fixed` (`kern_fixed_rtl`), `Optical`
+  (`kern_optical_rtl`) and faux-bold growth (`kern_faux_rtl`), overrides on
   formula seeds, an override at a line break (`kern_override_wrap`, see the comment on
   `KERN_WRAP_WIDTH_PX` for what the break shows today), and manual tracking on the pen,
   formula and vertical paths. The self-check

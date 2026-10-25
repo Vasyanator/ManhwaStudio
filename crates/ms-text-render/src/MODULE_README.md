@@ -1037,18 +1037,24 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
     — it cancels a built-in pair — and must never be filtered out anywhere.
     Uniform tracking (`KerningSettings::extra_spacing_px`) is a separate setting and
     is still added on top, unchanged.
-  - DIRECTION. `nominal_glyph_advance_px` is an `hmtx` advance and therefore
-    UNSIGNED, while cosmic-text lays a right-to-left run out by subtracting each
-    advance, so its shaped step is negative. The override's magnitude is mirrored
-    back onto the run's own axis by `pair_advance` (`StepDirection::FollowRun`; sign taken from
-    the shaped step, falling back to the left glyph's bidi level when that step is
-    degenerate), so a negative authored delta TIGHTENS a pair in both directions.
-    The formula path has no counterpart: its `advance_px` is a magnitude along the
-    drawn line, floored positive at every consumer. Out of scope and untouched:
-    `KerningMode::Fixed` WITHOUT an override still steps by the unsigned nominal
-    advance, and un-overridden `KerningMode::Optical` by the unsigned `prev.w`, so an
-    un-overridden RTL run keeps its pre-existing (rightward) direction under both
-    (pinned by the `quirk_*` tests in `pipeline.rs`).
+  - DIRECTION. cosmic-text lays a right-to-left run out by subtracting each
+    advance: the next glyph lands at `cur.x = prev.x - cur.w`, so the step is
+    NEGATIVE and it is spanned by the advance of the visually LEFT glyph (`cur`),
+    not of `prev` as left-to-right. `pair_advance::RunOrientation` owns both facts
+    (direction from the shaped step's sign, falling back to `prev`'s bidi level
+    when that step is degenerate; `spanning_glyph`; `sign`), and every run-axis
+    step honours them: an override (spanning glyph's `hmtx` advance + delta, so a
+    `0.0` entry on an un-kerned pair is a no-op and a negative delta TIGHTENS in
+    both directions), `KerningMode::Fixed` (spanning glyph's `hmtx` advance),
+    `KerningMode::Optical` (spanning glyph's shaped advance + the normalization
+    delta, with the ink gap measured between the sides that FACE each other:
+    `cur`'s right against `prev`'s left), and faux-bold growth (the spanning
+    glyph's extra, so thickening widens the pair). The delta's em basis stays the
+    `prev` glyph's font size in both directions. The formula path has no
+    counterpart (`StepDirection::Magnitude`): its `advance_px` is a magnitude along
+    the drawn line, floored positive at every consumer. NOT direction-aware: the
+    pen's tracking basis (`TrackingBasis::HorizontalPen` floors `|step|` at
+    `prev.w`), kept as is.
   - GUARDS (conservative on purpose; do not "simplify" them away). A pair applies
     only when both glyphs come from the SAME face (`font_id`) — a pair across a
     font-fallback boundary belongs to no typeface's design — that face carries a
@@ -1232,8 +1238,9 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   a deliberate behaviour change regenerates them with
   `MS_TEXT_RENDER_REGEN_CHARACTERIZATION=1 cargo test -p ms-text-render
   recorded_characterization` and names the rows it moved. Without that opt-in the
-  tests only read the fixtures. The intended quirks they contain are also pinned by
-  name (`quirk_*` tests in `pipeline.rs`), so a regenerated fixture cannot hide them.
+  tests only read the fixtures. The right-to-left contract they contain is also
+  pinned by name (`*_rtl_*` tests in `pipeline.rs` and `pair_advance.rs`), so a
+  regenerated fixture cannot hide a regression there.
 - Add golden or property-style tests for new layout contracts where exact pixels are
   fragile. Use explicit tolerances for floating-point geometry and alpha math.
 - After Rust changes, run `cargo check-all` and

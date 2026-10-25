@@ -24,12 +24,16 @@ Key items:
 - `PairAdvanceModel`: a `Copy` view over the render's face-keyed `CustomKerningMap`;
   `override_delta_px` / `is_overridden` (the guard) and `resolve` (the decided `PairStep`).
 - `StepDirection`: signed run-axis step (`FollowRun`) vs unsigned path distance (`Magnitude`).
+- `RunOrientation`: which way a run-axis step walks, which glyph's advance spans it (the
+  VISUALLY LEFT one), and how an unsigned magnitude is signed onto the axis.
 - `TrackingBasis`: the four historical tracking bases, gathered in one place.
 
 Notes:
-- PRESERVED QUIRKS (each pinned by a test in `pipeline.rs`): `Fixed` without an override is
-  NOT mirrored onto a right-to-left run (`resolve` returns the unsigned own advance), and the
-  four tracking bases differ by path (`TrackingBasis`).
+- RIGHT-TO-LEFT: on a run axis every step (override, `Fixed`, and the optical step the pen
+  builds through `RunOrientation`) is anchored on the advance of the glyph that physically
+  spans it and walks in the run's direction (`RunOrientation`).
+- PRESERVED DIVERGENCE (pinned by a test in `pipeline.rs`): the four tracking bases differ by
+  path (`TrackingBasis`).
 - GUI-free, no I/O, no logging; never panics (a glyph whose font is gone falls back to its
   shaped step).
 */
@@ -185,10 +189,9 @@ impl<'a> PairGlyph<'a> {
 /// Orientation of a pair step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StepDirection {
-    /// A signed x step along a shaped run (the horizontal pen). An override's unsigned
-    /// magnitude is mirrored onto the run axis: the sign of the shaped step when it is
-    /// finite and non-zero, else the left glyph's bidi level. PRESERVED QUIRK: `Fixed`
-    /// WITHOUT an override is NOT mirrored (behaviour change B2 will mirror it).
+    /// A signed x step along a shaped run (the horizontal pen). Override and `Fixed`
+    /// magnitudes are anchored on the advance of the glyph that spans the step and signed
+    /// onto the run axis, both through [`RunOrientation`].
     FollowRun,
     /// An unsigned distance along a drawn path (formula / drawn lines, LTR by construction):
     /// nothing is mirrored and the shaped step is used verbatim, never through `abs`.
@@ -285,8 +288,11 @@ impl<'a> PairAdvanceModel<'a> {
     ///
     /// `shaped_step_px` is the caller's starting step: `cur.x - prev.x` (signed) on the pen,
     /// the floored `seed_metric_advance_px(..)` on formula seeds. An override wins under
-    /// every mode; otherwise `Fixed` steps by the left glyph's own advance and `Auto` /
+    /// every mode; otherwise `Fixed` steps by the spanning glyph's own advance and `Auto` /
     /// `Optical` keep the shaped step (the optical callers add their own normalization).
+    /// Under `FollowRun` the override / `Fixed` magnitude is anchored on the glyph that spans
+    /// the step and signed onto the run axis ([`RunOrientation`]); under `Magnitude` it is
+    /// anchored on `prev` and never signed.
     /// `font_system` is read only for an override or `Fixed` (the `hmtx` advance); a glyph
     /// whose font is gone falls back to the shaped step. Never panics.
     #[must_use]
@@ -299,56 +305,93 @@ impl<'a> PairAdvanceModel<'a> {
         cur: PairGlyph<'_>,
         shaped_step_px: f32,
     ) -> PairStep {
-        if let Some(delta_px) = self.override_delta_px(prev, cur) {
-            // The `hmtx` advance is UNSIGNED, so on a run axis the shaped step is folded in
-            // only as an unsigned FALLBACK magnitude (feeding it in signed would re-introduce
-            // the RTL sign the orientation below applies once). A path distance is unsigned
-            // already and is used verbatim.
-            let fallback_px = match direction {
-                StepDirection::FollowRun => shaped_step_px.abs(),
-                StepDirection::Magnitude => shaped_step_px,
-            };
-            let own_px = nominal_glyph_advance_px(font_system, prev.glyph).unwrap_or(fallback_px);
-            let magnitude_px = optical_base_advance(own_px, fallback_px) + delta_px;
-            let step_px = match direction {
-                StepDirection::FollowRun => orient_on_run_axis(magnitude_px, shaped_step_px, prev.glyph),
-                StepDirection::Magnitude => magnitude_px,
-            };
-            return PairStep::Override { step_px, delta_px };
-        }
-        match mode {
-            // Steps by the glyph's OWN nominal (un-kerned) advance: cosmic-text bakes pair
-            // kerning into the shaped advance, so only the raw metrics table drops it.
-            // Deliberately NOT oriented (the preserved RTL quirk, see `StepDirection`).
-            KerningMode::Fixed => {
-                let own_px = nominal_glyph_advance_px(font_system, prev.glyph).unwrap_or(shaped_step_px);
-                PairStep::OwnAdvance {
-                    step_px: optical_base_advance(own_px, shaped_step_px),
-                }
-            }
-            KerningMode::Auto | KerningMode::Optical => PairStep::Shaped {
+        let delta_px = self.override_delta_px(prev, cur);
+        let unsigned_step = match (delta_px, mode) {
+            (Some(_), _) | (None, KerningMode::Fixed) => true,
+            (None, KerningMode::Auto | KerningMode::Optical) => false,
+        };
+        if !unsigned_step {
+            return PairStep::Shaped {
                 step_px: shaped_step_px,
+            };
+        }
+        // An override, or `Fixed` (no override): both step by a glyph's OWN nominal
+        // (un-kerned) `hmtx` advance — cosmic-text bakes pair kerning into the shaped
+        // advance, so only the raw metrics table drops it — plus the authored delta for an
+        // override. The `hmtx` advance is UNSIGNED, so on a run axis the shaped step is
+        // folded in only as an unsigned FALLBACK magnitude and the orientation is applied
+        // once at the end; a path distance is unsigned already and used verbatim.
+        let (anchor, fallback_px, orientation) = match direction {
+            StepDirection::FollowRun => {
+                let orientation = RunOrientation::of_step(shaped_step_px, prev.glyph);
+                (orientation.spanning_glyph(prev.glyph, cur.glyph), shaped_step_px.abs(), Some(orientation))
+            }
+            StepDirection::Magnitude => (prev.glyph, shaped_step_px, None),
+        };
+        let own_px = nominal_glyph_advance_px(font_system, anchor).unwrap_or(fallback_px);
+        let base_px = optical_base_advance(own_px, fallback_px);
+        let signed = |magnitude_px: f32| orientation.map_or(magnitude_px, |orientation| orientation.sign(magnitude_px));
+        match delta_px {
+            Some(delta_px) => PairStep::Override {
+                step_px: signed(base_px + delta_px),
+                delta_px,
+            },
+            None => PairStep::OwnAdvance {
+                step_px: signed(base_px),
             },
         }
     }
 }
 
-/// Mirrors an unsigned override magnitude onto the run's own axis.
+/// Which way a step along a shaped run walks.
 ///
 /// cosmic-text lays a right-to-left run out by SUBTRACTING each (positive) shaped advance,
-/// so `glyph.x` decreases and the shaped step is negative there
-/// (`cosmic-text/src/shape.rs`, `ShapeLine::layout_to_buffer`). The shaped step is the
-/// primary evidence of direction; a degenerate one (zero or non-finite, e.g. a zero-width
-/// glyph) carries no sign, so the left glyph's bidi level decides instead. Keeps a negative
-/// authored delta TIGHTENING the pair in both directions.
-#[must_use]
-fn orient_on_run_axis(magnitude_px: f32, shaped_step_px: f32, prev: &LayoutGlyph) -> f32 {
-    let rtl = if shaped_step_px.is_finite() && shaped_step_px != 0.0 {
-        shaped_step_px < 0.0
-    } else {
-        prev.level.is_rtl()
-    };
-    if rtl { -magnitude_px } else { magnitude_px }
+/// so `glyph.x` decreases with the glyph index and the next glyph lands at
+/// `cur.x = prev.x - cur.w` (`cosmic-text/src/shape.rs`, `ShapeLine::layout_to_buffer`).
+/// Two facts follow, and every run-axis step must honour both: the step is NEGATIVE, and the
+/// glyph whose advance spans it is the visually LEFT one, i.e. `cur` — not `prev` as in a
+/// left-to-right run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunOrientation {
+    LeftToRight,
+    RightToLeft,
+}
+
+impl RunOrientation {
+    /// The orientation of the step `prev -> cur` whose shaped length is `shaped_step_px`.
+    ///
+    /// The shaped step is the primary evidence (it IS the direction the shaper walked); a
+    /// degenerate one (zero or non-finite, e.g. a zero-width glyph) carries no sign, so the
+    /// bidi level of `prev` decides instead.
+    #[must_use]
+    pub(crate) fn of_step(shaped_step_px: f32, prev: &LayoutGlyph) -> Self {
+        let rtl = if shaped_step_px.is_finite() && shaped_step_px != 0.0 {
+            shaped_step_px < 0.0
+        } else {
+            prev.level.is_rtl()
+        };
+        if rtl { Self::RightToLeft } else { Self::LeftToRight }
+    }
+
+    /// The glyph whose advance spans the step: `prev` left-to-right, `cur` right-to-left.
+    #[must_use]
+    pub(crate) fn spanning_glyph<'g>(self, prev: &'g LayoutGlyph, cur: &'g LayoutGlyph) -> &'g LayoutGlyph {
+        match self {
+            Self::LeftToRight => prev,
+            Self::RightToLeft => cur,
+        }
+    }
+
+    /// `magnitude_px` signed onto the run axis (negated right-to-left), so a positive
+    /// magnitude always moves the pen in the run's direction and a negative authored delta
+    /// TIGHTENS a pair either way.
+    #[must_use]
+    pub(crate) fn sign(self, magnitude_px: f32) -> f32 {
+        match self {
+            Self::LeftToRight => magnitude_px,
+            Self::RightToLeft => -magnitude_px,
+        }
+    }
 }
 
 /// The basis a path measures PERCENT tracking against, one variant per historical rule.
@@ -531,9 +574,11 @@ mod tests {
         }
     }
 
-    /// `FollowRun` mirrors an override onto the run axis: by the sign of the shaped step,
-    /// or — when that step is zero or not finite — by the left glyph's bidi level.
-    /// `Magnitude` never mirrors.
+    /// `FollowRun` signs an override onto the run axis — by the sign of the shaped step, or,
+    /// when that step is zero or not finite, by `prev`'s bidi level — and anchors it on the
+    /// glyph that SPANS the step: `cur` right-to-left (cosmic-text puts it at
+    /// `prev.x - cur.w`), `prev` left-to-right. `Magnitude` never signs and always anchors on
+    /// `prev`.
     #[test]
     fn an_override_follows_the_run_axis_only_under_follow_run() {
         let mut faces = two_faces();
@@ -547,25 +592,39 @@ mod tests {
         assert!(shaped < 0.0, "precondition: the RTL run steps leftwards: {shaped}");
         let map = map_with(hebrew_id, &[('\u{05D0}', '\u{05D1}', -100.0)]);
         let model = PairAdvanceModel::new(&map);
-        let nominal = nominal_glyph_advance_px(&mut faces.font_system, &glyphs[0]).expect("hmtx");
-        let magnitude = nominal - 10.0;
+        let nominal_prev = nominal_glyph_advance_px(&mut faces.font_system, &glyphs[0]).expect("hmtx");
+        let nominal_cur = nominal_glyph_advance_px(&mut faces.font_system, &glyphs[1]).expect("hmtx");
+        assert!(
+            (nominal_prev - nominal_cur).abs() > 1.0,
+            "precondition: alef and bet differ in width, or the anchor is not observable"
+        );
 
         let mut resolve = |direction, step| {
             model
                 .resolve(&mut faces.font_system, KerningMode::Auto, direction, prev, cur, step)
                 .step_px()
         };
-        assert_eq!(resolve(StepDirection::FollowRun, shaped), -magnitude, "sign of the shaped step");
-        assert_eq!(resolve(StepDirection::FollowRun, 0.0), -magnitude, "bidi level on a zero step");
-        assert_eq!(resolve(StepDirection::FollowRun, f32::NAN), -magnitude, "bidi level on NaN");
-        assert_eq!(resolve(StepDirection::FollowRun, 7.0), magnitude, "a positive step is LTR");
-        assert_eq!(resolve(StepDirection::Magnitude, shaped), magnitude, "Magnitude never mirrors");
+        let rtl = -(nominal_cur - 10.0);
+        assert_eq!(resolve(StepDirection::FollowRun, shaped), rtl, "sign of the shaped step");
+        assert_eq!(resolve(StepDirection::FollowRun, 0.0), rtl, "bidi level on a zero step");
+        assert_eq!(resolve(StepDirection::FollowRun, f32::NAN), rtl, "bidi level on NaN");
+        assert_eq!(
+            resolve(StepDirection::FollowRun, 7.0),
+            nominal_prev - 10.0,
+            "a positive step is LTR and anchors on prev"
+        );
+        assert_eq!(
+            resolve(StepDirection::Magnitude, shaped),
+            nominal_prev - 10.0,
+            "Magnitude never signs and anchors on prev"
+        );
     }
 
-    /// PRESERVED QUIRK (B2 flips it): `Fixed` without an override steps by the UNSIGNED own
-    /// advance even on a right-to-left run.
+    /// `Fixed` without an override follows a right-to-left run exactly like an override:
+    /// leftwards, by the own advance of the glyph that spans the step (`cur`). The fixture
+    /// font has no alef -> bet kerning, so that is precisely the shaped step.
     #[test]
-    fn fixed_without_an_override_is_not_mirrored_on_an_rtl_run() {
+    fn fixed_without_an_override_follows_an_rtl_run_on_the_spanning_glyph() {
         let mut faces = two_faces();
         let (_, hebrew_family) = faces.hebrew.clone();
         let (glyphs, text) = shape(&mut faces.font_system, &hebrew_family, "\u{05D0}\u{05D1}", 100.0);
@@ -580,9 +639,13 @@ mod tests {
             PairGlyph::from_run(&text, &glyphs[1]),
             shaped,
         );
-        let nominal = nominal_glyph_advance_px(&mut faces.font_system, &glyphs[0]).expect("hmtx");
-        assert_eq!(step, PairStep::OwnAdvance { step_px: nominal });
-        assert!(step.step_px() > 0.0 && !step.is_override());
+        let nominal_cur = nominal_glyph_advance_px(&mut faces.font_system, &glyphs[1]).expect("hmtx");
+        assert_eq!(step, PairStep::OwnAdvance { step_px: -nominal_cur });
+        assert!(
+            (step.step_px() - shaped).abs() < 1e-3,
+            "no font kerning: Fixed equals the shaped step: {step:?} vs {shaped}"
+        );
+        assert!(!step.is_override());
     }
 
     /// `Auto` and `Optical` (before its normalization) keep the shaped step verbatim and never
@@ -608,6 +671,11 @@ mod tests {
         assert_eq!(
             plain.resolve(&mut gone, KerningMode::Fixed, StepDirection::FollowRun, prev, cur, 40.0),
             PairStep::OwnAdvance { step_px: 40.0 }
+        );
+        assert_eq!(
+            plain.resolve(&mut gone, KerningMode::Fixed, StepDirection::FollowRun, prev, cur, -40.0),
+            PairStep::OwnAdvance { step_px: -40.0 },
+            "right-to-left: |shaped| as the magnitude, signed back onto the run axis"
         );
 
         let map = map_with(latin_id, &[('A', 'V', -100.0)]);

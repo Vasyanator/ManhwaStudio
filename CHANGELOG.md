@@ -171,6 +171,7 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **Quick OCR availability** — quick recognition on the Translation canvas follows the AI backend's current state even when all tools are hidden.
 - **Touch input** — a touch cancelled by the system (for example by palm rejection) no longer leaves the pointer held down.
 - **SDXL error message** — when the SDXL library fails to load, the error now shows the real cause instead of always asking to install it.
+- **Right-to-left text spacing** — Hebrew and other right-to-left text no longer runs backwards or misspaces letters with «Metric» or optical kerning; your own kerning pairs now tighten or loosen right-to-left letter pairs by exactly the value entered (a 0 entry no longer shifts letters); faux bold widens right-to-left text instead of squeezing it.
 
 ---
 
@@ -347,3 +348,4 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **Доступность быстрого OCR** — быстрое распознавание на холсте перевода учитывает текущее состояние ИИ-бэкенда, даже когда все инструменты скрыты.
 - **Сенсорный ввод** — касание, отменённое системой (например, при отбрасывании ладони), больше не оставляет указатель зажатым.
 - **Сообщение об ошибке SDXL** — если библиотека SDXL не загружается, ошибка показывает настоящую причину, а не всегда просит её установить.
+- **Интервалы в тексте справа налево** — иврит и другой текст справа налево больше не идёт задом наперёд и не сбивается по интервалам при кернинге «Метрический» и оптическом; собственные кернинговые пары сдвигают буквы такого текста ровно на заданную величину (значение 0 больше не смещает буквы); искусственное полужирное начертание расширяет такой текст, а не сжимает его.
