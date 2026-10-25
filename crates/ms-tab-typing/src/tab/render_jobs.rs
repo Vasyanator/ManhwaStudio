@@ -158,6 +158,9 @@ impl TypingTextOverlayLayer {
                 &fallback_refs,
                 &page_sizes,
             );
+            // A closed channel means the tab was dropped (tab reset / project switch); the loaded
+            // overlays only feed that tab. Nobody is left to report to, so the send result is
+            // deliberately ignored.
             let _ = tx.send((project_dir_for_thread, result));
         });
         self.loading_project_dir = Some(project_dir);
@@ -224,6 +227,9 @@ impl TypingTextOverlayLayer {
                 Some(&unsaved_layers),
                 &page_sizes,
             );
+            // A closed channel means the tab was dropped (tab reset / project switch); the loaded
+            // overlays only feed that tab. Nobody is left to report to, so the send result is
+            // deliberately ignored.
             let _ = tx.send(result);
         });
         self.migration_rx = Some(rx);
@@ -725,6 +731,8 @@ impl TypingTextOverlayLayer {
             .and_then(|doc| doc.lock().ok().and_then(|g| g.raster_base_image(page_idx, &uid)));
         let (tx, rx) = mpsc::channel::<Result<TypingRasterEffectsResult, String>>();
         thread::spawn(move || {
+            // A closed channel means the tab dropped this request; the effects render only feeds
+            // the display. Nobody is left to report to, so the send result is deliberately ignored.
             let _ = tx.send(render_raster_effects(
                 page_idx,
                 uid,
@@ -1158,7 +1166,11 @@ impl TypingTextOverlayLayer {
         let (tx, rx) = mpsc::channel::<Result<Option<TypingEditOverlayResult>, String>>();
         thread::spawn(move || {
             let result = render_and_store_edited_overlay(request);
-            let _ = tx.send(result);
+            // A closed channel means the tab was dropped (tab reset / app closing) while this ran;
+            // a failure would then reach nobody, so it is logged here instead of being lost.
+            if let Err(std::sync::mpsc::SendError(Err(err))) = tx.send(result) {
+                ms_log::runtime_log::log_warn(format!("typing: edited text layer render/store failed after its tab was dropped: {err}"));
+            }
         });
         self.edit_render_rx = Some(rx);
     }
@@ -1178,7 +1190,11 @@ impl TypingTextOverlayLayer {
         let (tx, rx) = mpsc::channel::<Result<Option<TypingEditOverlayResult>, String>>();
         thread::spawn(move || {
             let result = render_and_store_image_effects_overlay(request);
-            let _ = tx.send(result);
+            // A closed channel means the tab was dropped (tab reset / app closing) while this ran;
+            // a failure would then reach nobody, so it is logged here instead of being lost.
+            if let Err(std::sync::mpsc::SendError(Err(err))) = tx.send(result) {
+                ms_log::runtime_log::log_warn(format!("typing: image layer effects render/store failed after its tab was dropped: {err}"));
+            }
         });
         self.edit_render_rx = Some(rx);
     }
@@ -1228,6 +1244,9 @@ impl TypingTextOverlayLayer {
             if worker_cancel_render.load(Ordering::Relaxed) {
                 return;
             }
+            // A closed channel means the menu that asked for this preview was closed; the tiles
+            // only feed it. Nobody is left to report to, so the send result is deliberately
+            // ignored.
             let _ = tx.send(Ok(TypingShapeVariantPreviewResult { menu_id, tiles }));
         });
 

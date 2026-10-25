@@ -463,7 +463,7 @@ fn layers_panel_rows_equal_the_canvas_fill_order_for_equal_z_ties() {
         texture: None,
     };
     let text = |uid: &str, page_idx: usize| {
-        text_runtime_from_doc_node(uid, page_idx, [1.0, 1.0], 1.0, 0.0, None, false, false, 0, None, [2, 2], vec![255; 16])
+        text_runtime_from_doc_node(uid, page_idx, OverlayPlacement::at([1.0, 1.0]), false, None, [2, 2], vec![255; 16])
     };
     let mut layer = TypingTextOverlayLayer::default();
     // One saved raster band; everything else is band-less (top-of-stack Z, equal ties).
@@ -1837,13 +1837,8 @@ fn duplication_rejects_an_image_overlay_and_an_out_of_range_index() {
         overlays: vec![text_runtime_from_doc_node(
             "img",
             0,
-            [10.0, 20.0],
-            1.0,
-            0.0,
-            None,
-            false,
+            OverlayPlacement::at([10.0, 20.0]),
             true, // is_image
-            0,
             None,
             [4, 3],
             vec![0u8; 4 * 3 * 4],
@@ -1863,13 +1858,8 @@ fn duplication_rejects_an_image_overlay_and_an_out_of_range_index() {
         overlays: vec![text_runtime_from_doc_node(
             "empty",
             0,
-            [10.0, 20.0],
-            1.0,
-            0.0,
-            None,
+            OverlayPlacement::at([10.0, 20.0]),
             false,
-            false,
-            0,
             None,
             [0, 0],
             Vec::new(),
@@ -1915,13 +1905,8 @@ fn loader_completion_merge_does_not_wipe_doc_created_runtimes() {
         text_runtime_from_doc_node(
             "ta",
             0,
-            [10.0, 20.0],
-            1.0,
-            0.0,
-            None,
+            OverlayPlacement { layer_idx: 1, ..OverlayPlacement::at([10.0, 20.0]) },
             false,
-            false,
-            1,
             None,
             [4, 3],
             vec![0u8; 4 * 3 * 4],
@@ -1929,13 +1914,8 @@ fn loader_completion_merge_does_not_wipe_doc_created_runtimes() {
         text_runtime_from_doc_node(
             "tb",
             0,
-            [30.0, 40.0],
-            1.0,
-            0.0,
-            None,
+            OverlayPlacement { layer_idx: 1, ..OverlayPlacement::at([30.0, 40.0]) },
             false,
-            false,
-            1,
             None,
             [4, 3],
             vec![0u8; 4 * 3 * 4],
@@ -1962,13 +1942,8 @@ fn loader_completion_merge_replaces_same_uid_without_duplicating() {
     let mut overlays: Vec<TypingOverlayRuntime> = vec![text_runtime_from_doc_node(
         "ta",
         0,
-        [10.0, 20.0],
-        1.0,
-        0.0,
-        None,
+        OverlayPlacement::at([10.0, 20.0]),
         false,
-        false,
-        0,
         None,
         [4, 3],
         vec![0u8; 4 * 3 * 4],
@@ -2008,13 +1983,8 @@ fn loader_completion_merge_replaces_same_uid_without_duplicating() {
     let mut o2 = vec![text_runtime_from_doc_node(
         "ta",
         1,
-        [5.0, 6.0],
-        1.0,
-        0.0,
-        None,
+        OverlayPlacement::at([5.0, 6.0]),
         false,
-        false,
-        0,
         None,
         [4, 3],
         vec![0u8; 4 * 3 * 4],
@@ -2037,12 +2007,7 @@ fn image_overlay_render_data_round_trips_effects() {
         0,
         "image_p0_1_fx.png",
         Some("image_p0_1.png"),
-        [10.0, 20.0],
-        true,
-        0,
-        0.0,
-        1.0,
-        None,
+        OverlayPlacement { mask_clip_enabled: true, ..OverlayPlacement::at([10.0, 20.0]) },
         Some(render_data),
     );
     let obj = entry.as_object().expect("entry must be an object");
@@ -2070,12 +2035,7 @@ fn image_overlay_entry_omits_original_when_same_as_file() {
         0,
         "image_p0_1.png",
         Some("image_p0_1.png"),
-        [0.0, 0.0],
-        true,
-        0,
-        0.0,
-        1.0,
-        None,
+        OverlayPlacement { mask_clip_enabled: true, ..OverlayPlacement::at([0.0, 0.0]) },
         Some(default_render_data_for_image()),
     );
     let obj = entry.as_object().expect("entry must be an object");
@@ -2554,13 +2514,8 @@ fn vector_base_reuses_current_texture_when_no_warp() {
     let overlay = text_runtime_from_doc_node(
         "t0",
         0,
-        [10.0, 20.0],
-        1.0,
-        0.0,
-        None,
+        OverlayPlacement::at([10.0, 20.0]),
         false,
-        false,
-        0,
         Some(json!({ "text_params": { "text": "hi" } })), // no raster_transform
         [2, 2],
         rgba.clone(),
@@ -2617,13 +2572,8 @@ fn vector_preview_active_requires_drag_and_base() {
     layer.overlays.push(text_runtime_from_doc_node(
         "t0",
         0,
-        [10.0, 20.0],
-        1.0,
-        0.0,
-        None,
+        OverlayPlacement::at([10.0, 20.0]),
         false,
-        false,
-        0,
         None,
         [2, 2],
         vec![0u8; 2 * 2 * 4],
@@ -3153,13 +3103,8 @@ fn overlay_transform_rec_maps_runtime_placement_to_doc() {
     let overlay = text_runtime_from_doc_node(
         "t0",
         0,
-        [12.5, 34.0],
-        2.0,
-        90.0,
-        None,
+        OverlayPlacement { center_page_px: [12.5, 34.0], scale: 2.0, rotation_deg: 90.0, deform_mesh: None, mask_clip_enabled: false, layer_idx: 0 },
         false,
-        false,
-        0,
         None,
         [4, 3],
         vec![0u8; 4 * 3 * 4],
@@ -3966,13 +3911,8 @@ fn centering_chosen_center_falls_back_to_image_center_when_extras_none() {
     let overlay = text_runtime_from_doc_node(
         "c0",
         0,
-        [50.0, 60.0],
-        1.0,
-        0.0,
-        None,
+        OverlayPlacement::at([50.0, 60.0]),
         false,
-        false,
-        0,
         None,
         [40, 20],
         vec![0u8; 40 * 20 * 4],
@@ -3996,13 +3936,8 @@ fn centering_chosen_center_uses_mean_when_present() {
     let mut overlay = text_runtime_from_doc_node(
         "c1",
         0,
-        [50.0, 60.0],
-        1.0,
-        0.0,
-        None,
+        OverlayPlacement::at([50.0, 60.0]),
         false,
-        false,
-        0,
         None,
         [40, 20],
         vec![0u8; 40 * 20 * 4],
@@ -4518,13 +4453,8 @@ fn sticky_centers_bit_tracks_the_overlay_and_reaches_the_edit_panel_payload() {
     let mut overlay = text_runtime_from_doc_node(
         "s1",
         0,
-        [50.0, 60.0],
-        1.0,
-        0.0,
-        None,
+        OverlayPlacement::at([50.0, 60.0]),
         false,
-        false,
-        0,
         None,
         [40, 20],
         vec![0u8; 40 * 20 * 4],
@@ -4994,13 +4924,8 @@ fn the_conversion_pass_leaves_a_path_only_match_verbatim() {
     layer.overlays.push(text_runtime_from_doc_node(
         "ov",
         0,
-        [10.0, 20.0],
-        1.0,
-        0.0,
-        None,
+        OverlayPlacement::at([10.0, 20.0]),
         false,
-        false,
-        0,
         Some(stored.clone()),
         [4, 3],
         vec![0u8; 4 * 3 * 4],
@@ -5213,13 +5138,8 @@ fn a_doc_edit_that_changes_nothing_marks_nothing() {
     layer.overlays.push(text_runtime_from_doc_node(
         "ghost",
         0,
-        [10.0, 20.0],
-        1.0,
-        0.0,
-        None,
+        OverlayPlacement::at([10.0, 20.0]),
         false,
-        false,
-        0,
         Some(json!({ "text_params": { "text": "x", "font_label": "real" } })),
         [4, 3],
         vec![0u8; 4 * 3 * 4],
@@ -5461,13 +5381,8 @@ fn tab_leave_flush_settles_an_open_move_and_reports_it_as_pending() {
         overlays: vec![text_runtime_from_doc_node(
             "t0",
             0,
-            [10.0, 20.0],
-            1.0,
-            0.0,
-            None,
+            OverlayPlacement::at([10.0, 20.0]),
             false,
-            false,
-            0,
             None,
             [4, 3],
             vec![0u8; 4 * 3 * 4],
@@ -5517,13 +5432,8 @@ fn discard_drops_an_open_move_without_marking_anything() {
         overlays: vec![text_runtime_from_doc_node(
             "t0",
             0,
-            [10.0, 20.0],
-            1.0,
-            0.0,
-            None,
+            OverlayPlacement::at([10.0, 20.0]),
             false,
-            false,
-            0,
             None,
             [4, 3],
             vec![0u8; 4 * 3 * 4],
@@ -5716,13 +5626,8 @@ fn whole_document_flush_settles_an_open_move() {
         overlays: vec![text_runtime_from_doc_node(
             "t0",
             0,
-            [10.0, 20.0],
-            1.0,
-            0.0,
-            None,
+            OverlayPlacement::at([10.0, 20.0]),
             false,
-            false,
-            0,
             None,
             [4, 3],
             vec![0u8; 4 * 3 * 4],
@@ -7086,4 +6991,26 @@ fn export_clean_fallback_follows_loader_scope_and_leaves_model_untouched() {
     assert!(locked.is_overlay_virtual_absent(0), "the page must not become save-dirty");
     drop(locked);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Folding several raster-menu instances of one frame keeps every chosen action: a later choice
+/// replaces an earlier one of the same kind, an unchosen kind leaves the earlier value in place.
+#[test]
+fn raster_menu_actions_absorb_keeps_earlier_choices_and_lets_later_ones_win() {
+    use super::selection_rasters::RasterMenuActions;
+    let mut frame = RasterMenuActions::default();
+    frame.absorb(RasterMenuActions { toggle_mask_clip: Some(1), move_z: Some((1, true)), ..RasterMenuActions::default() });
+    frame.absorb(RasterMenuActions::default());
+    frame.absorb(RasterMenuActions { exit_transform: true, move_z: Some((2, false)), delete: Some(2), ..RasterMenuActions::default() });
+    assert_eq!(
+        frame,
+        RasterMenuActions {
+            enter_transform: None,
+            exit_transform: true,
+            reset_transform: None,
+            toggle_mask_clip: Some(1),
+            move_z: Some((2, false)),
+            delete: Some(2),
+        }
+    );
 }

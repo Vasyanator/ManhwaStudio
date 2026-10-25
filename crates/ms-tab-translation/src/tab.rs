@@ -495,6 +495,16 @@ struct TextDetectorLineDragState {
     kind: TextDetectorLineDragKind,
 }
 
+/// Where one text-mask brush edit lands: the page, its source-image and mask sizes in pixels
+/// (`text_mask_target_sizes`) and the page's on-screen rect that scene positions map through.
+#[derive(Debug, Clone, Copy)]
+struct TextMaskPageGeom {
+    page_idx: usize,
+    source_size: [u32; 2],
+    mask_size: [u32; 2],
+    page_rect: Rect,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TextDetectorMaskStrokeState {
     page_idx: usize,
@@ -2480,18 +2490,12 @@ impl TranslationTabState {
         Some(([source_w, source_h], [source_w, source_h]))
     }
 
-    // All parameters are distinct pixel-buffer or layout properties; grouping would obscure rendering intent.
-    #[allow(clippy::too_many_arguments)]
-    fn paint_text_mask_segment(
-        &mut self,
-        page_idx: usize,
-        source_size: [u32; 2],
-        mask_size: [u32; 2],
-        page_rect: Rect,
-        from_scene: Pos2,
-        to_scene: Pos2,
-        erase: bool,
-    ) -> bool {
+    /// Paints (or, with `erase`, clears) one brush segment from `from_scene` to `to_scene` (scene
+    /// positions over `geom.page_rect`) into the page's text mask in the shared
+    /// `TextMaskModel`, then refreshes the dirty tiles of the page's mask texture. Returns `true`
+    /// when the mask changed (no model, an off-page point or a no-op stroke return `false`).
+    fn paint_text_mask_segment(&mut self, geom: TextMaskPageGeom, from_scene: Pos2, to_scene: Pos2, erase: bool) -> bool {
+        let TextMaskPageGeom { page_idx, source_size, mask_size, page_rect } = geom;
         let Some(src0) = scene_pos_to_source(
             page_rect,
             mask_size[0] as f32,

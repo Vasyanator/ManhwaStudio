@@ -222,6 +222,9 @@ impl TypingTextOverlayLayer {
         };
         let (tx, rx) = mpsc::channel::<Result<Option<TypingVectorBaseRenderResult>, String>>();
         thread::spawn(move || {
+            // A closed channel means the tab dropped this request; the base render only feeds the
+            // transform preview. Nobody is left to report to, so the send result is deliberately
+            // ignored.
             let _ = tx.send(render_vector_transform_base(request));
         });
         // Drop any previously reused/rendered base while the fresh render is in flight; the drag falls

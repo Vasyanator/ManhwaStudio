@@ -160,13 +160,21 @@ pub(super) fn effect_default_card(
 /// but not surfaced (best-effort save, matching the other TextTab preset writers).
 fn persist_effect_defaults_off_thread() {
     let defaults = all_effect_defaults();
-    let _ = thread::Builder::new()
+    let spawn_result = thread::Builder::new()
         .name("typing-save-effect-defaults".to_string())
         .spawn(move || {
             if let Err(err) = save_text_tab_effect_defaults(&defaults) {
                 eprintln!("ERROR typing::effect_defaults save failed: {err}");
             }
         });
+    if let Err(err) = spawn_result {
+        // Same best-effort contract as a failed save: the overrides stay live in memory and
+        // the next edit persists the whole map again.
+        ms_log::runtime_log::log_error(format!(
+            "typing effect defaults: could not spawn the save worker; this change is not \
+             persisted until the next edit: {err}"
+        ));
+    }
 }
 
 /// One editing row in `EffectDefaultsEditorState`: the buffered card for a kind plus

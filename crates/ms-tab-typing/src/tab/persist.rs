@@ -459,7 +459,11 @@ impl TypingTextOverlayLayer {
                     .into_iter()
                     .try_for_each(|(_page_idx, result)| result)
             })();
-            let _ = tx.send(result);
+            // A closed channel means the tab was dropped (tab reset / app closing) while this ran;
+            // a failure would then reach nobody, so it is logged here instead of being lost.
+            if let Err(std::sync::mpsc::SendError(Err(err))) = tx.send(result) {
+                ms_log::runtime_log::log_warn(format!("typing: text placement save failed after its tab was dropped: {err}"));
+            }
         });
         self.save_rx = Some(rx);
     }

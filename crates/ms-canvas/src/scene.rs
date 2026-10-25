@@ -16,6 +16,7 @@ Main responsibilities:
 Key structures:
 - CanvasSceneState
 - StripLayoutStamp (previous pass' strip geometry for the strip-width compensation)
+- PageStripViewport (loop-invariant strip geometry handed to every page reservation)
 
 Key functions:
 - CanvasView::begin_canvas_frame()
@@ -142,6 +143,17 @@ struct CanvasStripWorldWidths {
     content: f32,
     /// Widest page IMAGE alone, without any gutters. At least `1.0`.
     max_page: f32,
+}
+
+/// Strip-wide geometry shared by every page reserved in one scene pass (loop-invariant).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PageStripViewport {
+    /// Widest content row of the strip in world units (page plus aside gutters).
+    pub(super) content_world_width: f32,
+    /// Unexpanded visible screen rect; `CanvasView::page_in_view` adds its own margin.
+    pub(super) viewport_rect: Rect,
+    /// Screen Y of the viewport center line that selects the current page.
+    pub(super) viewport_center_y: f32,
 }
 
 /// Allocation-free, single-pass selection of the canvas' current page.
@@ -1006,11 +1018,14 @@ impl CanvasView {
             let page_gap = page_gap_world * self.state.zoom;
             ui.add_space(edge_margin);
 
-            let viewport_center_y = ui.clip_rect().center().y;
-            // Unexpanded viewport; `Self::page_in_view` expands it by
-            // `PAGE_VISIBILITY_MARGIN_PX` internally (equivalent to the old
-            // `clip_rect().expand(256.0)` test).
-            let viewport_rect = ui.clip_rect();
+            let strip_viewport = PageStripViewport {
+                content_world_width,
+                // Unexpanded viewport; `Self::page_in_view` expands it by
+                // `PAGE_VISIBILITY_MARGIN_PX` internally (equivalent to the old
+                // `clip_rect().expand(256.0)` test).
+                viewport_rect: ui.clip_rect(),
+                viewport_center_y: ui.clip_rect().center().y,
+            };
             // The per-frame transform must be re-established from this frame's first
             // laid-out page, so clear the previous frame's "established" marker.
             self.scene.view_established_this_frame = false;
@@ -1035,10 +1050,8 @@ impl CanvasView {
                     ui,
                     page.idx,
                     page_size_px,
-                    content_world_width,
                     page_world_top,
-                    viewport_rect,
-                    viewport_center_y,
+                    strip_viewport,
                     &mut current_page,
                 ) else {
                     continue;
@@ -1228,21 +1241,28 @@ impl CanvasView {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Allocates page `page_idx`'s row in the strip, records its world and screen rects, feeds
+    /// `current_page`, and returns the frame plus the row's click response.
+    ///
+    /// `page_size_px` is the unscaled page size and `page_world_top` its strip-space top.
+    /// Returns `None` (allocating nothing) for an empty page size.
     pub(super) fn reserve_canvas_page_frame(
         &mut self,
         ui: &mut egui::Ui,
         page_idx: usize,
         page_size_px: Vec2,
-        content_world_width: f32,
         page_world_top: f32,
-        viewport_rect: Rect,
-        viewport_center_y: f32,
+        strip_viewport: PageStripViewport,
         current_page: &mut CurrentPageTracker,
     ) -> Option<(CanvasScenePageFrame, egui::Response)> {
         if page_size_px.x <= 0.0 || page_size_px.y <= 0.0 {
             return None;
         }
+        let PageStripViewport {
+            content_world_width,
+            viewport_rect,
+            viewport_center_y,
+        } = strip_viewport;
         let image_size = page_size_px * self.state.zoom;
         let viewport_width = ui.clip_rect().width().max(1.0);
         let content_screen_width = content_world_width.max(1.0) * self.state.zoom;

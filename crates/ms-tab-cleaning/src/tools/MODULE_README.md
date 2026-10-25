@@ -122,6 +122,10 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   re-exports the dense-overlay colour solver `overlay_pixel_for_final_color` from
   `crate::tools::overlay_pixel`, so the whole subtree keeps reaching it as
   `base::overlay_pixel_for_final_color`.
+  Every region-editor window pass (`RegionEditToolBase::draw_overlay_ui*`,
+  `RegionMaskInpaintToolBase::draw_overlay_ui*`) takes one `RegionOverlayFrame` (context, canvas,
+  project, input, window title) that the tool builds in its `CleaningTool::draw_overlay_ui`; a
+  window body returns a `RegionEditorWindowOutcome` (close / apply) instead of out-flags.
 - `mask_generation.rs`: the host-neutral core of «Сгенерировать маску», shared by `base.rs` and
   `region_edit_v2/host.rs`. Owns the source catalog (`MaskSource`, `MASK_SOURCES`), the availability rule
   (`MaskSource::is_available` / `requires_torch`), the per-host parameters and progress

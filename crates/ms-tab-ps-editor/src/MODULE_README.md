@@ -557,7 +557,7 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   `persist_current_page` filters to `LayerKind::Raster` — so they ARE localized.
 - Non-destructive raster effects render off the GUI thread. `apply_effects_to_raster` parses the
   chain, clones the pre-effects base ColorImage (dropping the stack borrow first), and spawns
-  `render_ps_raster_effects`, which runs the expensive `apply_effects_to_color_image`. A render
+  an owned `PsRasterEffectsJob` whose `run` calls the expensive `apply_effects_to_color_image`. A render
   already in flight stashes the latest request in `pending_raster_effects` (latest-wins).
   `poll_ps_raster_effects_jobs` (called once per frame from `draw`) consumes the result and does the
   cheap GUI-side apply — recenter anchoring, `edit_doc_node` routing (swap base/display/effects +
@@ -793,7 +793,7 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
 - To change the copy/cut menu or its compositing/cut rules, edit `draw_selection_menu`,
   `clip_op_submenu`, `clip_layer_picker`, and `clip_into_new_layer` in `mod.rs`.
 - To change the raster effects pipeline (off-thread render, recenter, persist), edit
-  `apply_effects_to_raster`, `render_ps_raster_effects`, `poll_ps_raster_effects_jobs`, and
+  `apply_effects_to_raster`, `PsRasterEffectsJob::run`, `poll_ps_raster_effects_jobs`, and
   `apply_ps_raster_effects_result` in `mod.rs`.
 - To change GPU upload/compositing, edit `layer_render.rs` and `mod.rs::draw_canvas`.
 - To change the sampling mode («Сглаживание»), edit `PsEditorTabState::layer_texture_options` in

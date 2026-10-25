@@ -20,7 +20,7 @@ FILE HEADER (cleaning/tools/aot.rs)
   - При пустой маске обработка не запускается и возвращается исходный регион без изменений.
   - Ошибки backend пробрасываются пользователю в статус окна region editor.
 */
-use super::base::{CleaningTool, RegionMaskInpaintToolBase, StrokePoint};
+use super::base::{CleaningTool, RegionMaskInpaintToolBase, RegionOverlayFrame, StrokePoint};
 use std::sync::Arc;
 use crate::input::CleaningLabels;
 use ms_input::{ContextId, InputFrame};
@@ -199,11 +199,7 @@ impl CleaningTool for AotInpaintTool {
             &mut self.unload_status,
         );
         inpaint_base.draw_overlay_ui_custom_with_downloads(
-            ctx,
-            canvas,
-            project,
-            input,
-            t!("cleaning.tools.aot.title"),
+            RegionOverlayFrame { ctx, canvas, project, input, window_title: t!("cleaning.tools.aot.title") },
             {
                 let params = *params;
                 move |image, mask, downloads| Self::run_aot(image, mask, params, downloads)

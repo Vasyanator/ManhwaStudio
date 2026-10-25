@@ -290,6 +290,9 @@ impl TypingMaskLayer {
         let text_images_dir_for_thread = text_images_dir.clone();
         thread::spawn(move || {
             let result = load_masks_from_text_images_dir(&text_images_dir_for_thread);
+            // A closed channel means the mask layer was dropped (tab reset / project switch); the
+            // loaded masks only feed that layer. Nobody is left to report to, so the send result is
+            // deliberately ignored.
             let _ = tx.send((project_dir_for_thread, result));
         });
 
@@ -920,7 +923,11 @@ impl TypingMaskLayer {
         let (tx, rx) = mpsc::channel::<Result<(), String>>();
         thread::spawn(move || {
             let result = save_masks_to_text_images_dir(&text_images_dir, &pages);
-            let _ = tx.send(result);
+            // A closed channel means the tab was dropped (tab reset / app closing) while this ran;
+            // a failure would then reach nobody, so it is logged here instead of being lost.
+            if let Err(std::sync::mpsc::SendError(Err(err))) = tx.send(result) {
+                ms_log::runtime_log::log_warn(format!("typing: mask save failed after its tab was dropped: {err}"));
+            }
         });
         self.save_rx = Some(rx);
     }
@@ -983,22 +990,22 @@ impl TypingMaskLayer {
             seed_y,
             tolerance
         );
+        let job = FloodFillJob {
+            page_idx,
+            width,
+            height,
+            seed: [seed_x, seed_y],
+            tolerance,
+            mask_data,
+        };
         let (tx, rx) = mpsc::channel::<Result<TypingMaskFillJobResult, String>>();
         thread::spawn(move || {
             let result =
                 build_fill_source_from_cache_model(&overlays_model, page_idx, [width, height])
-                    .and_then(|fill_source| {
-                        flood_fill_mask_from_seed(
-                            page_idx,
-                            width,
-                            height,
-                            seed_x,
-                            seed_y,
-                            tolerance,
-                            mask_data,
-                            fill_source,
-                        )
-                    });
+                    .and_then(|fill_source| flood_fill_mask_from_seed(job, fill_source));
+            // A closed channel means the mask layer was dropped while the fill ran; the filled mask
+            // only feeds that layer. Nobody is left to report to, so the send result is
+            // deliberately ignored.
             let _ = tx.send(result);
         });
         self.fill_job_rx = Some(rx);
@@ -1254,18 +1261,36 @@ fn paint_mask_segment(
     true
 }
 
-// Parameters represent distinct required inputs with no natural grouping.
-#[allow(clippy::too_many_arguments)]
-fn flood_fill_mask_from_seed(
+/// One mask flood-fill request, captured on the GUI thread and moved to the fill worker: the page's
+/// mask snapshot (`mask_data`, `width` x `height`, one byte per pixel) and the fill seed in mask
+/// pixels.
+struct FloodFillJob {
     page_idx: usize,
     width: usize,
     height: usize,
-    seed_x: usize,
-    seed_y: usize,
+    /// Seed pixel `[x, y]` in mask pixels.
+    seed: [usize; 2],
+    /// Maximum per-channel RGB distance from the seed colour that still joins the fill.
     tolerance: u8,
-    mut mask_data: Vec<u8>,
+    mask_data: Vec<u8>,
+}
+
+/// Flood-fills `job.mask_data` with 255 from the seed over the 4-connected region of `source_rgba`
+/// (straight RGBA, same `width` x `height`) whose RGB stays within `tolerance` of the seed colour.
+/// Returns the filled mask with the dirty rect (`None` when nothing changed), or a localized error
+/// for a zero-size page, a mask or source buffer of the wrong length, or a seed outside the mask.
+fn flood_fill_mask_from_seed(
+    job: FloodFillJob,
     source_rgba: Vec<u8>,
 ) -> Result<TypingMaskFillJobResult, String> {
+    let FloodFillJob {
+        page_idx,
+        width,
+        height,
+        seed: [seed_x, seed_y],
+        tolerance,
+        mut mask_data,
+    } = job;
     if width == 0 || height == 0 {
         return Err(t!("typing.mask.fill_zero_page_error").to_string());
     }
@@ -1767,5 +1792,27 @@ mod tests {
         mask_frame(&ctx, &mut router, &mut layer, vec![right(true)]);
         mask_frame(&ctx, &mut router, &mut layer, vec![right(false)]);
         assert!(!layer.masks.get(&0).is_some_and(TypingPageMask::has_active_pixels), "a right-button press erases the dot");
+    }
+
+    /// A flood fill joins the 4-connected pixels within tolerance of the seed colour, stops at a
+    /// pixel outside it, and reports the filled mask with its dirty rect.
+    #[test]
+    fn flood_fill_fills_the_tolerance_region_and_reports_the_dirty_rect() {
+        // 4 x 1 page: two near-black pixels, a white wall, then near-black again (unreachable).
+        let source_rgba = [[0, 0, 0, 255], [5, 5, 5, 255], [255, 255, 255, 255], [0, 0, 0, 255]].concat();
+        let job = FloodFillJob { page_idx: 3, width: 4, height: 1, seed: [0, 0], tolerance: 10, mask_data: vec![0; 4] };
+        let result = flood_fill_mask_from_seed(job, source_rgba).expect("a valid fill succeeds");
+        assert_eq!(result.page_idx, 3);
+        assert_eq!([result.width, result.height], [4, 1]);
+        assert_eq!(result.data, vec![255, 255, 0, 0]);
+        assert_eq!(result.dirty_rect, Some((0, 0, 2, 1)));
+    }
+
+    /// A seed outside the mask and a source buffer of the wrong length are rejected, not filled.
+    #[test]
+    fn flood_fill_rejects_an_out_of_bounds_seed_and_a_short_source() {
+        let job = |seed| FloodFillJob { page_idx: 0, width: 2, height: 2, seed, tolerance: 0, mask_data: vec![0; 4] };
+        assert!(flood_fill_mask_from_seed(job([2, 0]), vec![0; 16]).is_err(), "seed x == width is outside");
+        assert!(flood_fill_mask_from_seed(job([0, 0]), vec![0; 12]).is_err(), "a short source buffer is rejected");
     }
 }

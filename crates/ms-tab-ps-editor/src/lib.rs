@@ -63,7 +63,7 @@ Architecture:
   dashed by CUMULATIVE arc length (`walk_dash_runs`) — dashing each segment on its own would restart
   the pattern every pixel and paint a solid line.
 - raster effects: applying a non-destructive effects chain runs the expensive
-  `apply_effects_to_color_image` on a worker thread (`render_ps_raster_effects`), never the GUI
+  `apply_effects_to_color_image` on a worker thread (`PsRasterEffectsJob::run`), never the GUI
   thread. `apply_effects_to_raster` clones the base pixels and spawns the render (stashing a
   latest-wins request via `pending_raster_effects` if one is already in flight);
   `poll_ps_raster_effects_jobs` (once per frame) does the cheap GUI-side apply (recenter, doc
@@ -1396,24 +1396,24 @@ impl PsEditorTabState {
                 _ => None,
             };
             self.node_generations.insert(cache_key, node.generation);
-            new_text.push(PsTextLayer::from_doc_node(
-                node.uid.clone(),
-                node.name.clone(),
-                node.visible,
+            new_text.push(PsTextLayer {
+                uid: node.uid.clone(),
+                name: node.name.clone(),
+                visible: node.visible,
                 layer_idx,
-                node.group_uid.clone(),
+                group_uid: node.group_uid.clone(),
                 pinned,
                 pinned_by_group,
                 text_content,
-                image.clone(),
-                LayerTransform {
+                image: image.clone(),
+                transform: LayerTransform {
                     center: Vec2::new(node.transform.cx, node.transform.cy),
                     rotation: node.transform.rotation,
                     scale: node.transform.scale,
                 },
-                node.deform.clone(),
+                deform: node.deform.clone(),
                 texture,
-            ));
+            });
         }
         self.text_layers = new_text;
 
@@ -2518,7 +2518,7 @@ impl PsEditorTabState {
         let Some(loader) = &self.loader else {
             return;
         };
-        let _ = loader.request_tx.send(Some(PageLoadRequest {
+        let request = PageLoadRequest {
             job_id,
             page_idx,
             page_path,
@@ -2526,7 +2526,13 @@ impl PsEditorTabState {
             layers_dir,
             legacy_text_dir,
             page_sizes,
-        }));
+        };
+        // A failed send means the loader worker has exited, so this page will never load.
+        if loader.request_tx.send(Some(request)).is_err() {
+            ms_log::runtime_log::log_warn(format!(
+                "[ps_editor] page load request not sent: loader worker has exited (job={job_id} page={page_idx})"
+            ));
+        }
     }
 
     /// Writes the current page's raster layers to the unsaved staging dir (`*_unsaved/layers/`).
@@ -5005,20 +5011,26 @@ impl PsEditorTabState {
         };
 
         // Spawn the expensive render off the GUI thread; `poll_ps_raster_effects_jobs` applies it.
-        let json_owned = json.to_string();
-        let effects_owned = effects;
+        let job = PsRasterEffectsJob {
+            page_idx,
+            uid,
+            id,
+            base_image,
+            base_size,
+            base_t,
+            json: json.to_string(),
+            effects,
+        };
         let (tx, rx) = mpsc::channel::<Result<PsRasterEffectsResult, String>>();
+        let (log_page, log_uid) = (job.page_idx, job.uid.clone());
         thread::spawn(move || {
-            let _ = tx.send(render_ps_raster_effects(
-                page_idx,
-                uid,
-                id,
-                base_image,
-                base_size,
-                base_t,
-                json_owned,
-                effects_owned,
-            ));
+            // The receiver is gone only when the tab was torn down (or the state replaced) while
+            // rendering; the result has no consumer then, so it is dropped with a note.
+            if tx.send(job.run()).is_err() {
+                ms_log::runtime_log::log_info(format!(
+                    "[ps_editor] raster effects result discarded: receiver gone (page={log_page} uid={log_uid})"
+                ));
+            }
         });
         self.raster_effects_state = Some(rx);
     }
@@ -7548,56 +7560,77 @@ fn layer_touches_selection(layer: &Layer, selection: &Selection, bounds: Selecti
     false
 }
 
-/// Worker: renders a raster's effects chain from the supplied pre-effects base image
-/// (non-destructive — the caller already cloned the base and dropped every lock). Runs the expensive
-/// `apply_effects_to_color_image` off the GUI thread and returns the data the GUI-side apply step
-/// needs (the new display image, the base content `origin` inside it, and the recenter references).
-///
-/// An empty `effects` chain means "clear effects": the result carries the base image unchanged with a
-/// zero `origin`, so the GUI step restores the base placement.
-///
-/// # Errors
-/// Returns a human-readable message string when the effects render fails (the caller logs it and
-/// keeps the raster unchanged).
-#[allow(clippy::too_many_arguments)]
-// Justification: this is a pure data-shuttle for the worker thread; every argument is an independent
-// piece of the already-resolved render context (no shared state to group them into) and bundling them
-// into an ad-hoc struct would only add indirection without clarifying the contract.
-fn render_ps_raster_effects(
+/// One non-destructive raster effects render, resolved on the GUI thread (the base already cloned,
+/// every lock dropped) and moved whole into the worker thread that calls [`PsRasterEffectsJob::run`].
+#[derive(Debug)]
+struct PsRasterEffectsJob {
+    /// Page the raster lives on (echoed into the result).
     page_idx: usize,
+    /// Stable doc uid of the raster.
     uid: String,
+    /// Session `LayerId` of the raster.
     id: LayerId,
+    /// The pre-effects image the chain is rendered from.
     base_image: ColorImage,
+    /// Size `[w, h]` of `base_image` (recenter reference).
     base_size: [usize; 2],
+    /// The raster's transform at dispatch time (recenter reference).
     base_t: LayerTransform,
+    /// The effects chain as the editor's JSON text, fed to the renderer.
     json: String,
+    /// The same chain parsed; empty means "clear effects".
     effects: Vec<serde_json::Value>,
-) -> Result<PsRasterEffectsResult, String> {
-    if effects.is_empty() {
-        // No render needed: clearing effects restores the base. `origin` is the base top-left.
-        return Ok(PsRasterEffectsResult {
+}
+
+impl PsRasterEffectsJob {
+    /// Worker: renders the effects chain from the pre-effects base image. Runs the expensive
+    /// `apply_effects_to_color_image` off the GUI thread and returns the data the GUI-side apply
+    /// step needs (the new display image, the base content `origin` inside it, and the recenter
+    /// references).
+    ///
+    /// An empty `effects` chain means "clear effects": the result carries the base image unchanged
+    /// with a zero `origin`, so the GUI step restores the base placement.
+    ///
+    /// # Errors
+    /// Returns a human-readable message string when the effects render fails (the caller logs it
+    /// and keeps the raster unchanged).
+    fn run(self) -> Result<PsRasterEffectsResult, String> {
+        let Self {
             page_idx,
             uid,
             id,
-            new_image: base_image,
-            origin: [0, 0],
+            base_image,
             base_size,
             base_t,
+            json,
             effects,
-        });
-    }
-    match effects::apply_effects_to_color_image(&base_image, &json) {
-        Ok((new_image, origin)) => Ok(PsRasterEffectsResult {
-            page_idx,
-            uid,
-            id,
-            new_image,
-            origin,
-            base_size,
-            base_t,
-            effects,
-        }),
-        Err(err) => Err(err),
+        } = self;
+        if effects.is_empty() {
+            // No render needed: clearing effects restores the base. `origin` is the base top-left.
+            return Ok(PsRasterEffectsResult {
+                page_idx,
+                uid,
+                id,
+                new_image: base_image,
+                origin: [0, 0],
+                base_size,
+                base_t,
+                effects,
+            });
+        }
+        match effects::apply_effects_to_color_image(&base_image, &json) {
+            Ok((new_image, origin)) => Ok(PsRasterEffectsResult {
+                page_idx,
+                uid,
+                id,
+                new_image,
+                origin,
+                base_size,
+                base_t,
+                effects,
+            }),
+            Err(err) => Err(err),
+        }
     }
 }
 

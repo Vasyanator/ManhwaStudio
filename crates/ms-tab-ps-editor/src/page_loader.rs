@@ -96,11 +96,19 @@ pub fn spawn_page_loader_thread(
                 break;
             };
             let outcome = load_page(&overlays_model, &request);
-            let _ = result_tx.send(PageLoadResult {
+            let result = PageLoadResult {
                 job_id: request.job_id,
                 page_idx: request.page_idx,
                 outcome,
-            });
+            };
+            // The receiver is gone only when the editor dropped its loader handles; the result has
+            // no consumer then, and the request channel closing ends this loop.
+            if result_tx.send(result).is_err() {
+                ms_log::runtime_log::log_info(format!(
+                    "[ps_editor] page load result discarded: receiver gone (job={} page={})",
+                    request.job_id, request.page_idx
+                ));
+            }
         }
     });
     PageLoaderHandles {

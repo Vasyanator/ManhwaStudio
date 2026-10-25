@@ -17,7 +17,7 @@ FILE HEADER (cleaning/tools/texture_synthesis.rs)
   - Маска примера (зелёная) ограничивает зону сэмплинга; если она пустая, используется
     старый fallback: всё вне дыры доступно для сэмплинга.
 */
-use super::base::{CleaningTool, RegionEditToolBase, RegionMaskInpaintToolBase, StrokePoint};
+use super::base::{CleaningTool, RegionEditToolBase, RegionMaskInpaintToolBase, RegionOverlayFrame, StrokePoint};
 use std::sync::Arc;
 use crate::input::CleaningLabels;
 use ms_input::{ContextId, InputFrame};
@@ -199,11 +199,7 @@ impl CleaningTool for TextureSynthesisInpaintTool {
     ) {
         let (inpaint_base, params) = (&mut self.inpaint_base, &mut self.params);
         inpaint_base.draw_overlay_ui_custom_with_sample_mask(
-            ctx,
-            canvas,
-            project,
-            input,
-            "Texture Synthesis Inpaint",
+            RegionOverlayFrame { ctx, canvas, project, input, window_title: t!("cleaning.tools.texture_synthesis.title") },
             {
                 let params = *params;
                 move |image, mask, sample_mask| {

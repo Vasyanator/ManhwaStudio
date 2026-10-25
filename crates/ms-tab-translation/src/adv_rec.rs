@@ -27,7 +27,7 @@ Notes:
 */
 
 use ms_input::{AxisSource, HitPhase, InputFrame, ViewId, ViewSurface, publish_view_surface, view};
-use ms_tools::MaskBrush;
+use ms_tools::{LineSegmentPx, MaskBrush};
 use ms_widgets::WheelSlider;
 use eframe::egui;
 use egui::color_picker::{self, Alpha};
@@ -938,10 +938,7 @@ fn paint_adv_rec_brush_to(session: &mut AdvancedRecognitionSession, pointer_pos:
     paint_line_mask_with_hardness(
         &mut session.brush_stroke_mask,
         session.working_overlay_image.size,
-        from_x,
-        from_y,
-        to_x,
-        to_y,
+        LineSegmentPx { x0: from_x, y0: from_y, x1: to_x, y1: to_y },
         i32::try_from(session.brush.radius_px().max(1)).unwrap_or(i32::MAX),
         session.brush_hardness,
     );
@@ -1272,18 +1269,11 @@ fn apply_adv_rec_brush_stroke(session: &mut AdvancedRecognitionSession) {
     }
 }
 
-// All parameters are independent brush stroke properties; grouping would obscure painting intent.
-#[allow(clippy::too_many_arguments)]
-fn paint_line_mask_with_hardness(
-    dst: &mut [f32],
-    image_size: [usize; 2],
-    x0: i32,
-    y0: i32,
-    x1: i32,
-    y1: i32,
-    radius: i32,
-    hardness: f32,
-) {
+/// Stamps soft circles of `radius` (at least one pixel) and `hardness` (0..=1) along `segment`
+/// into the stroke strength mask `dst` (`image_size` = `[width, height]`, row-major); a
+/// zero-length segment stamps one circle. Pixels outside the image are clipped.
+fn paint_line_mask_with_hardness(dst: &mut [f32], image_size: [usize; 2], segment: LineSegmentPx, radius: i32, hardness: f32) {
+    let LineSegmentPx { x0, y0, x1, y1 } = segment;
     let r = radius.max(1);
     let dx = (x1 - x0) as f32;
     let dy = (y1 - y0) as f32;

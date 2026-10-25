@@ -61,6 +61,52 @@ pub(super) fn empty_click_deselects(gates: TypingEmptyClickGates) -> bool {
     !(gates.mask_panel_open || gates.layout_editor_active || gates.eyedropper_blocks || gates.layer_claimed_pointer || gates.popup_open)
 }
 
+/// Raster context-menu choices of one frame, deferred so the menu closure never mutates the layer:
+/// [`TypingTextOverlayLayer::raster_context_menu`] returns what one menu instance chose, the frame
+/// folds every instance into one value with [`RasterMenuActions::absorb`], and
+/// [`TypingTextOverlayLayer::apply_raster_menu_actions`] applies it after the interaction pass.
+/// Each field is an independent optional action; the `usize` values are raster indices on the page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct RasterMenuActions {
+    /// Enter perspective transform mode on this raster (seeding its deform mesh).
+    pub(super) enter_transform: Option<usize>,
+    /// Leave transform mode.
+    pub(super) exit_transform: bool,
+    /// Clear this raster's deform mesh and leave transform mode.
+    pub(super) reset_transform: Option<usize>,
+    /// Flip this raster's mask clip.
+    pub(super) toggle_mask_clip: Option<usize>,
+    /// Move this raster one step in the unified z order (`true` = up).
+    pub(super) move_z: Option<(usize, bool)>,
+    /// Delete this raster.
+    pub(super) delete: Option<usize>,
+}
+
+impl RasterMenuActions {
+    /// Folds a later menu instance's choices into `self`: every action `later` chose replaces the
+    /// earlier value, an action it did not choose leaves the earlier value in place.
+    pub(super) fn absorb(&mut self, later: Self) {
+        if later.enter_transform.is_some() {
+            self.enter_transform = later.enter_transform;
+        }
+        if later.exit_transform {
+            self.exit_transform = true;
+        }
+        if later.reset_transform.is_some() {
+            self.reset_transform = later.reset_transform;
+        }
+        if later.toggle_mask_clip.is_some() {
+            self.toggle_mask_clip = later.toggle_mask_clip;
+        }
+        if later.move_z.is_some() {
+            self.move_z = later.move_z;
+        }
+        if later.delete.is_some() {
+            self.delete = later.delete;
+        }
+    }
+}
+
 impl TypingTextOverlayLayer {
     /// Deselects after an empty-canvas click (`empty_click_deselects` decided it). When the
     /// selected overlay lives on the clicked page (`view`), the click-away is its focus loss: its
@@ -1316,13 +1362,8 @@ impl TypingTextOverlayLayer {
             return;
         }
 
-        // Deferred menu actions (set inside the menu closure, applied after this method).
-        let mut menu_enter_transform: Option<usize> = None;
-        let mut menu_exit_transform = false;
-        let mut menu_reset_transform: Option<usize> = None;
-        let mut menu_toggle_mask_clip: Option<usize> = None;
-        let mut menu_move_z: Option<(usize, bool)> = None;
-        let mut menu_delete: Option<usize> = None;
+        // Deferred menu actions (chosen inside the menu closures, applied after this method).
+        let mut menu_actions = RasterMenuActions::default();
 
         // === Perspective transform mode: edit the selected raster's deform mesh corners. ===
         if let Some(sel) = self.transform_mode_raster_idx {
@@ -1391,35 +1432,21 @@ impl TypingTextOverlayLayer {
                     self.apply_raster_drag(&state, p, view);
                     self.primary_pointer_targets_overlay_this_frame = true;
                 }
-                self.raster_context_menu(
+                menu_actions.absorb(self.raster_context_menu(
                     input,
                     &resp,
                     true,
                     page_idx,
                     sel,
                     true,
-                    &mut menu_enter_transform,
-                    &mut menu_exit_transform,
-                    &mut menu_reset_transform,
-                    &mut menu_toggle_mask_clip,
-                    &mut menu_move_z,
-                    &mut menu_delete,
-                );
+                ));
 
                 // Decoration: deformed mesh wireframe outline + corner handles.
                 let scene_pts = deform_mesh_scene_points(&deform, view);
                 draw_textured_deform_mesh_wire(painter, &scene_pts, deform.cols, deform.rows);
                 draw_perspective_handles(painter, &corners);
             }
-            self.apply_raster_menu_actions(
-                view,
-                menu_enter_transform,
-                menu_exit_transform,
-                menu_reset_transform,
-                menu_toggle_mask_clip,
-                menu_move_z,
-                menu_delete,
-            );
+            self.apply_raster_menu_actions(view, menu_actions);
             return;
         }
 
@@ -1526,20 +1553,14 @@ impl TypingTextOverlayLayer {
                     self.primary_pointer_targets_overlay_this_frame = true;
                 }
                 // Keep the menu attached to the selected raster's resp even mid-drag, so it persists.
-                self.raster_context_menu(
+                menu_actions.absorb(self.raster_context_menu(
                     input,
                     &resp,
                     true,
                     page_idx,
                     active_idx,
                     false,
-                    &mut menu_enter_transform,
-                    &mut menu_exit_transform,
-                    &mut menu_reset_transform,
-                    &mut menu_toggle_mask_clip,
-                    &mut menu_move_z,
-                    &mut menu_delete,
-                );
+                ));
             }
         } else {
             // No active drag. Two independent responses are created (distinct Ids):
@@ -1634,20 +1655,14 @@ impl TypingTextOverlayLayer {
                         self.primary_pointer_targets_overlay_this_frame = true;
                     }
                 }
-                self.raster_context_menu(
+                menu_actions.absorb(self.raster_context_menu(
                     input,
                     &resp,
                     over,
                     page_idx,
                     sel,
                     false,
-                    &mut menu_enter_transform,
-                    &mut menu_exit_transform,
-                    &mut menu_reset_transform,
-                    &mut menu_toggle_mask_clip,
-                    &mut menu_move_z,
-                    &mut menu_delete,
-                );
+                ));
             }
 
             // (2) Non-selected rasters: topmost hit-test (skips the selected idx → no duplicate Id).
@@ -1743,20 +1758,14 @@ impl TypingTextOverlayLayer {
                         }
                         self.primary_pointer_targets_overlay_this_frame = true;
                     }
-                    self.raster_context_menu(
+                    menu_actions.absorb(self.raster_context_menu(
                         input,
                         &resp,
                         true,
                         page_idx,
                         idx,
                         false,
-                        &mut menu_enter_transform,
-                        &mut menu_exit_transform,
-                        &mut menu_reset_transform,
-                        &mut menu_toggle_mask_clip,
-                        &mut menu_move_z,
-                        &mut menu_delete,
-                    );
+                    ));
                 }
             }
         }
@@ -1784,23 +1793,16 @@ impl TypingTextOverlayLayer {
             draw_rotation_handle(painter, quad, image_rect);
         }
 
-        self.apply_raster_menu_actions(
-            view,
-            menu_enter_transform,
-            menu_exit_transform,
-            menu_reset_transform,
-            menu_toggle_mask_clip,
-            menu_move_z,
-            menu_delete,
-        );
+        self.apply_raster_menu_actions(view, menu_actions);
     }
 
-    /// Attaches the raster context menu to `resp`, recording chosen actions into the deferred `out_*`
-    /// slots (applied after the closure by `apply_raster_menu_actions`, avoiding mid-closure mutation).
-    /// `is_transform_mode` toggles the enter/exit/reset items. Mirrors the text-overlay canvas menu,
-    /// and opens through the same layer-menu path (`input::layer_menu_popup`: the `typing.layer.menu`
-    /// gesture with the pointer on the raster, `hit`).
-    #[allow(clippy::too_many_arguments)]
+    /// Attaches the raster context menu to `resp` and returns the actions chosen in it this frame
+    /// (all empty when the menu is closed or nothing was clicked); the caller folds them with
+    /// [`RasterMenuActions::absorb`] and applies them after the interaction pass through
+    /// `apply_raster_menu_actions`, avoiding mid-closure mutation. `is_transform_mode` toggles the
+    /// enter/exit/reset items. Mirrors the text-overlay canvas menu, and opens through the same
+    /// layer-menu path (`input::layer_menu_popup`: the `typing.layer.menu` gesture with the pointer on
+    /// the raster, `hit`).
     pub(super) fn raster_context_menu(
         &self,
         input: &InputFrame,
@@ -1809,13 +1811,8 @@ impl TypingTextOverlayLayer {
         _page_idx: usize,
         idx: usize,
         is_transform_mode: bool,
-        out_enter_transform: &mut Option<usize>,
-        out_exit_transform: &mut bool,
-        out_reset_transform: &mut Option<usize>,
-        out_toggle_mask_clip: &mut Option<usize>,
-        out_move_z: &mut Option<(usize, bool)>,
-        out_delete: &mut Option<usize>,
-    ) {
+    ) -> RasterMenuActions {
+        let mut actions = RasterMenuActions::default();
         let mask_clip_on = self
             .raster_layers_by_page
             .get(&_page_idx)
@@ -1823,7 +1820,7 @@ impl TypingTextOverlayLayer {
             .map(|l| l.mask_clip_enabled)
             .unwrap_or(false);
         let Some((_, menu_popup)) = input::layer_menu_popup(input, resp, hit, None) else {
-            return;
+            return actions;
         };
         menu_popup.show(|menu_ui| {
             if self.selected_raster_idx != Some(idx) {
@@ -1832,16 +1829,16 @@ impl TypingTextOverlayLayer {
             }
             if !is_transform_mode {
                 if menu_ui.button(t!("typing.context_menu.enter_transform_mode")).clicked() {
-                    *out_enter_transform = Some(idx);
+                    actions.enter_transform = Some(idx);
                     menu_ui.close();
                 }
             } else {
                 if menu_ui.button(t!("typing.context_menu.exit_transform_mode")).clicked() {
-                    *out_exit_transform = true;
+                    actions.exit_transform = true;
                     menu_ui.close();
                 }
                 if menu_ui.button(t!("typing.context_menu.reset_transform")).clicked() {
-                    *out_reset_transform = Some(idx);
+                    actions.reset_transform = Some(idx);
                     menu_ui.close();
                 }
             }
@@ -1852,41 +1849,39 @@ impl TypingTextOverlayLayer {
                 t!("typing.context_menu.enable_mask_clip")
             };
             if menu_ui.button(toggle_label).clicked() {
-                *out_toggle_mask_clip = Some(idx);
+                actions.toggle_mask_clip = Some(idx);
                 menu_ui.close();
             }
             menu_ui.separator();
             menu_ui.horizontal(|row| {
                 row.label(t!("typing.context_menu.order"));
                 if row.button("▲").clicked() {
-                    *out_move_z = Some((idx, true));
+                    actions.move_z = Some((idx, true));
                 }
                 if row.button("▼").clicked() {
-                    *out_move_z = Some((idx, false));
+                    actions.move_z = Some((idx, false));
                 }
             });
             menu_ui.separator();
             if menu_ui.button(t!("typing.context_menu.delete_layer")).clicked() {
-                *out_delete = Some(idx);
+                actions.delete = Some(idx);
                 menu_ui.close();
             }
         });
+        actions
     }
 
-    /// Applies the deferred raster context-menu actions captured by `raster_context_menu`.
-    // The six deferred menu-action slots are independent outcomes of one menu; bundling them would only
-    // obscure that each is a distinct, optional action.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn apply_raster_menu_actions(
-        &mut self,
-        view: PageView,
-        enter_transform: Option<usize>,
-        exit_transform: bool,
-        reset_transform: Option<usize>,
-        toggle_mask_clip: Option<usize>,
-        move_z: Option<(usize, bool)>,
-        delete: Option<usize>,
-    ) {
+    /// Applies the deferred raster context-menu actions captured by `raster_context_menu`, in a fixed
+    /// order: enter transform, exit, reset, mask-clip toggle, z move, delete.
+    pub(super) fn apply_raster_menu_actions(&mut self, view: PageView, actions: RasterMenuActions) {
+        let RasterMenuActions {
+            enter_transform,
+            exit_transform,
+            reset_transform,
+            toggle_mask_clip,
+            move_z,
+            delete,
+        } = actions;
         let page_idx = view.page_idx;
         if let Some(idx) = enter_transform {
             // Seed the mesh (if absent) and enter perspective transform mode.

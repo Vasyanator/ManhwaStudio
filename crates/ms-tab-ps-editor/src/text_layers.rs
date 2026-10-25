@@ -17,7 +17,9 @@ Model edits from the PS side route through the shared doc (`lib.rs`), never thro
 Notes:
 An overlay's GPU handle is stored together with the `TextureOptions` it was uploaded with, so the
 tab-wide «Сглаживание» toggle can re-upload it and the recorded mode can never drift from the
-handle that survives a re-projection (`take_texture` / `from_doc_node`).
+handle that survives a re-projection (`take_texture`, then the struct literal in `sync_view_from_doc`).
+The pixel / geometry / texture fields are `pub(crate)` only so that projection can build the
+runtime with a struct literal; every other edit goes through the methods (e.g. the scale clamp).
 */
 
 use super::layers::LayerTransform;
@@ -26,6 +28,10 @@ use ms_models::layer_model::manifest::DeformRec;
 use eframe::egui::{self, Color32, ColorImage, Pos2, Vec2};
 
 /// A typing-tab overlay shown read-only in the PS editor.
+///
+/// Built from the doc with a struct literal by `sync_view_from_doc` (pin / text-group metadata
+/// preserved from the prior runtime, `texture` carried across when the node's pixels are
+/// unchanged), or skeletal by [`PsTextLayer::meta_from_node`].
 pub struct PsTextLayer {
     pub uid: String,
     pub name: String,
@@ -42,59 +48,25 @@ pub struct PsTextLayer {
     /// Raw text string of the overlay (from the node's `render_data.text_params.text`), used to build
     /// a row preview label in the PS layers panel. Empty when the node carries no text.
     pub text_content: String,
-    image: ColorImage,
-    transform: LayerTransform,
+    /// Projected overlay pixels. Read via `image()`; written only by the doc projection.
+    pub(crate) image: ColorImage,
+    /// Page-space placement. Read and edited via the accessor / move / rotate / scale methods.
+    pub(crate) transform: LayerTransform,
     /// Perspective/bend deformation grid in page pixels (`cols`×`rows` control points), when the
     /// overlay was deformed in the typing tab. Absolute page positions — when present they drive
     /// rendering instead of the affine `transform`. Canonical `DeformRec` (shared with the layer
     /// model and the typing tab).
-    deform: Option<DeformRec>,
+    pub(crate) deform: Option<DeformRec>,
     /// Lazily uploaded overlay texture together with the `TextureOptions` it was uploaded with.
     ///
     /// The options are stored NEXT TO the handle rather than in a separate field because the handle
     /// is carried across re-projections by uid (`take_texture`): a mode recorded separately would
     /// desynchronise from the handle it describes. In egui 0.35 filtering is a property of the
     /// `TextureId`, so following the «Сглаживание» checkbox means re-uploading, not re-binding.
-    texture: Option<(egui::TextureHandle, egui::TextureOptions)>,
+    pub(crate) texture: Option<(egui::TextureHandle, egui::TextureOptions)>,
 }
 
 impl PsTextLayer {
-    /// Builds a `PsTextLayer` directly from a `LayerDoc` Text node's projected fields. Pin / text-group
-    /// (`layer_idx`) metadata is supplied by the caller (preserved from the prior runtime, else the
-    /// node's doc-owned `text_pinned` / `text_pinned_by_group` / `text_layer_idx`); `texture` is supplied so the GPU handle can be
-    /// reused across re-projections when the node's pixels are unchanged. `text_content` is the overlay's
-    /// raw text (from the node's `render_data`), used to build the panel row preview; empty when absent.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_doc_node(
-        uid: String,
-        name: String,
-        visible: bool,
-        layer_idx: u32,
-        group_uid: Option<String>,
-        pinned: bool,
-        pinned_by_group: bool,
-        text_content: String,
-        image: ColorImage,
-        transform: LayerTransform,
-        deform: Option<DeformRec>,
-        texture: Option<(egui::TextureHandle, egui::TextureOptions)>,
-    ) -> Self {
-        Self {
-            uid,
-            name,
-            visible,
-            layer_idx,
-            group_uid,
-            pinned,
-            pinned_by_group,
-            text_content,
-            image,
-            transform,
-            deform,
-            texture,
-        }
-    }
-
     /// Builds a skeletal `PsTextLayer` carrying only the PS-owned metadata of a doc Text node (pin /
     /// pinned_by_group / text-group `layer_idx` / unified `group_uid`). The image and geometry are
     /// placeholders, filled by the subsequent `sync_view_from_doc` projection from the doc (the source

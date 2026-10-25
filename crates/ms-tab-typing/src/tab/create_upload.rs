@@ -592,7 +592,11 @@ impl TypingTextOverlayLayer {
         let (tx, rx) = mpsc::channel::<Result<TypingOverlayDecoded, String>>();
         thread::spawn(move || {
             let result = render_and_store_created_overlay(request);
-            let _ = tx.send(result);
+            // A closed channel means the tab was dropped (tab reset / app closing) while this ran;
+            // a failure would then reach nobody, so it is logged here instead of being lost.
+            if let Err(std::sync::mpsc::SendError(Err(err))) = tx.send(result) {
+                ms_log::runtime_log::log_warn(format!("typing: created text layer render/store failed after its tab was dropped: {err}"));
+            }
         });
         self.create_render_state = Some(TypingCreateRenderState {
             rx,
@@ -650,7 +654,11 @@ impl TypingTextOverlayLayer {
         };
         let (tx, rx) = mpsc::channel::<Result<TypingCreatedRaster, String>>();
         thread::spawn(move || {
-            let _ = tx.send(render_and_store_created_raster(create_request));
+            // A closed channel means the tab was dropped (tab reset / app closing) while this ran;
+            // a failure would then reach nobody, so it is logged here instead of being lost.
+            if let Err(std::sync::mpsc::SendError(Err(err))) = tx.send(render_and_store_created_raster(create_request)) {
+                ms_log::runtime_log::log_warn(format!("typing: created raster layer render/store failed after its tab was dropped: {err}"));
+            }
         });
         self.create_raster_state = Some(TypingCreateRasterState { rx });
         self.create_status_error = None;

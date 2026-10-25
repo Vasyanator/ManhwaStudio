@@ -104,7 +104,8 @@ Contracts:
   gain and t-statistic instead.
 */
 use super::base::{
-    CleaningTool, RegionEditToolBase, RegionEditorSession, StrokePoint, build_tinted_mask_preview,
+    CleaningTool, RegionEditToolBase, RegionEditorSession, RegionOverlayFrame, StrokePoint,
+    build_tinted_mask_preview,
 };
 use super::mask_generation::{
     DEFAULT_WATERMARK_MODEL, WATERMARK_DETECT_DOWNSCALE_TO, WatermarkProgress, WatermarkStatus,
@@ -3524,11 +3525,7 @@ impl CleaningTool for WatermarkRemovalTool {
                 chapter_request: &mut chapter_request,
             };
             region_base.draw_overlay_ui(
-                ctx,
-                canvas,
-                project,
-                input,
-                t!("cleaning.tools.watermark.title"),
+                RegionOverlayFrame { ctx, canvas, project, input, window_title: t!("cleaning.tools.watermark.title") },
                 |editor| {
                     if editor.status.is_none() {
                         editor.status =

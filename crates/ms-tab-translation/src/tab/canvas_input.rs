@@ -38,7 +38,7 @@ use ms_project::ProjectData;
 use ms_theme::Severity;
 
 use super::{
-    TextDetectorLineDragKind, TextDetectorLineDragState, TextDetectorLineSelection, TextDetectorMaskStrokeState, TranslationTabState,
+    TextDetectorLineDragKind, TextDetectorLineDragState, TextDetectorLineSelection, TextDetectorMaskStrokeState, TextMaskPageGeom, TranslationTabState,
     scene_pos_to_source, source_rect_to_scene_rect,
 };
 use crate::text_detector::TextDetectorRect;
@@ -478,7 +478,7 @@ impl TranslationTabState {
             && let Some(pos) = press.or_else(|| response.interact_pointer_pos()).filter(|pos| page_rect.contains(*pos))
         {
             if let Some((source_size, mask_size)) = self.text_mask_target_sizes(page_idx, page_rect, zoom) {
-                self.paint_text_mask_segment(page_idx, source_size, mask_size, page_rect, pos, pos, erase);
+                self.paint_text_mask_segment(TextMaskPageGeom { page_idx, source_size, mask_size, page_rect }, pos, pos, erase);
             }
             self.text_detector_mask_stroke_state = None;
             self.draw_mask_brush_cursor(ui, page_idx, page_rect, zoom, response.hover_pos());
@@ -501,7 +501,7 @@ impl TranslationTabState {
                 _ => press.filter(|press| started && page_rect.contains(*press)).unwrap_or(pos),
             };
             if let Some((source_size, mask_size)) = self.text_mask_target_sizes(page_idx, page_rect, zoom) {
-                self.paint_text_mask_segment(page_idx, source_size, mask_size, page_rect, start_pos, pos, erase);
+                self.paint_text_mask_segment(TextMaskPageGeom { page_idx, source_size, mask_size, page_rect }, start_pos, pos, erase);
             }
             self.text_detector_mask_stroke_state = Some(TextDetectorMaskStrokeState { page_idx, erase, last_scene_pos: pos });
         }

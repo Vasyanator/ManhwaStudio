@@ -827,22 +827,25 @@ impl TypingTextOverlayLayer {
                 }
                 None => {
                     // CREATE: materialize a runtime from the doc node (migrated-chapter case).
+                    let placement = OverlayPlacement {
+                        center_page_px: center,
+                        scale: user_scale,
+                        rotation_deg: angle_deg,
+                        deform_mesh,
+                        mask_clip_enabled: mask_clip.unwrap_or(false),
+                        layer_idx: node.text_layer_idx.unwrap_or(0) as usize,
+                    };
                     let mut runtime = text_runtime_from_doc_node(
                         &node.uid,
                         page_idx,
-                        center,
-                        user_scale,
-                        angle_deg,
-                        deform_mesh,
-                        mask_clip.unwrap_or(false),
+                        placement,
                         *is_image,
-                        node.text_layer_idx.unwrap_or(0) as usize,
                         render_data_json,
                         size_px,
                         color_image_to_rgba(image),
                     );
-                    // Assigned here rather than threaded through the (already over-long) constructor:
-                    // the centers belong to the node's pixels, which were just projected above.
+                    // Assigned here rather than threaded through the constructor: the centers belong
+                    // to the node's pixels, which were just projected above.
                     runtime.extra = extra_centers.clone();
                     // Same rationale as `extra`: seeded here instead of widening the constructor.
                     runtime.centering_frame = centering_frame.map(CenteringFrame::from_rec);

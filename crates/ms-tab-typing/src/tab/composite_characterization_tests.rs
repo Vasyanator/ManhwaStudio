@@ -509,7 +509,7 @@ fn overlay_band_z_matches_pinned_uid_first_then_text_group_else_top() {
 /// rgba buffer length overridden by `rgba_len` when given (to model a malformed buffer).
 fn text_runtime(uid: &str, page_idx: usize, size: [usize; 2], rgba_len: Option<usize>) -> TypingOverlayRuntime {
     let len = rgba_len.unwrap_or(size[0] * size[1] * 4);
-    text_runtime_from_doc_node(uid, page_idx, [10.0, 10.0], 1.0, 0.0, None, false, false, 0, None, size, vec![255; len])
+    text_runtime_from_doc_node(uid, page_idx, OverlayPlacement::at([10.0, 10.0]), false, None, size, vec![255; len])
 }
 
 #[test]

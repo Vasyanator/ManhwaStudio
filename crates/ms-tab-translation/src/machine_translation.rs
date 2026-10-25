@@ -14,6 +14,8 @@ Main types:
   by the controller (`run_issues`) for the panel's warnings list and logged once there.
 - `TranslationMtController`: MT run lifecycle with immediate cancel semantics.
 - `ActiveMtRun`: currently active run-thread metadata (`run_id`, cancel switch, handle).
+- `AiMtRun` / `MtRunCounts`: one AI API run's identity, languages, settings, channel and cancel
+  switch (shared by the batched and per-ImageBubble drivers), and an MT run's running totals.
 - `MtRunCancel`: a run's cancel switch: the flag checked between batches/items plus the run's
   own `GenerationTracker` (live phase / received chars of the AI API request in flight).
 
@@ -983,21 +985,9 @@ fn run_translate_request(
     let total = items.iter().filter(|item| item.needs_translation).count();
     let _ = evt_tx.send(WorkerEvent::RunStarted { run_id, total });
 
-    let mut translated = 0usize;
-    let mut errors = 0usize;
-
     if let Some(ai_options) = ai_api {
-        run_ai_translate_request(
-            run_id,
-            &source_lang,
-            &target_lang,
-            items,
-            ai_options,
-            evt_tx,
-            cancel_requested,
-            &mut translated,
-            &mut errors,
-        );
+        let run = AiMtRun { run_id, source_lang: &source_lang, target_lang: &target_lang, options: ai_options, evt_tx, cancel: cancel_requested };
+        run_ai_translate_request(&run, items);
         return;
     }
 
@@ -1044,7 +1034,7 @@ impl PlainMtRun<'_> {
         let (bubble_ids, texts): (Vec<i64>, Vec<String>) = items.into_iter().filter(|item| item.needs_translation).map(|item| (item.bubble_id, item.text)).unzip();
         let batch_size = backend.preferred_batch_size().max(1);
         let mut texts = texts.into_iter();
-        let mut counts = PlainMtCounts::default();
+        let mut counts = MtRunCounts::default();
         for batch_ids in bubble_ids.chunks(batch_size) {
             if call.is_cancelled() {
                 self.send_cancelled(counts);
@@ -1088,7 +1078,7 @@ impl PlainMtRun<'_> {
     /// first `CoolingDown` -> `ItemFailed`, each with its progress event) and returns the
     /// first stop-kind item's reason, if any. Later stop-kind items are not reported: those
     /// texts were never sent.
-    fn apply_batch(&self, bubble_ids: &[i64], results: Vec<Result<String, MtItemError>>, counts: &mut PlainMtCounts) -> Option<RunStop> {
+    fn apply_batch(&self, bubble_ids: &[i64], results: Vec<Result<String, MtItemError>>, counts: &mut MtRunCounts) -> Option<RunStop> {
         let mut stop = None;
         for (&bubble_id, result) in bubble_ids.iter().zip(results) {
             match result {
@@ -1122,24 +1112,24 @@ impl PlainMtRun<'_> {
     }
 
     /// Reports one failed bubble and counts it.
-    fn fail_item(&self, bubble_id: i64, error: String, counts: &mut PlainMtCounts) {
+    fn fail_item(&self, bubble_id: i64, error: String, counts: &mut MtRunCounts) {
         send_worker_event(self.evt_tx, WorkerEvent::ItemFailed { run_id: self.run_id, bubble_id, error });
         counts.errors += 1;
     }
 
     /// Fails every bubble of a batch with `error`, each followed by its progress event.
-    fn fail_batch(&self, bubble_ids: &[i64], error: &str, counts: &mut PlainMtCounts) {
+    fn fail_batch(&self, bubble_ids: &[i64], error: &str, counts: &mut MtRunCounts) {
         for &bubble_id in bubble_ids {
             self.fail_item(bubble_id, error.to_string(), counts);
             self.send_progress(*counts);
         }
     }
 
-    fn send_progress(&self, counts: PlainMtCounts) {
+    fn send_progress(&self, counts: MtRunCounts) {
         send_mt_progress(self.evt_tx, WorkerProgressSnapshot::simple(self.run_id, counts.translated, counts.errors, self.total));
     }
 
-    fn send_cancelled(&self, counts: PlainMtCounts) {
+    fn send_cancelled(&self, counts: MtRunCounts) {
         send_worker_event(self.evt_tx, WorkerEvent::RunCancelled { run_id: self.run_id, translated: counts.translated, errors: counts.errors });
     }
 }
@@ -1156,11 +1146,24 @@ enum RunStop {
     Failed { message: String },
 }
 
-/// Running totals of a plain MT run.
+/// Running totals of an MT run (plain or AI API): bubbles translated and bubbles failed. Context
+/// replicas are never counted.
 #[derive(Debug, Clone, Copy, Default)]
-struct PlainMtCounts {
+struct MtRunCounts {
     translated: usize,
     errors: usize,
+}
+
+/// One AI API machine-translation run: its identity, languages, settings, event channel and
+/// cancel switch, shared by the batched and the per-ImageBubble drivers. The bubbles to
+/// translate are passed separately (the drivers consume them).
+struct AiMtRun<'a> {
+    run_id: u64,
+    source_lang: &'a str,
+    target_lang: &'a str,
+    options: AiMtOptions,
+    evt_tx: &'a Sender<WorkerEvent>,
+    cancel: &'a MtRunCancel,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1250,37 +1253,19 @@ fn item_results_to_messages(results: Vec<Result<String, MtItemError>>) -> Vec<Re
 /// producing a fake translation. Signature matches the native twin so the neutral
 /// `run_translate_request` dispatch compiles on both targets.
 #[cfg(target_arch = "wasm32")]
-#[allow(clippy::too_many_arguments)]
-fn run_ai_translate_request(
-    run_id: u64,
-    _source_lang: &str,
-    _target_lang: &str,
-    _items: Vec<MtTranslateItem>,
-    _options: AiMtOptions,
-    evt_tx: &Sender<WorkerEvent>,
-    _cancel_requested: &MtRunCancel,
-    _translated: &mut usize,
-    _errors: &mut usize,
-) {
-    let _ = evt_tx.send(WorkerEvent::RunFailed {
-        run_id,
+fn run_ai_translate_request(run: &AiMtRun<'_>, _items: Vec<MtTranslateItem>) {
+    let _ = run.evt_tx.send(WorkerEvent::RunFailed {
+        run_id: run.run_id,
         error: t!("translation.mt.ai_api_web_unavailable_error").to_string(),
     });
 }
 
+/// Runs one AI API translation run on the calling worker thread: resolves the target and its API
+/// key, sorts `items`, drives the batched or per-ImageBubble driver to completion and sends
+/// exactly one terminal event (`RunFinished`, `RunCancelled` or `RunFailed`).
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(clippy::too_many_arguments)]
-fn run_ai_translate_request(
-    run_id: u64,
-    source_lang: &str,
-    target_lang: &str,
-    mut items: Vec<MtTranslateItem>,
-    options: AiMtOptions,
-    evt_tx: &Sender<WorkerEvent>,
-    cancel_requested: &MtRunCancel,
-    translated: &mut usize,
-    errors: &mut usize,
-) {
+fn run_ai_translate_request(run: &AiMtRun<'_>, mut items: Vec<MtTranslateItem>) {
+    let AiMtRun { run_id, evt_tx, cancel: cancel_requested, ref options, .. } = *run;
     let service = options.service;
     let target = match AiApiTarget::new(service, &options.base_url) {
         Ok(target) => target,
@@ -1314,21 +1299,8 @@ fn run_ai_translate_request(
 
     sort_ai_mt_items(&mut items, options.sort_mode());
 
-    let result = block_on(async {
-        run_ai_translate_async(
-            run_id,
-            source_lang,
-            target_lang,
-            items,
-            options,
-            api_key,
-            evt_tx,
-            cancel_requested,
-            translated,
-            errors,
-        )
-        .await
-    });
+    let mut counts = MtRunCounts::default();
+    let result = block_on(async { run_ai_translate_async(run, items, api_key, &mut counts).await });
     let result = match result {
         Ok(result) => result,
         Err(err) => {
@@ -1358,54 +1330,36 @@ fn run_ai_translate_request(
     if cancel_requested.is_requested() {
         let _ = evt_tx.send(WorkerEvent::RunCancelled {
             run_id,
-            translated: *translated,
-            errors: *errors,
+            translated: counts.translated,
+            errors: counts.errors,
         });
     } else {
         let _ = evt_tx.send(WorkerEvent::RunFinished {
             run_id,
-            translated: *translated,
-            errors: *errors,
+            translated: counts.translated,
+            errors: counts.errors,
         });
     }
 }
 
+/// Drives one AI API run in the normal (batched chat-history) mode, or hands it to the
+/// per-ImageBubble driver in `ImagesOnly` mode. Item results and progress go to `run.evt_tx` as
+/// they arrive; `counts` accumulates the totals for the caller's terminal event. A cancel ends
+/// the run with `Ok(())`; `Err` is the localized run error (provider failure, bad request build).
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(clippy::too_many_arguments)]
-async fn run_ai_translate_async(
-    run_id: u64,
-    source_lang: &str,
-    target_lang: &str,
-    items: Vec<MtTranslateItem>,
-    options: AiMtOptions,
-    api_key: String,
-    evt_tx: &Sender<WorkerEvent>,
-    cancel_requested: &MtRunCancel,
-    translated: &mut usize,
-    errors: &mut usize,
-) -> Result<(), String> {
+async fn run_ai_translate_async(run: &AiMtRun<'_>, items: Vec<MtTranslateItem>, api_key: String, counts: &mut MtRunCounts) -> Result<(), String> {
     // Per-ImageBubble mode is a separate single-turn-per-image driver with its own prompts and cache
     // strategy; the batched chat-history path below is only for the normal mode.
-    if options.image_mode == AiMtImageMode::ImagesOnly {
-        return run_ai_imagebubble_translate_async(
-            run_id,
-            source_lang,
-            target_lang,
-            items,
-            options,
-            api_key,
-            evt_tx,
-            cancel_requested,
-            translated,
-            errors,
-        )
-        .await;
+    if run.options.image_mode == AiMtImageMode::ImagesOnly {
+        return run_ai_imagebubble_translate_async(run, items, api_key, counts).await;
     }
+    let AiMtRun { run_id, source_lang, target_lang, ref options, evt_tx, cancel: cancel_requested } = *run;
+    let MtRunCounts { translated, errors } = counts;
 
     let target = AiApiTarget::new(options.service, &options.base_url).map_err(|err| err.to_string())?;
     let client = build_client(&target, api_key);
     let model = model_iden(options.service, &options.model).map_err(|err| err.to_string())?;
-    let system_prompt = build_ai_mt_system_prompt(source_lang, target_lang, &options);
+    let system_prompt = build_ai_mt_system_prompt(source_lang, target_lang, options);
     send_context_notice(run_id, system_prompt.context_notice, evt_tx);
     let mut chat_req = ChatRequest::default().with_system(system_prompt.text);
     let chat_options = build_ai_mt_chat_options(options.reasoning);
@@ -1450,7 +1404,7 @@ async fn run_ai_translate_async(
         ));
         let translate_in_batch = chunk.iter().filter(|item| item.needs_translation).count();
         let context_in_batch = chunk.len().saturating_sub(translate_in_batch);
-        let (user_message, image_stats) = match build_ai_mt_user_message(chunk, &options) {
+        let (user_message, image_stats) = match build_ai_mt_user_message(chunk, options) {
             Ok(message) => message,
             Err(err) => {
                 runtime_log::log_error(format!(
@@ -1522,7 +1476,7 @@ async fn run_ai_translate_async(
         }
         // History keeps the batch's user message plus ONE canonical assistant turn (see the file
         // header), never the raw answer or the repair turns.
-        replace_last_ai_mt_user_message_with_history(&mut chat_req, chunk, &options)?;
+        replace_last_ai_mt_user_message_with_history(&mut chat_req, chunk, options)?;
         chat_req = chat_req.append_message(ChatMessage::assistant(collector.history_json()));
         history_batch_sizes.push_back(chunk.len());
 
@@ -1577,23 +1531,12 @@ const IMAGEBUBBLE_CONTEXT_HEADER: &str = "Chapter context so far (already known 
 /// the context is append-only and the image binary never enters the context, request N+1's input has
 /// request N's input as a literal prefix, so provider prompt caching reuses it across the chapter.
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(clippy::too_many_arguments)]
-async fn run_ai_imagebubble_translate_async(
-    run_id: u64,
-    source_lang: &str,
-    target_lang: &str,
-    items: Vec<MtTranslateItem>,
-    options: AiMtOptions,
-    api_key: String,
-    evt_tx: &Sender<WorkerEvent>,
-    cancel_requested: &MtRunCancel,
-    translated: &mut usize,
-    errors: &mut usize,
-) -> Result<(), String> {
+async fn run_ai_imagebubble_translate_async(run: &AiMtRun<'_>, items: Vec<MtTranslateItem>, api_key: String, counts: &mut MtRunCounts) -> Result<(), String> {
+    let AiMtRun { run_id, source_lang, target_lang, ref options, evt_tx, cancel: cancel_requested } = *run;
     let target = AiApiTarget::new(options.service, &options.base_url).map_err(|err| err.to_string())?;
     let client = build_client(&target, api_key);
     let model = model_iden(options.service, &options.model).map_err(|err| err.to_string())?;
-    let MtSystemPrompt { text: system_prompt, context_notice } = build_ai_mt_imagebubble_system_prompt(source_lang, target_lang, &options);
+    let MtSystemPrompt { text: system_prompt, context_notice } = build_ai_mt_imagebubble_system_prompt(source_lang, target_lang, options);
     send_context_notice(run_id, context_notice, evt_tx);
     // OpenAI-style providers route by this stable key; Anthropic gets message-level cache markers.
     let cache_key = format!(
@@ -1625,8 +1568,8 @@ async fn run_ai_imagebubble_translate_async(
         if cancel_requested.is_requested() {
             runtime_log::log_info(format!(
                 "[MT][run {run_id}] cancelled (translated={translated}, errors={errors})",
-                translated = *translated,
-                errors = *errors,
+                translated = counts.translated,
+                errors = counts.errors,
             ));
             return Ok(());
         }
@@ -1643,7 +1586,7 @@ async fn run_ai_imagebubble_translate_async(
 
         target_no += 1;
         let target_total = total;
-        let encoded = match imagebubble_target_image(&options, item) {
+        let encoded = match imagebubble_target_image(options, item) {
             Ok(encoded) => encoded,
             Err(err) => {
                 runtime_log::log_error(format!(
@@ -1655,17 +1598,8 @@ async fn run_ai_imagebubble_translate_async(
                     bubble_id: item.bubble_id,
                     error: err,
                 });
-                *errors = errors.saturating_add(1);
-                send_imagebubble_progress(
-                    evt_tx,
-                    run_id,
-                    *translated,
-                    *errors,
-                    total,
-                    &context,
-                    context_budget,
-                    pruned_replicas,
-                );
+                counts.errors = counts.errors.saturating_add(1);
+                send_imagebubble_progress(run, *counts, total, &context, context_budget, pruned_replicas);
                 continue;
             }
         };
@@ -1719,8 +1653,8 @@ async fn run_ai_imagebubble_translate_async(
             Err(AiApiError::Cancelled) => {
                 runtime_log::log_info(format!(
                     "[MT][run {run_id}] cancelled during target {target_no}/{target_total} (translated={translated}, errors={errors})",
-                    translated = *translated,
-                    errors = *errors,
+                    translated = counts.translated,
+                    errors = counts.errors,
                 ));
                 return Ok(());
             }
@@ -1733,7 +1667,7 @@ async fn run_ai_imagebubble_translate_async(
                 return Err(tf!("translation.mt.ai_translate_failed_error", err = detail));
             }
         }
-        let resolved = emit_imagebubble_result(run_id, evt_tx, item, &collector, target_lang, translated, errors);
+        let resolved = emit_imagebubble_result(run, item, &collector, counts);
 
         // Fold the just-handled image into the context as text (never its binary) so it carries over
         // to the next image while keeping the cached prefix cheap.
@@ -1744,46 +1678,33 @@ async fn run_ai_imagebubble_translate_async(
         ));
         pruned_replicas =
             pruned_replicas.saturating_add(prune_imagebubble_context(&mut context, context_budget));
-        send_imagebubble_progress(
-            evt_tx,
-            run_id,
-            *translated,
-            *errors,
-            total,
-            &context,
-            context_budget,
-            pruned_replicas,
-        );
+        send_imagebubble_progress(run, *counts, total, &context, context_budget, pruned_replicas);
     }
 
     runtime_log::log_info(format!(
         "[MT][run {run_id}] AI ImageBubble translation finished: translated={}/{total}, errors={}, pruned_total={pruned_replicas}",
-        *translated, *errors,
+        counts.translated, counts.errors,
     ));
     Ok(())
 }
 
+/// Sends one `Progress` event of a per-ImageBubble run: the running `counts` out of `total`
+/// targets, the chapter-context size as actually sent against `context_budget` (chars) and the
+/// number of context items pruned so far.
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(clippy::too_many_arguments)]
-fn send_imagebubble_progress(
-    evt_tx: &Sender<WorkerEvent>,
-    run_id: u64,
-    translated: usize,
-    errors: usize,
-    total: usize,
-    context: &[String],
-    context_budget: usize,
-    pruned_replicas: usize,
-) {
-    let _ = evt_tx.send(WorkerEvent::Progress {
-        run_id,
-        translated,
-        errors,
-        total,
-        context_used_chars: imagebubble_context_chars(context),
-        context_budget_chars: context_budget,
-        pruned_replicas,
-    });
+fn send_imagebubble_progress(run: &AiMtRun<'_>, counts: MtRunCounts, total: usize, context: &[String], context_budget: usize, pruned_replicas: usize) {
+    send_mt_progress(
+        run.evt_tx,
+        WorkerProgressSnapshot {
+            run_id: run.run_id,
+            translated: counts.translated,
+            errors: counts.errors,
+            total,
+            context_used_chars: imagebubble_context_chars(context),
+            context_budget_chars: context_budget,
+            pruned_replicas,
+        },
+    );
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1942,27 +1863,19 @@ struct ResolvedImageText {
 /// entry, or a failure with its reason) and returns its resolved text for context folding, or
 /// `None` when the model returned nothing usable (reported as a failure).
 #[cfg(not(target_arch = "wasm32"))]
-fn emit_imagebubble_result(
-    run_id: u64,
-    evt_tx: &Sender<WorkerEvent>,
-    item: &MtTranslateItem,
-    collector: &BatchCollector,
-    target_lang: &str,
-    translated: &mut usize,
-    errors: &mut usize,
-) -> Option<ResolvedImageText> {
+fn emit_imagebubble_result(run: &AiMtRun<'_>, item: &MtTranslateItem, collector: &BatchCollector, counts: &mut MtRunCounts) -> Option<ResolvedImageText> {
     let Some(entry) = collector.accepted(item.bubble_id) else {
         // A failed send means the controller (and its tab) was dropped; nothing to report to.
-        let _ = evt_tx.send(WorkerEvent::ItemFailed {
-            run_id,
+        let _ = run.evt_tx.send(WorkerEvent::ItemFailed {
+            run_id: run.run_id,
             bubble_id: item.bubble_id,
             error: collector.failure_text(item.bubble_id),
         });
-        *errors = errors.saturating_add(1);
+        counts.errors = counts.errors.saturating_add(1);
         return None;
     };
-    emit_accepted_translation(run_id, evt_tx, item, entry, target_lang);
-    *translated = translated.saturating_add(1);
+    emit_accepted_translation(run.run_id, run.evt_tx, item, entry, run.target_lang);
+    counts.translated = counts.translated.saturating_add(1);
     if entry.areas.is_empty() {
         Some(ResolvedImageText {
             original: entry.original_text.clone().unwrap_or_default(),

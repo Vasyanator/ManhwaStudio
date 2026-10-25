@@ -225,7 +225,8 @@ The main data flow is:
    change still lands its write). Panel transform edits persist through
    `persist_raster_transform_deferred` (doc + enqueued page save), never a synchronous manifest
    rewrite. A **right-click (ПКМ) canvas context menu** on a selected raster mirrors the text-overlay
-   menu (`raster_context_menu` → deferred `apply_raster_menu_actions`). In normal mode the menu is
+   menu (`raster_context_menu` returns a `RasterMenuActions`, folded per frame and applied after the
+   pass by `apply_raster_menu_actions`). In normal mode the menu is
    attached to a response re-created EVERY frame (like text overlays / transform mode): the SELECTED
    raster's response is created unconditionally (id `("typing_raster", page, sel)`), so the menu stays
    open when the cursor leaves the layer and closes only on a click outside it; NON-selected rasters use

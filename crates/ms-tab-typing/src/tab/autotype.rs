@@ -95,6 +95,9 @@ impl TypingTextOverlayLayer {
                     detection,
                 },
             );
+            // A closed channel means the tab dropped this auto-typing request (tab reset / app
+            // closing); the detection only feeds the UI. Nobody is left to report to, so the send
+            // result is deliberately ignored.
             let _ = tx.send(result);
         });
 

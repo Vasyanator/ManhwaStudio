@@ -270,6 +270,16 @@ pub struct BubblesPanelContext<'a> {
     pub input: Option<&'a InputFrame>,
 }
 
+/// Read-only inputs shared by every bubble card of one panel frame: the egui context (clipboard
+/// copy / paste), the open project and the frame time in seconds (`egui::InputState::time`) that
+/// stamps queued patches and text flushes.
+#[derive(Clone, Copy)]
+struct BubbleCardFrame<'a> {
+    ctx: &'a egui::Context,
+    project: &'a ProjectData,
+    now_s: f64,
+}
+
 /// Which class-dependent rows one bubble card draws.
 ///
 /// The shared rows (page/id header, class selector, replica-order spin box, move/delete actions)
@@ -489,7 +499,7 @@ impl BubblesPanelState {
         ui.label(tf!("translation.bubbles.visible_count_status", shown = self.visible_cache.len(), total = project.bubbles.len()));
         ui.add_space(4.0);
 
-        let now_s = ctx.input(|i| i.time);
+        let frame = BubbleCardFrame { ctx, project, now_s: ctx.input(|i| i.time) };
         let visible_indices = self.visible_cache.clone();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -498,24 +508,23 @@ impl BubblesPanelState {
                     let Some(bubble) = project.bubbles.get(bubble_idx) else {
                         continue;
                     };
-                    self.draw_card(ui, ctx, canvas, project, bubble, now_s, panel_ctx);
+                    self.draw_card(ui, frame, canvas, bubble, panel_ctx);
                     ui.add_space(8.0);
                 }
             });
     }
 
-    // Parameters represent distinct required inputs with no natural grouping.
-    #[allow(clippy::too_many_arguments)]
+    /// Draws one bubble card for `bubble` and applies its edits: card actions go to `canvas`,
+    /// footer / ImageBubble patches are queued in `panel_ctx`, editor state is kept in `self`.
     fn draw_card(
         &mut self,
         ui: &mut egui::Ui,
-        ctx: &egui::Context,
+        frame: BubbleCardFrame<'_>,
         canvas: &mut CanvasView,
-        project: &ProjectData,
         bubble: &Bubble,
-        now_s: f64,
         panel_ctx: &mut BubblesPanelContext<'_>,
     ) {
+        let BubbleCardFrame { ctx, project, now_s } = frame;
         let bubble_id = bubble.id;
         let mut bubble_class = bubble
             .bubble_class
@@ -1003,7 +1012,6 @@ impl BubblesPanelState {
         panel_ctx.footer_overrides.insert(bubble_id, footer_state);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn draw_image_bubble_controls(
         ui: &mut egui::Ui,
         project: &ProjectData,

@@ -411,12 +411,25 @@ impl TypingCreatePanelState {
         let (token, tx) = self.arm_font_reload();
         let fonts_dir = self.fonts_dir.clone();
         let imported = self.imported_system_fonts.clone();
-        let _ = thread::Builder::new()
+        let spawn_result = thread::Builder::new()
             .name("typing-font-reload-worker".to_string())
             .spawn(move || {
                 let result = build_font_reload_result(token, &fonts_dir, &imported);
+                // A closed channel means the panel was dropped or a newer reload superseded this
+                // one; the list only feeds that panel. Nobody is left to report to, so the send
+                // result is deliberately ignored.
                 let _ = tx.send(result);
             });
+        if let Err(err) = spawn_result {
+            // The unspawned closure dropped `tx`, so `poll_font_reload_results` sees a
+            // disconnected reload: it clears the in-flight flag and shows the reload error
+            // status, so the panel never waits for a list that cannot arrive.
+            ms_log::runtime_log::log_warn(format!(
+                "typing fonts: could not spawn the font-reload worker (fonts dir {}); the panel keeps \
+                 its current font list: {err}",
+                self.fonts_dir.display()
+            ));
+        }
     }
 
     /// Installs a finished background font reload: the combined list, the group list, the

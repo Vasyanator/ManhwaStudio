@@ -6,6 +6,7 @@ Main types:
 - `OcrPanelOptions`: user OCR options (engine/langs/model/behavior toggles).
 - `OcrPanelActions`: UI actions emitted to tab controller.
 - `OcrSelectionHints`: the binding texts and held state of the two canvas OCR selections.
+- `OcrPanelStatus`: the shown engine's load state, last error / result and live AI API request.
 
 Main functions:
 - `draw_ocr_panel`: renders OCR controls and last OCR preview.
@@ -306,6 +307,16 @@ pub struct OcrPanelActions {
     pub neurolate_key: NeurolateKeyActions,
 }
 
+/// Per-frame read-only status the OCR panel shows: the shown engine's load state, the OCR
+/// controller's last error and last result (the preview), and its live AI API request state.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OcrPanelStatus<'a> {
+    pub(crate) state: OcrLoadState,
+    pub(crate) last_error: Option<&'a str>,
+    pub(crate) last_result: Option<&'a OcrRecognizeResult>,
+    pub(crate) generation: &'a GenerationSnapshot,
+}
+
 /// What the panel lends to its NeuroLate section: the tab's ONE NeuroLate settings store and
 /// key panel (shared with the detector panel), and the project type "Auto" resolves with (the
 /// MT source language comes from `OcrPanelModelView::source_lang`).
@@ -431,26 +442,23 @@ fn engine_select_button(
 /// selection buttons gate on a per-engine [`AiRequirement`] (optimistic while the
 /// capability is unknown); the selected engine's options interface and the load
 /// button are disabled together when the selected engine+model requirement is
-/// known-unavailable. AiApi stays ungated (network-only). `generation` is the OCR
-/// controller's live AI API request state; while it is active the generation status
-/// widget is drawn and its "Stop" sets `OcrPanelActions::stop_generation`. `model` lends
+/// known-unavailable. AiApi stays ungated (network-only). `status` is the shown engine's
+/// load state, the controller's last error / result and its live AI API request state; while
+/// that request is active the generation status widget is drawn and its "Stop" sets
+/// `OcrPanelActions::stop_generation`. `model` lends
 /// the external-model state of the selected engine (download block, load gating) and
 /// whether the MT source language is Korean (Baberu warning). `selection` names the bindings of
 /// the canvas OCR selections and whether their modes are held. `neurolate` lends the NeuroLate
 /// section (drawn only with NeuroLate selected; its settings edits set `options_changed`).
-// Parameters represent distinct required inputs with no natural grouping.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_ocr_panel(
     ui: &mut egui::Ui,
-    state: OcrLoadState,
     options: &mut OcrPanelOptions,
-    last_error: Option<&str>,
-    last_result: Option<&OcrRecognizeResult>,
+    status: OcrPanelStatus<'_>,
     selection: OcrSelectionHints<'_>,
-    generation: &GenerationSnapshot,
     model: OcrPanelModelView<'_>,
     neurolate: OcrPanelNeurolate<'_>,
 ) -> OcrPanelActions {
+    let OcrPanelStatus { state, last_error, last_result, generation } = status;
     let mut actions = OcrPanelActions::default();
     let caps = AiCaps::current();
     // Strict gating: the selected engine's interface and load button are enabled

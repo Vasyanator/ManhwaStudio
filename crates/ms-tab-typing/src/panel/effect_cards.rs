@@ -994,7 +994,7 @@ pub(super) fn spawn_preview_render_worker() -> (Sender<PreviewRenderJob>, Receiv
     let (request_tx, request_rx) = mpsc::channel::<PreviewRenderJob>();
     let (result_tx, result_rx) = mpsc::channel::<PreviewRenderResult>();
 
-    let _ = thread::Builder::new()
+    let spawn_result = thread::Builder::new()
         .name("typing-text-preview-render-worker".to_string())
         .spawn(move || {
             while let Ok(mut job) = request_rx.recv() {
@@ -1033,6 +1033,14 @@ pub(super) fn spawn_preview_render_worker() -> (Sender<PreviewRenderJob>, Receiv
                 }
             }
         });
+    if let Err(err) = spawn_result {
+        // The unspawned closure dropped `request_rx`, so every later preview dispatch fails
+        // its send and the panel shows the dispatch error status instead of waiting forever.
+        ms_log::runtime_log::log_error(format!(
+            "typing preview: could not spawn the text-preview render worker; previews are \
+             unavailable for this panel: {err}"
+        ));
+    }
 
     (request_tx, result_rx)
 }

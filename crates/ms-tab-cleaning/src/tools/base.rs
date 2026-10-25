@@ -43,6 +43,10 @@ FILE HEADER (cleaning/tools/base.rs)
     один раз доцентрируется под новый размер (без повторного центрирования на zoom).
   - `draw_overlay_ui_custom` у `RegionEditToolBase` даёт инструментам полный контроль над содержимым
     окна редактора (включая собственный footer-контроллер кнопок).
+  - `RegionOverlayFrame` (English): the one per-frame bundle (ctx, canvas, project, input, window
+    title) every `draw_overlay_ui*` entry point of both bases takes; a window body returns a
+    `RegionEditorWindowOutcome` (close / apply). The mask editor body gets its split-off fields
+    as one `MaskEditorWindowCx` (with `MaskEditorCaps`).
   - `draw_region_editor_zoom_controls` и `draw_region_editor_scroll_area` дают общий zoom/scroll UI
     для изображения в окне region editor.
   - `draw_region_editor_collapsible_section` даёт единый helper для инструмент-специфичных
@@ -589,13 +593,9 @@ impl BrushToolBase {
         paint_line_mask_with_hardness(
             &mut stroke.mask,
             stroke.image.size,
-            sx0,
-            sy0,
-            sx1,
-            sy1,
-            radius_px as i32,
-            hardness,
-            strict_pixel_painting,
+            egui::pos2(sx0, sy0),
+            egui::pos2(sx1, sy1),
+            MaskDabTip { radius: radius_px as i32, hardness, strict_pixel_painting },
         );
         let dirty_overlay =
             segment_dirty_overlay_rect(x0, y0, x1, y1, paint_margin, stroke.overlay_rect);
@@ -672,13 +672,13 @@ impl BrushToolBase {
         paint_line_mask_with_hardness(
             &mut mask,
             patch.size,
-            x0f - dirty_overlay.x as f32,
-            y0f - dirty_overlay.y as f32,
-            x1f - dirty_overlay.x as f32,
-            y1f - dirty_overlay.y as f32,
-            self.brush.radius_px().max(1) as i32,
-            self.hardness,
-            self.strict_pixel_painting,
+            egui::pos2(x0f - dirty_overlay.x as f32, y0f - dirty_overlay.y as f32),
+            egui::pos2(x1f - dirty_overlay.x as f32, y1f - dirty_overlay.y as f32),
+            MaskDabTip {
+                radius: self.brush.radius_px().max(1) as i32,
+                hardness: self.hardness,
+                strict_pixel_painting: self.strict_pixel_painting,
+            },
         );
         apply_cleaning_brush_stroke(
             &mut patch,
@@ -849,6 +849,26 @@ impl RegionEditorSession {
         let h = self.image.size[1].max(1) as f32;
         egui::vec2((w * self.zoom).max(1.0), (h * self.zoom).max(1.0))
     }
+}
+
+/// One frame's inputs of a region editor's window pass: the egui context, the canvas the region
+/// is cut from and applied back into, the project the region loader reads, this frame's input
+/// (the editor window's zoom and the mask brush gestures) and the window's localized title.
+/// Built by the tool's `CleaningTool::draw_overlay_ui` and moved into one `draw_overlay_ui*` call.
+pub struct RegionOverlayFrame<'a> {
+    pub ctx: &'a egui::Context,
+    pub canvas: &'a mut CanvasView,
+    pub project: &'a ProjectData,
+    pub input: &'a InputFrame,
+    pub window_title: &'a str,
+}
+
+/// What the region editor window's body asked for this frame: close the window without applying
+/// (`request_close`) and/or insert the edited region back into the overlay (`apply_clicked`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RegionEditorWindowOutcome {
+    pub request_close: bool,
+    pub apply_clicked: bool,
 }
 
 pub struct RegionEditToolBase {
@@ -1319,67 +1339,49 @@ impl RegionEditToolBase {
     /// the shared footer: `draw_editor` fills the body, then the status line and
     /// the Отмена/Применить row are appended. Apply inserts `editor.image` back
     /// into the page overlay through `CanvasView::replace_overlay_region_px`.
-    // All parameters are distinct per-frame inputs of the window pass; grouping would hide which
-    // one a caller supplies.
-    #[allow(clippy::too_many_arguments)]
     pub fn draw_overlay_ui<OnOpen, DrawEditor>(
         &mut self,
-        ctx: &egui::Context,
-        canvas: &mut CanvasView,
-        project: &ProjectData,
-        input: &InputFrame,
-        window_title: &str,
+        frame: RegionOverlayFrame<'_>,
         on_open: OnOpen,
         mut draw_editor: DrawEditor,
     ) where
         OnOpen: FnMut(&mut RegionEditorSession),
         DrawEditor: FnMut(&mut egui::Ui, &mut RegionEditorSession),
     {
-        self.draw_overlay_ui_custom(
-            ctx,
-            canvas,
-            project,
-            input,
-            window_title,
-            on_open,
-            |ui, editor, request_close, apply_clicked| {
-                draw_editor(ui, editor);
-                if let Some(status) = editor.status.as_ref() {
-                    ui.separator();
-                    ui.small(status);
-                }
+        self.draw_overlay_ui_custom(frame, on_open, |ui, editor| {
+            draw_editor(ui, editor);
+            if let Some(status) = editor.status.as_ref() {
                 ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button(t!("cleaning.common.cancel_button")).clicked() {
-                        *request_close = true;
-                    }
-                    if ui.button(t!("cleaning.common.apply_button")).clicked() {
-                        *apply_clicked = true;
-                    }
-                });
-            },
-        );
+                ui.small(status);
+            }
+            ui.separator();
+            let mut outcome = RegionEditorWindowOutcome::default();
+            ui.horizontal(|ui| {
+                if ui.button(t!("cleaning.common.cancel_button")).clicked() {
+                    outcome.request_close = true;
+                }
+                if ui.button(t!("cleaning.common.apply_button")).clicked() {
+                    outcome.apply_clicked = true;
+                }
+            });
+            outcome
+        });
     }
 
     /// The window pass: starts / polls the region load, shows the loading window or the editor
-    /// window (`draw_window` fills its body), publishes the editor window's view surface and
-    /// applies the shared `view.*` zoom aimed at it (`input`), then applies or closes.
-    // All parameters are distinct per-frame inputs of the window pass; grouping would hide which
-    // one a caller supplies.
-    #[allow(clippy::too_many_arguments)]
+    /// window (`draw_window` fills its body and returns what the user asked for), publishes the
+    /// editor window's view surface and applies the shared `view.*` zoom aimed at it
+    /// (`frame.input`), then applies or closes.
     pub fn draw_overlay_ui_custom<OnOpen, DrawWindow>(
         &mut self,
-        ctx: &egui::Context,
-        canvas: &mut CanvasView,
-        project: &ProjectData,
-        input: &InputFrame,
-        window_title: &str,
+        frame: RegionOverlayFrame<'_>,
         mut on_open: OnOpen,
         mut draw_window: DrawWindow,
     ) where
         OnOpen: FnMut(&mut RegionEditorSession),
-        DrawWindow: FnMut(&mut egui::Ui, &mut RegionEditorSession, &mut bool, &mut bool),
+        DrawWindow: FnMut(&mut egui::Ui, &mut RegionEditorSession) -> RegionEditorWindowOutcome,
     {
+        let RegionOverlayFrame { ctx, canvas, project, input, window_title } = frame;
         self.start_pending_job(canvas, project);
         self.poll_loaded_regions(&mut on_open);
 
@@ -1416,7 +1418,9 @@ impl RegionEditToolBase {
             );
             window = window.current_pos(window_pos);
             let shown = window.show(ctx, |ui| {
-                draw_window(ui, editor, &mut request_close, &mut apply_clicked);
+                let outcome = draw_window(ui, editor);
+                request_close = outcome.request_close;
+                apply_clicked = outcome.apply_clicked;
             });
             self.force_center_after_load = false;
             if let Some(resp) = shown {
@@ -1855,6 +1859,30 @@ impl RegionInpaintEditorState {
     }
 }
 
+/// What the mask editor window may offer this frame: the second («область примера») mask layer
+/// (`sample_mask_enabled`, fixed by the tool's entry point) and the AI mask sources
+/// (`ai_backend_available` / `ai_backend_torch_available`, the pushed backend state).
+#[derive(Debug, Clone, Copy)]
+struct MaskEditorCaps {
+    sample_mask_enabled: bool,
+    ai_backend_available: bool,
+    ai_backend_torch_available: bool,
+}
+
+/// What the mask editor window body works on during one window pass: the fields of
+/// [`RegionMaskInpaintToolBase`] split off while its `region_base` runs the pass, this frame's
+/// input and labels, the tool's run and custom-UI callback, and the window's capabilities.
+struct MaskEditorWindowCx<'a, DrawCustomUi> {
+    input: &'a InputFrame,
+    labels: &'a CleaningLabels,
+    brush_base: &'a mut MaskBrush,
+    editor_state_slot: &'a mut Option<RegionInpaintEditorState>,
+    mask_generation: &'a mut MaskGenerationState,
+    run: Arc<RegionInpaintRunFn>,
+    caps: MaskEditorCaps,
+    draw_custom_ui: DrawCustomUi,
+}
+
 pub struct RegionMaskInpaintToolBase {
     region_base: RegionEditToolBase,
     brush_base: MaskBrush,
@@ -1957,32 +1985,23 @@ impl RegionMaskInpaintToolBase {
         self.ai_backend_torch_available = available;
     }
 
-    pub fn draw_overlay_ui<Run>(
-        &mut self,
-        ctx: &egui::Context,
-        canvas: &mut CanvasView,
-        project: &ProjectData,
-        input: &InputFrame,
-        window_title: &str,
-        run: Run,
-    ) where
+    /// The mask editor window pass for a tool without its own parameters: `run(image, mask)`
+    /// processes the region on a worker.
+    pub fn draw_overlay_ui<Run>(&mut self, frame: RegionOverlayFrame<'_>, run: Run)
+    where
         Run: Fn(&egui::ColorImage, &egui::ColorImage) -> Result<egui::ColorImage, String>
             + Send
             + Sync
             + 'static,
     {
-        self.draw_overlay_ui_custom(ctx, canvas, project, input, window_title, run, |_ui| {});
+        self.draw_overlay_ui_custom(frame, run, |_ui| {});
     }
 
-    // All parameters are distinct per-frame inputs of the window pass.
-    #[allow(clippy::too_many_arguments)]
+    /// [`Self::draw_overlay_ui`] with `draw_custom_ui` drawing the tool's own parameters inside
+    /// the editor window body, above the preview.
     pub fn draw_overlay_ui_custom<Run, DrawCustomUi>(
         &mut self,
-        ctx: &egui::Context,
-        canvas: &mut CanvasView,
-        project: &ProjectData,
-        input: &InputFrame,
-        window_title: &str,
+        frame: RegionOverlayFrame<'_>,
         run: Run,
         draw_custom_ui: DrawCustomUi,
     ) where
@@ -1998,27 +2017,14 @@ impl RegionMaskInpaintToolBase {
                   _sample_mask: Option<&egui::ColorImage>,
                   _downloads: &mut EnsureCtx<'_>| { run(image, mask) },
         ) as Arc<RegionInpaintRunFn>;
-        self.draw_overlay_ui_custom_impl(
-            ctx,
-            canvas,
-            project,
-            input,
-            window_title,
-            run,
-            false,
-            draw_custom_ui,
-        );
+        self.draw_overlay_ui_custom_impl(frame, run, false, draw_custom_ui);
     }
 
-    // All parameters are distinct per-frame inputs of the window pass.
-    #[allow(clippy::too_many_arguments)]
+    /// [`Self::draw_overlay_ui_custom`] with the second, «область примера» mask layer: `run` also
+    /// gets that mask (`None` when nothing was painted on it).
     pub fn draw_overlay_ui_custom_with_sample_mask<Run, DrawCustomUi>(
         &mut self,
-        ctx: &egui::Context,
-        canvas: &mut CanvasView,
-        project: &ProjectData,
-        input: &InputFrame,
-        window_title: &str,
+        frame: RegionOverlayFrame<'_>,
         run: Run,
         draw_custom_ui: DrawCustomUi,
     ) where
@@ -2038,31 +2044,15 @@ impl RegionMaskInpaintToolBase {
                   sample_mask: Option<&egui::ColorImage>,
                   _downloads: &mut EnsureCtx<'_>| { run(image, mask, sample_mask) },
         ) as Arc<RegionInpaintRunFn>;
-        self.draw_overlay_ui_custom_impl(
-            ctx,
-            canvas,
-            project,
-            input,
-            window_title,
-            run,
-            true,
-            draw_custom_ui,
-        );
+        self.draw_overlay_ui_custom_impl(frame, run, true, draw_custom_ui);
     }
 
     /// [`Self::draw_overlay_ui_custom`] for a run that may download an app-managed model: `run`
     /// also gets the job's `EnsureCtx` — its cancel flag is set when the user cancels the
     /// processing or closes the editor, and its events go to the job channel.
-    // All parameters are distinct per-frame inputs of the window pass (same shape as
-    // `draw_overlay_ui_custom`).
-    #[allow(clippy::too_many_arguments)]
     pub fn draw_overlay_ui_custom_with_downloads<Run, DrawCustomUi>(
         &mut self,
-        ctx: &egui::Context,
-        canvas: &mut CanvasView,
-        project: &ProjectData,
-        input: &InputFrame,
-        window_title: &str,
+        frame: RegionOverlayFrame<'_>,
         run: Run,
         draw_custom_ui: DrawCustomUi,
     ) where
@@ -2078,69 +2068,44 @@ impl RegionMaskInpaintToolBase {
                   _sample_mask: Option<&egui::ColorImage>,
                   downloads: &mut EnsureCtx<'_>| { run(image, mask, downloads) },
         ) as Arc<RegionInpaintRunFn>;
-        self.draw_overlay_ui_custom_impl(
-            ctx,
-            canvas,
-            project,
-            input,
-            window_title,
-            run,
-            false,
-            draw_custom_ui,
-        );
+        self.draw_overlay_ui_custom_impl(frame, run, false, draw_custom_ui);
     }
 
-    // All parameters are distinct pixel-buffer or layout properties; grouping would obscure rendering intent.
-    #[allow(clippy::too_many_arguments)]
+    /// The shared body of every entry point: the region window pass of `region_base` whose
+    /// window is the mask editor (`draw_mask_editor_window`); `sample_mask_enabled` turns on the
+    /// second mask layer.
     fn draw_overlay_ui_custom_impl<DrawCustomUi>(
         &mut self,
-        ctx: &egui::Context,
-        canvas: &mut CanvasView,
-        project: &ProjectData,
-        input: &InputFrame,
-        window_title: &str,
+        frame: RegionOverlayFrame<'_>,
         run: Arc<RegionInpaintRunFn>,
         sample_mask_enabled: bool,
-        mut draw_custom_ui: DrawCustomUi,
+        draw_custom_ui: DrawCustomUi,
     ) where
         DrawCustomUi: FnMut(&mut egui::Ui),
     {
-        let (region_base, brush_base, editor_state) = (
-            &mut self.region_base,
-            &mut self.brush_base,
-            &mut self.editor_state,
-        );
-        let mask_generation = &mut self.mask_generation;
-        let labels = Arc::clone(&region_base.labels);
-        region_base.draw_overlay_ui_custom(
-            ctx,
-            canvas,
-            project,
-            input,
-            window_title,
+        let labels = Arc::clone(&self.region_base.labels);
+        let mut window_cx = MaskEditorWindowCx {
+            input: frame.input,
+            labels: &labels,
+            brush_base: &mut self.brush_base,
+            editor_state_slot: &mut self.editor_state,
+            mask_generation: &mut self.mask_generation,
+            run,
+            caps: MaskEditorCaps {
+                sample_mask_enabled,
+                ai_backend_available: self.ai_backend_available,
+                ai_backend_torch_available: self.ai_backend_torch_available,
+            },
+            draw_custom_ui,
+        };
+        self.region_base.draw_overlay_ui_custom(
+            frame,
             |editor| {
                 if editor.status.is_none() {
                     editor.status = Some(t!("cleaning.mask_editor.draw_mask_hint").to_string());
                 }
             },
-            |ui, editor, request_close, apply_clicked| {
-                Self::draw_mask_editor_window(
-                    ui,
-                    input,
-                    &labels,
-                    editor,
-                    brush_base,
-                    editor_state,
-                    Arc::clone(&run),
-                    sample_mask_enabled,
-                    self.ai_backend_available,
-                    self.ai_backend_torch_available,
-                    mask_generation,
-                    &mut draw_custom_ui,
-                    request_close,
-                    apply_clicked,
-                );
-            },
+            |ui, editor| Self::draw_mask_editor_window(ui, editor, &mut window_cx),
         );
     }
 
@@ -2157,36 +2122,27 @@ impl RegionMaskInpaintToolBase {
         self.region_base.has_open_editor()
     }
 
-    // All parameters are distinct pixel-buffer or layout properties; grouping would obscure rendering intent.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_mask_editor_window<Run, DrawCustomUi>(
+    /// The mask editor window body: brush and zoom controls, the mask-generation section, the
+    /// tool's custom UI, the preview with its paint / erase gestures, and the action row
+    /// (Сгенерировать маску / Обработать / Переделать / Вернуть / Отмена / Применить). Returns
+    /// what the Отмена / Применить buttons asked for.
+    fn draw_mask_editor_window<DrawCustomUi>(
         ui: &mut egui::Ui,
-        input: &InputFrame,
-        labels: &CleaningLabels,
         editor: &mut RegionEditorSession,
-        brush_base: &mut MaskBrush,
-        editor_state_slot: &mut Option<RegionInpaintEditorState>,
-        run: Arc<Run>,
-        sample_mask_enabled: bool,
-        ai_backend_available: bool,
-        ai_backend_torch_available: bool,
-        mask_generation: &mut MaskGenerationState,
-        draw_custom_ui: &mut DrawCustomUi,
-        request_close: &mut bool,
-        apply_clicked: &mut bool,
-    ) where
-        Run: Fn(
-                &egui::ColorImage,
-                &egui::ColorImage,
-                Option<&egui::ColorImage>,
-                &mut EnsureCtx<'_>,
-            ) -> Result<egui::ColorImage, String>
-            + Send
-            + Sync
-            + 'static
-            + ?Sized,
+        cx: &mut MaskEditorWindowCx<'_, DrawCustomUi>,
+    ) -> RegionEditorWindowOutcome
+    where
         DrawCustomUi: FnMut(&mut egui::Ui),
     {
+        let input = cx.input;
+        let labels = cx.labels;
+        let brush_base = &mut *cx.brush_base;
+        let editor_state_slot = &mut *cx.editor_state_slot;
+        let mask_generation = &mut *cx.mask_generation;
+        let run = &cx.run;
+        let draw_custom_ui = &mut cx.draw_custom_ui;
+        let MaskEditorCaps { sample_mask_enabled, ai_backend_available, ai_backend_torch_available } = cx.caps;
+        let mut outcome = RegionEditorWindowOutcome::default();
         let editor_state =
             Self::ensure_editor_state(editor, editor_state_slot, sample_mask_enabled);
         let mut processing = Self::poll_processing_result(editor, editor_state);
@@ -2335,13 +2291,13 @@ impl RegionMaskInpaintToolBase {
                 .add_enabled(can_run, egui::Button::new(t!("cleaning.mask_editor.process_button")))
                 .clicked()
             {
-                Self::run_processing(editor, editor_state, Arc::clone(&run), false);
+                Self::run_processing(editor, editor_state, Arc::clone(run), false);
             }
             if ui
                 .add_enabled(can_rerun, egui::Button::new(t!("cleaning.mask_editor.redo_button")))
                 .clicked()
             {
-                Self::run_processing(editor, editor_state, Arc::clone(&run), true);
+                Self::run_processing(editor, editor_state, Arc::clone(run), true);
             }
             if ui
                 .add_enabled(can_undo, egui::Button::new(t!("cleaning.mask_editor.revert_button")))
@@ -2374,19 +2330,20 @@ impl RegionMaskInpaintToolBase {
                 ui.separator();
             }
             if ui.button(t!("cleaning.common.cancel_button")).clicked() {
-                *request_close = true;
+                outcome.request_close = true;
             }
             if ui
                 .add_enabled(can_run, egui::Button::new(t!("cleaning.common.apply_button")))
                 .clicked()
             {
-                *apply_clicked = true;
+                outcome.apply_clicked = true;
             }
         });
 
         if processing || generating_mask {
             ui.ctx().request_repaint();
         }
+        outcome
     }
 
     /// The preview of the mask editor window: the region image, the mask layers over it, the
@@ -3502,33 +3459,27 @@ fn union_overlay_rect(a: OverlayRectPx, b: OverlayRectPx) -> OverlayRectPx {
     }
 }
 
-// All parameters are independent brush stroke properties; grouping would obscure painting intent.
-#[allow(clippy::too_many_arguments)]
-fn paint_line_mask_with_hardness(
-    dst: &mut [f32],
-    image_size: [usize; 2],
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
+/// The tip of one mask-brush dab: `radius` in pixels (below 1 counts as 1), `hardness` (`0..=1`,
+/// the fully opaque inner fraction of the radius) and `strict_pixel_painting` (sample the
+/// falloff at pixel centres only, instead of the anti-aliased coverage of partly covered pixels).
+#[derive(Debug, Clone, Copy)]
+struct MaskDabTip {
     radius: i32,
     hardness: f32,
     strict_pixel_painting: bool,
-) {
-    let r = radius.max(1);
-    let dx = x1 - x0;
-    let dy = y1 - y0;
+}
+
+/// Paints dabs of `tip` along the segment `from` -> `to` (fractional pixel coordinates of the
+/// `image_size` = `[width, height]` row-major mask `dst`), keeping the per-pixel maximum
+/// strength. Dabs are spaced 0.45 radius apart; a strict tip skips a dab whose rounded centre
+/// repeats the previous one. A zero-length segment paints one dab.
+fn paint_line_mask_with_hardness(dst: &mut [f32], image_size: [usize; 2], from: Pos2, to: Pos2, tip: MaskDabTip) {
+    let r = tip.radius.max(1);
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
     let distance = (dx * dx + dy * dy).sqrt();
     if distance <= f32::EPSILON {
-        paint_circle_mask_with_hardness(
-            dst,
-            image_size,
-            x0,
-            y0,
-            r,
-            hardness,
-            strict_pixel_painting,
-        );
+        paint_circle_mask_with_hardness(dst, image_size, from, tip);
         return;
     }
     let step = (r as f32 * 0.45).max(1.0);
@@ -3536,33 +3487,21 @@ fn paint_line_mask_with_hardness(
     let mut last = (f32::NAN, f32::NAN);
     for i in 0..=stamps {
         let t = i as f32 / stamps.max(1) as f32;
-        let sx = x0 + dx * t;
-        let sy = y0 + dy * t;
-        if strict_pixel_painting && (sx.round(), sy.round()) == last {
+        let sx = from.x + dx * t;
+        let sy = from.y + dy * t;
+        if tip.strict_pixel_painting && (sx.round(), sy.round()) == last {
             continue;
         }
-        paint_circle_mask_with_hardness(
-            dst,
-            image_size,
-            sx,
-            sy,
-            r,
-            hardness,
-            strict_pixel_painting,
-        );
+        paint_circle_mask_with_hardness(dst, image_size, egui::pos2(sx, sy), tip);
         last = (sx.round(), sy.round());
     }
 }
 
-fn paint_circle_mask_with_hardness(
-    dst: &mut [f32],
-    image_size: [usize; 2],
-    cx: f32,
-    cy: f32,
-    radius: i32,
-    hardness: f32,
-    strict_pixel_painting: bool,
-) {
+/// Paints one dab of `tip` centred at `center` (fractional pixel coordinates) into the
+/// `image_size` row-major mask `dst`, keeping the per-pixel maximum strength.
+fn paint_circle_mask_with_hardness(dst: &mut [f32], image_size: [usize; 2], center: Pos2, tip: MaskDabTip) {
+    let MaskDabTip { radius, hardness, strict_pixel_painting } = tip;
+    let (cx, cy) = (center.x, center.y);
     let r = radius.max(1);
     let w_usize = image_size[0];
     let w = w_usize as i32;
@@ -3877,10 +3816,12 @@ mod tests {
     #[test]
     fn soft_pixel_coverage_reaches_partially_covered_neighbor() {
         let mut strict = vec![0.0; 9];
-        paint_line_mask_with_hardness(&mut strict, [3, 3], 1.0, 1.0, 1.0, 1.0, 1, 1.0, true);
+        let dot = egui::pos2(1.0, 1.0);
+        paint_line_mask_with_hardness(&mut strict, [3, 3], dot, dot, MaskDabTip { radius: 1, hardness: 1.0, strict_pixel_painting: true });
 
         let mut covered = vec![0.0; 9];
-        paint_line_mask_with_hardness(&mut covered, [3, 3], 1.49, 1.49, 1.49, 1.49, 1, 1.0, false);
+        let off_centre = egui::pos2(1.49, 1.49);
+        paint_line_mask_with_hardness(&mut covered, [3, 3], off_centre, off_centre, MaskDabTip { radius: 1, hardness: 1.0, strict_pixel_painting: false });
 
         assert_eq!(strict[8], 0.0);
         assert!(covered[8] > 0.0);
@@ -3890,9 +3831,29 @@ mod tests {
     #[test]
     fn soft_pixel_coverage_preserves_full_center_strength() {
         let mut mask = vec![0.0; 9];
-        paint_line_mask_with_hardness(&mut mask, [3, 3], 1.0, 1.0, 1.0, 1.0, 2, 1.0, false);
+        let dot = egui::pos2(1.0, 1.0);
+        paint_line_mask_with_hardness(&mut mask, [3, 3], dot, dot, MaskDabTip { radius: 2, hardness: 1.0, strict_pixel_painting: false });
 
         assert!((mask[4] - 1.0).abs() <= f32::EPSILON);
+    }
+
+    /// characterization (parameter-struct refactor): a long soft and a long strict segment with
+    /// partial hardness, pinned by an FNV-1a fingerprint of the mask bits. OBSERVED before the
+    /// segment and the brush tip became structs; it must stay bit-identical.
+    #[test]
+    fn characterization_paint_line_mask_segments() {
+        let fingerprint = |mask: &[f32]| {
+            mask.iter()
+                .flat_map(|m| m.to_bits().to_le_bytes())
+                .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
+        };
+        let mut soft = vec![0.0f32; 40 * 30];
+        let (from, to) = (egui::pos2(2.3, 4.7), egui::pos2(35.1, 26.4));
+        paint_line_mask_with_hardness(&mut soft, [40, 30], from, to, MaskDabTip { radius: 5, hardness: 0.4, strict_pixel_painting: false });
+        let mut strict = vec![0.0f32; 40 * 30];
+        paint_line_mask_with_hardness(&mut strict, [40, 30], from, to, MaskDabTip { radius: 5, hardness: 0.4, strict_pixel_painting: true });
+        let observed = (fingerprint(&soft), fingerprint(&strict));
+        assert_eq!(observed, (5_333_657_888_049_218_854, 6_152_694_257_659_312_777), "observed={observed:?}");
     }
 
     fn rect(x: usize, y: usize, w: usize, h: usize) -> OverlayRectPx {

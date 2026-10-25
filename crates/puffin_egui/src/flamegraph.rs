@@ -613,7 +613,6 @@ fn grid_text(grid_ns: NanoSecond) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn paint_record(
     info: &Info<'_>,
     options: &mut Options,

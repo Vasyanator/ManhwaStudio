@@ -15,7 +15,7 @@ FILE HEADER (cleaning/tools/flux_fill.rs)
 - Хранение настроек: отдельный файл `flux_fill_inpaint_settings.json`
   (см. `config::flux_fill_inpaint_settings_path`).
 */
-use super::base::{CleaningTool, RegionMaskInpaintToolBase, StrokePoint};
+use super::base::{CleaningTool, RegionMaskInpaintToolBase, RegionOverlayFrame, StrokePoint};
 use crate::input::CleaningLabels;
 use ms_input::{ContextId, InputFrame};
 use ms_backend_ipc::{self as backend_ipc, CallError};
@@ -410,11 +410,7 @@ impl CleaningTool for FluxFillInpaintTool {
         let mut want_status = false;
 
         inpaint_base.draw_overlay_ui_custom(
-            ctx,
-            canvas,
-            project,
-            input,
-            t!("cleaning.tools.flux.title"),
+            RegionOverlayFrame { ctx, canvas, project, input, window_title: t!("cleaning.tools.flux.title") },
             move |image, mask| Self::run_flux(image, mask, &run_config, &run_progress),
             |ui| {
                 draw_flux_progress_ui(ui, &ui_progress);

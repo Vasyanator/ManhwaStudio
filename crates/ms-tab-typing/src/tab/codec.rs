@@ -1126,22 +1126,27 @@ pub(super) fn parse_text_layout_mode_config_str(raw: &str) -> Option<TextLayoutM
     }
 }
 
-// Parameters represent distinct required inputs with no natural grouping.
-#[allow(clippy::too_many_arguments)]
+/// Encodes one overlay as a legacy `text_info.json` storage entry: identity (`uid`, `kind`, page),
+/// its image file names (`original_file_name` is written only for an image overlay whose original
+/// differs from `file_name`), its page `placement` and optional `render_data`. Transform and deform
+/// mesh go through the shared `ms_models::layer_model::text_payload` encoders.
 pub(super) fn build_storage_overlay_entry(
     uid: &str,
     kind: TypingOverlayKind,
     page_idx: usize,
     file_name: &str,
     original_file_name: Option<&str>,
-    center_page_px: [f32; 2],
-    mask_clip_enabled: bool,
-    layer_idx: usize,
-    rotation_deg: f32,
-    scale: f32,
-    deform_mesh: Option<TypingOverlayDeformMesh>,
+    placement: OverlayPlacement,
     render_data: Option<Value>,
 ) -> Value {
+    let OverlayPlacement {
+        center_page_px,
+        scale,
+        rotation_deg,
+        deform_mesh,
+        mask_clip_enabled,
+        layer_idx,
+    } = placement;
     let mut out = serde_json::Map::<String, Value>::new();
     out.insert("uid".to_string(), Value::String(uid.to_string()));
     out.insert(
@@ -2336,18 +2341,21 @@ pub(super) fn normalize_overlay_storage_entry(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| ms_models::layer_model::text_payload::stable_overlay_uid(&file_name));
+    let overlay_placement = OverlayPlacement {
+        center_page_px,
+        scale,
+        rotation_deg,
+        deform_mesh,
+        mask_clip_enabled,
+        layer_idx,
+    };
     Some(build_storage_overlay_entry(
         &uid,
         kind,
         page_idx,
         file_name.as_str(),
         original_file_name.as_deref(),
-        center_page_px,
-        mask_clip_enabled,
-        layer_idx,
-        rotation_deg,
-        scale,
-        deform_mesh,
+        overlay_placement,
         render_data,
     ))
 }

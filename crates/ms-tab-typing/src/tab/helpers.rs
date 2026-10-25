@@ -234,6 +234,41 @@ pub(super) fn color_image_to_rgba(image: &ColorImage) -> Vec<u8> {
     out
 }
 
+/// Page placement of one typing overlay: where it sits on its page and how it is transformed and
+/// clipped. Shared by the doc-node runtime constructor ([`text_runtime_from_doc_node`]) and the
+/// legacy storage-entry encoder (`codec::build_storage_overlay_entry`), so both take the same six
+/// fields in one value instead of six positional arguments.
+#[derive(Clone, Debug)]
+pub(super) struct OverlayPlacement {
+    /// Overlay center in page pixels.
+    pub(super) center_page_px: [f32; 2],
+    /// User scale factor (1.0 = rendered size).
+    pub(super) scale: f32,
+    /// Rotation in DEGREES (the runtime's `angle_deg`; the storage encoder converts to radians).
+    pub(super) rotation_deg: f32,
+    /// Optional mesh deformation in overlay-local pixels.
+    pub(super) deform_mesh: Option<TypingOverlayDeformMesh>,
+    /// Whether the overlay is clipped by the page's typing mask.
+    pub(super) mask_clip_enabled: bool,
+    /// The overlay's text-layer index on its page.
+    pub(super) layer_idx: usize,
+}
+
+#[cfg(test)]
+impl OverlayPlacement {
+    /// Identity placement at `center_page_px`: scale 1, no rotation, no mesh, no mask clip, layer 0.
+    pub(super) fn at(center_page_px: [f32; 2]) -> Self {
+        Self {
+            center_page_px,
+            scale: 1.0,
+            rotation_deg: 0.0,
+            deform_mesh: None,
+            mask_clip_enabled: false,
+            layer_idx: 0,
+        }
+    }
+}
+
 /// Materializes a typing overlay runtime from a doc Text node's projected fields. `is_image` selects
 /// the runtime image kind for placed-PNG overlays. Used by
 /// `sync_from_doc` when a doc Text node has no local runtime (the migrated-chapter case, where the
@@ -242,17 +277,11 @@ pub(super) fn color_image_to_rgba(image: &ColorImage) -> Vec<u8> {
 /// doc's text flush (`write_text_image`) writes — so a later placement-save/flush round-trips. Pure
 /// (no egui), so it is unit-testable. The new runtime starts with no GPU texture and is stale, so the
 /// caller queues it for upload.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn text_runtime_from_doc_node(
     uid: &str,
     page_idx: usize,
-    center_page_px: [f32; 2],
-    user_scale: f32,
-    angle_deg: f32,
-    deform_mesh: Option<TypingOverlayDeformMesh>,
-    mask_clip_enabled: bool,
+    placement: OverlayPlacement,
     is_image: bool,
-    layer_idx: usize,
     render_data_json: Option<Value>,
     size_px: [usize; 2],
     source_rgba: Vec<u8>,
@@ -265,24 +294,24 @@ pub(super) fn text_runtime_from_doc_node(
             TypingOverlayKind::Text
         },
         page_idx,
-        center_page_px,
-        mask_clip_enabled,
-        layer_idx,
+        center_page_px: placement.center_page_px,
+        mask_clip_enabled: placement.mask_clip_enabled,
+        layer_idx: placement.layer_idx,
         // Doc-only composite metadata: like `extra`, assigned by `sync_from_doc` right after this
         // call; the defaults (ungrouped, visible) are what a node without them composites as.
         group_uid: None,
         visible: true,
-        user_scale,
-        angle_deg,
-        deform_mesh,
+        user_scale: placement.scale,
+        angle_deg: placement.rotation_deg,
+        deform_mesh: placement.deform_mesh,
         file_name: ms_models::layer_model::persist::text_image_file_name(page_idx, uid),
         original_file_name: None,
         render_data_json,
         size_px,
         source_rgba,
-        // Centering-assist centers are NOT a constructor parameter (the signature is already
-        // over-long): `sync_from_doc` assigns them from the doc node right after this call, next to
-        // the pixels they belong to. A caller that skips that assignment gets the neutral default.
+        // Centering-assist centers are NOT a constructor parameter: `sync_from_doc` assigns them
+        // from the doc node right after this call, next to the pixels they belong to. A caller
+        // that skips that assignment gets the neutral default.
         extra: RenderedTextExtraInfo::default(),
         // No centering-assist frame until the reconciliation creates one for the selected overlay.
         centering_frame: None,

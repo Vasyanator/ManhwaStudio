@@ -486,7 +486,7 @@ mod tests {
 
     /// A drawn 20x20 text overlay `uid` on page 0 centred at `center` (page px).
     fn text_overlay(ctx: &egui::Context, uid: &str, center: [f32; 2]) -> TypingOverlayRuntime {
-        let mut overlay = text_runtime_from_doc_node(uid, 0, center, 1.0, 0.0, None, false, false, 0, None, [20, 20], vec![255; 20 * 20 * 4]);
+        let mut overlay = text_runtime_from_doc_node(uid, 0, OverlayPlacement::at(center), false, None, [20, 20], vec![255; 20 * 20 * 4]);
         overlay.texture = Some(ctx.load_texture(format!("touch_{uid}"), ColorImage::filled([20, 20], Color32::WHITE), TextureOptions::LINEAR));
         overlay
     }

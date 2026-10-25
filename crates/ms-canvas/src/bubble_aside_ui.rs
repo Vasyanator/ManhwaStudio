@@ -20,6 +20,7 @@ Key structures:
   as `&mut` through the whole layout chain; `CanvasView` stays a SEPARATE `&mut` param.
 - AsideColumnLayout: per-column sizing/style bundle shared by the measure and draw passes.
 - AsideBodyMeasure: grouped inputs for the card body-height estimator.
+- ImageAreaEdits: one frame's outcome of the editable image bubble's row blocks.
 
 Key functions:
 - draw_aside_for_page()
@@ -1615,10 +1616,9 @@ fn draw_aside_slots(
             ms_widgets::ui_fonts::ensure_covers(ui.ctx(), description);
             ms_widgets::ui_fonts::ensure_covers(ui.ctx(), translation);
         }
-        let mut want_add_area = false;
-        let mut remove_area: Option<usize> = None;
-        let mut area_text_changed = false;
-        let mut block_rects: Vec<Rect> = Vec::new();
+        // Filled by `draw_editable_image_areas` (editable image bubble only), applied after the
+        // card is drawn; its `block_rects` also route the card-body drag and aim the links below.
+        let mut image_area_edits = ImageAreaEdits::default();
         // Unique egui id discriminator: read-only image areas share a bubble id across cards.
         let item_key = (bid, area_idx.unwrap_or(usize::MAX));
         // Single deferred command accumulated across all three context-menu closures below.
@@ -1677,19 +1677,10 @@ fn draw_aside_slots(
                         side,
                     );
                     ui.add_space(4.0);
-                    draw_editable_image_areas(
-                        canvas,
-                        ui,
-                        bid,
-                        text_width,
-                        &mut area_drafts,
-                        &mut want_add_area,
-                        &mut remove_area,
-                        &mut area_text_changed,
-                        &mut block_rects,
-                        &mut bubble_has_focus,
-                        &mut interacted_with_bubble,
-                    );
+                    image_area_edits =
+                        draw_editable_image_areas(canvas, ui, bid, text_width, &mut area_drafts);
+                    bubble_has_focus |= image_area_edits.bubble_has_focus;
+                    interacted_with_bubble |= image_area_edits.interacted;
                 } else if canvas.editable {
                     let text_width = ui.available_width().max(40.0);
                     if visible_groups.show_hint_text {
@@ -2014,15 +2005,7 @@ fn draw_aside_slots(
             canvas.bubble_runtime.pending_delete.insert(bid);
         }
         if is_image_bubble && canvas.editable && area_idx.is_none() {
-            apply_image_area_edits(
-                canvas,
-                bid,
-                &area_drafts,
-                area_text_changed,
-                want_add_area,
-                remove_area,
-                &block_rects,
-            );
+            apply_image_area_edits(canvas, bid, &area_drafts, &image_area_edits);
         }
 
         // `egui_wants_keyboard_input`: a focused field anywhere keeps the card still (dragging
@@ -2051,7 +2034,7 @@ fn draw_aside_slots(
             let target = if is_image_bubble {
                 // Grabbing a row block moves that area; grabbing the card body outside all blocks
                 // moves the red image rect (with every area following it).
-                match block_rects.iter().position(|block| block.contains(pos)) {
+                match image_area_edits.block_rects.iter().position(|block| block.contains(pos)) {
                     Some(idx) => AsideDragTarget::ImageAreaRect(idx),
                     None => AsideDragTarget::ImageRedRect,
                 }
@@ -2203,7 +2186,8 @@ fn draw_aside_slots(
                 .unwrap_or_default();
             for (idx, area) in areas.iter().enumerate() {
                 let color = image_area_palette(idx);
-                let block_center_y = block_rects
+                let block_center_y = image_area_edits
+                    .block_rects
                     .get(idx)
                     .map_or(response.rect.center().y, |block| block.center().y);
                 let target_y = block_center_y.clamp(min_target_y, max_target_y);
@@ -2565,27 +2549,41 @@ fn move_image_area_anchor_by_delta(
     area.anchor.y = (area.anchor.y + dv).clamp(rect.p1.y, rect.p2.y);
 }
 
+/// One frame's interaction outcome of the editable image bubble's row blocks, produced by
+/// `draw_editable_image_areas` and consumed by `apply_image_area_edits`.
+#[derive(Debug, Default)]
+struct ImageAreaEdits {
+    /// The "add area" button was clicked.
+    want_add: bool,
+    /// Index of the area whose remove (`✕`) button was clicked (never 0: area 0 has none).
+    remove: Option<usize>,
+    /// Some area field's text changed; the drafts must be written back.
+    text_changed: bool,
+    /// Scene rect of every drawn row block, in area order.
+    block_rects: Vec<Rect>,
+    /// One of the area fields holds keyboard focus.
+    bubble_has_focus: bool,
+    /// The user interacted with a block (edit, focus, add or remove).
+    interacted: bool,
+}
+
 /// Applies the per-frame editable image-bubble edits: text drafts, add/remove area, and the
 /// recorded row-block rects (used next frame to route card-body drags). Re-normalizes areas inside
 /// the red rect, mirrors area 0's text to the legacy fields, recomputes the side, and marks an
 /// upsert when anything changed.
-#[allow(clippy::too_many_arguments)]
 fn apply_image_area_edits(
     canvas: &mut CanvasView,
     bid: i64,
     drafts: &[(String, String, String)],
-    text_changed: bool,
-    want_add: bool,
-    remove: Option<usize>,
-    block_rects: &[Rect],
+    edits: &ImageAreaEdits,
 ) {
     let Some(bubble) = canvas.bubble_runtime.runtime_bubbles.get_mut(&bid) else {
         return;
     };
-    bubble.image_block_rects = block_rects.to_vec();
+    bubble.image_block_rects = edits.block_rects.clone();
 
     let mut text_dirty = false;
-    if text_changed {
+    if edits.text_changed {
         for (idx, (orig, desc, tr)) in drafts.iter().enumerate() {
             if let Some(area) = bubble.text_areas.get_mut(idx)
                 && (&area.original != orig || &area.description != desc || &area.translation != tr)
@@ -2599,14 +2597,14 @@ fn apply_image_area_edits(
     }
 
     let mut structure_dirty = false;
-    if let Some(idx) = remove
+    if let Some(idx) = edits.remove
         && idx > 0
         && idx < bubble.text_areas.len()
     {
         bubble.text_areas.remove(idx);
         structure_dirty = true;
     }
-    if want_add {
+    if edits.want_add {
         let new_area = default_image_text_area(bubble.rect_coords, bubble.text_areas.len());
         bubble.text_areas.push(new_area);
         structure_dirty = true;
@@ -2633,22 +2631,17 @@ fn apply_image_area_edits(
 /// Renders the editable image bubble's per-area row blocks and the "add area" button.
 ///
 /// Each block frames `Оригинал` / `Описание` / `Перевод` for one text area in that area's palette
-/// color; blocks after the first carry a remove (`✕`) button. Records each block's scene rect into
-/// `block_rects` so the caller can target links at block centers and route card-body drags.
-#[allow(clippy::too_many_arguments)]
+/// color; blocks after the first carry a remove (`✕`) button. Edits the `drafts` in place and
+/// returns the frame's outcome, including each block's scene rect so the caller can target links
+/// at block centers and route card-body drags.
 fn draw_editable_image_areas(
     canvas: &mut CanvasView,
     ui: &mut egui::Ui,
     bid: i64,
     text_width: f32,
     drafts: &mut [(String, String, String)],
-    want_add: &mut bool,
-    remove: &mut Option<usize>,
-    text_changed: &mut bool,
-    block_rects: &mut Vec<Rect>,
-    bubble_has_focus: &mut bool,
-    interacted: &mut bool,
-) {
+) -> ImageAreaEdits {
+    let mut edits = ImageAreaEdits::default();
     let field_width = (text_width - 20.0).max(24.0);
     for (idx, draft) in drafts.iter_mut().enumerate() {
         let color = image_area_palette(idx);
@@ -2666,8 +2659,8 @@ fn draw_editable_image_areas(
                         );
                         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                             if ui.small_button("✕").clicked() {
-                                *remove = Some(idx);
-                                *interacted = true;
+                                edits.remove = Some(idx);
+                                edits.interacted = true;
                             }
                         });
                     });
@@ -2700,27 +2693,28 @@ fn draw_editable_image_areas(
                 });
                 for resp in [&orig.response, &desc.response, &tr.response] {
                     if resp.changed() {
-                        *text_changed = true;
-                        *interacted = true;
+                        edits.text_changed = true;
+                        edits.interacted = true;
                         canvas.schedule_text_upsert(bid, ui.ctx().input(|i| i.time));
                     }
                     if resp.has_focus() {
                         canvas.bubble_runtime.selected_bubble = Some(bid);
-                        *bubble_has_focus = true;
-                        *interacted = true;
+                        edits.bubble_has_focus = true;
+                        edits.interacted = true;
                     }
                     if resp.lost_focus() {
                         canvas.commit_text_upsert_now(bid);
                     }
                 }
             });
-        block_rects.push(block.response.rect);
+        edits.block_rects.push(block.response.rect);
         ui.add_space(4.0);
     }
     if ui.button(t!("canvas.image_area.add_text_area_button")).clicked() {
-        *want_add = true;
-        *interacted = true;
+        edits.want_add = true;
+        edits.interacted = true;
     }
+    edits
 }
 
 /// The 8 resize handle positions (4 corners + 4 edge midpoints) of a scene rect.

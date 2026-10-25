@@ -4,6 +4,9 @@ FILE HEADER (cleaning/tools/gradient.rs)
 - Ключевые сущности:
   - `GradientFillTool`: wiring инструмента (выделение региона, UI, routing ввода/курсора).
   - `run(...)`: основной pipeline масочного заполнения из Python `ui_new/tools/gradient_fill.py`.
+  - `LabPlanes` / `LabBuffers` (borrowed / owned planar Lab of one grid), `ScanGeometry` (one
+    scanline family), `ScreenedPoissonParams` (one channel consolidation): the parameter
+    bundles of the private scanline and Poisson helpers.
 - Алгоритм:
   - Перевод RGB -> Lab.
   - По маске выбирается ROI и оценивается лучший угол тонких scanline-линий.
@@ -22,7 +25,7 @@ FILE HEADER (cleaning/tools/gradient.rs)
   - sRGB <-> CIELAB goes through the project's one conversion `ms_region_postprocess::LabTables`
     (+ `encode_srgb`); only the dithered, half-up quantization of `lab_to_rgb` is this tool's.
 */
-use super::base::{CleaningTool, RegionMaskInpaintToolBase, StrokePoint};
+use super::base::{CleaningTool, RegionMaskInpaintToolBase, RegionOverlayFrame, StrokePoint};
 use std::sync::Arc;
 use crate::input::CleaningLabels;
 use ms_input::{ContextId, InputFrame};
@@ -44,6 +47,44 @@ struct AngleBoundaryPair {
     l_out: f32,
     a_out: f32,
     b_out: f32,
+}
+
+/// Planar CIELAB of one row-major `width x height` grid: the three channels, each of length
+/// `width * height`, borrowed together so a scanline helper cannot mix channels of two grids.
+#[derive(Clone, Copy)]
+struct LabPlanes<'a> {
+    l: &'a [f32],
+    a: &'a [f32],
+    b: &'a [f32],
+    width: usize,
+    height: usize,
+}
+
+/// Owned planar CIELAB channels of one grid (the output of [`scan_fill_lines`]).
+struct LabBuffers {
+    l: Vec<f32>,
+    a: Vec<f32>,
+    b: Vec<f32>,
+}
+
+/// One family of parallel scanlines: lines at `theta_deg` degrees, `v_step` pixels apart
+/// across the lines (a step below 1 counts as 1) and sampled every `t_step` pixels along them.
+#[derive(Clone, Copy)]
+struct ScanGeometry {
+    theta_deg: f32,
+    v_step: usize,
+    t_step: f32,
+}
+
+/// Settings of one screened-Poisson channel consolidation ([`screened_poisson_refine`]): the
+/// solve region is the mask's bounding box grown by `pad` pixels, `lam_in` / `lam_out` are the
+/// data-fidelity weights inside / outside the mask, and `schedule` drives the shared SOR kernel.
+#[derive(Clone, Copy)]
+struct ScreenedPoissonParams {
+    pad: usize,
+    lam_in: f32,
+    lam_out: f32,
+    schedule: SorSchedule,
 }
 
 pub struct GradientFillTool {
@@ -154,8 +195,8 @@ impl CleaningTool for GradientFillTool {
         project: &ProjectData,
         input: &InputFrame,
     ) {
-        self.inpaint_base
-            .draw_overlay_ui(ctx, canvas, project, input, t!("cleaning.tools.gradient.overlay_title"), Self::run);
+        let window_title = t!("cleaning.tools.gradient.overlay_title");
+        self.inpaint_base.draw_overlay_ui(RegionOverlayFrame { ctx, canvas, project, input, window_title }, Self::run);
     }
 
     fn draw_cursor(
@@ -219,19 +260,9 @@ fn scanlines_parallel_lab(base_rgb: &[[u8; 3]], mask: &[bool], w: usize, h: usiz
             return;
         }
         tested[a_deg] = true;
-        let score = angle_consistency_score(
-            &l_roi,
-            &a_roi,
-            &b_roi,
-            &roi_mask,
-            rw,
-            rh,
-            a_deg as f32,
-            10.0,
-            2,
-            1.0,
-            300,
-        );
+        let roi_lab = LabPlanes { l: &l_roi, a: &a_roi, b: &b_roi, width: rw, height: rh };
+        let scan = ScanGeometry { theta_deg: a_deg as f32, v_step: 2, t_step: 1.0 };
+        let score = angle_consistency_score(roi_lab, &roi_mask, scan, 10.0, 300);
         if score > best_score {
             best_score = score;
             best_theta = a_deg as f32;
@@ -245,24 +276,11 @@ fn scanlines_parallel_lab(base_rgb: &[[u8; 3]], mask: &[bool], w: usize, h: usiz
         try_angle(ang);
     }
 
-    let mut fill_l = vec![f32::NAN; rw.saturating_mul(rh)];
-    let mut fill_a = vec![f32::NAN; rw.saturating_mul(rh)];
-    let mut fill_b = vec![f32::NAN; rw.saturating_mul(rh)];
-
-    scan_fill_lines(
-        &l_roi,
-        &a_roi,
-        &b_roi,
+    let LabBuffers { l: mut fill_l, a: mut fill_a, b: mut fill_b } = scan_fill_lines(
+        LabPlanes { l: &l_roi, a: &a_roi, b: &b_roi, width: rw, height: rh },
         &roi_mask,
-        rw,
-        rh,
-        best_theta,
-        1,
-        1.0,
+        ScanGeometry { theta_deg: best_theta, v_step: 1, t_step: 1.0 },
         DELTA_E_THRESHOLD,
-        &mut fill_l,
-        &mut fill_a,
-        &mut fill_b,
     );
 
     nearest_fill_in_mask(&mut fill_l, &roi_mask, rw, rh, 2);
@@ -279,7 +297,8 @@ fn scanlines_parallel_lab(base_rgb: &[[u8; 3]], mask: &[bool], w: usize, h: usiz
         } else {
             ring_mask(mask, w, h, 1, 4)
         };
-        return fill_constant_from_ring(base_rgb, mask, &l, &a, &b, w, h, &fallback_ring);
+        let lab = LabPlanes { l: &l, a: &a, b: &b, width: w, height: h };
+        return fill_constant_from_ring(base_rgb, mask, lab, &fallback_ring);
     }
 
     let mut l_ref = l.clone();
@@ -298,7 +317,8 @@ fn scanlines_parallel_lab(base_rgb: &[[u8; 3]], mask: &[bool], w: usize, h: usiz
         }
     }
 
-    let l_refined = screened_poisson_refine(&l_ref, &l, mask, w, h, pad + 4, 1.0, 120.0, 220, 1.95);
+    let poisson = ScreenedPoissonParams { pad: pad + 4, lam_in: 1.0, lam_out: 120.0, schedule: SorSchedule { iters: 220, omega: 1.95 } };
+    let l_refined = screened_poisson_refine(&l_ref, &l, mask, [w, h], poisson);
     let rgb_hat = lab_to_rgb(&l_refined, &a_ref, &b_ref, w, h, 0.6, Some(mask));
 
     let mut out = base_rgb.to_vec();
@@ -356,18 +376,12 @@ fn primary_angle_candidates(gx: &[f32], gy: &[f32], ring: &[bool]) -> Vec<usize>
     out
 }
 
-// All parameters are distinct pixel-buffer or layout properties; grouping would obscure rendering intent.
-#[allow(clippy::too_many_arguments)]
-fn fill_constant_from_ring(
-    base_rgb: &[[u8; 3]],
-    mask: &[bool],
-    l: &[f32],
-    a: &[f32],
-    b: &[f32],
-    w: usize,
-    h: usize,
-    ring: &[bool],
-) -> Vec<[u8; 3]> {
+/// Fallback fill: every masked pixel of `base_rgb` gets the per-channel median Lab colour of the
+/// `ring` pixels (of all unmasked pixels when the ring is empty), the L channel is then
+/// consolidated by screened Poisson. `lab` is `base_rgb` in Lab; returns `base_rgb` unchanged
+/// when there is nothing to sample.
+fn fill_constant_from_ring(base_rgb: &[[u8; 3]], mask: &[bool], lab: LabPlanes<'_>, ring: &[bool]) -> Vec<[u8; 3]> {
+    let LabPlanes { l, a, b, width: w, height: h } = lab;
     let mut l_samples = Vec::new();
     let mut a_samples = Vec::new();
     let mut b_samples = Vec::new();
@@ -406,7 +420,8 @@ fn fill_constant_from_ring(
         }
     }
 
-    let l_refined = screened_poisson_refine(&l_hat, l, mask, w, h, 12, 1.0, 120.0, 200, 1.95);
+    let poisson = ScreenedPoissonParams { pad: 12, lam_in: 1.0, lam_out: 120.0, schedule: SorSchedule { iters: 200, omega: 1.95 } };
+    let l_refined = screened_poisson_refine(&l_hat, l, mask, [w, h], poisson);
     let rgb_hat = lab_to_rgb(&l_refined, &a_hat, &b_hat, w, h, 0.6, Some(mask));
     let mut out = base_rgb.to_vec();
     for idx in 0..mask.len() {
@@ -417,22 +432,11 @@ fn fill_constant_from_ring(
     out
 }
 
-// All parameters are distinct pixel-buffer or layout properties; grouping would obscure rendering intent.
-#[allow(clippy::too_many_arguments)]
-fn angle_consistency_score(
-    l: &[f32],
-    a: &[f32],
-    b: &[f32],
-    mask: &[bool],
-    w: usize,
-    h: usize,
-    theta_deg: f32,
-    delta_e_cap: f32,
-    v_step: usize,
-    t_step: f32,
-    max_pairs: usize,
-) -> f32 {
-    let pairs = collect_boundary_pairs(l, a, b, mask, w, h, theta_deg, v_step, t_step, max_pairs);
+/// Scores how well the scanlines of `scan` bridge the mask: minus the sum of the Lab colour
+/// distances (each capped at `delta_e_cap`) across at most `max_pairs` boundary pairs, plus a
+/// small bonus per pair. `-1e9` when no line crosses the mask cleanly.
+fn angle_consistency_score(lab: LabPlanes<'_>, mask: &[bool], scan: ScanGeometry, delta_e_cap: f32, max_pairs: usize) -> f32 {
+    let pairs = collect_boundary_pairs(lab, mask, scan, max_pairs);
     if pairs.is_empty() {
         return -1e9;
     }
@@ -447,20 +451,12 @@ fn angle_consistency_score(
     score + 0.25 * pairs.len() as f32
 }
 
-// All parameters are distinct pixel-buffer or layout properties; grouping would obscure rendering intent.
-#[allow(clippy::too_many_arguments)]
-fn collect_boundary_pairs(
-    l: &[f32],
-    a: &[f32],
-    b: &[f32],
-    mask: &[bool],
-    w: usize,
-    h: usize,
-    theta_deg: f32,
-    v_step: usize,
-    t_step: f32,
-    max_pairs: usize,
-) -> Vec<AngleBoundaryPair> {
+/// Walks the scanlines of `scan` over the grid and, for each line that enters and leaves the
+/// mask, records the Lab colours one pixel before the entry and one pixel after the exit (both
+/// unmasked). Stops after `max_pairs` pairs.
+fn collect_boundary_pairs(lab: LabPlanes<'_>, mask: &[bool], scan: ScanGeometry, max_pairs: usize) -> Vec<AngleBoundaryPair> {
+    let LabPlanes { l, a, b, width: w, height: h } = lab;
+    let ScanGeometry { theta_deg, v_step, t_step } = scan;
     let theta = theta_deg.to_radians();
     let c = theta.cos();
     let s = theta.sin();
@@ -570,22 +566,15 @@ fn collect_boundary_pairs(
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-fn scan_fill_lines(
-    l: &[f32],
-    a: &[f32],
-    b: &[f32],
-    mask: &[bool],
-    w: usize,
-    h: usize,
-    theta_deg: f32,
-    v_step: usize,
-    t_step: f32,
-    delta_e_thr: f32,
-    out_l: &mut [f32],
-    out_a: &mut [f32],
-    out_b: &mut [f32],
-) {
+/// Fills the masked span of every scanline of `scan` from its two unmasked ends: the ends'
+/// mean when their Lab distance is at most `delta_e_thr`, else a smoothstep blend between them.
+/// Returns the filled channels; a pixel no line filled is NaN.
+fn scan_fill_lines(lab: LabPlanes<'_>, mask: &[bool], scan: ScanGeometry, delta_e_thr: f32) -> LabBuffers {
+    let LabPlanes { l, a, b, width: w, height: h } = lab;
+    let ScanGeometry { theta_deg, v_step, t_step } = scan;
+    let mut out_l = vec![f32::NAN; w.saturating_mul(h)];
+    let mut out_a = vec![f32::NAN; w.saturating_mul(h)];
+    let mut out_b = vec![f32::NAN; w.saturating_mul(h)];
     let theta = theta_deg.to_radians();
     let c = theta.cos();
     let s = theta.sin();
@@ -686,6 +675,7 @@ fn scan_fill_lines(
 
         v += v_step.max(1) as f32;
     }
+    LabBuffers { l: out_l, a: out_a, b: out_b }
 }
 
 fn nearest_fill_in_mask(arr: &mut [f32], mask: &[bool], w: usize, h: usize, passes: usize) {
@@ -741,19 +731,18 @@ fn nearest_fill_in_mask(arr: &mut [f32], mask: &[bool], w: usize, h: usize, pass
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Screened-Poisson consolidation of one channel of a row-major `[width, height]` grid:
+/// solves for a smooth field pinned to `channel_pred` inside the mask and to `channel_orig`
+/// outside it, within the region `params` describes, through the shared SOR kernel. Returns
+/// `channel_pred` with the solved region written back (unchanged when the mask is empty).
 fn screened_poisson_refine(
     channel_pred: &[f32],
     channel_orig: &[f32],
     mask: &[bool],
-    w: usize,
-    h: usize,
-    pad: usize,
-    lam_in: f32,
-    lam_out: f32,
-    iters: usize,
-    omega: f32,
+    [w, h]: [usize; 2],
+    params: ScreenedPoissonParams,
 ) -> Vec<f32> {
+    let ScreenedPoissonParams { pad, lam_in, lam_out, schedule } = params;
     let Some((x0, x1, y0, y1)) = mask_bbox(mask, w, h) else {
         return channel_pred.to_vec();
     };
@@ -795,7 +784,7 @@ fn screened_poisson_refine(
 
     if rw >= 3 && rh >= 3 {
         let problem = SorProblem { u0: &u0, lam: &lam, denom: &denom, width: rw, height: rh };
-        red_black_sor_sweeps(&mut u, &problem, SorSchedule { iters, omega });
+        red_black_sor_sweeps(&mut u, &problem, schedule);
     }
 
     let mut out = channel_pred.to_vec();
@@ -1229,5 +1218,23 @@ mod tests {
         let identity = plain.iter().zip(&cube).filter(|(x, y)| x == y).count();
         let observed = (identity, fnv1a64(&plain.concat()), fnv1a64(&dithered.concat()));
         assert_eq!(observed, (729, 7_310_844_075_801_908_823, 11_622_179_329_196_392_038), "observed={observed:?}");
+    }
+
+    /// characterization (parameter-struct refactor): the constant-from-ring fallback, which the
+    /// whole-fill fixtures never reach, on the first fixture's ramp with a ring around its mask.
+    /// The fingerprint was OBSERVED before the Lab planes became one struct; it must stay
+    /// byte-identical.
+    #[test]
+    fn characterization_fill_constant_from_ring() {
+        let (w, h) = (29usize, 21usize);
+        let (image, mask_image) = characterization_fill_fixture(w, h, 0x5eed_0001);
+        let base_rgb = image.pixels.iter().map(|px| [px.r(), px.g(), px.b()]).collect::<Vec<_>>();
+        let mask = mask_image.pixels.iter().map(|px| px.a() > 127).collect::<Vec<_>>();
+        let ring = ring_mask(&mask, w, h, 1, 3);
+        let (l, a, b) = rgb_to_lab(&base_rgb);
+        let out = fill_constant_from_ring(&base_rgb, &mask, LabPlanes { l: &l, a: &a, b: &b, width: w, height: h }, &ring);
+        let changed = out.iter().zip(&base_rgb).filter(|(x, y)| x != y).count();
+        let observed = (changed, fnv1a64(&out.concat()));
+        assert_eq!(observed, (111, 4_430_390_945_410_059_422), "observed={observed:?}");
     }
 }

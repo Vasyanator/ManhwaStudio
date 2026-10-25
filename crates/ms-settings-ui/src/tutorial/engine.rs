@@ -36,6 +36,7 @@ Key structures:
 - `TutorialRegistry` — per-frame map of `&'static str` key -> `Rect`.
 - `TutorialStep` — target key(s) + title + body for one step.
 - `Tutorial` — ordered step list, current index, active flag, hole padding.
+- `CalloutContent` — per-frame snapshot of what the current step's callout box shows.
 
 Key functions:
 - `Tutorial::render` — draws the whole overlay and advances on button clicks.
@@ -332,6 +333,27 @@ enum NextButton {
     Waiting,
     /// Not shown at all (the step uses choice buttons instead).
     Hidden,
+}
+
+/// Everything one step's callout box shows, snapshotted from the step each frame.
+#[derive(Debug)]
+struct CalloutContent<'a> {
+    /// Bold heading line.
+    title: &'a str,
+    /// Step description.
+    body: &'a str,
+    /// Progress line ("2 / 5" or "step N"), shown on its own row.
+    counter: &'a str,
+    /// Branch buttons; when non-empty they replace the navigation row.
+    choices: &'a [(String, StepNext)],
+    /// State of the "Далее" button in the navigation row.
+    next_button: NextButton,
+    /// Advancing ends the tutorial ("Готово" instead of "Далее").
+    terminal: bool,
+    /// Whether the "Назад" button is offered.
+    show_back: bool,
+    /// Opaque fill replacing the themed popup fill, if the surface asks for one.
+    tint: Option<Color32>,
 }
 
 /// The zone of the viewport (relative to its centre) that the highlight sits in.
@@ -651,19 +673,17 @@ impl<C> Tutorial<C> {
         };
 
         // 3. Callout box (interactive, above the dim). Returns any button action.
-        let (callout_rect, action) = Self::show_callout(
-            ctx,
-            content,
-            callout_pos,
-            &title,
-            &body,
-            &counter,
-            &choices,
+        let callout = CalloutContent {
+            title: &title,
+            body: &body,
+            counter: &counter,
+            choices: &choices,
             next_button,
             terminal,
             show_back,
-            self.callout_tint,
-        );
+            tint: self.callout_tint,
+        };
+        let (callout_rect, action) = Self::show_callout(ctx, content, callout_pos, &callout);
         self.last_callout_size = callout_rect.size();
 
         // 4. Decoration on top of everything: dashed outline + the fixed arrow.
@@ -735,23 +755,14 @@ impl<C> Tutorial<C> {
             });
     }
 
-    /// Show the callout box at `pos` (top-left) and return its final rect plus any
-    /// button action. Width is fixed so anchoring against the arrow is stable.
-    #[allow(clippy::too_many_arguments)]
-    // Kept flat on purpose: bundling these small primitives into a struct would
-    // add indirection without clarifying this single call site.
+    /// Show the callout box at `pos` (top-left), clipped to the safe `content` rect, and
+    /// return its final rect plus any button action. Width is fixed so anchoring against
+    /// the arrow is stable.
     fn show_callout(
         ctx: &Context,
         content: Rect,
         pos: Pos2,
-        title: &str,
-        body: &str,
-        counter: &str,
-        choices: &[(String, StepNext)],
-        next_button: NextButton,
-        terminal: bool,
-        show_back: bool,
-        callout_tint: Option<Color32>,
+        callout: &CalloutContent<'_>,
     ) -> (Rect, Option<CalloutAction>) {
         // constrain(false): keep the exact position so the arrow enters/leaves at
         // the computed anchor. Placement is biased toward the centre, so the box
@@ -768,7 +779,7 @@ impl<C> Tutorial<C> {
                 // fill when a surface asks for an opaque tint (readability under a
                 // light dim).
                 let mut frame = egui::Frame::popup(ui.style());
-                if let Some(tint) = callout_tint {
+                if let Some(tint) = callout.tint {
                     frame = frame.fill(tint);
                 }
                 frame
@@ -785,9 +796,9 @@ impl<C> Tutorial<C> {
                         widgets.active.weak_bg_fill = CALLOUT_BTN_ACTIVE_FILL;
                         widgets.active.expansion = CALLOUT_BTN_EXPANSION;
                         let mut action = None;
-                        ui.strong(title);
+                        ui.strong(callout.title);
                         ui.add_space(6.0);
-                        ui.label(body);
+                        ui.label(callout.body);
                         ui.add_space(10.0);
                         ui.separator();
                         ui.add_space(4.0);
@@ -795,12 +806,18 @@ impl<C> Tutorial<C> {
                         // 3-button footer (Пропустить/Назад/Готово) can grow left
                         // past a same-line counter and overlap it, so the two
                         // never share a row.
-                        ui.weak(counter);
+                        ui.weak(callout.counter);
                         ui.add_space(2.0);
-                        if choices.is_empty() {
-                            Self::show_nav_row(ui, next_button, terminal, show_back, &mut action);
+                        if callout.choices.is_empty() {
+                            Self::show_nav_row(
+                                ui,
+                                callout.next_button,
+                                callout.terminal,
+                                callout.show_back,
+                                &mut action,
+                            );
                         } else {
-                            Self::show_choice_buttons(ui, choices, &mut action);
+                            Self::show_choice_buttons(ui, callout.choices, &mut action);
                         }
                         action
                     })

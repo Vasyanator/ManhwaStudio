@@ -47,7 +47,7 @@ use crate::ocr::{OcrEngine, OcrLoadState};
 use crate::panels::bubbles::{BubblesPanelContext, draw_bubbles_panel};
 use crate::panels::composition::draw_composition_panel;
 use crate::panels::machine_translation::{MtPanelRun, MtTransportPanel, draw_machine_translation_panel};
-use crate::panels::ocr::{OcrPanelModelView, OcrPanelNeurolate, OcrSelectionHints, draw_ocr_panel};
+use crate::panels::ocr::{OcrPanelModelView, OcrPanelNeurolate, OcrPanelStatus, OcrSelectionHints, draw_ocr_panel};
 use crate::panels::text_detector::{
     TextDetectorAlgorithm, TextDetectorNeurolate, TextDetectorPanelView, draw_text_detector_panel,
 };
@@ -496,19 +496,22 @@ impl TranslationTabState {
         let backend_unavailable = requires_backend && self.ai_backend_unavailable();
         let quick_selection_active = self.ocr_quick_selection_mode_active();
         let advanced_selection_active = self.ocr_advanced_selection_mode_active();
+        let ocr_state = self.ocr_state_for_engine(self.ocr_panel_options.engine);
         let actions = draw_ocr_panel(
             ui,
-            self.ocr_state_for_engine(self.ocr_panel_options.engine),
             &mut self.ocr_panel_options,
-            self.ocr_controller.last_error(),
-            self.ocr_controller.last_result(),
+            OcrPanelStatus {
+                state: ocr_state,
+                last_error: self.ocr_controller.last_error(),
+                last_result: self.ocr_controller.last_result(),
+                generation: &self.ocr_controller.generation_snapshot(),
+            },
             OcrSelectionHints {
                 quick_binding: &self.input_labels.quick_rect,
                 quick_active: quick_selection_active,
                 advanced_binding: &self.input_labels.advanced_rect,
                 advanced_active: advanced_selection_active,
             },
-            &self.ocr_controller.generation_snapshot(),
             OcrPanelModelView {
                 korean_source,
                 source_lang: &self.mt_panel_options.source_lang,

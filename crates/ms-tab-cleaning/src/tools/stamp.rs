@@ -53,6 +53,7 @@ use super::base::{
 };
 use crate::input::{self, CleaningLabels};
 use ms_canvas::{CanvasView, OverlayRectPx};
+use ms_tools::LineSegmentPx;
 use ms_input::{ActionId, ContextId, InputFrame};
 use ms_models::SessionCapabilities;
 use ms_project::ProjectData;
@@ -719,29 +720,25 @@ impl StampTool {
         };
         let radius = self.brush_base.radius_px().max(1);
 
+        let segment = LineSegmentPx { x0: x0 as i32, y0: y0 as i32, x1: x1 as i32, y1: y1 as i32 };
+        let hardness = self.brush_base.hardness();
+
         let mut dirty_overlay: Option<OverlayRectPx> = None;
         if let Some(scratch) = self.scratch.as_mut() {
+            let target = StampPaintTarget {
+                dst: &mut scratch.image,
+                base: &scratch.base_image,
+                mask: &mut scratch.mask,
+                overlay_rect: scratch.overlay_rect,
+            };
             if self.active_erase {
-                erase_stamp_segment_on_image(
-                    &mut scratch.image,
-                    &scratch.base_image,
-                    &mut scratch.mask,
-                    scratch.overlay_rect,
-                    x0 as i32,
-                    y0 as i32,
-                    x1 as i32,
-                    y1 as i32,
-                    radius as i32,
-                    self.brush_base.hardness(),
-                );
+                erase_stamp_segment_on_image(target, segment, radius as i32, hardness);
             } else if self.mode == StampMode::AltVersion {
                 let Some(source) = self.active_source.as_ref() else {
                     return;
                 };
                 stamp_segment_on_image(
-                    &mut scratch.image,
-                    &scratch.base_image,
-                    &mut scratch.mask,
+                    target,
                     &StampSourceContext {
                         source: Some(source),
                         overlay: None,
@@ -752,13 +749,9 @@ impl StampTool {
                         rotation_degrees: 0.0,
                         y_offset: self.y_offset,
                     },
-                    scratch.overlay_rect,
-                    x0 as i32,
-                    y0 as i32,
-                    x1 as i32,
-                    y1 as i32,
+                    segment,
                     radius as i32,
-                    self.brush_base.hardness(),
+                    hardness,
                 );
             } else {
                 let Some(anchor) = self.source_anchor else {
@@ -769,9 +762,7 @@ impl StampTool {
                     return;
                 };
                 stamp_segment_on_image(
-                    &mut scratch.image,
-                    &scratch.base_image,
-                    &mut scratch.mask,
+                    target,
                     &StampSourceContext {
                         source: self.active_source.as_ref(),
                         overlay: canvas.overlay_image(to.page_idx),
@@ -782,13 +773,9 @@ impl StampTool {
                         rotation_degrees: self.rotation_degrees,
                         y_offset: 0,
                     },
-                    scratch.overlay_rect,
-                    x0 as i32,
-                    y0 as i32,
-                    x1 as i32,
-                    y1 as i32,
+                    segment,
                     radius as i32,
-                    self.brush_base.hardness(),
+                    hardness,
                 );
             }
             scratch.texture_dirty = true;
@@ -1764,6 +1751,10 @@ struct StampSourceContext<'a> {
     y_offset: i32,
 }
 
+/// The scratch a stamp dab paints into: `dst` (the scratch pixels) over `base` (the overlay
+/// before the stroke), the per-pixel dab strength `mask` (same length as `dst`), and
+/// `overlay_rect`, where the scratch sits in overlay pixels. A dab that finds the three buffers
+/// of different sizes paints nothing.
 struct StampPaintTarget<'a> {
     dst: &'a mut egui::ColorImage,
     base: &'a egui::ColorImage,
@@ -1771,21 +1762,24 @@ struct StampPaintTarget<'a> {
     overlay_rect: OverlayRectPx,
 }
 
-// All parameters are independent brush stroke properties; grouping would obscure painting intent.
-#[allow(clippy::too_many_arguments)]
+impl StampPaintTarget<'_> {
+    /// A shorter-lived target over the same buffers, so one target serves every dab of a segment.
+    fn reborrow(&mut self) -> StampPaintTarget<'_> {
+        StampPaintTarget { dst: &mut *self.dst, base: self.base, mask: &mut *self.mask, overlay_rect: self.overlay_rect }
+    }
+}
+
+/// Stamps dabs of `radius` overlay pixels and `hardness` (`0..=1`) along `segment` (overlay
+/// pixel coordinates) into `target`, sampling `source`; the dab spacing is
+/// `STAMP_SPACING_FACTOR` of the radius. A non-positive radius paints nothing.
 fn stamp_segment_on_image(
-    dst: &mut egui::ColorImage,
-    base: &egui::ColorImage,
-    mask: &mut [f32],
+    mut target: StampPaintTarget<'_>,
     source: &StampSourceContext<'_>,
-    dst_overlay_rect: OverlayRectPx,
-    x0: i32,
-    y0: i32,
-    x1: i32,
-    y1: i32,
+    segment: LineSegmentPx,
     radius: i32,
     hardness: f32,
 ) {
+    let LineSegmentPx { x0, y0, x1, y1 } = segment;
     if radius <= 0 {
         return;
     }
@@ -1798,13 +1792,7 @@ fn stamp_segment_on_image(
         let t = i as f32 / steps as f32;
         let cx = (x0 as f32 + dx * t).round() as i32;
         let cy = (y0 as f32 + dy * t).round() as i32;
-        let target = StampPaintTarget {
-            dst,
-            base,
-            mask,
-            overlay_rect: dst_overlay_rect,
-        };
-        stamp_circle_to_image(target, source, [cx, cy], radius, hardness);
+        stamp_circle_to_image(target.reborrow(), source, [cx, cy], radius, hardness);
     }
 }
 
@@ -1923,20 +1911,11 @@ fn stamp_circle_to_image(
     }
 }
 
-// All parameters mirror stamp_segment_on_image but this path only changes alpha.
-#[allow(clippy::too_many_arguments)]
-fn erase_stamp_segment_on_image(
-    dst: &mut egui::ColorImage,
-    base: &egui::ColorImage,
-    mask: &mut [f32],
-    dst_overlay_rect: OverlayRectPx,
-    x0: i32,
-    y0: i32,
-    x1: i32,
-    y1: i32,
-    radius: i32,
-    hardness: f32,
-) {
+/// The erase twin of [`stamp_segment_on_image`]: the same dab walk along `segment`, but each
+/// dab writes the `target.base` pixel with its alpha lowered by the dab strength (erasing
+/// toward transparent), sampling no source.
+fn erase_stamp_segment_on_image(mut target: StampPaintTarget<'_>, segment: LineSegmentPx, radius: i32, hardness: f32) {
+    let LineSegmentPx { x0, y0, x1, y1 } = segment;
     if radius <= 0 {
         return;
     }
@@ -1949,13 +1928,7 @@ fn erase_stamp_segment_on_image(
         let t = i as f32 / steps as f32;
         let cx = (x0 as f32 + dx * t).round() as i32;
         let cy = (y0 as f32 + dy * t).round() as i32;
-        let target = StampPaintTarget {
-            dst,
-            base,
-            mask,
-            overlay_rect: dst_overlay_rect,
-        };
-        erase_stamp_circle_to_image(target, [cx, cy], radius, hardness);
+        erase_stamp_circle_to_image(target.reborrow(), [cx, cy], radius, hardness);
     }
 }
 
@@ -2573,5 +2546,54 @@ mod tests {
         tool.set_mode(StampMode::AltVersion);
         tool.set_session_capabilities(SessionCapabilities::IMAGE_SET);
         assert_eq!(tool.mode, StampMode::CurrentImage);
+    }
+
+    /// FNV-1a over `bytes`, the fingerprint of the segment characterization below.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3))
+    }
+
+    /// characterization (parameter-struct refactor): one alt-version stamp segment and one erase
+    /// segment over a partly clipped overlay rect, pinned by FNV-1a fingerprints of the scratch
+    /// pixels and the mask bits. The values were OBSERVED before the segment functions took a
+    /// paint target and a segment struct; they must stay byte-identical.
+    #[test]
+    fn characterization_stamp_and_erase_segments() {
+        let (w, h) = (24usize, 18usize);
+        let rect = OverlayRectPx { x: 3, y: 2, w, h };
+        let mut base = egui::ColorImage::filled([w, h], Color32::TRANSPARENT);
+        for (i, px) in base.pixels.iter_mut().enumerate() {
+            let v = u8::try_from(i % 251).unwrap_or(0);
+            *px = Color32::from_rgba_unmultiplied(v, 255 - v, v / 2, if i % 3 == 0 { 0 } else { 200 });
+        }
+        let source = Arc::new(RgbaImage::from_fn(40, 30, |x, y| {
+            let v = u8::try_from((x * 7 + y * 5) % 256).unwrap_or(0);
+            image::Rgba([v, 90, 255 - v, if (x + y) % 4 == 0 { 0 } else { 230 }])
+        }));
+        let context = StampSourceContext {
+            source: Some(&source),
+            overlay: None,
+            mode: StampMode::AltVersion,
+            current_source: CurrentImageStampSource::OriginalOnly,
+            source_anchor: None,
+            stroke_origin_overlay: None,
+            rotation_degrees: 0.0,
+            y_offset: 2,
+        };
+        let mut dst = base.clone();
+        let mut mask = vec![0.0f32; w * h];
+        let target = StampPaintTarget { dst: &mut dst, base: &base, mask: &mut mask, overlay_rect: rect };
+        stamp_segment_on_image(target, &context, LineSegmentPx { x0: 1, y0: 5, x1: 25, y1: 14 }, 4, 0.5);
+        let stamped = (
+            fnv1a64(&dst.pixels.iter().flat_map(|px| px.to_array()).collect::<Vec<_>>()),
+            fnv1a64(&mask.iter().flat_map(|m| m.to_bits().to_le_bytes()).collect::<Vec<_>>()),
+        );
+        let target = StampPaintTarget { dst: &mut dst, base: &base, mask: &mut mask, overlay_rect: rect };
+        erase_stamp_segment_on_image(target, LineSegmentPx { x0: 10, y0: 3, x1: 12, y1: 22 }, 3, 0.8);
+        let erased = (
+            fnv1a64(&dst.pixels.iter().flat_map(|px| px.to_array()).collect::<Vec<_>>()),
+            fnv1a64(&mask.iter().flat_map(|m| m.to_bits().to_le_bytes()).collect::<Vec<_>>()),
+        );
+        assert_eq!((stamped, erased), ((10_510_345_150_799_113_660, 15_132_775_699_886_058_089), (407_016_160_630_252_422, 6_958_960_420_722_940_184)), "observed={:?}", (stamped, erased));
     }
 }

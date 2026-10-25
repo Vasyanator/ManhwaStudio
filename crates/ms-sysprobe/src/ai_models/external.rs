@@ -654,7 +654,8 @@ impl FileJob<'_> {
         match file.origin {
             FileOrigin::Direct => {
                 let part = part_path(self.staging, file);
-                self.fetch_verified_into(index, file, url, &part, &final_path, Expected::SizeSha256 { size: file.size, sha256: file.sha256 }, file.sha256)
+                let request = FileRequest { url, part: &part, dest: &final_path, expected: Expected::SizeSha256 { size: file.size, sha256: file.sha256 } };
+                self.fetch_verified_into(index, file, &request, file.sha256)
             }
             FileOrigin::ZipMember { archive, archive_size, archive_sha256, member } => {
                 self.fetch_member(index, file, url, &final_path, ZipPin { archive, archive_size, archive_sha256, member })
@@ -687,15 +688,8 @@ impl FileJob<'_> {
             ));
         }
         let part = part_path(self.staging, file);
-        self.fetch_verified_into(
-            index,
-            file,
-            url,
-            &part,
-            &staged_archive,
-            Expected::SizeSha256 { size: pin.archive_size, sha256: pin.archive_sha256 },
-            pin.archive_sha256,
-        )?;
+        let request = FileRequest { url, part: &part, dest: &staged_archive, expected: Expected::SizeSha256 { size: pin.archive_size, sha256: pin.archive_sha256 } };
+        self.fetch_verified_into(index, file, &request, pin.archive_sha256)?;
         self.report(index, file, ExternalDownloadPhase::Verifying, 0);
         zip_member_atomic(&staged_archive, pin.member, final_path, Expected::SizeSha256 { size: file.size, sha256: file.sha256 })
             .map_err(|error| map_download_error(self.spec, file, file.sha256, error))?;
@@ -703,24 +697,13 @@ impl FileJob<'_> {
         remove_file_if_exists(&staged_archive)
     }
 
-    /// One `fetch_verified` of `url` into `dest` through `part`, with its events mapped onto
-    /// [`ExternalDownloadProgress`] and its errors onto [`ExternalModelError`] (`pin_sha256`
-    /// is the pin a `HashMismatch` names).
-    #[expect(clippy::too_many_arguments, reason = "the request fields stay explicit at the two call sites; bundling them would only rename them")]
-    fn fetch_verified_into(
-        &mut self,
-        index: usize,
-        file: &'static ExternalFile,
-        url: &str,
-        part: &Path,
-        dest: &Path,
-        expected: Expected<'_>,
-        pin_sha256: &'static str,
-    ) -> Result<(), ExternalModelError> {
+    /// One `fetch_verified` of `request` (catalog file `file`, the `index`-th of the spec), with
+    /// its events mapped onto [`ExternalDownloadProgress`] and its errors onto
+    /// [`ExternalModelError`] (`pin_sha256` is the pin a `HashMismatch` names).
+    fn fetch_verified_into(&mut self, index: usize, file: &'static ExternalFile, request: &FileRequest<'_>, pin_sha256: &'static str) -> Result<(), ExternalModelError> {
         let log_context = format!("id={} file={}", self.spec.id, file.path);
         let engine = ResumableFetch { fetcher: self.fetcher, retry: self.retry, cancel: self.cancel, log_tag: LOG_TAG, log_context: &log_context };
-        let request = FileRequest { url, part, dest, expected };
-        let result = fetch_verified(&engine, &request, &mut |event| match event {
+        let result = fetch_verified(&engine, request, &mut |event| match event {
             FileEvent::Waiting => self.report(index, file, ExternalDownloadPhase::Downloading, 0),
             FileEvent::Verifying { done, .. } => self.report(index, file, ExternalDownloadPhase::Verifying, done),
             FileEvent::Stream(StreamEvent::Downloading { staged, .. }) => self.report(index, file, ExternalDownloadPhase::Downloading, staged),
