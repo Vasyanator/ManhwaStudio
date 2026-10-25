@@ -10,6 +10,9 @@ edition = "2024"
 # through the `ms-storage` seam and is JSON-only. It receives paths from its callers and
 # must never depend on `ms-config` (which sits ABOVE it).
 [dependencies]
+# The atomic write recipe (temp + fsync + rename, temp naming, step journal), owned there and
+# re-exported from the crate root unchanged.
+ms-atomic-file = { path = "../ms-atomic-file" }
 # Write-failure diagnostics (`ms_log::runtime_log::log_error`).
 ms-log = { path = "../ms-log" }
 # On wasm32 every file operation goes through the process-wide backend
@@ -41,10 +44,13 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 [features]
 # Exposes the atomic-write step journal (`recorded_steps`, `WriteStep`) and the fault
-# injector (`arm_fault`, `FaultPoint`) to DEPENDENT crates' tests. A `#[cfg(test)]` item is
-# invisible outside its own crate. Enable it from `[dev-dependencies]` only.
-test-support = []
+# injector (`arm_fault`, `FaultPoint`) of `ms-atomic-file` to DEPENDENT crates' tests,
+# re-exported from this crate's root. A `#[cfg(test)]` item is invisible outside its own
+# crate. Enable it from `[dev-dependencies]` only.
+test-support = ["ms-atomic-file/test-support"]
 
 [dev-dependencies]
+# This crate's own tests use the re-exported journal and fault injector.
+ms-atomic-file = { path = "../ms-atomic-file", features = ["test-support"] }
 # Isolated on-disk fixtures: every test works inside its own temp directory.
 tempfile.workspace = true

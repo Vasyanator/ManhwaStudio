@@ -25,11 +25,11 @@ Key functions:
 - convert_document / convert_many / chapter_format_report (convert.rs, re-exported)
 - is_temp_artifact (skip crash-leftover temp files when copying document trees)
 - write_bytes_atomic (native: the atomic write recipe for non-document files, e.g. a
-  user image saved in place; json.rs, re-exported)
+  user image saved in place; `ms_atomic_file::write_atomic`, re-exported)
 
 Notes:
-- Two formats: `<stem>.json` (JSON codec, json.rs) and `<stem>.db` (SQLite fragment codec,
-  split.rs + sqlite.rs + whole.rs; native only — `Db` is `Unsupported` on wasm32). Every
+- Two formats: `<stem>.json` (JSON codec: `ms-atomic-file` writes, json.rs conflict
+  vocabulary) and `<stem>.db` (SQLite fragment codec, split.rs + sqlite.rs + whole.rs; native only — `Db` is `Unsupported` on wasm32). Every
   operation resolves the document's format first (resolve.rs) and dispatches (codec.rs).
 - Every write is serialized per document by a process-local, NON-reentrant lock
   (lock.rs). Cross-process: `.db` writes are `BEGIN IMMEDIATE` transactions (safe with the
@@ -37,8 +37,8 @@ Notes:
   optimistic check for documents that need it.
 - A MALFORMED document is never overwritten by `update`: it fails with `Malformed` and the
   file is left untouched. Plain `write_value` replaces whatever is there by design.
-- Native: reads, stats and writes all address the real `Path` through `std::fs` (fsio.rs,
-  json.rs: atomic temp + rename). wasm32: everything goes through
+- Native: reads, stats and writes all address the real `Path` through `std::fs` (fsio.rs;
+  writes: `ms-atomic-file`'s atomic temp + rename). wasm32: everything goes through
   `ms_storage::global::storage()`; a write there is a plain seam `write`.
 */
 
@@ -71,11 +71,16 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-pub use json::{AtomicWriteError, Durability, FaultPoint, Fingerprint, SaveBaseline, WriteStep, fingerprint, is_temp_artifact, temp_path_for};
+pub use json::{Fingerprint, SaveBaseline, fingerprint};
+/// The atomic write recipe is owned by `ms-atomic-file`; re-exported so the store's public
+/// vocabulary (and its dependents' imports) stays one surface.
+pub use ms_atomic_file::{AtomicWriteError, Durability, FaultPoint, WriteStep, is_temp_artifact, temp_path_for};
+/// `ms_atomic_file::write_atomic` under the store's historical name: the atomic write recipe
+/// for files that are NOT owned documents (parent must exist, identical bytes not rewritten).
 #[cfg(not(target_arch = "wasm32"))]
-pub use json::write_bytes_atomic;
+pub use ms_atomic_file::write_atomic as write_bytes_atomic;
 #[cfg(any(test, feature = "test-support"))]
-pub use json::{arm_fault, recorded_steps};
+pub use ms_atomic_file::{arm_fault, recorded_steps};
 pub use convert::{BatchOutcome, ChapterFormatReport, ConvertHook, ConvertOutcome, ConvertStep, NoHook, chapter_format_report, convert_document, convert_many};
 pub use resolve::{chapter_new_format, default_format, set_default_format};
 /// The storage seam's error, carried by [`DocStoreError::Storage`]; re-exported so callers

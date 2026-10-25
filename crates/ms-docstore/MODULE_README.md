@@ -9,18 +9,19 @@ fragment store) behind one API; the Python backend mirrors the `.db` codec in th
 repo-root `docstore.py` (it touches only `user_config`).
 
 ## Architecture
-- Layer: depends on `ms-storage` (wasm seam + error vocabulary), `ms-log`, and natively
-  `rusqlite` (`bundled`). It receives paths and must NEVER depend on `ms-config`.
+- Layer: depends on `ms-atomic-file` (the atomic write recipe), `ms-storage` (wasm seam +
+  error vocabulary), `ms-log`, and natively `rusqlite` (`bundled`). It receives paths and must NEVER depend on `ms-config`.
 - Every operation resolves the document's format (`resolve.rs`) and dispatches per format
   (`codec.rs`). Reads are unlocked; mutations run under a process-local per-stem lock;
   `with_lock` resolves the format once per critical section (`LockedDoc`).
-- JSON writes: sibling temp `.{name}.{pid}.tmp` → fsync (unless `Durability::None`) →
+- JSON writes (`ms_atomic_file::write_atomic`, owned there): sibling temp `.{name}.{pid}.tmp` → fsync (unless `Durability::None`) →
   rename (Windows sharing-violation retry) → optional directory fsync. When the file
   already holds the exact bytes nothing is rewritten (no temp/rename): only the requested
   durability is applied to the existing file (`Contents` fsyncs it, `ContentsAndDirectory`
   also the directory), so an unchanged flush costs a stat + a cached read.
   `Durability::None` performs no fsync anywhere (neither temp nor directory).
-- `write_bytes_atomic(path, bytes, durability)` (native) exposes that same recipe for files
+- `write_bytes_atomic(path, bytes, durability)` (native; a re-export of
+  `ms_atomic_file::write_atomic`) exposes that same recipe for files
   that are NOT owned documents (single-image Save overwriting the user's image). Parent must
   exist (never created); the old file is never deleted first; on failure it is intact and
   the temp is removed; the rename replaces the directory entry (a symlink is replaced, not
@@ -48,8 +49,9 @@ repo-root `docstore.py` (it touches only `user_config`).
 - `src/sqlite.rs`: schema, open/pragmas, strict read, diff-write transaction, create. Native.
 - `src/whole.rs`: whole-document temp → validate → commit (rename). Native.
 - `src/convert.rs`: `convert_document` protocol, `convert_many`, `chapter_format_report`.
-- `src/json.rs`: atomic write recipe, `Fingerprint`/`SaveBaseline`/`Durability`,
-  `is_temp_artifact`, test step journal + fault injector (`test-support` feature).
+- `src/json.rs`: `Fingerprint`/`SaveBaseline`. The atomic write recipe, `Durability`,
+  `is_temp_artifact`, the step journal and fault injector are `ms-atomic-file`'s, re-exported
+  from `lib.rs` (`test-support` forwards to that crate's feature).
 - `src/fsio.rs`: exists/read/metadata/remove/rename/copy (`std::fs` native, seam on wasm).
 - `src/lock.rs`: per-stem lock registry (normalized keys, poison recovery, pruning).
 - `src/tests.rs`, `src/tests_db.rs`: contract tests; `fixtures/`: golden cases shared with
@@ -118,16 +120,14 @@ repo-root `docstore.py` (it touches only `user_config`).
   are logged here (not `DirSync`, which the caller logs).
 
 ## Known debt
-Three private copies of the atomic-write recipe exist outside this crate and do not use
-`write_bytes_atomic`: `ms-page-ops/src/fs_exec.rs::atomic_write` (also creates the parent and
-deletes a stale destination before retrying the rename), `ms-tab-cleaning/src/tools/
-watermark_library.rs::write_atomic_bytes` (creates the parent, no Windows retry), `ms-config/src/locale_store.rs::write_atomic`
-(no fsync, no Windows retry; ms-config is above ms-docstore, so it could call it). Fold them
-into `write_bytes_atomic` when their owners are next touched, after checking each one's
-differing semantics.
+Private copies of the atomic-write recipe still exist outside `ms-atomic-file` (e.g.
+`ms-page-ops/src/fs_exec.rs::atomic_write`, `ms-tab-cleaning/src/tools/
+watermark_library.rs::write_atomic_bytes`, `ms-config/src/locale_store.rs::write_atomic`);
+they migrate to `ms_atomic_file::write_atomic_with`, whose options cover their differing
+semantics (parent creation, unix mode, unique temp).
 
 ## Editing map
 - Schema / split rule: `split.rs` + `sqlite.rs` + `docstore.py` + `fixtures/` TOGETHER.
 - Resolution rules: `resolve.rs`. Conversion protocol: `convert.rs` + `whole.rs`.
-- JSON write recipe / durability: `json.rs`. Lock semantics: `lock.rs`.
+- JSON write recipe / durability: `crates/ms-atomic-file`. Conflict vocabulary: `json.rs`. Lock semantics: `lock.rs`.
 - New document kind: `DocKind` variant + `DocKind::as_str` (frozen spelling).

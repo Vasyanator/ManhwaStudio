@@ -108,7 +108,9 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   backend returns raw FLUX klein output and never post-processes),
   sRGB <-> CIELAB conversion (`ms_region_postprocess::LabTables` + `encode_srgb`; a caller may own
   only its quantization), the ordered preset writer thread and free default-name allocator
-  (`ms_config::preset_store`), SOR
+  (`ms_config::preset_store`), atomic replacement of a file's contents and its temp names
+  (`ms_atomic_file::write_atomic` / `write_atomic_with`; publishing an already-staged file uses its
+  `rename_with_retry` + `sync_directory`; no private temp+rename copy), SOR
   kernel (`ms_tools::red_black_sor_sweeps`), pixel-inspection threshold and grid
   (`ms_canvas::pixel_inspection_recommended_for`, `pixel_grid::draw_pixel_grid`), page <-> clean
   binding (`ms_page_ops::clean_binding` + `ms_models::clean_assign`), text-detection scale and

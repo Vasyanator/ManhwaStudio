@@ -3480,6 +3480,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-atomic-file"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ms-backend-ipc"
 version = "0.1.0"
 dependencies = [
@@ -3588,6 +3596,7 @@ dependencies = [
 name = "ms-docstore"
 version = "0.1.0"
 dependencies = [
+ "ms-atomic-file",
  "ms-log",
  "ms-storage",
  "rusqlite",

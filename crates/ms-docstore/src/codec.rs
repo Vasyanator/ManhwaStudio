@@ -4,7 +4,7 @@ File: codec.rs
 Purpose:
 Per-format dispatch of every document operation: the public API in lib.rs resolves a
 document's format (resolve.rs) and calls in here with it. JSON is the byte-file codec
-(atomic temp + rename, json.rs); `Db` is the SQLite fragment codec (sqlite.rs, whole.rs),
+(atomic temp + rename, `ms-atomic-file`); `Db` is the SQLite fragment codec (sqlite.rs, whole.rs),
 compiled out on wasm32 where every `Db` arm is `Unsupported`.
 
 Key functions:
@@ -36,7 +36,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::json::{AtomicWriteError, Fingerprint, SaveBaseline, fingerprint};
+use crate::json::{Fingerprint, SaveBaseline, fingerprint};
+use ms_atomic_file::AtomicWriteError;
 use crate::{DocFormat, DocRef, DocStoreError, Result, Signature, Snapshot, WriteOptions, fsio, resolve};
 
 /// One read of a document, before parsing into the caller's shape.
@@ -303,7 +304,7 @@ pub(crate) fn write_bytes(path: &Path, bytes: &[u8], opts: WriteOptions) -> Resu
     {
         std::fs::create_dir_all(parent).map_err(|source| DocStoreError::Io { path: parent.to_path_buf(), source })?;
     }
-    crate::json::write_atomic(path, bytes, opts.durability)?;
+    ms_atomic_file::write_atomic(path, bytes, opts.durability)?;
     Ok(())
 }
 

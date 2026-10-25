@@ -12,7 +12,7 @@ translated (bubbles, OCR, machine translation), cleaned (clean layers, inpaintin
 (rendered text layers) and exported.
 
 - **Rust application** — a Cargo workspace: the root package `manhwastudio_rs` (`src/`: a
-  library holding the application, plus a thin binary entry) over 47 `ms-*` library crates in
+  library holding the application, plus a thin binary entry) over 48 `ms-*` library crates in
   `crates/`. Builds for Linux and Windows (mandatory), macOS, `wasm32` (web entry,
   `src/web_entry.rs`; currently inactive and not kept building, `PROJECT_RULES.md`) and, in progress, Android (`dev-docs/ANDROID_PORT.md`; the library target
   exists so that build can export `android_main`).
@@ -55,7 +55,7 @@ root package (src/: lib.rs + thin main.rs, startup/, shell/, studio.rs, tabs/set
   <- ms-config / ms-text-render
   <- ms-backend-ipc / ms-docstore / ms-download / ms-fonts / ms-memory / ms-onnx / ms-platform / ms-browser-bridge
   <- ms-log / ms-text-detect
-  <- ms-actions / ms-browser-ext / ms-custom-fonts / ms-gifs / ms-i18n / ms-raster / ms-storage / ms-text-util / ms-theme / ms-thread
+  <- ms-actions / ms-atomic-file / ms-browser-ext / ms-custom-fonts / ms-gifs / ms-i18n / ms-raster / ms-storage / ms-text-util / ms-theme / ms-thread
 ```
 
 Non-obvious edges: `ms-tools` sits ABOVE `ms-canvas`; `ms-widgets` does NOT depend on
@@ -69,6 +69,11 @@ shared wiki view). The studio never references
 
 **Foundation (levels 0-2)**
 - `ms-thread` — `std::thread` surface; Web Workers on wasm.
+- `ms-atomic-file` — the one owner of replacing a file's contents atomically: sibling temp, fsync,
+  rename (Windows sharing-violation retry), optional directory fsync, temp removed on failure;
+  options for parent creation, unix mode, identical-bytes skip, unique temp; the temp-name pattern
+  (`temp_path_for` / `is_temp_artifact`, mirrored by `docstore.py`). std + thiserror, no logging;
+  `ms-docstore` re-exports it.
 - `ms-storage` — object-safe sync `Storage` seam (desktop passthrough, sandboxed native,
   in-memory web). Raw writes are not atomic.
 - `ms-i18n` — UI localization: `t!` / `tf!` / `tp!`, embedded catalogs (en, ru, es, fr, pt);
@@ -623,7 +628,7 @@ logged error); the GUI thread only polls and applies results.
 - One owner per rule: the page <-> clean binding (`clean_binding` + `clean_assign`), Python
   lookup and spawn (`ms_sysprobe::python_manager`), semantic colours (`ms-theme`), `winit`
   (`ms-window-geometry`), OS integration records (`ms-os-integration`), glyph rendering fonts
-  (`ms-fonts` + `ms-text-render`), layer composite order / visibility / group fold
+  (`ms-fonts` + `ms-text-render`), atomic file replacement (`ms_atomic_file`), layer composite order / visibility / group fold
   (`ms_models::layer_model::ordering`, consumed by the typing canvas, the typing
   flatten/export and the PS composite, layers tree and structural order), platform
   capability decisions (`ms_platform::PlatformFeature`), file dialogs

@@ -1,0 +1,29 @@
+[package]
+name = "ms-atomic-file"
+version = "0.1.0"
+edition = "2024"
+
+# The single owner of "replace a file's contents atomically" in ManhwaStudio: sibling temp,
+# write + optional fsync, close, rename over the target (bounded retry on Windows sharing
+# violations), optional directory fsync, temp removed on every failure. Also owns the temp-name
+# pattern (`temp_path_for` / `is_temp_artifact`, mirrored by the Python `docstore.py`).
+#
+# Layer: level 0 (foundation). std plus `thiserror` only, no `ms-*` dependency, so every crate
+# — including `ms-browser-ext` (no ms-* deps) and `ms-docstore` — can use it. It compiles on
+# every target; on wasm32 std's file system is unsupported, so every write fails with
+# `io::ErrorKind::Unsupported` (callers keep their own wasm seams). A private copy of this
+# recipe elsewhere is a defect.
+[dependencies]
+# Typed public error (`AtomicWriteError`).
+thiserror.workspace = true
+
+[features]
+# Exposes the write-step journal (`recorded_steps`, `WriteStep`) and the fault injector
+# (`arm_fault`, `FaultPoint`) to DEPENDENT crates' tests (`ms-docstore` forwards it). A
+# `#[cfg(test)]` item is invisible outside its own crate. Enable it from `[dev-dependencies]`
+# only.
+test-support = []
+
+[dev-dependencies]
+# Isolated on-disk fixtures: every test works inside its own temp directory.
+tempfile.workspace = true

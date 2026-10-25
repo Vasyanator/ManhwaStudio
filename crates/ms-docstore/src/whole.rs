@@ -18,7 +18,7 @@ Key functions:
 Notes:
 - Windows: the temp is fsynced through a WRITE handle (`FlushFileBuffers` requires
   `GENERIC_WRITE`; a read-only `File::open` handle fails with ACCESS_DENIED).
-- The temp name is the atomic-write recipe's (`json::temp_path_for`), so
+- The temp name is the atomic-write recipe's (`ms_atomic_file::temp_path_for`), so
   `is_temp_artifact` recognizes it (and its `-journal`) as a crash leftover.
 - HOT-JOURNAL HAZARD: SQLite replays a `<db>-journal` into whatever file carries the `<db>`
   name. Replacing (or deleting) a `.db` therefore removes its `-journal` first; the caller
@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::json::{self, AtomicWriteError};
+use ms_atomic_file::AtomicWriteError;
 use crate::{DocFormat, DocRef, DocStoreError, Result};
 
 /// `<path>-journal`, `SQLite`'s rollback journal of the database at `path`.
@@ -64,12 +64,12 @@ pub(crate) fn write_temp(doc: &DocRef, value: &Value, format: DocFormat, create_
     {
         std::fs::create_dir_all(parent).map_err(|source| DocStoreError::Io { path: parent.to_path_buf(), source })?;
     }
-    let temp = json::temp_path_for(&target);
+    let temp = ms_atomic_file::temp_path_for(&target);
     remove_temp(&temp);
     let written = match format {
         DocFormat::Json => {
             let text = serde_json::to_string_pretty(value).map_err(|err| DocStoreError::Serialize { path: target.clone(), cause: err.to_string() })?;
-            json::write_temp_file(&temp, text.as_bytes(), true).map_err(|(kind, reason)| DocStoreError::Write(AtomicWriteError::TempWrite { path: temp.clone(), reason, kind }))
+            ms_atomic_file::write_temp_file(&temp, text.as_bytes(), true).map_err(DocStoreError::Write)
         }
         DocFormat::Db => {
             // Monotonic revision across a whole rewrite, so a revision probe sees a change.
@@ -145,12 +145,12 @@ pub(crate) fn commit_temp(doc: &DocRef, temp: &Path, format: DocFormat) -> Resul
             return Err(DocStoreError::Io { path: journal, source });
         }
     }
-    json::rename_with_retry(temp, &target).map_err(|err| {
+    ms_atomic_file::rename_with_retry(temp, &target).map_err(|err| {
         remove_temp(temp);
         DocStoreError::Write(AtomicWriteError::Rename { path: target.clone(), reason: err.to_string(), kind: err.kind() })
     })?;
     let parent = target.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    json::sync_directory(parent).map_err(|reason| DocStoreError::Write(AtomicWriteError::DirSync { dir: parent.to_path_buf(), reason }))
+    ms_atomic_file::sync_directory(parent).map_err(DocStoreError::Write)
 }
 
 /// Writes `value` as the whole `format` file of `doc`: temp, validation, atomic commit.
