@@ -3,7 +3,7 @@
 ## Purpose
 Direct ("quick") chapter downloader of the New Project launcher: it takes one chapter or series URL,
 resolves the page image URLs for the supported sites, downloads and decodes them off the GUI thread,
-and hands ribbon pages back to `window.rs`.
+and hands ribbon pages back to `window/`.
 
 ## Architecture
 Four layers, dependencies point downwards only:
@@ -18,7 +18,7 @@ sites/*.rs         one file per supported site: URL shapes, endpoints, markers, 
 http.rs  url_util.rs  html.rs  base64.rs      site-agnostic primitives
 ```
 
-`window.rs` only sees `mod.rs`. It calls `QuickDownloadController::begin_download(url)`, drains
+`window/` only sees `mod.rs`. It calls `QuickDownloadController::begin_download(url)`, drains
 `QuickDownloadEvent`s in `poll(ctx)` and calls `cancel()` when the window closes; everything below
 the controller runs on the worker thread.
 A site module never downloads images itself — it returns a `SiteDownloadPlan` (pages in reading
@@ -65,7 +65,7 @@ list with `PlannedImage::from_urls`.
   the `supported_sites_hint` locale string (see below). No other file changes.
 - **The user-visible list of supported sites is a locale string, not code.**
   `launcher.new_project.quick_dl.supported_sites_hint` is parsed by `supported_quick_download_sites()`
-  in `../window.rs` as "header line + one host per line"; keep that shape. A new site must be
+  in `../window/` as "header line + one host per line"; keep that shape. A new site must be
   appended there in all five catalogs. ⚠️ `crates/ms-config/src/locale_store.rs` only ADDS missing keys to an existing
   on-disk `locale/<tag>.json` and never overwrites a value already present, so a machine that has
   already run the app keeps the OLD hint until that file is deleted or patched — a new key reaches
@@ -98,7 +98,7 @@ list with `PlannedImage::from_urls`.
   injected, so the tests never touch the network or wait on the clock.
 - **Cancel.** Every run owns one cancel flag (`Arc<AtomicBool>`) and its own channel.
   `begin_download` cancels the run still in flight before starting the next, `cancel()` (called
-  by `window.rs` when the window closes) and dropping the controller cancel too, and the
+  by `window/` when the window closes) and dropping the controller cancel too, and the
   controller forgets the run at once, so a cancelled run's events can never reach a later
   receiver. The worker checks the flag after resolving the plan, before every page, before every
   attempt, inside the backoff wait (the injected sleep takes the flag; production
@@ -139,4 +139,4 @@ list with `PlannedImage::from_urls`.
 - To change timeouts, headers, or the web-build behavior, edit `http.rs`.
 - To change URL/HTML/base64 primitives, edit `url_util.rs` / `html.rs` / `base64.rs` and their tests.
 - To change what the launcher can call, edit the re-exports in `mod.rs` (and check
-  `../window.rs`).
+  `../window/`).

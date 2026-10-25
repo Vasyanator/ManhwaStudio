@@ -77,9 +77,10 @@ impl TranslationTabState {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        CompositionPanelOptions, MtPanelOptions, OcrPanelOptions, TextDetectorOcrTask, TextDetectorPanelOptions, Value, apply_translation_settings_sections,
-        block_ocr_retry_after_failure, ocr_engine_to_project_key, parse_ocr_engine_key, parse_text_detector_algorithm_key,
+        CompositionPanelOptions, MtPanelOptions, OcrPanelOptions, TextDetectorOcrTask, TextDetectorPanelOptions, Value,
+        block_ocr_retry_after_failure,
     };
+    use super::super::settings_io::{apply_translation_settings_sections, ocr_engine_to_project_key, parse_ocr_engine_key, parse_text_detector_algorithm_key};
     use crate::ocr::OcrEngine;
     use crate::neurolate::{NeurolateLanguageChoice, NeurolateSettings, NeurolateTypeChoice, settings_from_json};
     use crate::panels::text_detector::TextDetectorAlgorithm;

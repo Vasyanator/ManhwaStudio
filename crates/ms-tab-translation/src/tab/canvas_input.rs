@@ -39,8 +39,8 @@ use ms_theme::Severity;
 
 use super::{
     TextDetectorLineDragKind, TextDetectorLineDragState, TextDetectorLineSelection, TextDetectorMaskStrokeState, TextMaskPageGeom, TranslationTabState,
-    scene_pos_to_source, source_rect_to_scene_rect,
 };
+use super::detection_mask::{scene_pos_to_source, source_rect_to_scene_rect};
 use crate::text_detector::TextDetectorRect;
 use crate::input::{
     IMAGE_CROP_RECT, LINES_DESELECT, LINES_MOVE, LINES_RESIZE, LINES_SELECT, MASK_ERASE, MASK_PAINT, OCR_ADVANCED_RECT, OCR_QUICK_RECT, OCR_QUICK_RECT_TOUCH,
@@ -435,7 +435,7 @@ impl TranslationTabState {
                 true
             } else {
                 let page = page.clone();
-                model.set_page_with_blocks(page_idx, page.source_size, page.mask_size, page.mask_alpha, super::detector_rects_to_blocks_px(&result.blocks));
+                model.set_page_with_blocks(page_idx, page.source_size, page.mask_size, page.mask_alpha, super::detection_mask::detector_rects_to_blocks_px(&result.blocks));
                 false
             }
         };

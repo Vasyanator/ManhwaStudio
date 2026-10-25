@@ -151,7 +151,7 @@ The dock is `crates/ms-widgets/src/panel_dock/` (contract: `dev-docs/dockable_pa
 `PanelTab` (crates/ms-widgets/src/panel_dock/tab.rs:43) declares one tab, `CollapsiblePanel`
 (crates/ms-widgets/src/panel_dock/panel.rs:232) draws one panel. **You never construct either directly** —
 the frame driver does. You call `PanelDock::begin` → `.tab(id)` … → `.end(&mut cx)`
-(crates/ms-widgets/src/panel_dock/mod.rs:644, :663, :718).
+(crates/ms-widgets/src/panel_dock/mod.rs:1168, :1186, :1241).
 
 You declare **tabs, not panels.** Which panel a tab lands in, where that panel sits, whether it is
 docked to another one or torn off into its own OS window — all of that belongs to the user's saved

@@ -341,6 +341,9 @@ own runtime and draws the returned `CompositeStep`s; none re-implements a band-Z
     opacity refused; `collapsed` untouched), and the page's next doc save writes it through
     `save_page_rasters`' `groups` argument — no dedicated job, format unchanged. `collapsed` is panel-only
     PS view state with the same single owner (`LayerDoc::set_group_collapsed`, same persistence).
+- `layer_doc.rs` — `LayerDoc`, the shared in-memory per-page layer document (load, in-memory edits,
+  sync flush and the async saver funnel; see the sections above). Its unit tests live in the child
+  file `layer_doc/tests.rs` (the directory holds only that test module, so it has no readme of its own).
 - `effects.rs` — the "render type 2" seam: `apply_effects_to_color_image(&ColorImage, effects_json)`
   bridges egui `ColorImage` to the typing tab's pure `apply_effects_to_image`. Straight alpha both
   ways; effects may enlarge the canvas (shadow/glow), so center-placed callers must recenter.

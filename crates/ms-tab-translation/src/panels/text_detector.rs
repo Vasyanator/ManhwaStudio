@@ -445,7 +445,7 @@ pub(crate) struct TextDetectorNeurolate<'a> {
 }
 
 /// Read-only per-frame state the tab lends to [`draw_text_detector_panel`]. Every
-/// field is a snapshot computed by `tab.rs`; the panel never reaches back into the tab.
+/// field is a snapshot computed by the tab (`tab/`); the panel never reaches back into the tab.
 #[derive(Debug, Clone, Copy)]
 pub struct TextDetectorPanelView<'a> {
     /// Detector status line and its severity colour.

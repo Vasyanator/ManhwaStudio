@@ -3,7 +3,7 @@ FILE HEADER (cleaning/tools/watermark_library.rs)
 
 Purpose:
 On-disk LIBRARY of measured watermarks: the reusable half of the chapter-level
-watermark decomposition («По главе (точное вычитание)», `watermark_removal.rs`).
+watermark decomposition («По главе (точное вычитание)», `watermark_removal/`).
 A library entry is a self-contained directory under `config::watermark_library_dir()`,
 so an entry can be copied, backed up or handed to another user as a folder.
 

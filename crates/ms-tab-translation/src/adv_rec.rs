@@ -23,7 +23,7 @@ Key types:
 
 Notes:
 - The module intentionally owns only window/crop-preview state.
-- OCR dispatch and bubble creation stay in `tab.rs`, which already owns OCR controller/canvas logic.
+- OCR dispatch and bubble creation stay in the tab (`tab.rs` + `tab/`), which already owns OCR controller/canvas logic.
 */
 
 use ms_input::{AxisSource, HitPhase, InputFrame, ViewId, ViewSurface, publish_view_surface, view};

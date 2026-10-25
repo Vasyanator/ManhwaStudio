@@ -535,7 +535,7 @@ impl LayerStack {
     /// (`sample_visible_composite`), and for user rasters by the CPU ROI composite
     /// (`visible_layers_bottom_to_top`) and the patch-tool source. The GPU user-layer composite and the
     /// eyedropper's user-raster pass do NOT read it: their visibility and group fold come from the one
-    /// owner `ms_models::layer_model::ordering::composite_plan` (via `composite_steps` in `lib.rs`),
+    /// owner `ms_models::layer_model::ordering::composite_plan` (via `composite_steps` in `composite.rs`),
     /// which applies the same fold for one group level. Keep the two in step.
     #[must_use]
     pub fn layer_visible(&self, layer: &Layer) -> bool {

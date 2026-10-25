@@ -5,7 +5,7 @@ Purpose:
 Module root for the node-based batch processing system.
 
 Main responsibilities:
-- Re-export the public API surface used by new_project/window.rs
+- Re-export the public API surface used by new_project/window/
 - Declare submodule visibility
 
 Key submodules:

@@ -54,7 +54,8 @@ use ms_models::text_mask_model::TextMaskModel;
 use ms_project::ProjectData;
 use ms_theme::Severity;
 
-use super::{TranslationTabState, TranslationTool, detector_rects_to_blocks_px, rasterize_resolved_blocks};
+use super::{TranslationTabState, TranslationTool};
+use super::detection_mask::{detector_rects_to_blocks_px, rasterize_resolved_blocks};
 use crate::panels::ocr::OcrPanelOptions;
 use crate::ocr::{DetectMaskFlags, OcrEngine, OcrRegionWant, OcrRuntimeOptions};
 use crate::panels::text_detector::TextDetectorAlgorithm;
@@ -700,7 +701,7 @@ mod tests {
     /// The OCR runtime options of `engine` with NeuroLate's "create mask" set to `detect_mask`.
     fn ocr_options_for(engine: OcrEngine, detect_mask: bool) -> OcrRuntimeOptions {
         let settings = crate::neurolate::NeurolateSettings { detect_mask, ..Default::default() };
-        super::super::build_ocr_runtime_options(&OcrPanelOptions { engine, ..Default::default() }, "ko", &settings, None)
+        super::super::ocr_flow::build_ocr_runtime_options(&OcrPanelOptions { engine, ..Default::default() }, "ko", &settings, None)
     }
 
     /// A quick NeuroLate selection asks its OCR request for the region (idle detector); other

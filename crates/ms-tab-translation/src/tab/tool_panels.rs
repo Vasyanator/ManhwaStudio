@@ -42,7 +42,8 @@ use ms_theme::Severity;
 use ms_widgets::panel_dock::{PanelDockState, TabId};
 use web_time::Duration;
 
-use super::{TranslationTabState, build_ocr_runtime_options};
+use super::TranslationTabState;
+use super::ocr_flow::build_ocr_runtime_options;
 use crate::ocr::{OcrEngine, OcrLoadState};
 use crate::panels::bubbles::{BubblesPanelContext, draw_bubbles_panel};
 use crate::panels::composition::draw_composition_panel;

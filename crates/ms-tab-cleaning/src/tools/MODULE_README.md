@@ -35,7 +35,7 @@ new source or requirement rule reaches both hosts at once.
 A tool whose mask is not the mask-inpaint one builds on `RegionEditToolBase` ALONE. That base
 gives the selection, the loader, the editor window, zoom/scroll and Apply; everything the mask base
 keeps in its private `RegionInpaintEditorState` — the run channel, the undo stack, the result
-preview and the Escape handling — is then owned by the tool itself. `watermark_removal.rs` does
+preview and the Escape handling — is then owned by the tool itself. `watermark_removal/` does
 this because it has NO mask to paint: the network predicts its own.
 
 The SELECTION GESTURE is `cleaning.region.select_rect` (Shift+LMB drag by default), with ONE
@@ -167,7 +167,8 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   (FLUX.1 Fill)" section (collapsed by default; default mode = object removal). Poisson seam
   matching is a toggle. Settings persist to `flux_fill_inpaint_settings.json` (see
   `config::flux_fill_inpaint_settings_path`) on background threads.
-- `watermark_removal.rs`: the standalone «Удаление водяных знаков» tool. Built on
+- `watermark_removal/`: the standalone «Удаление водяных знаков» tool (its own
+  `MODULE_README.md` maps the behaviour onto files). Built on
   `RegionEditToolBase` alone — nothing here needs a painted mask — and it hosts THREE modes,
   picked in the editor window above the parameter sections:
   - `mask_only` (default, streams `watermark.detect`, draws the predicted mask over the region and
@@ -178,7 +179,7 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
     (`dev-docs/watermark_removal_plan.md` §1.2, §7.4);
   - `chapter` — «По главе (точное вычитание)»: no backend, no Torch, no weights. The catalog of
     marks, the calibration samples, the chapter scan, the apply and the reports around
-    `../watermark_chapter.rs`, plus the on-disk library in `watermark_library.rs`. Its editing UI
+    `../watermark_chapter/`, plus the on-disk library in `watermark_library.rs`. Its editing UI
     lives inside the SAME region-editor window; only the library MANAGEMENT screen is a surface
     of its own, and that one is a dock tab (`watermark_library_window.rs`).
   `pytorch_required()` is a CONSTANT `false` here: the chapter mode needs nothing, so the picker
@@ -306,7 +307,7 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   `entry_verdict_line` is pure and refuses to describe an entry resting on a hand-stated
   background as measured, and `pending_ready` refuses to commit a captured crop whose level the
   user has not actually stated — the colour control's starting value is not an answer. The
-  first rule binds the REGION EDITOR too: `describe_conditioning` in `watermark_removal.rs`
+  first rule binds the REGION EDITOR too: `describe_conditioning` in `watermark_removal/describe.rs`
   takes the same assertion flag (read off `ModelProvenance::manual_backgrounds`) and switches
   to the same `_asserted` wording, so the card and the editor cannot disagree about one entry.
   `entry_verdict_line` matches `ModelConditioning` EXHAUSTIVELY: its fallback means "a stored
@@ -412,7 +413,7 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   out-of-range tile, overlap, threshold, dilation, mode or model id onto the network, nor an
   out-of-range anchor tolerance, background radius or ring width onto the chapter engine.
 - Chapter mode owns no maths. Sample validation, the `c`/`s` fit, the conditioning verdict, mark
-  identity, anchor discovery, detection and removal all belong to `../watermark_chapter.rs`; this
+  identity, anchor discovery, detection and removal all belong to `../watermark_chapter/`; this
   layer decodes pages, runs jobs, applies patches, persists and reports.
 - Chapter jobs decode ONE page at a time (a chapter is several strips of ~700x18000) and take a
   COPY of the catalog; the GUI keeps the previous copy to draw and holds the catalog UI read-only
@@ -614,7 +615,8 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
 - To change how request PNGs are encoded, edit `ms_tools::png_wire` (bytes) or `region_png.rs`
   (error texts); never add an encoder in a tool or engine.
 - To change the standalone watermark tool (modes, tiling/threshold parameters, mask preview, its
-  settings file), edit `watermark_removal.rs`; the shared model catalog, status query and progress
+  settings file), edit `watermark_removal/` (`settings.rs`, `editor_ui.rs`, `backend.rs`); the
+  shared model catalog, status query and progress
   bar it reuses live in `base.rs`.
 - To change FLUX.2 klein, Lama or SDXL Inpaint, edit `ai_editor/engines/flux2_klein/`,
   `ai_editor/engines/lama/` or `ai_editor/engines/sdxl/` — they are engines of the «ИИ-редактор
@@ -627,21 +629,22 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
 - To change what the library CARD can warn about or draw without recomputing anything, edit
   `EntryWarnings` / `entry_warnings` / `render_mark_on_white` in `watermark_entry.rs`; the raw
   material they read comes from `EntrySummary` in `watermark_library.rs`.
-- To change the chapter mode's UI, jobs, reports or overlay patches, edit `watermark_removal.rs`
-  (`ChapterState` and the `run_chapter_*` workers); to change the maths behind them, edit
-  `../watermark_chapter.rs`; to change what a stored watermark holds on disk, or how it is
+- To change the chapter mode's UI, jobs, reports or overlay patches, edit `watermark_removal/`
+  (`ChapterState` in `mod.rs` / `chapter_state.rs`, the `run_chapter_*` workers in
+  `chapter_jobs.rs`, the UI in `editor_ui.rs`); to change the maths behind them, edit
+  `../watermark_chapter/`; to change what a stored watermark holds on disk, or how it is
   exported/imported, edit `watermark_library.rs` and `config::watermark_library_dir`.
 - To change reference-crop intake (background measurement, alignment, the refusal wording) or the
   auto-match ranking, or how a stored footprint is trimmed to the mark, edit `watermark_entry.rs`
-  (the extent measurement itself lives in `../watermark_chapter.rs`); to change the library screen itself — either of
+  (the extent measurement itself lives in `../watermark_chapter/template.rs`); to change the library screen itself — either of
   its two modes, the card, the sample list or the pending crops — edit
   `watermark_library_window.rs`, and where its panel sits by default is
   `cleaning_default_dock_layout` in `../tab.rs`.
 - To change what a library card does to the open chapter (select / unselect / already here) or
   what an armed canvas selection becomes, edit `run_library_panel_request`,
   `unload_library_entry`, `chapter_library_selection`, `chapter_saved_entries`,
-  `chapter_entry_index`, `next_library_arm` and `run_library_capture` in
-  `watermark_removal.rs`; the card's three-way state itself is `entry_membership` in
+  `chapter_entry_index` (`watermark_removal/tool_ops.rs`), `next_library_arm`
+  (`chapter_state.rs`) and `run_library_capture` (`library_capture.rs`); the card's three-way state itself is `entry_membership` in
   `watermark_library_window.rs`. The panel only raises the request.
 - To change when a reservation ENDS, edit `WatermarkLibraryWindow::arm_survives` (which screen
   draws the cancel) and the one place the tool consults it in `draw_overlay_ui`.
@@ -649,7 +652,7 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   halves of the round trip it is built on — `rebuild_stored_kind` and `save_request_from_kind`
   in `watermark_entry.rs`, which the reference intake and the chapter's library load/write share.
 - To change how long session scratch crops live, edit `sweep_stale_scratch_crops` /
-  `scratch_crop_is_stale` in `watermark_removal.rs`; the panel's own delete-on-commit /
+  `scratch_crop_is_stale` in `watermark_removal/library_capture.rs`; the panel's own delete-on-commit /
   delete-on-discard is `remove_scratch_crop` in `watermark_library_window.rs`.
 - To change the on-canvas region frame (its geometry, lock rules, painting or input), edit
   `region_edit_v2/` and read its `MODULE_README.md` first. To change what a hosted tool DOES

@@ -34,7 +34,7 @@ Key structures:
 - `MaskGenerationSpawner`: the type of `spawn_mask_generation`, so a host can hold the spawner
   in a field and its unit tests can install a stub instead of starting the real detector
 - `WatermarkProgress`, `WatermarkModelSpec`, `WatermarkStatus`: the watermark source's extras,
-  shared with the standalone `watermark_removal.rs` tool
+  shared with the standalone `watermark_removal/` tool
 
 Key functions:
 - `spawn_mask_generation` / `poll_mask_generation`: the whole worker lifecycle
@@ -91,7 +91,7 @@ const MASK_DILATE_RANGE: std::ops::RangeInclusive<i32> = 0..=30;
 /// resolved at render time) is localized — same split as `LamaModelSpec`,
 /// see `dev-docs/i18n_exclusions.md` §A5.
 ///
-/// Shared with the standalone `watermark_removal.rs` tool, which selects from the
+/// Shared with the standalone `watermark_removal/` tool, which selects from the
 /// same catalog — the catalog must never be duplicated per tool.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct WatermarkModelSpec {
@@ -144,7 +144,7 @@ impl WatermarkStatus {
 /// that runs it and the editor UI that renders the progress bar.
 ///
 /// Written by the mask-generation worker of this module and by the standalone
-/// `watermark_removal.rs` tool, which streams `watermark.remove` with the same
+/// `watermark_removal/` tool, which streams `watermark.remove` with the same
 /// two-phase (`download` bytes / `generate` steps) contract.
 #[derive(Debug, Default)]
 pub(super) struct WatermarkProgress {

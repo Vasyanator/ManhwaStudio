@@ -2,8 +2,8 @@
 File: crates/ms-tab-ps-editor/src/composite_plan_tests.rs
 
 Purpose:
-Tests of the PS canvas draw plan `composite_steps` (crate root, `lib.rs`): the order and effective
-opacities `draw_composite` paints above the base layers.
+Tests of the PS canvas draw plan `composite_steps` (`composite.rs`, imported by the crate root): the
+order and effective opacities `draw_composite` paints above the base layers.
 
 Notes:
 `composite_steps` is a thin adapter over the shared owner
@@ -15,6 +15,7 @@ lookup is uid-first. Pure: no files, no GPU, no egui context.
 */
 
 use super::*;
+use crate::grouping::band_order_after_move;
 use egui::Color32;
 use ms_models::layer_model::layer_doc::{DocPage, LayerNode, NodeBody, NodeKind};
 

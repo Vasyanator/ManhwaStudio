@@ -573,7 +573,7 @@ fn cleaning_combo_width(ctx: &egui::Context, style: &egui::Style, selected_text:
 /// the captions it is about to draw.
 ///
 /// Both bounds are per-locale by necessity. The dock never re-measures a tab's
-/// WIDTH — it stores the width the panel ASKED for (`panel_dock/mod.rs`,
+/// WIDTH — it stores the width the panel ASKED for (`panel_dock/frame_plan.rs`,
 /// `PanelPlan::assumed_size`) — so `initial_size.x` is the panel's width until the
 /// user drags it, and a fixed number sized for Russian opens the French panel on a
 /// permanent horizontal scrollbar.

@@ -6,7 +6,8 @@ downloads or imports external chapter content, and saves the resulting project w
 main launcher UI.
 
 ## Architecture
-UI-facing state lives in `window.rs`. The launcher hosts it in an `ms_widgets::EmbeddedWindow`
+UI-facing state lives in `window/` (`NewProjectWindowState`, split by area into child files; see
+`window/MODULE_README.md`). The launcher hosts it in an `ms_widgets::EmbeddedWindow`
 (which alone decides separate OS window vs embedded) and calls three entry points per pass:
 `poll` (every worker; on every pass the window is open, also while covered or collapsed),
 `show_content` (form, ribbon preview, crop/manual-cut UI and the window's own dialogs; only while
@@ -33,13 +34,14 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
 
 ## Files and submodules
 - `mod.rs`: public module map for the new-project window.
-- `window.rs`: `NewProjectWindowState` (`poll` / `show_content` / `show_children` /
-  `on_window_closed`), the batch child window and its one close path `close_batch_window`, left-panel modes, ribbon preview,
-  crop/manual cut UI, save forms, controller polling, and open-project handoff after save. The
-  ribbon preview's on-screen geometry is decided by two persisted preferences
-  (`NewProjectWindow/RibbonUniformWidth`, `NewProjectWindow/RibbonWidthFraction`) resolved through
-  the pure helpers `ribbon_scale_base_px` / `ribbon_page_display_size` /
-  `clamp_ribbon_width_fraction`.
+- `window/`: `NewProjectWindowState` (`poll` / `show_content` / `show_children` /
+  `on_window_closed` in `window/mod.rs`), the batch child window and its one close path
+  `close_batch_window`, left-panel modes, ribbon preview, crop/manual cut UI, save forms,
+  controller polling, and open-project handoff after save; one child file per area (see
+  `window/MODULE_README.md`). The ribbon preview's on-screen geometry is decided by two persisted
+  preferences (`NewProjectWindow/RibbonUniformWidth`, `NewProjectWindow/RibbonWidthFraction`)
+  resolved through the pure helpers `ribbon_scale_base_px` / `ribbon_page_display_size` /
+  `clamp_ribbon_width_fraction` (`window/ribbon_view.rs`).
 - `open_source.rs`: source picker and workers for folders, saved HTML, archives, and single image
   files; includes byte-signature image detection, natural ordering, filtering, and progress events.
 - `project_io.rs`: projects-root catalog scan, target resolution, parallel PNG save pipeline, and
@@ -66,14 +68,14 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
 - `reline_models.rs`: pure, offline classification of catalog model names into gallery categories
   with friendly titles, capability descriptions, and recommendations (curated table plus a
   name-derived heuristic fallback). No UI, no network; consumed by the simplified Reline gallery in
-  `window.rs`.
+  `window/processing_ui.rs`.
 - `ribbon.rs`: `RibbonState`, `RibbonPage`, `RibbonTiles`, `RibbonCrop`, `ImportedImage`, tiled
   preview generation and painting (`build_ribbon_tiles`, `paint_ribbon_tiles`,
   `ribbon_upload_budget` over the `egui-large-image` crate), adjacent page merge, non-destructive
   crop state, and original-page restoration.
 - `batch_processing/`: standalone visual graph editor and executor for repeated import/download,
   browser, stitch, waifu2x, and save pipelines. See `batch_processing/MODULE_README.md`.
-- `tutorial.rs`: branching onboarding tour (`TutorialId::NewProject`). `window.rs` owns a
+- `tutorial.rs`: branching onboarding tour (`TutorialId::NewProject`). `window/mod.rs` owns a
   `TutorialController<NpTutorialCtx>` rendered over THIS window's content. Because the pipeline triggers are
   private `&mut self` methods, the tutorial drives them via a command/snapshot context: `on_enter`
   pushes `NpTutorialCommand`s that `show_content()` drains into `apply_tutorial_command` after `sync`, and
@@ -143,15 +145,16 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
   `waifu2x.rs`.
 - To change Reline backend request shape, temporary file handoff, model-catalog loading, or
   response parsing, edit `reline.rs`.
-- The Reline section in `window.rs` has two modes behind a persisted toggle (simplified by
+- The Reline section in `window/processing_ui.rs` has two modes behind a persisted toggle (simplified by
   default, full/expert behind it). To change model categories, descriptions, or recommendations
   shown in the simplified gallery, edit `reline_models.rs`; to change the simplified controls or
-  preset-to-pipeline mapping, edit `show_reline_simple`/`build_reline_simple_options` in
-  `window.rs`.
-- To change the window's UI flow, controller wiring or the batch child window, edit `window.rs`;
+  preset-to-pipeline mapping, edit `show_reline_simple` (`window/processing_ui.rs`) and
+  `build_reline_simple_options` (`window/options.rs`).
+- To change the window's UI flow, controller wiring or the batch child window, edit `window/` (map in its
+  `MODULE_README.md`);
   how it is hosted (title, size, collapse, close) is in `crates/ms-launcher/src/app.rs`.
 - To change how ribbon pages are scaled or how wide the ribbon container is, edit
-  `show_ribbon`/`apply_ribbon_resize` in `window.rs`. Every page rect derives from one
+  `show_ribbon`/`apply_ribbon_resize` in `window/ribbon_view.rs`. Every page rect derives from one
   `(width_scale, image_size)` pair, so downstream tile painting, manual-cut guides, page-boundary
   markers and the gutter arrows follow any scale change without their own math.
 - To change batch graph editing or execution, edit `batch_processing/`.

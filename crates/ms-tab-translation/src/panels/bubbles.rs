@@ -13,7 +13,7 @@ Main types:
 - `BubblesPanelContext`: shared tab state links (footer overrides, pending patches, character refresh flags,
   the tab's image-bubble file-dialog slot, this frame's input).
 - `ImageBubbleFilePick`: a pending «choose file» dialog for one external image bubble; started here
-  or from the canvas footer, resolved by the tab (`tab.rs::poll_image_bubble_pick`).
+  or from the canvas footer, resolved by the tab (`tab/characters.rs::poll_image_bubble_pick`).
 
 Main flow:
 - `draw_bubbles_panel` -> `BubblesPanelState::draw`: renders controls, applies filters, draws card list.
@@ -1352,7 +1352,7 @@ pub fn bubble_extra_i32(extra: &Map<String, Value>, key: &str, default: i32) -> 
 /// Default page-crop rect centered on the bubble anchor, sized to a 256x256 source-pixel square.
 ///
 /// Page dimensions are read from the image header to convert 256 px into normalized half-extents,
-/// falling back to a small UV box when unavailable (mirrors `tab.rs::default_image_crop_rect_values`).
+/// falling back to a small UV box when unavailable (mirrors `tab/canvas_hooks.rs::default_image_crop_rect_values`).
 fn default_image_crop_rect(project: &ProjectData, bubble: &Bubble) -> Vec<Value> {
     const DEFAULT_IMAGE_CROP_SIDE_SRC_PX: f32 = 256.0;
     let half = DEFAULT_IMAGE_CROP_SIDE_SRC_PX * 0.5;

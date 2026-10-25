@@ -41,7 +41,7 @@ written completely, then committed on the same worker.
 
 Notes:
 This file draws only the window CONTENT (`show_content` lays its panels out inside whatever
-`Ui` the owner hands it); the owner in `new_project/window.rs` decides how the window is
+`Ui` the owner hands it); the owner in `new_project/window/` decides how the window is
 hosted and when it closes, and calls `on_window_closed` on every close path. It does not own
 a project; it operates on standalone image pipelines and saves results to user-specified
 folders.

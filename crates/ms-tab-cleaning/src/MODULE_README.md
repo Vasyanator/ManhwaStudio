@@ -108,7 +108,8 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `CleaningTabState::request_orphan_clean_rescan`, which the studio reaches through
   `StudioTab::on_committed_tree_changed` after a successful «Сохранить проект». Message selection is the pure, unit-tested
   `select_clean_status_messages`. Dismissals are session-only and never persisted.
-- `watermark_chapter.rs`: GUI-free chapter-level watermark decomposition engine — the exact,
+- `watermark_chapter/`: GUI-free chapter-level watermark decomposition engine (its own
+  `MODULE_README.md` maps the stages onto files) — the exact,
   AI-free counterpart of the neural watermark path. A semi-transparent mark composites as
   `I = c + s*B` (`c = alpha*W`, `s = 1 - alpha`), constant across every occurrence of one mark, so
   observing it over different backgrounds determines `c`/`s` and removal is the division
@@ -123,7 +124,7 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   named iteration count. `trimmed_footprint_from_model` / `trimmed_footprint_from_template`
   MEASURE where the mark actually ends inside a footprint (see the footprint contract below). Design and the measurements it rests on:
   `dev-docs/watermark_chapter_decomposition_plan.md`. Consumed by the «По главе (точное
-  вычитание)» mode of `tools/watermark_removal.rs`; `mod.rs` keeps an `allow(dead_code)` for the
+  вычитание)» mode of `tools/watermark_removal/`; `lib.rs` keeps an `allow(dead_code)` for the
   refinement surface the tool deliberately does not use (see the comment there).
 - `tools/`: cleaning tool trait — including the five additive, defaulted methods a tool that owns
   more than «Выбранный инструмент» uses (`set_panel_rects`, fed from `panel_rects` after
@@ -406,12 +407,13 @@ tab draws; `CleaningDrawParams::{input, input_registry}` carry the frame and the
   `autoclean_page` boundary and `paint_patch_from_mask` may touch egui.
 - To change watermark decomposition — sample validation, the `c`/`s` fit, the conditioning
   verdict and its alpha uncertainty, mark identity, anchor discovery, detection thresholds or the
-  removal/residual maths — edit `watermark_chapter.rs`. Its named constants carry their own
+  removal/residual maths — edit `watermark_chapter/` (stage -> file map in its
+  `MODULE_README.md`). Its named constants carry their own
   rationale; change one only against the measurements in
   `dev-docs/watermark_chapter_decomposition_plan.md`, and note that the two chapters measured
   there disagree on several of them, so a constant is source-evidence, not a universal. The engine
   must stay GUI-free: the mark catalog, the region editor, the jobs, `CanvasView` patches, i18n
-  and the watermark library belong to `tools/watermark_removal.rs`,
+  and the watermark library belong to `tools/watermark_removal/`,
   `tools/watermark_library.rs`, `tools/watermark_entry.rs` and
   `tools/watermark_library_window.rs`. In particular, whether a set of samples separates the
   model is answered by `estimate_model`'s own verdict; no caller may re-derive it from a copied

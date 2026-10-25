@@ -23,7 +23,9 @@ belongs to exactly one block); the expansion is the detector panel's `block_expa
 use ms_canvas::CanvasView;
 use ms_project::ProjectData;
 
-use super::{OcrPendingBubbleInsert, TranslationTabState, build_bubble_original_text, detector_expand_blocks};
+use super::{OcrPendingBubbleInsert, TranslationTabState};
+use super::detection_mask::detector_expand_blocks;
+use super::ocr_flow::build_bubble_original_text;
 use crate::ocr::{OcrRecognizeResult, OcrTextFinish, finish_recognized_text};
 use crate::text_detector::{TextDetectorPageResult, TextDetectorRect};
 

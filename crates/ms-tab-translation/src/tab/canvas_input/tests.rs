@@ -145,7 +145,8 @@ mod line_edits_reach_the_model {
     use ms_models::page_view::{PageImageInfo, SourcePageLoadState};
     use ms_models::text_mask_model::TextMaskModel;
 
-    use crate::tab::{TextDetectorLineDragKind, TextDetectorLineDragState, TextDetectorLineSelection, TranslationTabState, detector_rects_to_blocks_px, rasterize_resolved_blocks};
+    use crate::tab::{TextDetectorLineDragKind, TextDetectorLineDragState, TextDetectorLineSelection, TranslationTabState};
+    use crate::tab::detection_mask::{detector_rects_to_blocks_px, rasterize_resolved_blocks};
     use crate::text_detector::{TextDetectorPageResult, TextDetectorRect};
 
     fn rect(x1: f32, y1: f32, x2: f32, y2: f32) -> TextDetectorRect {

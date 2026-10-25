@@ -10,7 +10,7 @@ The window's pipeline triggers are private `&mut self` methods, so the step
 script cannot hold a reference to the window. Instead the tutorial context
 `NpTutorialCtx` is a per-frame COMMAND SINK + STATE SNAPSHOT: `on_enter` pushes
 `NpTutorialCommand`s (drained and executed by the window after `sync`), and gates
-read the snapshot booleans. Keys here MUST match the `mark` calls in `window.rs`.
+read the snapshot booleans. Keys here MUST match the `mark` calls in `window/`.
 
 Two branches:
 - Visual: download a test chapter, stitch+cut it, run waifu2x — each step waits
@@ -50,7 +50,7 @@ pub enum NpTutorialCommand {
     StartWaifu2x,
 }
 
-// Target keys — must match `window.rs` `mark(...)` sites.
+// Target keys — must match `window/` `mark(...)` sites.
 pub const TARGET_MODE_TABS: &str = "np_mode_tabs";
 pub const TARGET_TEST_DOWNLOAD: &str = "np_test_download";
 pub const TARGET_IMPORT: &str = "np_import";

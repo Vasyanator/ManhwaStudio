@@ -6,7 +6,7 @@ Composed-translation panel of the Translation tab: builds the prompt text from t
 bubbles, hosts the plain/MiniJinja formatting options, and exports the result to TXT/DOCX.
 
 Main responsibilities:
-- own `CompositionPanelOptions` (the settings boundary read and written by `tab.rs` through the
+- own `CompositionPanelOptions` (the settings boundary read and written by the tab (`tab/settings_io.rs`) through the
   codec below)
 - filter, sort and format bubbles into the composed text (`compose_translation_text`)
 - own the ONE JSON mapping of `CompositionPanelOptions` (`write_composition_options_json` /

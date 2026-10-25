@@ -6,7 +6,7 @@ Module root of the direct ("quick") chapter downloader used by the New Project l
 
 Main responsibilities:
 - declare the layered submodules of the downloader;
-- re-export the launcher-facing API unchanged (`window.rs` imports only from here).
+- re-export the launcher-facing API unchanged (`window/` imports only from here).
 
 Key items:
 - QuickDownloadController, QuickDownloadEvent (re-exported from `controller`)
@@ -36,7 +36,7 @@ mod plan;
 mod sites;
 mod url_util;
 
-// The launcher-facing surface is exactly what `new_project/window.rs` imports.
+// The launcher-facing surface is exactly what `new_project/window/` imports.
 // `QuickDownloadSuccess` is intentionally NOT re-exported: it is only ever received inside
 // `QuickDownloadEvent::Loaded`, and an unused `pub use` is a hard error under `-D warnings`
 // in this binary crate.

@@ -104,7 +104,31 @@ it falls back to the synchronous `persist::save_page_band_order` / `save_page_gr
 doc falls back inside the enqueue.
 
 ## Files and submodules
-- `mod.rs`: `PsEditorTabState` orchestration — the seven dock tabs (see «Panels» below), canvas
+- `lib.rs` + its split-out children: `PsEditorTabState` orchestration. `lib.rs` is the crate root and
+  holds only the `mod` list, the constants (dock tab ids, panel flags and sizes, marquee and undo
+  limits), every type of the tab (`PsEditorTabState`, its private aux types such as `RowSel`,
+  `GroupOp`, `PanelActions`, the dock context / visibility types, the composite views, `CanvasInput`,
+  `DashRun`, `PsRasterEffectsJob`) and `impl Default`. The behaviour lives in sibling files, each an
+  `impl PsEditorTabState` block or a group of free functions that reach the root's items through
+  `use super::*` (the root `use`s their crate-private free functions back, so siblings and the test
+  modules see them unqualified):
+  - `frame.rs`: `draw` (the per-frame entry) and the non-layer dock tab contents;
+  - `dock_panels.rs`: `ps_editor_default_dock_layout` (re-exported `pub`), the `draw_*_tab_body`
+    functions the dock calls, the «Панели…» menu;
+  - `doc_sync.rs`: model injection and the doc -> view projection (`sync_view_from_doc`,
+    `materialize_text_runtime_from_doc`, `route_to_doc`);
+  - `history.rs`: undo/redo, the `PsEditOp` appliers and the doc writers they use;
+  - `page_session.rs`: camera hand-over, page loader, page persistence, tool / selection setters;
+  - `layers_panel.rs`: the «Слои» panel (rows, selection rules, active-layer strip, panel actions);
+  - `grouping.rs`: band moves, group ops and their structural-edit persistence;
+  - `raster_effects.rs`: the effects editor and the off-thread effects render + apply;
+  - `canvas_draw.rs`: input gate, `draw_canvas`, tool commits, render cache / composite, and the
+    tab-level shortcuts with their displayed list;
+  - `selection_ops.rs`: text drag, marquee, selection menu, clip ops, `merge_down`;
+  - `composite.rs`: composite plan adapter and the page-rectangle composite;
+  - `raster_ops.rs`: pure raster / record helpers; `marquee.rs`: marquee decimation and dashing;
+  - `tests.rs`: the crate root's unit tests (`composite_plan_tests.rs` pins `composite_steps`).
+  Together they cover the seven dock tabs (see «Panels» below), canvas
   input routing, render-cache sync, the dashed selection marquee, the selection right-click
   copy/cut menu (`clip_into_new_layer`), layer/group save+load via `models::layer_model`,
   `merge_down` (`composite_to_page` flattens a raster onto the layer directly beneath it by unified
@@ -150,7 +174,7 @@ doc falls back inside the enqueue.
   «Finger input» below.
 - `text_layers.rs`: `PsTextLayer` — display of the typing tab's overlays, projected from the shared
   `LayerDoc` (the source of truth). `sync_view_from_doc` builds/reconciles one text layer per doc Text
-  node (image + geometry + group from the node); `materialize_text_runtime_from_doc` (in `lib.rs`)
+  node (image + geometry + group from the node); `materialize_text_runtime_from_doc` (in `doc_sync.rs`)
   creates / refreshes the runtimes with the doc-owned pin / pinned_by_group / text-group `layer_idx`
   (`PsTextLayer::meta_from_node`). PS reads NO `text_info.json` and no `layers.json` text meta. Rendering mirrors the typing tab: a deformed
   overlay draws its textured `cols`×`rows` mesh (absolute page-pixel control points mapped through the
@@ -734,43 +758,43 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   `LayerKind::is_base` plus `remove_layer` / `reorder_rasters` / `set_layer_group` /
   `is_transformable`.
 - To change how a `Клин` edit reaches the shared model (bounds, revision handling, `base_image`
-  mirroring), edit the ONE helper `write_clean_region_to_model` in `mod.rs`. Its callers are the
+  mirroring), edit the ONE helper `write_clean_region_to_model` in `history.rs`. Its callers are the
   brush stroke commit, `perform_clip`, `merge_down` and `apply_ps_clean_edit`; do not add a fifth
   hand-written copy.
 - To change which layer a merge targets, edit `merge_candidates_by_band_z` (it reserves band-Z 0 for
-  `Клин` and shifts the rasters up by one) and `merge_down` in `mod.rs`.
+  `Клин` and shifts the rasters up by one) in `layers_panel.rs` and `merge_down` in `selection_ops.rs`.
 - To change base-layer visibility handling, edit the `toggle_visible_raster` block in
   `apply_panel_actions`.
 - To change move/rotate/scale behavior or the gizmo, edit `tools/transform.rs`.
-- To change "select layer fully", edit `select_active_layer_fully` in `mod.rs`.
+- To change "select layer fully", edit `select_active_layer_fully` in `layers_panel.rs`.
 - To change which panels exist, where they start, or what the «Панели…» menu offers, edit
-  `ps_editor_default_dock_layout` / `PsEditorPanelVisibility` / `ps_editor_panels_menu` in `mod.rs`
+  `ps_editor_default_dock_layout` / `PsEditorPanelVisibility` / `ps_editor_panels_menu` in `dock_panels.rs` (the visibility type in `lib.rs`)
   (its builder reaches the studio through `StudioTab::default_dock_layout`, `studio_tab.rs`).
-- To change what a panel SHOWS, edit its `*_tab_contents` method in `mod.rs`
+- To change what a panel SHOWS, edit its `*_tab_contents` method in `frame.rs` (`layers_panel_body` in `layers_panel.rs`)
   (`main_tab_contents` / `tools_tab_contents` / `active_tool_tab_contents` / `hotkeys_tab_contents`
   / `layers_panel_body`); the «Коррекция» body lives in `correction/ui.rs`.
 - To change the view-only colour correction — its maths, its shader, its panel, or which part of the
   canvas it covers — edit `correction/` (see that directory's `MODULE_README.md`) and
-  `draw_correction_pass` in `lib.rs`.
+  `draw_correction_pass` in `canvas_draw.rs`.
 - To change the panel's row ORDER (including the `Клин`-above-`Исходник` base tail), edit
   `build_unified_tree` in `tree.rs` — never the `LayerStack` vector order.
 - To change the layers tree (rows, indent, collapse), edit `tree.rs` + `layers_panel_body` /
-  `draw_group_row` / `draw_leaf_row` in `mod.rs`. To change grouping ops, edit `apply_group_op` +
+  `draw_group_row` / `draw_leaf_row` in `layers_panel.rs`. To change grouping ops, edit `apply_group_op` (`grouping.rs`) +
   `persist::save_page_grouping`. To change reorder behavior, edit `build_unified_order` /
   `move_band_one` / `move_group_block`. To change how a structural edit is persisted or mirrored
   (saver job, doc mirror, text pin meta), edit `apply_structural_edit` / `text_pin_meta_after`. To change multi-select, edit `select_row`.
 - To change which row is the active one, or how it is highlighted, edit `normalize_panel_primary` /
   `active_row_sel` / `row_exists` and the pure `row_is_selected` / `group_row_is_selected` /
-  `selectable_row_order` helpers in `mod.rs`. To change what the strip offers a base layer, edit the
+  `selectable_row_order` helpers in `layers_panel.rs`. To change what the strip offers a base layer, edit the
   `RowSel::Base` arm of `draw_active_controls`.
 - To add a tool, implement `PsTool` in `tools/` and register it in `PsEditorTabState::default`.
   A REGION tool (worker thread, on-canvas surface, own dock panel) implements the defaulted hook
   block on top of that — see `tools/MODULE_README.md`, «Region-tool hooks»; every call site already
   exists here. `PatchTool` is the worked example.
 - To change how a page RECTANGLE is composited, edit `composite_rect` / `visible_layers_bottom_to_top`
-  in `mod.rs`; both the clip and the patch tool read them, so a change moves both.
+  in `composite.rs`; both the clip and the patch tool read them, so a change moves both.
 - To change how a tool-requested pixel write is performed, edit `apply_tool_actions` /
-  `apply_tool_region_write` and the pure `blend_premul_region` in `mod.rs`. To change what such a
+  `apply_tool_region_write` (`canvas_draw.rs`) and the pure `blend_premul_region` (`raster_ops.rs`). To change what such a
   write records or where it is pushed, edit `commit_pixel_region` / `record_pixel_region` and the
   pure `pixel_region_edit_op` — the brush stroke goes through the same three, so a change moves
   both.
@@ -779,27 +803,27 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
 - To change brush painting or selection geometry, edit `tools/brush.rs` / `tools/select.rs` and
   `selection.rs`.
 - To change the marquee look, edit `walk_dash_runs` / `decimate_to_screen` /
-  `draw_selection_marquee` (`mod.rs`) and `draw_dashed_preview` (`tools/select.rs`); the boundary
+  `draw_selection_marquee` (`marquee.rs`, `selection_ops.rs`) and `draw_dashed_preview` (`tools/select.rs`); the boundary
   loops come from `Selection::outline_loops`. `walk_dash_runs` is shared with the brush's
   pixel-exact cursor outline (`tools/brush.rs`), so a change there moves both.
 - To change the selection combination modes or the boundary tracer, edit `selection.rs`
   (`SelectionOp`, `apply_rect` / `apply_polygon`, the pixel-edge tracer). To change the lasso
   gesture (Photoshop modes at press, Alt straight segments, Esc / Backspace), edit
   `SelectTool::step` in `tools/select.rs`. To change the tool sections, edit `PsToolSection` /
-  `PsToolId::section` (`tools/mod.rs`) and `tools_tab_contents` (`mod.rs`).
+  `PsToolId::section` (`tools/mod.rs`) and `tools_tab_contents` (`frame.rs`).
 - To change a TAB-LEVEL shortcut, edit `handle_hotkeys` AND `ps_editor_common_hotkey_rows` next to
-  it in `mod.rs` — they are deliberately adjacent so the dispatched keys and the displayed list
+  it in `canvas_draw.rs` — they are deliberately adjacent so the dispatched keys and the displayed list
   cannot drift. A TOOL's shortcuts belong to its own `PsTool::hotkey_rows`.
 - To change the copy/cut menu or its compositing/cut rules, edit `draw_selection_menu`,
-  `clip_op_submenu`, `clip_layer_picker`, and `clip_into_new_layer` in `mod.rs`.
+  `clip_op_submenu`, `clip_layer_picker` (`selection_ops.rs`) and `clip_into_new_layer` (`raster_ops.rs`).
 - To change the raster effects pipeline (off-thread render, recenter, persist), edit
   `apply_effects_to_raster`, `PsRasterEffectsJob::run`, `poll_ps_raster_effects_jobs`, and
-  `apply_ps_raster_effects_result` in `mod.rs`.
-- To change GPU upload/compositing, edit `layer_render.rs` and `mod.rs::draw_canvas`.
+  `apply_ps_raster_effects_result` in `raster_effects.rs`.
+- To change GPU upload/compositing, edit `layer_render.rs` and `canvas_draw.rs::draw_canvas`.
 - To change the sampling mode («Сглаживание»), edit `PsEditorTabState::layer_texture_options` in
-  `mod.rs` — it is the ONE place the mode is decided, consumed by `upload_layers`
+  `canvas_draw.rs` — it is the ONE place the mode is decided, consumed by `upload_layers`
   (`TiledTexture::set_options`) and by `draw_composite` (`PsTextLayer::draw`).
 - To change the pixel grid, edit the SHARED painter `canvas::pixel_grid::draw_pixel_grid`; only
   the gate (`pixel_grid_enabled` + `canvas::pixel_inspection_recommended_for`) and the page rect
-  live here, in `mod.rs::draw_canvas` right after `draw_composite`.
+  live here, in `canvas_draw.rs::draw_canvas` right after `draw_composite`.
 - To change how base layers are sourced, edit `page_loader.rs`.

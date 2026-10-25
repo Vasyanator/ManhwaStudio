@@ -5,7 +5,7 @@ Purpose:
 The management screen of the watermark library — the screen that turns the on-disk entries
 of `watermark_library.rs` into something a user can read and curate. It is the BODY of the
 «Библиотека знаков» dock tab of the Cleaning tab, supplied by the «Удаление водяных знаков»
-tool through `CleaningTool::draw_library_panel` (`watermark_removal.rs`). Every floating
+tool through `CleaningTool::draw_library_panel` (`watermark_removal/`). Every floating
 surface of that program tab is a dock tab (`egui-docs/01-app-shell.md` §3.1), so this state
 owns no window, reports no rect of its own, and has no close affordance: the two
 «Библиотека знаков…» buttons of the tool TOGGLE it.

@@ -21,7 +21,7 @@ FILE HEADER (tabs/cleaning/tools/mod.rs)
   - `region_png` — the localized face of `ms_tools::png_wire`: the one encoder of the region
     and mask PNGs the AOT, Flux-Fill and AI-editor engines send to the backend.
   - `watermark_library` — библиотека измеренных знаков на диске; используется
-    режимом «По главе» из `watermark_removal.rs`.
+    режимом «По главе» из `watermark_removal/`.
   - `watermark_entry` — мост между движком разложения и библиотекой: приём
     эталонных кадров, отображение вердиктов и подбор записей по подписи знака.
   - `watermark_library_window` — окно управления библиотекой, открываемое из

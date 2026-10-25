@@ -6,13 +6,13 @@ Read-only display of the typing tab's text/image overlays inside the PS editor, 
 The overlays are Text nodes of the shared `LayerDoc`; this module holds their PS-side runtime
 (`PsTextLayer`: projected image + geometry, the doc-owned pin / text-group metadata, and the GPU
 texture) and renders each overlay at its page-space placement through the PS viewport. It reads no
-disk: runtimes are built from the doc by `lib.rs` (`materialize_text_runtime_from_doc`,
+disk: runtimes are built from the doc by `doc_sync.rs` (`materialize_text_runtime_from_doc`,
 `sync_view_from_doc`).
 
 Why separate from `LayerStack`:
 These layers are owned by the typing tab; here they are display-only. Keeping them out of
 `LayerStack` means the raster invariants and tools (paint/cut/merge/reorder/stash) are untouched.
-Model edits from the PS side route through the shared doc (`lib.rs`), never through this module.
+Model edits from the PS side route through the shared doc (`doc_sync.rs`, `history.rs`), never through this module.
 
 Notes:
 An overlay's GPU handle is stored together with the `TextureOptions` it was uploaded with, so the
@@ -308,7 +308,7 @@ impl PsTextLayer {
 
 // NOTE: PS no longer reads or writes `text_info.json`, and reads no `layers.json` text metadata either.
 // Text layers are projected from the shared `LayerDoc` (`sync_view_from_doc`), with the PS-owned
-// pin/group metadata taken from the doc node (`materialize_text_runtime_from_doc` in `lib.rs`). The
+// pin/group metadata taken from the doc node (`materialize_text_runtime_from_doc` in `doc_sync.rs`). The
 // former `text_info.json` readers/writers (`read_text_info_array` / `load_png` / `persist_overlay_transform` / `delete_overlay`) were removed
 // across Phases A4–A5 and D. The doc's `decode_page_payload` is the only reader of the legacy file, and
 // only for un-migrated chapters.

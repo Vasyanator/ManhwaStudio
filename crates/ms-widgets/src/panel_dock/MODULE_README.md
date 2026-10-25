@@ -8,7 +8,7 @@ widgets that draw it, and the per-frame driver that ties them together. The desi
 
 Current state: **phases 0–6**. The pure layer (`model.rs`, `solver.rs`, `drag.rs`,
 `cross_window.rs`), the widget
-layer (`tab.rs`, `panel.rs`), the `PanelDock` driver in `mod.rs` including the reorganisation
+layer (`tab.rs`, `panel.rs`), the `PanelDock` driver in `mod.rs` and its frame-step children, including the reorganisation
 gestures, the persistence layer (`persist.rs`) and the detached OS windows (`window.rs`). The
 production consumers are FOUR program tabs. Three of them are CANVAS tabs: «Текст», whose eight
 tabs plus the canvas' own «Лента» live in seven default panels, «Клининг», whose «Клин» /
@@ -253,9 +253,19 @@ at least one caption. Rules:
 
 ## Files and submodules
 - `mod.rs`: the public re-export surface, `PanelDockState`, `DockArea`, `PanelDock`,
-  `PanelDockOutput`, and the three pure frame-planning helpers (`ensure_declared_tabs`,
-  `plan_frame`, `frame_layout`) the driver is built from. Edit when the driver's contract or the
-  public surface changes.
+  `PanelDockOutput`, `TabMeta` and the measurement caches. Edit when the driver's contract or the
+  public surface changes. The driver's frame steps live in private children (`pub(super)` items
+  only; each file's header lists its items):
+  - `host_draw.rs`: `draw_host`, one window's pass, and its records (`HostRecord`, pending drops,
+    `HostOutcome`).
+  - `frame_plan.rs`: `plan_frame` / `tab_request` / `frame_layout` (pure).
+  - `seeding.rs`: `ensure_declared_tabs` and where a newly declared tab's panel lands (pure).
+  - `panel_drag.rs`: applying the panel-move drag and tab drops, `write_back_positions`.
+  - `drop_apply.rs`: addressed cross-window drops, detaches into a new window, `apply_mutations`.
+  - `menu_move.rs`: the «Переместить в окно →» move and its landing rules.
+  - `sub_windows.rs`: live window geometry, immediate / idle sub-window passes, cross-window
+    feedback, `apply_frame_detaches`.
+  - `tests.rs`: the GPU-free unit tests of the driver and those children.
 - `model.rs`: `TabId`, `PanelId`, `HostId`, `DockEdge`, `PanelAnchor`, `PanelNode`, `DockLayout`,
   `MoveTabOutcome`, `DockModelError`. All layout mutations (insert, remove, re-anchor, move a tab)
   live here, together with `validate()` and `chains()`.
@@ -308,7 +318,7 @@ at least one caption. Rules:
   (`window_at`), the three-way verdict (`address_drop`, `DropAddress`) and what a tab
   (`tab_landing`, `TabLanding`, `PanelDropTarget`) or a whole panel (`panel_landing`) lands on
   inside the receiving window. Entirely pure; the live geometry is fed in by
-  `mod.rs::window_geometries`.
+  `sub_windows.rs::window_geometries`.
 
 ### Transparent until hover
 A tab may declare `PanelTab::transparent_until_hover(true)`. The panel drawing that tab then keeps
@@ -1086,7 +1096,7 @@ content.
   first (`ShrinkPriority` / `SHRINK_PRIORITIES`) — edit `solver.rs`; every rule there is covered by
   a test asserting the contract, not the implementation.
 - To change how big a panel asks to be (the maximum over its tabs, what an unmeasured tab
-  contributes, which minimum applies), edit `plan_frame` / `tab_request` in `mod.rs`.
+  contributes, which minimum applies), edit `plan_frame` / `tab_request` in `frame_plan.rs`.
 - To change how a panel LOOKS (header, collapse arrow, scroll behaviour, resize grip), edit
   `panel.rs`. Header rows: the wrapping block and the two measurements are in
   `CollapsiblePanel::contents` / `header_block`; which caption is on which row is
@@ -1096,9 +1106,9 @@ content.
 - To change WHEN a transparent-until-hover panel shows its chrome, edit `ChromeGate::shows_chrome`
   in `panel.rs`; to change WHAT fades with it, edit `CollapsiblePanel::chrome_opacity` /
   `caption_opacity` / `faded_scroll_style` / the `faded` call sites there. To change which panel is transparent at all,
-  edit `plan_frame` in `mod.rs` (`PanelPlan::transparent`) and `TabMeta`; to change what forces
+  edit `plan_frame` in `frame_plan.rs` (`PanelPlan::transparent`) and `TabMeta` in `mod.rs`; to change what forces
   visibility from outside the widget, edit `force_visible` at the `CollapsiblePanel` call site in
-  `draw_host`. Both rules are pure and unit-tested — keep them that way rather than growing a
+  `draw_host` (`host_draw.rs`). Both rules are pure and unit-tested — keep them that way rather than growing a
   condition inside the drawing loop.
 - To change what a caller may declare about a tab, edit `tab.rs` and the `TabMeta` it fills in
   `mod.rs`. Pinned sections: the budget split is `scroll_budget` / `CollapsiblePanel::contents`
@@ -1108,8 +1118,8 @@ content.
   the subtraction of its filler from the measured content height is in
   `CollapsiblePanel::contents` (`panel.rs`), next to `elastic::open_body` / `close_body`.
 - To change the frame model (which sizes are fed to the solver, which panels are solved, which tab
-  is drawn, when a repaint is requested), edit `plan_frame` / `frame_layout` / `PanelDock::end` in
-  `mod.rs`. All planning helpers are pure and unit-tested; keep new decisions inside them rather
+  is drawn, when a repaint is requested), edit `plan_frame` / `frame_layout` in `frame_plan.rs` and
+  `PanelDock::end` in `mod.rs`. All planning helpers are pure and unit-tested; keep new decisions inside them rather
   than inside the drawing loop, so they stay testable without a GPU.
 - Constants (`DOCK_GAP`, `COLLAPSED_PANEL_HEIGHT`, `PANEL_MIN_CONTENT_HEIGHT`, `PANEL_MIN_WIDTH`,
   `PANEL_MIN_BODY_HEIGHT`) are single-source: add new ones next to them in `solver.rs` rather than
@@ -1135,21 +1145,22 @@ content.
 - To change where a drop that crossed a window border goes — how a monitor coordinate is built,
   which window claims an overlapped point, what a tab or a panel lands on inside the receiving
   window — edit `cross_window.rs`; every rule there is a pure function with a test. To change how
-  the live geometry reaches it, or when the verdict is applied, edit `window_geometries` /
-  `apply_addressed_tab_drop` / `apply_addressed_panel_drop` in `mod.rs`. To change what the
-  receiving window SHOWS while the cursor is over it, edit `paint_cross_window_feedback` there and
+  the live geometry reaches it, or when the verdict is applied, edit `window_geometries`
+  (`sub_windows.rs`) / `apply_addressed_tab_drop` / `apply_addressed_panel_drop` (`drop_apply.rs`).
+  To change what the receiving window SHOWS while the cursor is over it, edit
+  `paint_cross_window_feedback` in `sub_windows.rs` and
   the painters in `drag.rs`.
 - To change when a drag becomes a detach — how much resistance the border offers
   (`DETACH_TENSION_DISTANCE`), what counts as torn off (`drag_tension`), which release opens a
   window (`detach_trigger`) — or what a sub-window looks like and how one is placed and
   closed, edit `window.rs` for the DECISIONS (all pure and unit-tested) and
-  `show_sub_windows` / `observe_sub_window_geometry` / `apply_frame_detaches` in `mod.rs` for the
+  `show_sub_windows` / `observe_sub_window_geometry` / `apply_frame_detaches` in `sub_windows.rs` for the
   egui plumbing.
 - To change what the «Переместить в окно →» submenu OFFERS (which windows, in which order, under
   which name), edit `move_targets` / `move_target_label` / `sub_window_name` in `window.rs` — pure
   and unit-tested. To change where a menu move LANDS, edit `menu_tab_landing` / `menu_panel_slot` /
   `centered_slot_in_host` / `step_off_occupied` / `menu_subject_size` / `free_slot_in_host` /
-  `move_into_existing_host` / `apply_menu_move` in `mod.rs`. To change how the submenu is drawn,
+  `move_into_existing_host` / `apply_menu_move` in `menu_move.rs`. To change how the submenu is drawn,
   edit `move_to_window_submenu` in `panel.rs`. Never derive an entry's egui id from its localised
   label; the entry is keyed by its `MoveTarget`.
 - To change how a gesture DECIDES (snap distance, target priority, the sibling rule, where a
@@ -1158,11 +1169,11 @@ content.
   `panel.rs`. Where a dropped tab lands in a header strip, and where its marker goes, is ONE rule
   (`drag::insertion_slot`) used by the widget, `cross_window::tab_landing` and
   `paint_cross_window_feedback`; never re-derive it at a call site. To change when it is applied, edit `advance_panel_drag` / `begin_panel_drag` /
-  `apply_panel_drop` / `apply_tab_drop` in `mod.rs`.
+  `apply_panel_drop` / `apply_tab_drop` in `panel_drag.rs`.
 - To change where a NEWLY DECLARED tab's panel lands — what the default is asked, how a slot that
   is already taken is answered, in which order the new panels are created — edit
   `default_placement` / `default_anchor_tab` / `free_anchor_slot` / `seeding_order` /
-  `sibling_slot` / `seeding_group` / `ensure_declared_tabs` in `mod.rs`; all are pure and
+  `sibling_slot` / `seeding_group` / `ensure_declared_tabs` in `seeding.rs`; all are pure and
   unit-tested.
 - The solver still lays two panels with an identical `target` + `edge` + `align` on top of each
   other — it is a total function of whatever layout it is given. Three things guarantee the user

@@ -26,7 +26,7 @@ the tab's input declarations and contexts, the dock builder, GPU eviction (canva
 sampling, the background drain while hidden (`poll_background`) and the exit-only
 `Canvas.translation_hint_collapsed` key.
 
-`TranslationTabState` in `tab.rs` is the tab orchestrator and `CanvasHooks` implementation. It owns
+`TranslationTabState` in `tab.rs` (behaviour in `tab/`, see `tab/MODULE_README.md`) is the tab orchestrator and `CanvasHooks` implementation. It owns
 panel state, controller instances, footer metadata caches, text-detection storage, OCR selection
 state, and debounced settings persistence.
 
@@ -125,7 +125,7 @@ Long work is delegated to focused controllers:
   `ms_ai_api::exec_chat_validated` (the tracked executor plus ONE format-repair retry, whose
   reason the generation widget shows). The OCR controller owns one `GenerationTracker` shared with its
   worker; each MT run owns a fresh one inside its cancel switch (`MtRunCancel`). Both controllers
-  expose `generation_snapshot()`; `tab.rs` only lends it to the panels, which draw
+  expose `generation_snapshot()`; the tab state only lends it to the panels, which draw
   `ms_ai_api::draw_generation_status` outside their collapsible sections. OCR "Stop" carries the
   clicked snapshot -> `TranslationOcrController::cancel_generation(run_id)` (a stale click never
   stops a later queued request), plus `abort_textdetector_ocr` with a neutral status when the
@@ -137,7 +137,7 @@ Long work is delegated to focused controllers:
   in flight is aborted and queued AI API requests return before their keyring read; queued
   non-AI requests still run before the worker stops (pre-existing).
 - The AI API connection blocks of the OCR and MT panels (key save/delete, metadata refresh) do
-  not go through either controller: `tab.rs` owns one `ms_ai_api::AiApiTaskRunner` per panel
+  not go through either controller: the tab state owns one `ms_ai_api::AiApiTaskRunner` per panel
   (`ocr_ai_api_tasks`, `mt_ai_api_tasks`), submits the panel's `AiApiConnectionActions` to it and
   applies its events in `poll_ai_api_events` (a model replaced by a refresh marks that panel's
   settings dirty; notices become toasts).
@@ -390,7 +390,7 @@ backend offline. The UI trigger gate `ocr::ocr_route_availability(engine, model,
 local_ai)` is the single source of truth for "can this OCR selection run here, and on what?":
 `ocr_route_kind` maps the selection to `AiRouteKind::{Cloud, Native, Backend}` (native ONNX routes,
 backend routes, and `AiApi` over `genai` = `Cloud`), and `AiRouteKind::availability` checks it
-against the process's `LocalAiAvailability`; `tab.rs` (`current_ocr_route_availability`,
+against the process's `LocalAiAvailability`; `tab/ocr_routing.rs` (`current_ocr_route_availability`,
 `ocr_request_refusal`) calls it, reading the runtime+guard from a per-tab snapshot that a background worker
 (`tab/route_inputs.rs`) re-reads at most every `OCR_ROUTE_INPUTS_CACHE_TTL`, one read in flight,
 so the GUI thread never touches the disk for it (until the first read lands the snapshot is
@@ -459,9 +459,12 @@ is an author note addressed to the translator, not a replica.
   draw), `TranslationDrawParams` / `draw` and the `StudioTab` impl. `host/hotkeys.rs`: the execute
   dispatch of every fired command. `host/tests.rs`: declarations identity, execute coverage of
   every declared command, contexts, hint-collapsed round trip, dock builder.
-- `tab.rs`: main tab state, canvas hooks, OCR request building, advanced-recognition
-  integration, footer metadata sync, text-detection mask/line storage, detector result storage,
-  MT dispatch, and coalesced translation settings persistence. The title `settings.json` is
+- `tab.rs` + `tab/`: `TranslationTabState`, the tab orchestrator and `CanvasHooks`
+  implementation. `tab.rs` holds the shared types, constants, the struct, its lifecycle and host
+  API; behaviour is split by concern into `tab/` children (OCR routing, characters / footer, OCR
+  flow, detector storage / mask / block OCR, MT, canvas hooks, settings IO, tools, dock, canvas
+  input, region detection, background drain, scrollbar marks, browser extension) — map and
+  contracts in `tab/MODULE_README.md`. The title `settings.json` is
   written only via `ms_docstore::update` touching the tab's four sections (`OCR`,
   `machine_translation`, `composition`, `text_detector`); a malformed file makes the save fail
   and is left untouched. Retired `text_detector.params` keys (`STALE_TEXT_DETECTOR_PARAM_KEYS`:
@@ -539,53 +542,6 @@ is an author note addressed to the translator, not a replica.
   `BRUSH_ACTIVE` while either is on (`TranslationTabState::brush_input_active`) and applies them
   before drawing (`apply_brush_input`); its view zoom and its preview gestures come from the input
   frame (see "Input").
-- `tab/canvas_input.rs` (child module of `tab`): the canvas pointer drivers — the claimed rect
-  selections (`advance_selection`, `drive_canvas_selection`), the lines editor and the mask brush
-  on the page, the lines edit commands and the hand-off of edited lines to the shared model;
-  `tab/canvas_input/tests.rs` covers the pure helpers and that hand-off.
-- `tab/detector_region.rs` (child module of `tab`): the selection region-detection trigger, the
-  merge of its answer into `text_detector_results` and the shared `TextMaskModel`, and the
-  detector Save snapshot of the shown masks (`detection_pages_for_save`); unit tests inline.
-- `tab/block_bubbles.rs` (child module of `tab`): the one "detector block + recognized text ->
-  bubble" path (`block_uv_rect`, `insert_recognized_bubble`), used by block OCR's results and by
-  the NeuroLate detector mode's "recognize text right away" (`create_bubbles_from_page_texts`:
-  the page's block texts finished by `ocr::finish_recognized_text` with the OCR panel's text
-  options, blocks expanded like block OCR's, never merged).
-- `tab/neurolate.rs` (child module of `tab`): the step of the tab's ONE NeuroLate key panel
-  (`pump_neurolate_key` with the drawn panel's actions — the detector panel and the OCR panel
-  with NeuroLate selected —, `poll_neurolate_key` per frame only while its work is in flight) and
-  `neurolate_params` (the request parameters of every NeuroLate call).
-- `tab/route_inputs.rs` (child module of `tab`, desktop-only): `OcrRouteInputsRefresh`, the
-  non-blocking refresh state machine of the OCR/detector routing inputs (injected reader, unit
-  tests inline) and its production spawner over `ocr::read_ocr_route_inputs`.
-- `tab/dock.rs` (child module of `tab`): the tab's panel dock — `translation_default_dock_layout`
-  (re-exported by `tab.rs` for `host.rs`), `TranslationDockCx`, `draw_panel_dock` (declares all
-  eight tabs), the «Последние персонажи» body with its card helpers and size constants,
-  `text_detector_edit_panel_pos`; its unit tests pin the default layout (and that it solves into
-  disjoint panels) and the card geometry.
-- `tab/browser_extension.rs` (child module of `tab`, `pub(crate)` for the MT panel's view
-  types): `ExtensionUiState::from_status` (the extension block's ONE state, GUI-free: bridge
-  status + folder probe + embedded bundle), `BrowserExtensionController` (bridge start on first
-  view, folder probe, the install job `run_install_job` = install -> start -> open folder ->
-  reload stale peers, open folder, the MT transport save; all on workers, `poll` per frame) over
-  the `ExtensionOps` seam; `tab/browser_extension/tests.rs` pins the mapping table and the job
-  state machine with a fake.
-- `tab/background.rs` (child module of `tab`): `poll_background_work`, the off-draw drain the
-  host's `StudioTab::poll_background` runs while the tab was not drawn last frame
-  (`tab_hidden_last_frame` over `TranslationTab::last_drawn_frame`): only while a job is in flight
-  (`BackgroundWork`), it syncs the hidden canvas (`CanvasView::sync_shared_models_while_hidden`),
-  runs the draw's own detector / storage / OCR / MT polls and the next detector-OCR dispatch, and
-  re-polls after `BACKGROUND_POLL_INTERVAL` (workers do not wake the GUI); unit tests inline.
-- `tab/scrollbar_marks.rs` (child module of `tab`): the translation-status marks of
-  `canvas_scrollbar_marks` (hint exemption, `Marks` / `UntilNext`) and `ScrollbarStatusCache`, the
-  per-bubble world-space entries kept across frames under `(bubbles_key, page_layout_key)` from
-  `ms_canvas::CanvasScrollbarContext` (rebuilt on any bubble or vertical layout change, not on
-  zoom); unit tests inline.
-- `tab/tool_panels.rs` (child module of `tab`): the five tools — `TranslationTool`, `ToolToggles`,
-  the toolbar and tool tab ids, restore / prepare / toggle / `apply_tool_dock_requests`, the
-  toolbar body and its measured size, the router `draw_tool_body` with one `draw_*_tool_body` per
-  tool; its unit tests pin independent toggling, focus-on-enable and the on-set round trip.
-
 ## Contracts and invariants
 - Input action ids are persistence keys (`user_config` -> `Hotkeys`): never rename one. Every
   declared command has an execute arm in `host/hotkeys.rs` (`host/tests.rs` checks it); where a
@@ -741,7 +697,7 @@ is an author note addressed to the translator, not a replica.
   `ms_theme::canvas::SELECTION`. Detector/debug overlay colours stay local.
 - `build_ai_mt_request_preview` assembles the first AI request (system prompt + first batch user
   message with decoded inline images) without contacting the provider, reusing the exact item sort,
-  batch split, and `build_ai_mt_user_parts` ordering as a real run. `tab.rs` runs it on a worker
+  batch split, and `build_ai_mt_user_parts` ordering as a real run. `tab/mt.rs` runs it on a worker
   thread (it loads/decodes images) and shows the result in the debug "Полный запрос" window; the
   per-button right-click action only applies to the AI API tab.
 - The AI MT worker emits diagnostic lines to `runtime_log` (session `last.log`) tagged
@@ -801,7 +757,8 @@ is an author note addressed to the translator, not a replica.
   `AiRouteKind::availability`);
   to change which OCR selection runs on what, edit `ocr::ocr_route_kind` / `ocr_route`.
 - To change canvas overlays/hooks, OCR selection behavior, detector storage, footer sync, or
-  settings persistence, edit `tab.rs`. To change the toolbar, the tools' on/off rules, focus or
+  settings persistence, edit the matching `tab/` child (`canvas_hooks.rs`, `ocr_flow.rs`,
+  `detection_storage.rs`, `characters.rs`, `settings_io.rs`). To change the toolbar, the tools' on/off rules, focus or
   persistence, or what a tool's body does with its panel's actions, edit `tab/tool_panels.rs`;
   where the tools start and how big, `translation_default_dock_layout` in `tab/dock.rs` and the
   `TOOL_TAB_*_SIZE_PX` constants.
@@ -813,10 +770,10 @@ is an author note addressed to the translator, not a replica.
   `draw_recent_characters_tab_body` in `tab/dock.rs`; to change how big their panel starts or how small
   it may get, edit the two `TRANSLATION_RECENT_CHARACTERS_TAB_*_SIZE_PX` constants there. The
   history itself is `collect_recent_character_history` and the digit lookup is
-  `recent_character_entry_for_rank`, both in `tab.rs`.
+  `recent_character_entry_for_rank`, both in `tab/characters.rs`.
 - To change what the character list holds or in what order, edit
   `build_translation_character_names` (group order/dedup) and `collect_chapter_character_names`
-  (which bubbles contribute a name) in `tab.rs`; to change WHEN it is rebuilt, edit
+  (which bubbles contribute a name) in `tab/characters.rs`; to change WHEN it is rebuilt, edit
   `sync_chapter_character_names` and its call site inside `sync_footer_tracking`; to change what
   the FOOTER field is allowed to suggest (as opposed to the panel combo box), edit
   `footer_autocomplete_candidates`.
@@ -839,9 +796,9 @@ is an author note addressed to the translator, not a replica.
 - To change how often an MT service is asked, its cooldowns or the long-text split, edit
   `mt_limits/` (numbers only in `mt_limits/table.rs`); providers never pace themselves.
 - To change bubble list editing, footer fields, search/filter behavior, or text write-through, edit
-  `panels/bubbles.rs` and footer sync helpers in `tab.rs`.
+  `panels/bubbles.rs` and footer sync helpers in `tab/characters.rs`.
 - To change composed text generation or export, edit `panels/composition.rs`.
-- To change advanced manual OCR crop behavior, edit `adv_rec.rs`; keep OCR dispatch in `tab.rs`.
+- To change advanced manual OCR crop behavior, edit `adv_rec.rs`; keep OCR dispatch in `tab/ocr_flow.rs`.
 - To change NeuroLate's "Auto" rules, persisted keys or settings widgets, edit `neurolate.rs` /
   `neurolate/view.rs`; the key panel step and request parameters, `tab/neurolate.rs`; the
   detector mode and the answer -> mask + blocks conversion, `text_detector/neurolate.rs`.

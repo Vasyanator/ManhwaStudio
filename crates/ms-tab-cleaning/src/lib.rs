@@ -49,7 +49,7 @@ mod text_mask_storage;
 mod tools;
 // GUI-free chapter-level watermark decomposition engine (`I = c + s*B`, solved from several
 // occurrences), consumed by the «По главе (точное вычитание)» mode of
-// `tools/watermark_removal.rs`.
+// `tools/watermark_removal/`. Split into stage files under `watermark_chapter/`.
 //
 // `allow(dead_code)`: the tool uses the flat-sample path, so the engine's estimated-background
 // REFINEMENT surface (`refit_with_refined_backgrounds`, `provisional_background`,

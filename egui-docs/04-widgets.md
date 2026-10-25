@@ -13,7 +13,7 @@ memory of 0.27-0.31 — several APIs on this page did not exist then.
 one.** Every floating panel of the studio is declared as a **tab** of the panel dock — the two
 widgets `CollapsiblePanel` (`crates/ms-widgets/src/panel_dock/panel.rs:232`) and `PanelTab`
 (`crates/ms-widgets/src/panel_dock/tab.rs:43`) are **mandatory**, and you reach them through the frame driver
-`PanelDock::begin` → `.tab(id)` → `.end(&mut cx)` (`crates/ms-widgets/src/panel_dock/mod.rs:644`) rather than
+`PanelDock::begin` → `.tab(id)` → `.end(&mut cx)` (`crates/ms-widgets/src/panel_dock/mod.rs:1168`) rather than
 constructing them yourself. Full call-site recipe and rationale: `01-app-shell.md` §3.1; the rule as
 written: `PROJECT_RULES.md` ("egui: never write it from memory") and `crates/ms-widgets/src/panel_dock/MODULE_README.md`.
 

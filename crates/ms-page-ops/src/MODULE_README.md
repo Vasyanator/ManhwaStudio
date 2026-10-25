@@ -26,7 +26,7 @@ execute_page_op(paths, pages, op)             recover_pending_page_op(project_di
   journal A -> phase A + per-rename dir fsync -> journal B -> phase B -> slots deleted
   (write plan)          (reversible)            (commit pt)  (idempotent)
 ```
-- `plan.rs` is pure: permutation math + a journal-serializable action plan
+- `plan.rs` + `plan/` are pure: permutation math + a journal-serializable action plan
   built from a snapshot struct. `json_remap.rs` is pure: `Value`-level rewrites
   of the page-keyed JSON documents. All filesystem work lives in `fs_exec.rs`.
 - Phase A stages created files and renames every affected file to a unique
@@ -87,9 +87,11 @@ execute_page_op(paths, pages, op)             recover_pending_page_op(project_di
   Owned documents (`translation_bubbles`, `settings`, the layers manifest, …)
   may be `.json` or `.db` on disk; open them through `chapter_docs` /
   `ms_docstore`, never by the literal file name.
-- `plan.rs`: permutation math, canonical page-keyed file-name helpers (with
-  citations to the owning modules), snapshot types, plan types, `build_plan`,
-  and the pixel-identity geometry: `PlacementMap` (the ONE affine from a page
+- `plan.rs` + `plan/` (map: `plan/MODULE_README.md`): `plan.rs` declares the
+  canonical page-keyed file-name helpers (with citations to the owning
+  modules), snapshot types, plan types and the geometry types; the children
+  hold the behaviour — permutation math, `build_plan`, the per-artifact
+  planners and the pixel-identity geometry: `PlacementMap` (the ONE affine from a page
   to an output canvas, shared by all three ops), `StitchGeometry`,
   `SplitGeometry` + `SplitTreeRouting`, `CropGeometry` + `CropTreeRouting`, and
   the `PageGeometry` enum every planner takes. `PageGeometry` exposes NO
@@ -541,12 +543,13 @@ Deliberately NOT touched (each with the reason):
   (`_unsaved` is a sibling of the chapter under the same title dir).
 
 ## Editing map
-- New op kind or index-math change: `plan.rs` (`permutation_for_op`) +
+- New op kind or index-math change: `plan/permutation.rs` (`permutation_for_op`) +
   `mod.rs` (`PageOpKind`). A new PIXEL-IDENTITY op also needs a `PageGeometry`
   variant, which the compiler then demands at every planner and remap site, plus
   both `fs_exec::scan_chapter` switches (`needs_sizes`, the layer-PNG probe).
 - New page-keyed artifact category: add it to `TreeSnapshot`/`ChapterSnapshot`
-  + a `plan_*` function in `plan.rs`, scanning in `fs_exec::scan_tree`, and a
+  + a `plan_*` function in `plan/artifacts.rs` (called from `build_plan` in
+  `plan/builder.rs`), scanning in `fs_exec::scan_tree`, and a
   rewrite in `json_remap.rs` if it is a JSON document.
 - Journal format / crash-safety behavior: `fs_exec.rs` (bump
   `JOURNAL_SCHEMA_VERSION` on incompatible plan changes; it is at 4 —
@@ -557,13 +560,13 @@ Deliberately NOT touched (each with the reason):
   is left in place.
 - New chapter document format rule / chapter layout / write durability of the
   owned documents: `chapter_docs.rs`.
-- Stitch / split geometry: `plan.rs` (`PlacementMap` is the single affine —
+- Stitch / split geometry: `plan/placement.rs` + `plan/split.rs` (`PlacementMap` is the single affine —
   never re-derive the formula at a call site; `SplitGeometry::part_for_*` is the
   single routing decision) + `json_remap.rs` for the per-document application.
 - Page ROTATION (canvas size, the point mappings, crop legality): only
   `crop_geometry.rs`. The engine, the pixel executor and the UI preview all call
   it; a second copy of `|w·cosθ| + |h·sinθ|` anywhere is a defect.
-- Crop geometry and survival rules: `plan.rs` (`resolve_crop` is the single
+- Crop geometry and survival rules: `plan/crop.rs` (`resolve_crop` is the single
   legality rule, `CropGeometry::keeps_*` the single survival test) +
   `json_remap.rs` (`crop_layer_routing`, `layer_survives_crop`,
   `bubble_survives_crop`, `text_info_survives_crop`, `crop_page_layers`,
@@ -571,12 +574,12 @@ Deliberately NOT touched (each with the reason):
 - Crop PIXELS (rotation, resampling, mask sampling): `fs_exec.rs`
   (`rotate_page_raster` + `sample_nearest` / `sample_bilinear_premultiplied`),
   driven by the journaled `ComposeSource::rotation`.
-- Split part DELETION: `plan.rs` (`validate_split_routing` is the single
+- Split part DELETION: `plan/split.rs` (`validate_split_routing` is the single
   legality rule, `resolve_split_parts` the survivor ranking); every consumer
   branches on `SplitGeometry::part_new_idx` being `None` — grep it before
   adding a new per-part loop, and never default such a loop to part 0.
 - Split routing of layers: `json_remap.rs` (`split_layer_routing`,
-  `assign_layer_part`, `deform_mesh_cells`) + `plan.rs` (`SplitTreeRouting`,
+  `assign_layer_part`, `deform_mesh_cells`) + `plan/split.rs` (`SplitTreeRouting`,
   `SplitGeometry::part_for_polygon_group` — the fold-correct area sum).
 - Split routing of detection blocks: `json_remap.rs`
   (`detection_merge_blocker` + `detection_rect_blocker` are the two gates,

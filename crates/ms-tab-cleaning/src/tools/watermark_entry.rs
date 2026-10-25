@@ -2,7 +2,7 @@
 FILE HEADER (cleaning/tools/watermark_entry.rs)
 
 Purpose:
-The bridge between the GUI-free decomposition engine (`../watermark_chapter.rs`) and the
+The bridge between the GUI-free decomposition engine (`../watermark_chapter/`) and the
 on-disk library (`watermark_library.rs`). It owns three things neither of those may own:
 
 1. the MAPPING between a fitted `WatermarkKind` and the library's plain-data records —
