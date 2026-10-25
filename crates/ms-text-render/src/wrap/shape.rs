@@ -8,9 +8,8 @@ Main responsibilities:
 - строить width profile для `Rectangle`, `Oval`, `Hexagon`;
 - выполнять iterative reshape текста под форму без участия raster-слоя;
 - возвращать предупреждения о приблизительном fallback отдельно от обычного wrap;
-- pass the render's face-keyed user-authored kerning map
-  (`ShapeWrapRequest::custom_kerning`) into `WrapScoringContext`, so every width the
-  wrap measures is the width the pen loop draws.
+- pass the render's run-width measure (`ShapeWrapRequest::run_width`, the pen) into
+  `WrapScoringContext`, so every width the wrap measures is the width the pen draws.
 
 Source:
 - `reshape_text_for_shape`
@@ -25,7 +24,7 @@ use super::horizontal::{
 };
 use super::{HyphenationDictionaries, WordBreakPolicy};
 use ms_text_util::segmentation::count_layout_units;
-use crate::font_registry::CustomKerningMap;
+use super::RunWidthMeasure;
 use crate::types::{TextShape, TextWrapMode};
 use cosmic_text::{Attrs, FontSystem};
 
@@ -39,10 +38,10 @@ pub(crate) struct ShapeWrapRequest<'a> {
     pub(crate) text: &'a str,
     pub(crate) font_system: &'a mut FontSystem,
     pub(crate) attrs: &'a Attrs<'a>,
-    /// The render's user-authored kerning overrides keyed by registered face (the
-    /// SAME map the pen loop uses). Wrapping must see them or the chosen line breaks
-    /// drift from the pen loop, which applies the very same overrides.
-    pub(crate) custom_kerning: &'a CustomKerningMap,
+    /// How a shaped run's laid-out width is decided: the pen in a render
+    /// (`pipeline::PenRunWidth`: kerning mode, tracking, user-authored pairs), so the
+    /// chosen line breaks follow the drawn widths.
+    pub(crate) run_width: &'a mut dyn RunWidthMeasure,
     pub(crate) font_size_px: f32,
     pub(crate) line_height_px: f32,
     pub(crate) base_width_px: f32,
@@ -73,7 +72,7 @@ pub(crate) fn reshape_text_for_shape(request: ShapeWrapRequest<'_>) -> LayoutTex
         request.attrs,
         request.font_size_px,
         request.line_height_px,
-        request.custom_kerning,
+        request.run_width,
     );
     let base_units = scoring.estimate_base_units(
         request.text,

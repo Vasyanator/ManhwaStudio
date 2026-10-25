@@ -21,10 +21,13 @@ Used by:
   решения вынесены в `FormSearchParams`; дедлайна по часам нет (крейт собирается
   и под wasm) — только детерминированные бюджеты по числу узлов.
 
-User-authored kerning pairs:
-`GlyphWidths::build` takes the render's face-keyed `CustomKerningMap` and REPLACES the
-font's own pair delta with the authored one, so the form search sizes lines against
-the widths the renderer actually draws. WHICH pairs are overridden is the pen's own
+Pen spacing (`MetricKerning`):
+`GlyphWidths::build` takes a `MetricKerning` — the render's face-keyed
+`CustomKerningMap`, kerning mode and manual tracking — so the form search sizes lines
+against the widths the renderer actually draws. Under `Fixed` or tracking each pair's
+kern is the pen's own step plus tracking minus the spanning glyph's advance
+(`measure_pair_units`); `Optical` is measured like `Auto`. Under plain spacing an
+overridden pair REPLACES the font's own pair delta with the authored one. WHICH pairs are overridden is the pen's own
 decision (`pair_advance::PairAdvanceModel::override_per_mille` over the two glyphs the
 pair shapes into: same face carrying a table, one `char` per cluster), so a pair that
 falls through to a fallback face or fuses into a ligature is measured like any other.
@@ -109,7 +112,11 @@ use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
 use super::is_hanging_punctuation;
 use ms_text_util::text_punctuation::clamp_hanging_weight;
 use crate::font_registry::CustomKerningMap;
-use crate::pair_advance::{PairAdvanceModel, PairGlyph};
+use crate::pair_advance::{
+    KerningSettings, PairAdvanceModel, PairGlyph, RunOrientation, StepDirection, TrackingBasis,
+    effective_spacing_percent,
+};
+use crate::types::KerningMode;
 use crate::inline_styles::{InlineTagClass, classify_inline_tag_body};
 use ms_text_util::segmentation::{
     BindingMode, Block, Conservatism, NON_BREAKING_SPACE, SOFT_HYPHEN, SegmentOptions,
@@ -630,7 +637,7 @@ impl GlyphWidths {
         hanging: f32,
         tolerance: u32,
         scope: InlineTagScope,
-        custom_kerning: &CustomKerningMap,
+        kerning: MetricKerning<'_>,
     ) -> Self {
         let text = prepare_inline_no_break_text(form_source_text, scope);
         let visible: Vec<char> = text
@@ -658,27 +665,25 @@ impl GlyphWidths {
             pairs.insert((ch, '-'));
         }
         let mut kerns = HashMap::with_capacity(pairs.len());
-        let model = PairAdvanceModel::new(custom_kerning);
         for &(a, b) in &pairs {
             scratch.clear();
             scratch.push(a);
             scratch.push(b);
-            let (pair_width, authored_per_mille) = measure_pair_units(font_system, attrs, &scratch, model);
-            // A pair the pen overrides REPLACES the font's own pair kerning. The unit
-            // already matches: `WIDTH_METRIC_EM` px per em and per-mille offsets, so the
-            // override IS the delta in these units. `0.0` must survive as an entry that
-            // cancels the font's own kerning, which is why the `delta != 0` filter below
-            // is not applied here.
-            if let Some(offset) = authored_per_mille {
-                let delta = offset.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i32;
-                kerns.insert((a, b), delta);
-                continue;
-            }
-            let sum = i64::from(advances.get(&a).copied().unwrap_or(0))
-                + i64::from(advances.get(&b).copied().unwrap_or(0));
-            let delta = (i64::from(pair_width) - sum).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
-            if delta != 0 {
-                kerns.insert((a, b), delta);
+            match measure_pair_units(font_system, attrs, &scratch, kerning, &advances) {
+                // A kern the pen decides for this pair (an override, `Fixed`, tracking).
+                // `0` must survive as an entry: an override of `0.0` cancels the font's
+                // own kerning, which is why the `delta != 0` filter below is not applied.
+                PairUnits::Decided(delta) => {
+                    kerns.insert((a, b), delta);
+                }
+                PairUnits::Shaped(pair_width) => {
+                    let sum = i64::from(advances.get(&a).copied().unwrap_or(0))
+                        + i64::from(advances.get(&b).copied().unwrap_or(0));
+                    let delta = (i64::from(pair_width) - sum).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+                    if delta != 0 {
+                        kerns.insert((a, b), delta);
+                    }
+                }
             }
         }
 
@@ -732,34 +737,166 @@ impl LineWidthMetric for GlyphWidths {
     }
 }
 
-/// A two-character `pair` shaped at `WIDTH_METRIC_EM`: its width in metric units (as
-/// [`measure_units`]) and, when the pen would override it, the authored offset in
-/// per-mille — decided by `model` over the two shaped glyphs (a pair that shapes into
-/// any other glyph count — a ligature, a split — is never overridden).
+/// What the metric learned about one pair.
+enum PairUnits {
+    /// The pen decides this pair's kern itself (an override, `Fixed`, tracking): the
+    /// signed kern in metric units, to be stored as is.
+    Decided(i32),
+    /// The plain shaped width of the pair in metric units; the kern is derived from it.
+    Shaped(u32),
+}
+
+/// A two-character `pair` shaped at `WIDTH_METRIC_EM`, measured the way the pen draws it
+/// under `kerning`.
+///
+/// When the pair shapes into exactly two glyphs, the pen's own decision applies:
+/// - plain spacing (`Auto` / `Optical`, no tracking): an overridden pair is
+///   `Decided(authored per-mille)` — the unit already matches — and any other pair is
+///   `Shaped` (the font's own kern, derived by the caller exactly as before);
+/// - otherwise: `Decided(round(|step| + tracking) - advance of the spanning glyph)`, where
+///   `step` is `pair_advance`'s `resolve` (`Fixed` own advance, or the override, or the
+///   shaped step) and the tracking is the pen's `TrackingBasis::HorizontalPen` term — so
+///   `advances` + `kerns` sum to the pen's line width.
+///
+/// A pair that shapes into any other glyph count (a ligature, a split) is `Shaped`: the
+/// pen places no step, and no tracking, inside it.
 fn measure_pair_units(
     font_system: &mut FontSystem,
     attrs: &Attrs<'_>,
     pair: &str,
-    model: PairAdvanceModel<'_>,
-) -> (u32, Option<f32>) {
+    kerning: MetricKerning<'_>,
+    advances: &HashMap<char, u32>,
+) -> PairUnits {
     let mut buffer = Buffer::new(font_system, Metrics::new(WIDTH_METRIC_EM, WIDTH_METRIC_EM));
     buffer.set_size(font_system, None, None);
     buffer.set_text(font_system, pair, attrs, Shaping::Advanced);
     buffer.shape_until_scroll(font_system, false);
+    let model = PairAdvanceModel::new(kerning.custom_kerning);
     let mut width = 0.0f32;
-    let mut authored = None;
+    let mut decided = None;
     for run in buffer.layout_runs() {
         width = width.max(run.line_w);
-        if let [first, second] = run.glyphs {
-            authored = authored.or_else(|| {
-                model.override_per_mille(
-                    PairGlyph::from_run(run.text, first),
-                    PairGlyph::from_run(run.text, second),
-                )
+        let [first, second] = run.glyphs else {
+            continue;
+        };
+        if decided.is_some() {
+            continue;
+        }
+        let prev = PairGlyph::from_run(run.text, first);
+        let cur = PairGlyph::from_run(run.text, second);
+        decided = if kerning.is_plain() {
+            model.override_per_mille(prev, cur).map(|offset| {
+                offset.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i32
+            })
+        } else {
+            let shaped_step = second.x - first.x;
+            let step = model.resolve(
+                font_system,
+                kerning.pen_mode(),
+                StepDirection::FollowRun,
+                prev,
+                cur,
+                shaped_step,
+            );
+            let tracking = kerning.tracking_units(TrackingBasis::HorizontalPen {
+                shaped_step_px: shaped_step,
+                prev_w_px: first.w,
+                default_advance_px: WIDTH_METRIC_EM * 0.5,
             });
+            let spanning_char = match RunOrientation::of_step(shaped_step, first) {
+                RunOrientation::LeftToRight => prev.cluster_char,
+                RunOrientation::RightToLeft => cur.cluster_char,
+            };
+            let spanning_advance = spanning_char
+                .and_then(|ch| advances.get(&ch).copied())
+                .unwrap_or(0);
+            let kern = ((step.step_px().abs() + tracking).round() as i64 - i64::from(spanning_advance))
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            Some(kern)
+        };
+    }
+    match decided {
+        Some(delta) => PairUnits::Decided(delta),
+        None => PairUnits::Shaped(width.round().max(0.0) as u32),
+    }
+}
+
+/// How the pen spaces a line, expressed for [`GlyphWidths`]: the user-authored overrides
+/// (keyed by registered face), the kerning mode and the block's manual tracking.
+///
+/// Built once per metric with [`Self::new`] from the SAME values the render gets
+/// (`TextRenderParams::{kerning_mode, kerning_px, kerning_percent, font_size_px,
+/// glyph_width_percent}`), so the form search sizes lines with the widths the pen
+/// draws. Unit convention: the metric measures widths BEFORE the horizontal glyph scale
+/// and the form window divides the line height by that scale
+/// ([`FormSearchParams::line_height_units`]), so a drawn px of tracking is converted to
+/// `px / font_size_px * 1000 / width_scale` metric units.
+///
+/// `KerningMode::Optical` is measured like `Auto` here: its step depends on the median ink
+/// gap of the whole DRAWN line, which a per-pair metric cannot express (the line wrap
+/// measures it exactly; the form metric does not).
+#[derive(Debug, Clone, Copy)]
+pub struct MetricKerning<'a> {
+    custom_kerning: &'a CustomKerningMap,
+    mode: KerningMode,
+    /// Tracking settings in metric units, before the width-scale division.
+    settings: KerningSettings,
+    /// Horizontal glyph scale (`glyph_width_percent / 100`, clamped like the renderer).
+    width_scale: f32,
+}
+
+impl<'a> MetricKerning<'a> {
+    /// The pen's spacing for a block rendered with these `TextRenderParams` values.
+    #[must_use]
+    pub fn new(
+        custom_kerning: &'a CustomKerningMap,
+        kerning_mode: KerningMode,
+        kerning_px: f32,
+        kerning_percent: f32,
+        font_size_px: f32,
+        glyph_width_percent: f32,
+    ) -> Self {
+        let font_size_px = if font_size_px.is_finite() { font_size_px.max(1.0) } else { 1.0 };
+        Self {
+            custom_kerning,
+            mode: kerning_mode,
+            settings: KerningSettings {
+                mode: kerning_mode,
+                spacing_px: kerning_px.clamp(-300.0, 300.0) / font_size_px * WIDTH_METRIC_EM,
+                spacing_percent: effective_spacing_percent(kerning_percent, glyph_width_percent),
+                custom_pairs: false,
+            },
+            width_scale: (glyph_width_percent / 100.0).clamp(0.01, 3.0),
         }
     }
-    (width.round().max(0.0) as u32, authored)
+
+    /// Plain `Auto` spacing (no tracking, no glyph scale) over `custom_kerning`: the
+    /// metric for a caller that has no spacing settings.
+    #[must_use]
+    pub fn auto(custom_kerning: &'a CustomKerningMap) -> Self {
+        Self::new(custom_kerning, KerningMode::Auto, 0.0, 0.0, 100.0, 100.0)
+    }
+
+    /// Whether the pen keeps the shaped step for every non-overridden pair (no `Fixed`, no
+    /// tracking): then the metric keeps measuring the font's own kerning by shaping.
+    fn is_plain(self) -> bool {
+        self.mode != KerningMode::Fixed
+            && self.settings.spacing_px.abs() <= f32::EPSILON
+            && self.settings.spacing_percent.abs() <= f32::EPSILON
+    }
+
+    /// The mode the per-pair step is resolved with (`Optical` -> `Auto`, see the type doc).
+    fn pen_mode(self) -> KerningMode {
+        match self.mode {
+            KerningMode::Fixed => KerningMode::Fixed,
+            KerningMode::Auto | KerningMode::Optical => KerningMode::Auto,
+        }
+    }
+
+    /// The pen's tracking for one step in metric units, divided by the width scale.
+    fn tracking_units(self, basis: TrackingBasis) -> f32 {
+        self.settings.tracking_px(basis) / self.width_scale
+    }
 }
 
 /// Ширина текста в единицах `WIDTH_METRIC_EM`, измеренная шейпером.
@@ -5308,7 +5445,7 @@ Pages wired down:                        333333.\n";
             0.0,
             DEFAULT_WIDTH_TOLERANCE,
             InlineTagScope::NoBreakOnly,
-            &CustomKerningMap::default(),
+            MetricKerning::auto(&CustomKerningMap::default()),
         );
         let kerned = GlyphWidths::build(
             &mut font_system,
@@ -5317,7 +5454,7 @@ Pages wired down:                        333333.\n";
             0.0,
             DEFAULT_WIDTH_TOLERANCE,
             InlineTagScope::NoBreakOnly,
-            &map_on(face, &[('A', 'V', -120.0)]),
+            MetricKerning::auto(&map_on(face, &[('A', 'V', -120.0)])),
         );
 
         // The font's own `AV` kern is what gets replaced, so it must be non-zero for
@@ -5353,7 +5490,7 @@ Pages wired down:                        333333.\n";
             0.0,
             DEFAULT_WIDTH_TOLERANCE,
             InlineTagScope::NoBreakOnly,
-            &map_on(face, &[('A', 'V', 0.0)]),
+            MetricKerning::auto(&map_on(face, &[('A', 'V', 0.0)])),
         );
         assert_eq!(
             cancelled.kerns.get(&('A', 'V')).copied(),
@@ -5404,7 +5541,7 @@ Pages wired down:                        333333.\n";
                 0.0,
                 DEFAULT_WIDTH_TOLERANCE,
                 InlineTagScope::NoBreakOnly,
-                map,
+                MetricKerning::auto(map),
             )
         };
         let plain = build(&mut font_system, FALLBACK_PAIR, &CustomKerningMap::default());

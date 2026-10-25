@@ -1079,24 +1079,25 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
     SECOND time, for the same reason the optical branch does: an overridden pair is
     exempt from the uniform-ink normalization and excluded from the line's median
     target, while the rest of the line is still normalized.
-  - MEASUREMENT GOES THROUGH THE SAME OWNER, so a line breaks where it is drawn. Both
-    width measurements keep the shaped glyphs (per-glyph face ids and clusters) and
-    ask `pair_advance` the pen's own question, bound to faces by the SAME
-    `CustomKerningMap` (`CustomKerningMap::record` after the load; public for the
-    typing tab's form metric):
-    `wrap::horizontal::WrapScoringContext` measures every line — AND the per-unit
-    capacity estimate the candidate lines are cut by — through
-    `pair_advance::measured_run_width_px` (the shaped `line_w`, verbatim when no pair
-    of the run is overridden, else moved by exactly the change of the pen's
-    `line_width_px` rule); `wrap::forms::GlyphWidths::build` stores the authored
-    per-mille offset of a pair the pen overrides (`override_per_mille` over the two
-    glyphs the pair shapes into) in place of the font's own delta, an exact overwrite
-    in the same unit. A pair drawn by a fallback face, fused into a ligature or split
-    into another glyph count is measured like any other, as the pen draws it. The
-    wrap measures `KerningMode::Auto` without tracking: `Fixed` and manual tracking do
-    not reach it (a separate, undecided change). Pinned by
-    `pipeline::tests::the_wrap_width_equals_the_pen_width_for_overridden_lines` and
-    `wrap::horizontal::tests::a_line_breaks_where_its_overridden_width_says_it_does`.
+  - MEASUREMENT IS THE PEN, so a line breaks where it is drawn.
+    `wrap::horizontal::WrapScoringContext` measures every candidate line — AND the
+    per-unit capacity estimate the candidates are cut by — through a
+    `wrap::RunWidthMeasure`; the render passes `pipeline::PenRunWidth`, which lays each
+    shaped run out with `horizontal_run_layout` itself (block kerning mode incl.
+    `Optical`, manual tracking px/percent, user-authored pairs bound by the SAME
+    `CustomKerningMap`) and returns its `line_width_px`. Inline spans do not reach it
+    (the wrap shapes plain lines), and faux bold is deliberately left out of the
+    measurement. `wrap::forms::GlyphWidths::build` (per-char advances + per-pair kerns,
+    the typing tab's form search) takes `forms::MetricKerning`: an overridden pair
+    stores the authored per-mille offset (`override_per_mille` over the two glyphs the
+    pair shapes into) under plain spacing, and under `Fixed` or tracking every pair
+    stores `round(|resolve step| + tracking) - advance of the spanning glyph`, so the
+    sums equal the pen's width; its `Optical` is measured like `Auto` (a per-pair
+    metric cannot express the line's median gap). `CustomKerningMap::record` is public
+    so that metric binds tables exactly like the renderer. Pinned by
+    `pipeline::tests::the_wrap_width_equals_the_pen_width_for_every_mode_and_tracking`,
+    `a_line_breaks_where_its_drawn_width_says_it_does` and
+    `the_form_metric_sums_to_the_pen_width_under_fixed_and_tracking`.
     `WrapScoringContext` without a font system measures no px at all: its "width" is
     a unit count.
   - REJECTED: patching the font BINARY. A legacy `kern` table is consulted by

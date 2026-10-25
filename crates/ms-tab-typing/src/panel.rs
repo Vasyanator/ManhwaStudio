@@ -2937,6 +2937,15 @@ struct AdvancedFormMetricSpec {
     /// the same name. Decides how much an edge punctuation run counts toward a line's
     /// measured width in the form search.
     hanging_punctuation: f32,
+    /// The block's spacing as the renderer gets it (`TextRenderParams::kerning_mode`,
+    /// `kerning_px`, `kerning_percent`, `font_size_px`, `glyph_width_percent`), so the
+    /// metric measures `Fixed` and manual tracking exactly as the pen draws them
+    /// (`forms::MetricKerning::new`).
+    kerning_mode: KerningMode,
+    kerning_px: f32,
+    kerning_percent: f32,
+    font_size_px: f32,
+    glyph_width_percent: f32,
 }
 
 /// An in-flight background resolve of [`AdvancedFormFont`].
@@ -2994,6 +3003,14 @@ struct AdvancedFormMetricSignature {
     /// small, must rebuild the width metric. Fed from `self.hanging_punctuation.to_bits()`
     /// exactly like the neighbouring `faux_bold_thicken_percent`.
     hanging_punctuation_bits: u32,
+    /// The spacing the metric measures with (`forms::MetricKerning`): the kerning mode
+    /// (`None` only in `Default`), and as RAW `f32` BITS like the field above — px tracking
+    /// PER EM (the metric's unit, so a font-size change alone does not rebuild it),
+    /// percent tracking and the horizontal glyph scale in percent.
+    kerning_mode: Option<KerningMode>,
+    tracking_per_em_bits: u32,
+    tracking_percent_bits: u32,
+    glyph_width_percent_bits: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

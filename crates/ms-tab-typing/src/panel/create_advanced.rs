@@ -45,6 +45,13 @@ the same replacement, decided by the same guard, the renderer's pen loop perform
 existing signature: a font reload clears `advanced_form_font`, so `font_content_id`
 passes through `None` and back, which rebuilds the cache with the new table.
 
+THE METRIC SPACES LINES LIKE THE PEN. The spec also carries the block's kerning mode,
+manual tracking, font size and glyph width scale (the values the renderer gets), and
+`forms::MetricKerning::new` turns them into the metric's units, so `Fixed` and tracking
+widen or narrow the forms exactly as they widen or narrow the drawn lines; the signature
+keys them (tracking per em, so a font-size change alone does not rebuild the metric).
+`Optical` is measured like `Auto` by the metric (see `MetricKerning`).
+
 THE SEARCH INPUT IS THE RAW EDITOR TEXT, AND THE TAGS COME BACK. `advanced_form_source_text`
 returns `self.text` with its inline tags intact: `forms::search_forms` and
 `forms::GlyphWidths::build` each strip them themselves, once, from that raw string. Stripping
@@ -1184,6 +1191,11 @@ impl TypingCreatePanelState {
             // as `0.0` but carries a different bit pattern, so its sign is canonicalized
             // first to avoid one spurious metric rebuild.
             hanging_punctuation_bits: if self.hanging_punctuation == 0.0 { 0.0_f32 } else { self.hanging_punctuation }.to_bits(),
+            kerning_mode: Some(self.kerning_mode),
+            // `+ 0.0` canonicalizes `-0.0` (same "no tracking", different bits).
+            tracking_per_em_bits: (self.kerning.as_px_percent().0 / self.font_size_px.max(1.0) + 0.0).to_bits(),
+            tracking_percent_bits: (self.kerning.as_px_percent().1 + 0.0).to_bits(),
+            glyph_width_percent_bits: self.glyph_width.as_percent_of(self.font_size_px.max(1.0)).to_bits(),
         }
     }
 
@@ -1221,6 +1233,12 @@ impl TypingCreatePanelState {
             force_italic: self.force_italic,
             faux_italic: self.faux_italic,
             hanging_punctuation: self.hanging_punctuation,
+            // The same values `create_apply::build_render_params_for` hands the renderer.
+            kerning_mode: self.kerning_mode,
+            kerning_px: self.kerning.as_px_percent().0,
+            kerning_percent: self.kerning.as_px_percent().1,
+            font_size_px: self.font_size_px.max(1.0),
+            glyph_width_percent: self.glyph_width.as_percent_of(self.font_size_px.max(1.0)),
         }
     }
 
@@ -1260,7 +1278,7 @@ impl TypingCreatePanelState {
 /// Поэтому он приходит отдельным аргументом из `AdvancedFormSearchBase`, а не хранится
 /// в снимке метрики: у обоих потребителей должен быть один источник, иначе метрика
 /// померяет не тот алфавит, который сегментируется.
-fn build_advanced_form_glyph_widths_from_spec(
+pub(super) fn build_advanced_form_glyph_widths_from_spec(
     spec: &AdvancedFormMetricSpec,
     form_source_text: &str,
     scope: forms::InlineTagScope,
@@ -1347,7 +1365,14 @@ fn build_advanced_form_glyph_widths_from_spec(
         spec.hanging_punctuation,
         forms::DEFAULT_WIDTH_TOLERANCE,
         scope,
-        &custom_kerning,
+        forms::MetricKerning::new(
+            &custom_kerning,
+            spec.kerning_mode,
+            spec.kerning_px,
+            spec.kerning_percent,
+            spec.font_size_px,
+            spec.glyph_width_percent,
+        ),
     ))
 }
 

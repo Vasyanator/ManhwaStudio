@@ -35,25 +35,26 @@ output images, or apply effects.
   MUCH a character of that set counts, never which characters are in it.
 - `horizontal.rs`: DP/scored paragraph wrapping, line-width measurement, candidate
   break collection, keep-together heuristics, and target-width scoring. Its
-  `WrapScoringContext` measures every line AND the capacity estimate through
-  `pair_advance::measured_run_width_px`, i.e. with the render's USER-AUTHORED kerning
-  pairs applied by the pen's own guard over the shaped glyphs (face ids, clusters), so a
-  line breaks where the pen's laid-out line ends (see CUSTOM KERNING in the crate
+  `WrapScoringContext` measures every line AND the capacity estimate through a
+  `RunWidthMeasure` (this module's root) — in a render the pen itself
+  (`pipeline::PenRunWidth`: kerning mode, tracking, user-authored pairs) — so a line
+  breaks where the pen's laid-out line ends (see CUSTOM KERNING in the crate
   `MODULE_README.md`). With no font system at all the context measures no px: its
   "width" is a unit count.
 - `hyphenation.rs`: embedded Russian/English dictionaries, soft-hyphen insertion,
   safe split filtering, dictionary split lookup, and emergency split fallback.
 - `shape.rs`: shape width profiles for rectangle/oval/hexagon, soft peak no-tree ordering,
   iterative horizontal reshaping, and approximate-shape warnings. `ShapeWrapRequest` carries
-  the render's face-keyed `CustomKerningMap` down into `horizontal.rs`'s scoring context.
+  the render's `RunWidthMeasure` (the pen) down into `horizontal.rs`'s scoring context.
 - `vertical.rs`: vertical column preparation, paragraph splitting, shape-aware vertical
   targets, and vertical emergency token splitting.
 - `forms.rs`: shared discrete line-break "form" logic (presets `FreeNoTree`/`Lens`/
   `Widen`/`Narrow`, pluggable `LineWidthMetric` line widths — `GlyphWidths` measures
   pixel widths via cosmic-text shaping with a precomputed per-glyph advance + adjacent-pair
   kerning table — into which a USER-AUTHORED kerning override REPLACES the font's own pair
-  value verbatim for every pair the pen overrides (`GlyphWidths::build`'s face-keyed
-  `custom_kerning` map, decided by `pair_advance::PairAdvanceModel::override_per_mille`; the metric measures in
+  value verbatim for every pair the pen overrides, and which spaces pairs under `Fixed`
+  and manual tracking exactly as the pen does (`GlyphWidths::build`'s `MetricKerning`,
+  decided by `pair_advance`; `Optical` is measured like `Auto`; the metric measures in
   per-mille of the em, the same unit the overrides use, so the substitution is exact and a
   `0.0` entry is stored rather than dropped), `CharWidthMetric` is the no-font fallback; both honor the hanging-punctuation
   edge rule at the caller's STRENGTH, blending the full-line and core measurements so

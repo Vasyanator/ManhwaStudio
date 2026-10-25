@@ -521,6 +521,21 @@ fn kern_cases() -> Vec<KernCase> {
         pairs: &[],
     });
 
+    // Tracking that DECIDES line breaks: the `h_left` paragraph and box with 6 px tracking.
+    // The wrap measures every candidate line with the pen (tracking included), so no line
+    // of this case may run past the 520 px box.
+    let mut tracking_wrap = base_params();
+    tracking_wrap.font_name = KERN_FONT_NAME.to_string();
+    tracking_wrap.text = "Привет, мир! Hello world.\nЭто тест переноса строк and mixed Latin текста для базовой проверки раскладки.".to_string();
+    tracking_wrap.width_px = 520;
+    tracking_wrap.kerning_px = 6.0;
+    cases.push(KernCase {
+        name: "tracking_px_wrap",
+        params: tracking_wrap,
+        font: TrackedFont::NotoSans,
+        pairs: &[],
+    });
+
     let mut tracking_formula = formula_wave_params("Формула formula волна");
     tracking_formula.font_name = KERN_FONT_NAME.to_string();
     tracking_formula.kerning_px = 4.0;

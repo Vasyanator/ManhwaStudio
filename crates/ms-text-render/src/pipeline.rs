@@ -321,6 +321,61 @@ fn estimate_placeholder_height(params: &TextRenderParams) -> u32 {
     u32::try_from(line_count).unwrap_or(u32::MAX)
 }
 
+/// The pen as the wrap's line-width measure: a shaped run is laid out by
+/// [`horizontal_run_layout`] with the block's kerning mode, manual tracking and the
+/// render's user-authored pairs, and its `line_width_px` is the width the wrap scores —
+/// so a line breaks exactly where the drawn line ends.
+///
+/// Measured with the block-level settings only: the wrap shapes plain candidate lines,
+/// so inline `<…>` spans do not reach it. Faux bold is deliberately left OUT of the
+/// measurement (the wrap measures the undecorated pen): honouring it is a separate
+/// behaviour change. Owns its own per-render outline / contour caches (the `Optical`
+/// branch measures ink), dropped with the wrap.
+pub(crate) struct PenRunWidth<'a> {
+    params: TextRenderParams,
+    custom_kerning: &'a CustomKerningMap,
+    font_size_px: f32,
+    swash_cache: SwashCache,
+    outline_cache: OutlineCache,
+    contour_cache: OpticalContourCache,
+}
+
+impl<'a> PenRunWidth<'a> {
+    /// The pen for `params` (faux bold switched off, see the type doc) over the render's
+    /// face-keyed overrides `custom_kerning`, at the block font size `font_size_px`.
+    #[must_use]
+    pub(crate) fn new(params: &TextRenderParams, custom_kerning: &'a CustomKerningMap, font_size_px: f32) -> Self {
+        let mut params = params.clone();
+        params.faux_bold = None;
+        Self {
+            params,
+            custom_kerning,
+            font_size_px,
+            swash_cache: SwashCache::new(),
+            outline_cache: OutlineCache::new(),
+            contour_cache: OpticalContourCache::new(),
+        }
+    }
+}
+
+impl super::wrap::RunWidthMeasure for PenRunWidth<'_> {
+    fn run_width_px(&mut self, font_system: &mut FontSystem, run: &LayoutRun<'_>) -> f32 {
+        horizontal_run_layout(
+            &self.params,
+            run,
+            font_system,
+            &mut self.swash_cache,
+            &mut self.outline_cache,
+            &mut self.contour_cache,
+            &[0],
+            None,
+            self.custom_kerning,
+            self.font_size_px,
+        )
+        .line_width_px
+    }
+}
+
 // Layout comparison needs the same resolved render context as the main prepass.
 #[allow(clippy::too_many_arguments)]
 fn build_layout_text_for_shape_params(
@@ -350,7 +405,7 @@ fn build_layout_text_for_shape_params(
             text: shaped_text.as_str(),
             font_system,
             attrs,
-            custom_kerning,
+            run_width: &mut PenRunWidth::new(params, custom_kerning, font_size_px),
             font_size_px,
             line_height_px: base_line_height_px,
             base_width_px: shape_params.width_px.max(1) as f32,
@@ -8263,61 +8318,254 @@ mod tests {
         );
     }
 
-    /// THE WRAP MEASURES A LINE EXACTLY AS THE PEN DRAWS IT. For lines with overridden
-    /// pairs — including a ligature (`fi`, one cluster: never overridden on either side),
-    /// a right-to-left run and pairs the table does not list — the width the wrap scores
-    /// (`wrap::measured_line_width_px_for_tests`, the same code path the line breaker
-    /// uses) equals the pen's own `line_width_px` (`max(x + w)`), the extent the line is
-    /// laid out and aligned with.
-    #[test]
-    fn the_wrap_width_equals_the_pen_width_for_overridden_lines() {
-        use crate::characterization::TrackedFont;
+    /// The wrap's width of `text` (the same measurement the line breaker scores) with the
+    /// pen of `params` over `pairs` bound to `font`'s face.
+    fn wrap_line_width(
+        font: &mut crate::characterization::LoadedFont,
+        params: &TextRenderParams,
+        pairs: &[(char, char, f32)],
+        text: &str,
+    ) -> f32 {
         use crate::font_provider::CustomKerningTable;
         use crate::font_registry::CustomKerningMap;
         use cosmic_text::{Attrs, Family};
+
+        let mut map = CustomKerningMap::default();
+        if !pairs.is_empty() {
+            map.insert(
+                font.face_id,
+                Arc::new(CustomKerningTable::from_pairs(pairs.iter().copied())),
+                "fixture",
+            );
+        }
+        let attrs = Attrs::new().family(Family::Name(font.family.as_str()));
+        let mut pen = super::PenRunWidth::new(params, &map, params.font_size_px);
+        crate::wrap::measured_line_width_px_for_tests(
+            &mut font.font_system,
+            &attrs,
+            params.font_size_px,
+            &mut pen,
+            text,
+        )
+    }
+
+    /// THE WRAP MEASURES A LINE EXACTLY AS THE PEN DRAWS IT. Under every kerning mode
+    /// (`Auto`, `Fixed`, `Optical`), with manual tracking in px and in percent, with
+    /// user-authored pairs (including a ligature candidate `fi` and pairs the table does
+    /// not list), left-to-right and right-to-left, the width the line breaker scores
+    /// (`wrap::measured_line_width_px_for_tests`, the same code path) equals the pen's own
+    /// `line_width_px` — the extent the line is laid out and aligned with.
+    #[test]
+    fn the_wrap_width_equals_the_pen_width_for_every_mode_and_tracking() {
+        use crate::characterization::TrackedFont;
 
         let cases: [(TrackedFont, &str); 6] = [
             (TrackedFont::Latin, "AVATAR WAY To"),
             (TrackedFont::Latin, "AVAVAVAVAV AVAVAVAVAV"),
             (TrackedFont::Latin, "office fit AV"),
-            (TrackedFont::Latin, "To Wa Yo"),
+            (TrackedFont::Latin, "To Wa Yo il"),
             (TrackedFont::Hebrew, "\u{05D0}\u{05D1}\u{05D2} \u{05D0}\u{05D1}"),
             (TrackedFont::Hebrew, "\u{05D0}\u{05D1}"),
         ];
         let tables: [&[(char, char, f32)]; 3] = [
+            &[],
             &[('A', 'V', -120.0), ('T', 'o', -80.0), ('f', 'i', -300.0), ('\u{05D0}', '\u{05D1}', -150.0)],
             &[('A', 'V', 0.0), ('W', 'a', 90.0), ('\u{05D0}', '\u{05D1}', 0.0)],
-            &[('Q', 'z', -200.0)],
         ];
         for (font, text) in cases {
             let mut loaded = font.load();
-            for pairs in tables {
-                for em in [36.0f32, 48.0, 100.0] {
-                    let mut params = base_params();
-                    params.text = text.to_string();
-                    params.font_size_px = em;
-                    params.kerning_mode = KerningMode::Auto;
-                    let (xs, line_width_px) = tracked_font_run_layout(&mut loaded, text, &params, pairs);
+            for mode in [KerningMode::Auto, KerningMode::Fixed, KerningMode::Optical] {
+                for (kerning_px, kerning_percent) in [(0.0, 0.0), (3.5, 0.0), (0.0, -20.0), (6.0, 15.0)] {
+                    for pairs in tables {
+                        for em in [36.0f32, 100.0] {
+                            let mut params = base_params();
+                            params.text = text.to_string();
+                            params.font_size_px = em;
+                            params.kerning_mode = mode;
+                            params.kerning_px = kerning_px;
+                            params.kerning_percent = kerning_percent;
+                            let (xs, line_width_px) =
+                                tracked_font_run_layout(&mut loaded, text, &params, pairs);
+                            let wrap_px = wrap_line_width(&mut loaded, &params, pairs, text);
+                            assert!(
+                                (wrap_px - line_width_px).abs() < 1e-3,
+                                "{text:?} {mode:?} tracking ({kerning_px}, {kerning_percent}%) em {em} \
+                                 table {pairs:?}: wrap {wrap_px} vs pen {line_width_px} (xs {xs:?})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-                    let mut map = CustomKerningMap::default();
-                    map.insert(
-                        loaded.face_id,
-                        Arc::new(CustomKerningTable::from_pairs(pairs.iter().copied())),
-                        "fixture",
-                    );
-                    let attrs = Attrs::new().family(Family::Name(loaded.family.as_str()));
-                    let wrap_px = crate::wrap::measured_line_width_px_for_tests(
-                        &mut loaded.font_system,
-                        &attrs,
-                        em,
-                        &map,
-                        text,
-                    );
-                    assert!(
-                        (wrap_px - line_width_px).abs() < 1e-2,
-                        "{text:?} em {em} table {pairs:?}: wrap {wrap_px} vs pen {line_width_px} \
-                         (xs {xs:?})"
-                    );
+    /// Wraps `text` in a free whole-word box of `width_px` with the pen of `params` over
+    /// `pairs`; returns the laid-out lines.
+    fn wrap_free(
+        font: &mut crate::characterization::LoadedFont,
+        params: &TextRenderParams,
+        pairs: &[(char, char, f32)],
+        text: &str,
+        width_px: f32,
+    ) -> Vec<String> {
+        use crate::font_provider::CustomKerningTable;
+        use crate::font_registry::CustomKerningMap;
+        use crate::types::{TextShape, TextWrapMode};
+        use crate::wrap::{ShapeWrapRequest, reshape_text_for_shape};
+        use cosmic_text::{Attrs, Family};
+
+        let mut map = CustomKerningMap::default();
+        if !pairs.is_empty() {
+            map.insert(
+                font.face_id,
+                Arc::new(CustomKerningTable::from_pairs(pairs.iter().copied())),
+                "fixture",
+            );
+        }
+        let attrs = Attrs::new().family(Family::Name(font.family.as_str()));
+        let mut pen = super::PenRunWidth::new(params, &map, params.font_size_px);
+        reshape_text_for_shape(ShapeWrapRequest {
+            text,
+            font_system: &mut font.font_system,
+            attrs: &attrs,
+            run_width: &mut pen,
+            font_size_px: params.font_size_px,
+            line_height_px: params.font_size_px * 1.2,
+            base_width_px: width_px,
+            wrap_mode: TextWrapMode::WholeWords,
+            hyphen_dicts: None,
+            word_break_policy: None,
+            shape: TextShape::Free,
+            min_width_percent: 55.0,
+            shape_variant: 5,
+            allow_moderate_trees: false,
+            hanging_punctuation: 0.0,
+            preserve_edge_spaces: false,
+        })
+        .text
+        .lines()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// THE BREAK FOLLOWS THE DRAWN WIDTH. For a setting that makes the drawn line LONGER
+    /// (px / percent tracking, `Fixed` on a font that kerns its pairs tighter) and one that
+    /// makes it SHORTER (a tightening override, negative tracking), a box between the
+    /// plain and the drawn one-line width must break the text exactly when the DRAWN line
+    /// does not fit: the per-unit capacity estimate the candidates are cut by is measured
+    /// by the same pen, so a fitting line is offered and a non-fitting one is not.
+    #[test]
+    fn a_line_breaks_where_its_drawn_width_says_it_does() {
+        use crate::characterization::TrackedFont;
+
+        const TEXT: &str = "AVAVAVAVAV AVAVAVAVAV";
+        let mut latin = TrackedFont::Latin.load();
+        let mut plain = base_params();
+        plain.text = TEXT.to_string();
+        plain.font_size_px = 48.0;
+        let plain_px = wrap_line_width(&mut latin, &plain, &[], TEXT);
+
+        let mut tracked_px = plain.clone();
+        tracked_px.kerning_px = 4.0;
+        let mut tracked_percent = plain.clone();
+        tracked_percent.kerning_percent = 12.0;
+        let mut fixed = plain.clone();
+        fixed.kerning_mode = KerningMode::Fixed;
+        let mut negative = plain.clone();
+        negative.kerning_px = -3.0;
+        /// One setting under test: label, params and the override pairs.
+        type Variant<'v> = (&'v str, &'v TextRenderParams, &'v [crate::characterization::AuthoredPair]);
+        let tighten: &[(char, char, f32)] = &[('A', 'V', -120.0)];
+        let variants: [Variant<'_>; 5] = [
+            ("tracking px", &tracked_px, &[]),
+            ("tracking percent", &tracked_percent, &[]),
+            ("fixed", &fixed, &[]),
+            ("negative tracking", &negative, &[]),
+            ("override", &plain, tighten),
+        ];
+        for (label, params, pairs) in variants {
+            let drawn_px = wrap_line_width(&mut latin, params, pairs, TEXT);
+            assert!(
+                (drawn_px - plain_px).abs() > 10.0,
+                "{label}: precondition, the setting must change the line noticeably: \
+                 {drawn_px} vs {plain_px}"
+            );
+            let between = (drawn_px + plain_px) * 0.5;
+            let drawn_lines = wrap_free(&mut latin, params, pairs, TEXT, between);
+            let plain_lines = wrap_free(&mut latin, &plain, &[], TEXT, between);
+            let (expected_drawn, expected_plain) = if drawn_px < plain_px { (1, 2) } else { (2, 1) };
+            assert_eq!(drawn_lines.len(), expected_drawn, "{label}: {drawn_lines:?} at {between}");
+            assert_eq!(plain_lines.len(), expected_plain, "{label} control: {plain_lines:?}");
+            // And the drawn text always fits a box as wide as its own drawn line.
+            assert_eq!(
+                wrap_free(&mut latin, params, pairs, TEXT, drawn_px + 1.0).len(),
+                1,
+                "{label}: a box as wide as the drawn line holds it"
+            );
+        }
+    }
+
+    /// THE FORM METRIC SUMS TO THE PEN'S WIDTH. `forms::GlyphWidths` (per-character
+    /// advances + per-pair kerns at 1000 units per em) built with the block's
+    /// `MetricKerning` must measure a line within one unit per glyph of the pen's
+    /// `line_width_px` at em 1000 (each pair kern and advance is rounded once), under
+    /// `Auto` and `Fixed`, with tracking in px and in percent, with and without
+    /// user-authored pairs. (`Optical` is measured like `Auto` by contract, and a
+    /// right-to-left line's pen width is pending its own fix, so neither is pinned here.)
+    #[test]
+    fn the_form_metric_sums_to_the_pen_width_under_fixed_and_tracking() {
+        use crate::characterization::TrackedFont;
+        use crate::font_provider::CustomKerningTable;
+        use crate::font_registry::CustomKerningMap;
+        use crate::wrap::forms::{
+            DEFAULT_WIDTH_TOLERANCE, GlyphWidths, InlineTagScope, LineWidthMetric, MetricKerning,
+        };
+        use cosmic_text::{Attrs, Family, Metrics};
+
+        const EM: f32 = 1000.0;
+        let texts = ["AVATAR WAY To", "AVAVAVAVAV AVAVAVAVAV", "To Wa Yo il"];
+        let tables: [&[(char, char, f32)]; 2] = [&[], &[('A', 'V', -120.0), ('T', 'o', -80.0)]];
+        let mut latin = TrackedFont::Latin.load();
+        for text in texts {
+            for mode in [KerningMode::Auto, KerningMode::Fixed] {
+                for (kerning_px, kerning_percent) in [(0.0, 0.0), (35.0, 0.0), (0.0, -20.0), (60.0, 15.0)] {
+                    for pairs in tables {
+                        let mut params = base_params();
+                        params.text = text.to_string();
+                        params.font_size_px = EM;
+                        params.kerning_mode = mode;
+                        params.kerning_px = kerning_px;
+                        params.kerning_percent = kerning_percent;
+                        let (xs, pen_width) = tracked_font_run_layout(&mut latin, text, &params, pairs);
+
+                        let mut map = CustomKerningMap::default();
+                        if !pairs.is_empty() {
+                            map.insert(
+                                latin.face_id,
+                                Arc::new(CustomKerningTable::from_pairs(pairs.iter().copied())),
+                                "fixture",
+                            );
+                        }
+                        let attrs = Attrs::new()
+                            .family(Family::Name(latin.family.as_str()))
+                            .metrics(Metrics::new(EM, EM));
+                        let metric = GlyphWidths::build(
+                            &mut latin.font_system,
+                            &attrs,
+                            text,
+                            0.0,
+                            DEFAULT_WIDTH_TOLERANCE,
+                            InlineTagScope::NoBreakOnly,
+                            MetricKerning::new(&map, mode, kerning_px, kerning_percent, EM, 100.0),
+                        );
+                        let metric_width = metric.line_width(text) as f32;
+                        let glyphs = xs.len() as f32;
+                        assert!(
+                            (metric_width - pen_width).abs() <= glyphs,
+                            "{text:?} {mode:?} tracking ({kerning_px}, {kerning_percent}%) table \
+                             {pairs:?}: metric {metric_width} vs pen {pen_width}"
+                        );
+                    }
                 }
             }
         }

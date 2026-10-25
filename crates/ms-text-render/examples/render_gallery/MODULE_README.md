@@ -34,7 +34,8 @@ links it (`ms_text_render::render_text_to_image` + `::types::*`). It needs no
   (`kern_optical_rtl`) and faux-bold growth (`kern_faux_rtl`), overrides on
   formula seeds, an override at a line break (`kern_override_wrap`, a box the text fits
   only through its overrides, see `KERN_WRAP_WIDTH_PX`), and manual tracking on the pen,
-  formula and vertical paths. The self-check
+  formula and vertical paths, including tracking that decides line breaks
+  (`tracking_px_wrap`: no line may run past its box). The self-check
   `the_kerning_cases_really_carry_their_override_table` proves each table reaches the
   face the text is drawn with.
 - Run: `cargo run -p ms-text-render --example render_gallery -- <outdir> [aa_mode]`;

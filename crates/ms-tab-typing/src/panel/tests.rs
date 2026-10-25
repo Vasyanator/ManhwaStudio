@@ -7719,3 +7719,65 @@ paths change.
         assert!(!state.custom_font.adhoc_recipe_damaged);
         assert!(state.missing_font.is_none());
     }
+
+    /// The create-advanced width metric spaces lines like the pen: from the SAME values
+    /// the renderer gets, `Fixed` (which drops the font's own tighter `AV` / `To` pairs)
+    /// and positive px / percent tracking widen the measured line, negative tracking
+    /// narrows it, and a user-authored pair on the font REPLACES the font's own value.
+    /// Uses the tracked `fonts/ui` Noto Sans, so it runs on a fresh clone.
+    #[test]
+    fn the_advanced_form_metric_follows_kerning_mode_tracking_and_overrides() {
+        use crate::render_next::forms::{InlineTagScope, LineWidthMetric};
+        use crate::render_next::{CustomKerningTable, font_content_id};
+
+        const TEXT: &str = "AVATAR WAY To";
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fonts/ui/core/00-NotoSans-Regular.ttf");
+        let bytes = std::fs::read(&path).expect("tracked fonts/ui Noto Sans");
+        let content_id = font_content_id(&bytes);
+        let content = FontContent {
+            name: "metric-test".to_string(),
+            original_name: "metric-test".to_string(),
+            data: Arc::new(bytes),
+            face_index: 0,
+            content_id,
+            custom_kerning: None,
+        };
+        let spec_with = |content: FontContent, mode: KerningMode, px: f32, percent: f32| AdvancedFormMetricSpec {
+            content: Some(content),
+            face_index: 0,
+            bundled_stack: false,
+            path: path.clone(),
+            display_label: "metric-test".to_string(),
+            force_bold: false,
+            faux_bold: false,
+            force_italic: false,
+            faux_italic: false,
+            hanging_punctuation: 0.0,
+            kerning_mode: mode,
+            kerning_px: px,
+            kerning_percent: percent,
+            font_size_px: 48.0,
+            glyph_width_percent: 100.0,
+        };
+        let width = |spec: &AdvancedFormMetricSpec| {
+            create_advanced::build_advanced_form_glyph_widths_from_spec(spec, TEXT, InlineTagScope::NoBreakOnly)
+                .expect("metric from the tracked font")
+                .line_width(TEXT)
+        };
+        let auto = width(&spec_with(content.clone(), KerningMode::Auto, 0.0, 0.0));
+        let fixed = width(&spec_with(content.clone(), KerningMode::Fixed, 0.0, 0.0));
+        let wide_px = width(&spec_with(content.clone(), KerningMode::Auto, 4.8, 0.0));
+        let wide_percent = width(&spec_with(content.clone(), KerningMode::Auto, 0.0, 10.0));
+        let narrow = width(&spec_with(content.clone(), KerningMode::Auto, -2.4, 0.0));
+        assert!(fixed > auto, "Fixed drops the font's tighter pairs: {fixed} vs {auto}");
+        // 4.8 px at 48 px is 100 metric units per step, 12 steps.
+        assert_eq!(wide_px, auto + 1200, "px tracking adds exactly its units per step");
+        assert!(wide_percent > auto, "{wide_percent} vs {auto}");
+        assert_eq!(narrow + 600, auto, "negative px tracking narrows by its units per step");
+
+        let mut kerned = content;
+        kerned.custom_kerning = Some(Arc::new(CustomKerningTable::from_pairs([('A', 'V', -300.0)])));
+        let overridden = width(&spec_with(kerned, KerningMode::Auto, 0.0, 0.0));
+        assert!(overridden < auto, "a -300 per-mille AV pair tightens the line: {overridden} vs {auto}");
+    }

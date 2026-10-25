@@ -77,3 +77,15 @@ pub(crate) fn should_prehyphenate_overlong(wrap_mode: TextWrapMode) -> bool {
 pub(crate) fn is_hanging_punctuation(ch: char) -> bool {
     ms_text_util::text_punctuation::is_hanging_punctuation(ch)
 }
+
+/// How the horizontal wrap turns one shaped run into a laid-out width.
+///
+/// The wrap shapes candidate lines itself but must not decide their width itself: the
+/// width a line is DRAWN with depends on the kerning mode, manual tracking and
+/// user-authored pairs, all owned by the pen. A render implements this with the pen
+/// (`pipeline::PenRunWidth`), so a line breaks exactly where its drawn line ends.
+pub(crate) trait RunWidthMeasure {
+    /// The laid-out width in px of `run`, shaped by `font_system`.
+    fn run_width_px(&mut self, font_system: &mut cosmic_text::FontSystem, run: &cosmic_text::LayoutRun<'_>) -> f32;
+}
+

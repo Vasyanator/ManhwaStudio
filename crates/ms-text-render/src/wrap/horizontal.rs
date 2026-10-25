@@ -21,14 +21,13 @@ remaining blocks; it is `(start_index, split_tail)` over the original slice: the
 one-element-longer temporary view. This keeps memoization keys and state transitions
 O(1) in allocation instead of cloning/hashing the whole block suffix per DP state.
 
-Custom kerning:
-Line widths are measured by SHAPING, and the shaper knows nothing about user-authored
-kerning pairs. Every measurement — the line widths the DP scores AND the per-unit
-capacity estimate the candidate lines are cut by — therefore goes through
-`pair_advance::measured_run_width_px` over the shaped `LayoutRun`, which applies the
-overrides with the pen's own guard (per-glyph face ids, single-char clusters),
-magnitude and right-to-left anchor. A line is measured exactly as it is drawn under
-`KerningMode::Auto` without tracking (the wrap ignores `Fixed` and tracking).
+Line width = the pen's width:
+Line widths are measured by SHAPING, and the shaper knows nothing about the kerning
+mode, manual tracking or user-authored kerning pairs. Every measurement — the line
+widths the DP scores AND the per-unit capacity estimate the candidate lines are cut by
+— therefore hands each shaped `LayoutRun` to a `RunWidthMeasure`; a render passes the
+pen itself (`pipeline::PenRunWidth`, i.e. `horizontal_run_layout`'s `line_width_px`),
+so a line breaks exactly where its drawn line ends.
 
 Source:
 - `collect_line_break_candidates`
@@ -50,8 +49,7 @@ use ms_text_util::segmentation::{
     count_layout_units, with_default_segmenter,
 };
 use ms_text_util::text_punctuation::clamp_hanging_weight;
-use crate::font_registry::CustomKerningMap;
-use crate::pair_advance::{PairAdvanceModel, measured_run_width_px};
+use super::RunWidthMeasure;
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
 use std::collections::HashMap;
 
@@ -89,9 +87,10 @@ pub(super) struct WrapScoringContext<'font, 'attrs> {
     font_size_px: f32,
     line_height_px: f32,
     width_cache_px: HashMap<String, f32>,
-    /// The pair owner over the render's face-keyed overrides; `None` only for the
-    /// font-less test context, which measures nothing in px.
-    pair_model: Option<PairAdvanceModel<'attrs>>,
+    /// How one shaped run's laid-out width is decided — the pen itself in a render
+    /// (`pipeline::PenRunWidth`); `None` only for the font-less test context, which
+    /// measures nothing in px.
+    run_width: Option<&'font mut dyn RunWidthMeasure>,
 }
 
 impl<'font, 'attrs> WrapScoringContext<'font, 'attrs> {
@@ -103,22 +102,22 @@ impl<'font, 'attrs> WrapScoringContext<'font, 'attrs> {
             font_size_px: 1.0,
             line_height_px: 1.0,
             width_cache_px: HashMap::new(),
-            pair_model: None,
+            run_width: None,
         }
     }
 
     /// Scoring context measuring with `font_system`/`attrs`.
     ///
-    /// `custom_kerning` is the render's face-keyed override map, bound to the faces of
-    /// `font_system` exactly as the pen sees them (`CustomKerningMap::record`); an empty
-    /// map measures the plain shaped widths. The wrap decides line breaks from these
-    /// widths, so a map that misses a face the pen kerns drifts from what is drawn.
+    /// `run_width` decides the width of every shaped run the wrap measures — line
+    /// candidates AND the capacity estimate. A render passes the pen
+    /// (`pipeline::PenRunWidth`: kerning mode, tracking and user-authored pairs exactly
+    /// as drawn), so a line breaks where its drawn line ends.
     pub(super) fn new(
         font_system: &'font mut FontSystem,
         attrs: &'attrs Attrs<'attrs>,
         font_size_px: f32,
         line_height_px: f32,
-        custom_kerning: &'attrs CustomKerningMap,
+        run_width: &'font mut dyn RunWidthMeasure,
     ) -> Self {
         Self {
             font_system: Some(font_system),
@@ -126,7 +125,7 @@ impl<'font, 'attrs> WrapScoringContext<'font, 'attrs> {
             font_size_px,
             line_height_px,
             width_cache_px: HashMap::new(),
-            pair_model: Some(PairAdvanceModel::new(custom_kerning)),
+            run_width: Some(run_width),
         }
     }
 
@@ -135,14 +134,18 @@ impl<'font, 'attrs> WrapScoringContext<'font, 'attrs> {
             return width_px;
         }
 
-        let width_px = match (self.font_system.as_deref_mut(), self.attrs) {
-            (Some(font_system), Some(attrs)) => measure_word_width_px(
+        let width_px = match (
+            self.font_system.as_deref_mut(),
+            self.attrs,
+            self.run_width.as_deref_mut(),
+        ) {
+            (Some(font_system), Some(attrs), Some(run_width)) => measure_word_width_px(
                 line_text,
                 font_system,
                 attrs,
                 self.font_size_px,
                 self.line_height_px,
-                self.pair_model,
+                run_width,
             ),
             _ => fallback_units as f32,
         };
@@ -157,36 +160,29 @@ impl<'font, 'attrs> WrapScoringContext<'font, 'attrs> {
         base_width_px: f32,
         hanging_punctuation: f32,
     ) -> usize {
-        let (font_size_px, line_height_px, pair_model) =
-            (self.font_size_px, self.line_height_px, self.pair_model);
-        if let Some(font_system) = self.font_system.as_deref_mut() {
-            estimate_line_capacity_units(text, base_width_px, hanging_punctuation, |sample| {
-                measure_word_width_px(sample, font_system, attrs, font_size_px, line_height_px, pair_model)
-            })
-        } else {
-            1
+        let (font_size_px, line_height_px) = (self.font_size_px, self.line_height_px);
+        match (self.font_system.as_deref_mut(), self.run_width.as_deref_mut()) {
+            (Some(font_system), Some(run_width)) => {
+                estimate_line_capacity_units(text, base_width_px, hanging_punctuation, |sample| {
+                    measure_word_width_px(sample, font_system, attrs, font_size_px, line_height_px, run_width)
+                })
+            }
+            _ => 1,
         }
     }
 }
 
-/// One line's width as the wrap measures it (user-authored pairs included), for the
-/// pipeline tests that compare it with the width the pen draws.
+/// One line's width as the wrap measures it through `run_width`, for the pipeline tests
+/// that compare it with the width the pen draws.
 #[cfg(test)]
 pub(crate) fn measured_line_width_px_for_tests(
     font_system: &mut FontSystem,
     attrs: &Attrs<'_>,
     font_size_px: f32,
-    custom_kerning: &CustomKerningMap,
+    run_width: &mut dyn RunWidthMeasure,
     line: &str,
 ) -> f32 {
-    measure_word_width_px(
-        line,
-        font_system,
-        attrs,
-        font_size_px,
-        font_size_px * 1.2,
-        Some(PairAdvanceModel::new(custom_kerning)),
-    )
+    measure_word_width_px(line, font_system, attrs, font_size_px, font_size_px * 1.2, run_width)
 }
 
 /// Memoization key for `solve_wrap_paragraph_dp`.
@@ -999,16 +995,15 @@ fn shape_monotonic_phase(settings: WrapSettings<'_>, line_idx: usize) -> ShapeMo
     }
 }
 
-/// Width in px of `word` shaped as one unwrapped line: the widest run, each measured
-/// through `pair_model` (user-authored pairs applied exactly as the pen draws them,
-/// `pair_advance::measured_run_width_px`); without a model, the plain shaped width.
+/// Width in px of `word` shaped as one unwrapped line: the widest run, each measured by
+/// `run_width` (in a render: the pen, `pipeline::PenRunWidth`).
 fn measure_word_width_px(
     word: &str,
     font_system: &mut FontSystem,
     attrs: &Attrs<'_>,
     font_size_px: f32,
     line_height_px: f32,
-    pair_model: Option<PairAdvanceModel<'_>>,
+    run_width: &mut dyn RunWidthMeasure,
 ) -> f32 {
     let mut measure = Buffer::new(
         font_system,
@@ -1019,11 +1014,7 @@ fn measure_word_width_px(
     measure.shape_until_scroll(font_system, false);
     let mut width_px = 0.0f32;
     for run in measure.layout_runs() {
-        let run_width_px = match pair_model {
-            Some(model) => measured_run_width_px(model, font_system, &run),
-            None => run.line_w,
-        };
-        width_px = width_px.max(run_width_px);
+        width_px = width_px.max(run_width.run_width_px(font_system, &run));
     }
     width_px
 }
@@ -1033,8 +1024,6 @@ mod tests {
     use super::{
         WrapScoringContext, WrapSettings, violates_tree_width_rule, wrap_text_with_targets_scored,
     };
-    use crate::font_registry::CustomKerningMap;
-    use cosmic_text::{Attrs, Family, FontSystem, fontdb};
     use crate::wrap::WordBreakPolicy;
     use ms_text_util::segmentation::{
         BindingMode, count_layout_units, with_default_segmenter,
@@ -1517,140 +1506,4 @@ mod tests {
             assert_eq!(upper, upper_of_lower, "lower: {lower:?}");
         }
     }
-
-    /// The tracked Latin + Hebrew `fonts/ui` faces in ONE database (so the shaper really
-    /// falls back between them), the Latin family, and both face ids.
-    fn tracked_two_face_system() -> (FontSystem, String, fontdb::ID, fontdb::ID) {
-        use crate::characterization::TrackedFont;
-        let mut db = fontdb::Database::new();
-        db.load_font_data(TrackedFont::Latin.bytes());
-        let (latin_face, latin_family) = db
-            .faces()
-            .next()
-            .map(|face| (face.id, face.families[0].0.clone()))
-            .expect("latin face");
-        db.load_font_data(TrackedFont::Hebrew.bytes());
-        let hebrew_face = db
-            .faces()
-            .map(|face| face.id)
-            .find(|id| *id != latin_face)
-            .expect("hebrew face");
-        (
-            FontSystem::new_with_locale_and_db("en-US".to_string(), db),
-            latin_family,
-            latin_face,
-            hebrew_face,
-        )
-    }
-
-    fn map_on(face: fontdb::ID, pairs: &[(char, char, f32)]) -> CustomKerningMap {
-        let mut map = CustomKerningMap::default();
-        map.insert(
-            face,
-            std::sync::Arc::new(crate::font_provider::CustomKerningTable::from_pairs(pairs.iter().copied())),
-            "fixture",
-        );
-        map
-    }
-
-    /// The wrap measurement applies an override exactly as the pen does: the authored
-    /// pair REPLACES the font's own kern (anchored on the un-kerned `hmtx` advance), a
-    /// table without a matching pair leaves the shaped width bit-identical, and a pair
-    /// drawn by a face WITHOUT the table (here: Hebrew falling back to the Hebrew face
-    /// while the table sits on the Latin one) is not overridden.
-    #[test]
-    fn the_scoring_context_measures_overrides_with_the_pens_guard() {
-        let (mut font_system, family, latin_face, _) = tracked_two_face_system();
-        let attrs = Attrs::new().family(Family::Name(family.as_str()));
-        let empty = CustomKerningMap::default();
-        let mut width_of = |text: &str, map: &CustomKerningMap| {
-            let mut scoring = WrapScoringContext::new(&mut font_system, &attrs, 100.0, 120.0, map);
-            scoring.measure_line_width_px(text, 2)
-        };
-
-        let plain = width_of("AV", &empty);
-        let tightened = width_of("AV", &map_on(latin_face, &[('A', 'V', -100.0)]));
-        let cancelled = width_of("AV", &map_on(latin_face, &[('A', 'V', 0.0)]));
-        assert!(
-            (cancelled - tightened - 10.0).abs() < 1e-3,
-            "-100 per mille at em 100 is exactly 10 px against the un-kerned pair: \
-             {tightened} vs {cancelled}"
-        );
-        assert!(
-            (cancelled - plain).abs() > 1e-2,
-            "the fixture font must kern 'AV' itself, or REPLACING it proves nothing"
-        );
-        assert_eq!(
-            width_of("AV", &map_on(latin_face, &[('Q', 'z', -500.0)])),
-            plain,
-            "a table without a matching pair must leave the shaped width bit-identical"
-        );
-        let hebrew = "\u{05D0}\u{05D1}";
-        assert_eq!(
-            width_of(hebrew, &map_on(latin_face, &[('\u{05D0}', '\u{05D1}', -400.0)])),
-            width_of(hebrew, &empty),
-            "a pair drawn by a fallback face (no table) must not be overridden"
-        );
-    }
-
-    /// THE BREAK FOLLOWS THE DRAWN WIDTH. Two words of five `AV` pairs each fit on ONE
-    /// line exactly when the box is at least as wide as the line's kerned width. With a
-    /// box between the kerned and the un-kerned one-line width, the overridden text must
-    /// stay on one line and the plain text must break; the per-unit capacity estimate the
-    /// candidate lines are cut by is measured through the overrides too, or the one-line
-    /// candidate would never be offered (which is what kept the break from moving).
-    #[test]
-    fn a_line_breaks_where_its_overridden_width_says_it_does() {
-        use crate::wrap::{ShapeWrapRequest, reshape_text_for_shape};
-        use crate::types::{TextShape, TextWrapMode};
-
-        const TEXT: &str = "AVAVAVAVAV AVAVAVAVAV";
-        let (mut font_system, family, latin_face, _) = tracked_two_face_system();
-        let attrs = Attrs::new().family(Family::Name(family.as_str()));
-        let kerned_map = map_on(latin_face, &[('A', 'V', -120.0)]);
-        let empty = CustomKerningMap::default();
-        let one_line_width = |font_system: &mut FontSystem, map: &CustomKerningMap| {
-            let mut scoring = WrapScoringContext::new(font_system, &attrs, 48.0, 57.6, map);
-            scoring.measure_line_width_px(TEXT, 21)
-        };
-        let kerned_px = one_line_width(&mut font_system, &kerned_map);
-        let plain_px = one_line_width(&mut font_system, &empty);
-        assert!(plain_px - kerned_px > 10.0, "precondition: {kerned_px} vs {plain_px}");
-
-        let wrap = |font_system: &mut FontSystem, map: &CustomKerningMap, width: f32| {
-            reshape_text_for_shape(ShapeWrapRequest {
-                text: TEXT,
-                font_system,
-                attrs: &attrs,
-                custom_kerning: map,
-                font_size_px: 48.0,
-                line_height_px: 57.6,
-                base_width_px: width,
-                wrap_mode: TextWrapMode::WholeWords,
-                hyphen_dicts: None,
-                word_break_policy: None,
-                shape: TextShape::Free,
-                min_width_percent: 55.0,
-                shape_variant: 5,
-                allow_moderate_trees: false,
-                hanging_punctuation: 0.0,
-                preserve_edge_spaces: false,
-            })
-            .text
-        };
-        let between = (kerned_px + plain_px) * 0.5;
-        assert_eq!(wrap(&mut font_system, &kerned_map, between), TEXT, "kerned text fits");
-        assert_eq!(
-            wrap(&mut font_system, &empty, between).lines().count(),
-            2,
-            "the un-kerned text does not fit the same box"
-        );
-        // And the kerned text still breaks once the box is narrower than its own width.
-        assert_eq!(
-            wrap(&mut font_system, &kerned_map, kerned_px - 2.0).lines().count(),
-            2,
-            "a box narrower than the kerned width must break"
-        );
-    }
-
 }
