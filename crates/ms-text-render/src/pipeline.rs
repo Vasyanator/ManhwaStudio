@@ -326,11 +326,10 @@ fn estimate_placeholder_height(params: &TextRenderParams) -> u32 {
 /// render's user-authored pairs, and its `line_width_px` is the width the wrap scores —
 /// so a line breaks exactly where the drawn line ends.
 ///
-/// Measured with the block-level settings only: the wrap shapes plain candidate lines,
-/// so inline `<…>` spans do not reach it. Faux bold is deliberately left OUT of the
-/// measurement (the wrap measures the undecorated pen): honouring it is a separate
-/// behaviour change. Owns its own per-render outline / contour caches (the `Optical`
-/// branch measures ink), dropped with the wrap.
+/// Measured with the block-level settings only (faux bold included): the wrap shapes
+/// plain candidate lines, so inline `<…>` spans do not reach it. Owns its own
+/// per-render outline / contour caches (the `Optical` branch measures ink, faux bold
+/// resolves counters), dropped with the wrap.
 pub(crate) struct PenRunWidth<'a> {
     params: TextRenderParams,
     custom_kerning: &'a CustomKerningMap,
@@ -341,14 +340,12 @@ pub(crate) struct PenRunWidth<'a> {
 }
 
 impl<'a> PenRunWidth<'a> {
-    /// The pen for `params` (faux bold switched off, see the type doc) over the render's
-    /// face-keyed overrides `custom_kerning`, at the block font size `font_size_px`.
+    /// The pen for `params` over the render's face-keyed overrides `custom_kerning`, at
+    /// the block font size `font_size_px`.
     #[must_use]
     pub(crate) fn new(params: &TextRenderParams, custom_kerning: &'a CustomKerningMap, font_size_px: f32) -> Self {
-        let mut params = params.clone();
-        params.faux_bold = None;
         Self {
-            params,
+            params: params.clone(),
             custom_kerning,
             font_size_px,
             swash_cache: SwashCache::new(),
@@ -2599,6 +2596,7 @@ fn horizontal_run_layout(
     // `faux_floored_advance` rule as the pen above, so alignment can never be
     // computed from an effective advance the pen did not take.
     // `faux_extras` are exact zeros without faux, keeping this byte-identical.
+    anchor_rtl_run_at_its_left_edge(run, &mut glyph_xs);
     let line_width_px = run
         .glyphs
         .iter()
@@ -2615,6 +2613,33 @@ fn horizontal_run_layout(
         line_width_px,
         leading_hang_px,
         trailing_hang_px,
+    }
+}
+
+/// Keeps a right-to-left run's LEFT end where the shaper put it.
+///
+/// The pen accumulates from the run's first glyph, which in a right-to-left run is the
+/// RIGHTMOST one, and walks leftwards. When the pen changes the run's length (an
+/// override, `Fixed`, `Optical`, faux bold, tracking), the change therefore lands on the
+/// LEFT end: a tightened line leaves a gap at its left, a widened one runs past `x = 0`,
+/// and `line_width_px` (`max(x + w)`, the right end) never sees it — so the line is
+/// aligned and wrapped by a width it is not drawn with. Shifting every pen position by
+/// `min(pen x) - min(shaped x)` puts the left end back on the shaper's left end, so
+/// `max(x + w)` is the line's real drawn extent; alignment and the wrap
+/// (`PenRunWidth`) both read it. A left-to-right run starts at its left end already
+/// and is untouched; an unchanged right-to-left run shifts by exactly `0.0`.
+fn anchor_rtl_run_at_its_left_edge(run: &LayoutRun<'_>, glyph_xs: &mut [f32]) {
+    if !run.rtl {
+        return;
+    }
+    let shaped_left = run.glyphs.iter().map(|glyph| glyph.x).fold(f32::INFINITY, f32::min);
+    let pen_left = glyph_xs.iter().copied().fold(f32::INFINITY, f32::min);
+    let shift = pen_left - shaped_left;
+    if shift == 0.0 || !shift.is_finite() {
+        return;
+    }
+    for glyph_x in glyph_xs.iter_mut() {
+        *glyph_x -= shift;
     }
 }
 
@@ -2818,6 +2843,7 @@ fn optical_horizontal_run_layout(
         glyph_xs.push(current_x);
     }
 
+    anchor_rtl_run_at_its_left_edge(run, &mut glyph_xs);
     let line_width_px = run
         .glyphs
         .iter()
@@ -8351,8 +8377,9 @@ mod tests {
 
     /// THE WRAP MEASURES A LINE EXACTLY AS THE PEN DRAWS IT. Under every kerning mode
     /// (`Auto`, `Fixed`, `Optical`), with manual tracking in px and in percent, with
-    /// user-authored pairs (including a ligature candidate `fi` and pairs the table does
-    /// not list), left-to-right and right-to-left, the width the line breaker scores
+    /// user-authored pairs (including a ligature candidate `fi`, pairs the table does not
+    /// list, tightening and widening ones), with and without faux bold, left-to-right and
+    /// right-to-left, the width the line breaker scores
     /// (`wrap::measured_line_width_px_for_tests`, the same code path) equals the pen's own
     /// `line_width_px` — the extent the line is laid out and aligned with.
     #[test]
@@ -8367,36 +8394,105 @@ mod tests {
             (TrackedFont::Hebrew, "\u{05D0}\u{05D1}\u{05D2} \u{05D0}\u{05D1}"),
             (TrackedFont::Hebrew, "\u{05D0}\u{05D1}"),
         ];
-        let tables: [&[(char, char, f32)]; 3] = [
+        let tables: [&[(char, char, f32)]; 4] = [
             &[],
             &[('A', 'V', -120.0), ('T', 'o', -80.0), ('f', 'i', -300.0), ('\u{05D0}', '\u{05D1}', -150.0)],
             &[('A', 'V', 0.0), ('W', 'a', 90.0), ('\u{05D0}', '\u{05D1}', 0.0)],
+            &[('A', 'V', 100.0), ('\u{05D0}', '\u{05D1}', 200.0)],
         ];
         for (font, text) in cases {
             let mut loaded = font.load();
             for mode in [KerningMode::Auto, KerningMode::Fixed, KerningMode::Optical] {
                 for (kerning_px, kerning_percent) in [(0.0, 0.0), (3.5, 0.0), (0.0, -20.0), (6.0, 15.0)] {
                     for pairs in tables {
-                        for em in [36.0f32, 100.0] {
+                        for (em, faux) in [(36.0f32, false), (100.0, false), (100.0, true)] {
                             let mut params = base_params();
                             params.text = text.to_string();
                             params.font_size_px = em;
                             params.kerning_mode = mode;
                             params.kerning_px = kerning_px;
                             params.kerning_percent = kerning_percent;
+                            // Faux bold grows the pen too; the wrap measures it.
+                            params.force_bold = faux;
+                            params.faux_bold = faux.then(|| test_faux_bold(10.0, 5.0));
                             let (xs, line_width_px) =
                                 tracked_font_run_layout(&mut loaded, text, &params, pairs);
                             let wrap_px = wrap_line_width(&mut loaded, &params, pairs, text);
                             assert!(
                                 (wrap_px - line_width_px).abs() < 1e-3,
                                 "{text:?} {mode:?} tracking ({kerning_px}, {kerning_percent}%) em {em} \
-                                 table {pairs:?}: wrap {wrap_px} vs pen {line_width_px} (xs {xs:?})"
+                                 faux {faux} table {pairs:?}: wrap {wrap_px} vs pen {line_width_px} \
+                                 (xs {xs:?})"
                             );
                         }
                     }
                 }
             }
         }
+    }
+
+    /// A RIGHT-TO-LEFT LINE IS ALIGNED BY ITS REAL DRAWN EXTENT. When the pen changes an
+    /// RTL line's length (a tightening or widening override, `Fixed`, `Optical`, faux
+    /// bold, tracking), the change lands on the line's LEFT end; the left end must stay
+    /// on the shaper's left end (`x = 0` here), so that `line_width_px` (`max(x + w)`) is
+    /// the drawn extent. Then a left-aligned line's ink starts at the box's left edge, a
+    /// right-aligned one ends at its right edge, and the width moves by exactly the
+    /// authored delta (10 px per 100 per mille at em 100) — no gap left behind a
+    /// tightened line, no overflow past the left edge for a widened one.
+    #[test]
+    fn an_rtl_line_is_aligned_by_its_real_drawn_extent() {
+        use crate::characterization::TrackedFont;
+        use crate::types::HorizontalAlign;
+
+        const TEXT: &str = "\u{05D0}\u{05D1}\u{05D2} \u{05D0}\u{05D1}";
+        const BOX: u32 = 400;
+        let mut hebrew = TrackedFont::Hebrew.load();
+        let mut plain = base_params();
+        plain.text = TEXT.to_string();
+        plain.font_size_px = 100.0;
+        let (plain_xs, plain_width) = tracked_font_run_layout(&mut hebrew, TEXT, &plain, &[]);
+        let shaped_left = plain_xs.iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(shaped_left.abs() < 1e-3, "precondition: the shaper starts the line at 0");
+
+        let tighten: &[(char, char, f32)] = &[('\u{05D0}', '\u{05D1}', -100.0)];
+        let widen: &[(char, char, f32)] = &[('\u{05D0}', '\u{05D1}', 100.0)];
+        let mut fixed = plain.clone();
+        fixed.kerning_mode = KerningMode::Fixed;
+        let mut optical = plain.clone();
+        optical.kerning_mode = KerningMode::Optical;
+        let mut faux = plain.clone();
+        faux.force_bold = true;
+        faux.faux_bold = Some(test_faux_bold(10.0, 5.0));
+        let mut tracked = plain.clone();
+        tracked.kerning_px = 5.0;
+        let variants: [(&str, &TextRenderParams, &[crate::characterization::AuthoredPair]); 6] = [
+            ("tighten", &plain, tighten),
+            ("widen", &plain, widen),
+            ("fixed + tighten", &fixed, tighten),
+            ("optical", &optical, &[]),
+            ("faux bold", &faux, &[]),
+            ("tracking", &tracked, &[]),
+        ];
+        for (label, params, pairs) in variants {
+            let (xs, width) = tracked_font_run_layout(&mut hebrew, TEXT, params, pairs);
+            let left = xs.iter().copied().fold(f32::INFINITY, f32::min);
+            assert!(
+                (left - shaped_left).abs() < 1e-3,
+                "{label}: the RTL line's left end must stay on the shaper's: {xs:?}"
+            );
+            let left_aligned = super::horizontal_line_offset(BOX, width, HorizontalAlign::LEFT) as f32;
+            let right_aligned = super::horizontal_line_offset(BOX, width, HorizontalAlign::RIGHT) as f32;
+            assert!((left_aligned + left).abs() < 1e-3, "{label}: left-aligned ink starts at the box edge");
+            assert!(
+                (right_aligned + width - BOX as f32).abs() <= 0.5,
+                "{label}: right-aligned line ends at the box edge"
+            );
+        }
+        // Exactly the authored change, twice (two alef -> bet pairs), on the width.
+        let (_, tight_width) = tracked_font_run_layout(&mut hebrew, TEXT, &plain, tighten);
+        let (_, wide_width) = tracked_font_run_layout(&mut hebrew, TEXT, &plain, widen);
+        assert!((plain_width - tight_width - 20.0).abs() < 1e-3, "{tight_width} vs {plain_width}");
+        assert!((wide_width - plain_width - 20.0).abs() < 1e-3, "{wide_width} vs {plain_width}");
     }
 
     /// Wraps `text` in a free whole-word box of `width_px` with the pen of `params` over
@@ -8567,6 +8663,65 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// The form metric sums to the pen's width on a RIGHT-TO-LEFT line too, now that an
+    /// RTL line's width is its drawn extent: `Auto` and `Fixed`, with tightening and
+    /// widening overrides. Manual tracking is left out: the pen currently adds tracking
+    /// as a POSITIVE x step even on a leftward RTL run (it narrows the line), a separate
+    /// defect the metric does not reproduce.
+    #[test]
+    fn the_form_metric_sums_to_the_pen_width_on_an_rtl_line() {
+        use crate::characterization::TrackedFont;
+        use crate::font_provider::CustomKerningTable;
+        use crate::font_registry::CustomKerningMap;
+        use crate::wrap::forms::{
+            DEFAULT_WIDTH_TOLERANCE, GlyphWidths, InlineTagScope, LineWidthMetric, MetricKerning,
+        };
+        use cosmic_text::{Attrs, Family, Metrics};
+
+        const EM: f32 = 1000.0;
+        const TEXT: &str = "\u{05D0}\u{05D1}\u{05D2} \u{05D0}\u{05D1}";
+        let tables: [&[(char, char, f32)]; 3] = [
+            &[],
+            &[('\u{05D0}', '\u{05D1}', -150.0)],
+            &[('\u{05D0}', '\u{05D1}', 200.0)],
+        ];
+        let mut hebrew = TrackedFont::Hebrew.load();
+        for mode in [KerningMode::Auto, KerningMode::Fixed] {
+            for pairs in tables {
+                let mut params = base_params();
+                params.text = TEXT.to_string();
+                params.font_size_px = EM;
+                params.kerning_mode = mode;
+                let (xs, pen_width) = tracked_font_run_layout(&mut hebrew, TEXT, &params, pairs);
+                let mut map = CustomKerningMap::default();
+                if !pairs.is_empty() {
+                    map.insert(
+                        hebrew.face_id,
+                        Arc::new(CustomKerningTable::from_pairs(pairs.iter().copied())),
+                        "fixture",
+                    );
+                }
+                let attrs = Attrs::new()
+                    .family(Family::Name(hebrew.family.as_str()))
+                    .metrics(Metrics::new(EM, EM));
+                let metric = GlyphWidths::build(
+                    &mut hebrew.font_system,
+                    &attrs,
+                    TEXT,
+                    0.0,
+                    DEFAULT_WIDTH_TOLERANCE,
+                    InlineTagScope::NoBreakOnly,
+                    MetricKerning::new(&map, mode, 0.0, 0.0, EM, 100.0),
+                );
+                let metric_width = metric.line_width(TEXT) as f32;
+                assert!(
+                    (metric_width - pen_width).abs() <= xs.len() as f32,
+                    "{mode:?} table {pairs:?}: metric {metric_width} vs pen {pen_width} (xs {xs:?})"
+                );
             }
         }
     }

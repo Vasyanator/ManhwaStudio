@@ -1052,9 +1052,15 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
     glyph's extra, so thickening widens the pair). The delta's em basis stays the
     `prev` glyph's font size in both directions. The formula path has no
     counterpart (`StepDirection::Magnitude`): its `advance_px` is a magnitude along
-    the drawn line, floored positive at every consumer. NOT direction-aware: the
-    pen's tracking basis (`TrackingBasis::HorizontalPen` floors `|step|` at
-    `prev.w`), kept as is.
+    the drawn line, floored positive at every consumer. LINE EXTENT: the pen walks an
+    RTL run from its first (rightmost) glyph, so whatever changes the line's length
+    lands on its LEFT end; `pipeline::anchor_rtl_run_at_its_left_edge` shifts the pen
+    back by `min(pen x) - min(shaped x)` (an exact `0.0` when nothing changed), so
+    `line_width_px` (`max(x + w)`) is the RTL line's real drawn extent and alignment
+    and the wrap follow it. NOT direction-aware (known, open): the pen's tracking
+    basis (`TrackingBasis::HorizontalPen` floors `|step|` at `prev.w`), and manual
+    tracking itself, which is added as a positive x step even on a leftward RTL run
+    (positive tracking narrows RTL text).
   - GUARDS (conservative on purpose; do not "simplify" them away). A pair applies
     only when both glyphs come from the SAME face (`font_id`) — a pair across a
     font-fallback boundary belongs to no typeface's design — that face carries a
@@ -1085,15 +1091,17 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
     `wrap::RunWidthMeasure`; the render passes `pipeline::PenRunWidth`, which lays each
     shaped run out with `horizontal_run_layout` itself (block kerning mode incl.
     `Optical`, manual tracking px/percent, user-authored pairs bound by the SAME
-    `CustomKerningMap`) and returns its `line_width_px`. Inline spans do not reach it
-    (the wrap shapes plain lines), and faux bold is deliberately left out of the
-    measurement. `wrap::forms::GlyphWidths::build` (per-char advances + per-pair kerns,
+    `CustomKerningMap`, block faux bold) and returns its `line_width_px` — for an RTL
+    line its real drawn extent (see DIRECTION). Inline spans do not reach it (the wrap
+    shapes plain lines). `wrap::forms::GlyphWidths::build` (per-char advances + per-pair kerns,
     the typing tab's form search) takes `forms::MetricKerning`: an overridden pair
     stores the authored per-mille offset (`override_per_mille` over the two glyphs the
     pair shapes into) under plain spacing, and under `Fixed` or tracking every pair
     stores `round(|resolve step| + tracking) - advance of the spanning glyph`, so the
-    sums equal the pen's width; its `Optical` is measured like `Auto` (a per-pair
-    metric cannot express the line's median gap). `CustomKerningMap::record` is public
+    sums equal the pen's width, RTL included; its `Optical` is measured like `Auto` (a
+    per-pair metric cannot express the line's median gap) and faux bold is NOT
+    measured (its growth depends on each glyph's outline — counters — which the
+    per-character metric does not extract). `CustomKerningMap::record` is public
     so that metric binds tables exactly like the renderer. Pinned by
     `pipeline::tests::the_wrap_width_equals_the_pen_width_for_every_mode_and_tracking`,
     `a_line_breaks_where_its_drawn_width_says_it_does` and

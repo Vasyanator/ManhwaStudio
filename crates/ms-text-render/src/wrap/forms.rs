@@ -834,7 +834,9 @@ fn measure_pair_units(
 ///
 /// `KerningMode::Optical` is measured like `Auto` here: its step depends on the median ink
 /// gap of the whole DRAWN line, which a per-pair metric cannot express (the line wrap
-/// measures it exactly; the form metric does not).
+/// measures it exactly; the form metric does not). Faux bold is not measured either: its
+/// advance growth depends on each glyph's outline (the counter flag of `outward_only`),
+/// which this per-character metric does not extract; the line wrap does measure it.
 #[derive(Debug, Clone, Copy)]
 pub struct MetricKerning<'a> {
     custom_kerning: &'a CustomKerningMap,
