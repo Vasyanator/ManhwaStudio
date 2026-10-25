@@ -247,14 +247,16 @@ pub fn render_text_to_image(params: &TextRenderParams) -> Result<RenderedTextIma
     let layout_text = reshape_text_for_shape(
         hyphenated_text.as_str(),
         &mut font_system,
-        &attrs,
-        font_size_px,
-        base_line_height_px,
-        width_px as f32,
+        WrapMetrics {
+            attrs: &attrs,
+            font_size_px,
+            line_height_px: base_line_height_px,
+            base_width_px: width_px as f32,
+            strict_shape_fit: params.strict_shape_fit,
+        },
         params.text_shape,
         params.shape_min_width_percent,
         params.shape_variant,
-        params.strict_shape_fit,
     );
     let justify_alignment = justify_alignment_option(params.align);
 
@@ -809,21 +811,38 @@ fn justify_alignment_option(align: HorizontalAlign) -> Option<Align> {
     }
 }
 
-// Text layout parameters are distinct rendering properties; grouping them would obscure intent.
-#[allow(clippy::too_many_arguments)]
-fn reshape_text_for_shape(
-    text: &str,
-    font_system: &mut FontSystem,
-    attrs: &Attrs,
+/// How the wrap measures a line: the attrs and metrics a candidate is shaped with,
+/// the base line width and whether an overlong word may be split to fit the shape.
+#[derive(Clone, Copy)]
+struct WrapMetrics<'a> {
+    attrs: &'a Attrs<'a>,
     font_size_px: f32,
     line_height_px: f32,
     base_width_px: f32,
+    strict_shape_fit: bool,
+}
+
+/// Re-wrap `text` so its line widths follow `shape` (`min_width_percent` /
+/// `shape_variant` tune the profile); `Free` returns the text unchanged.
+fn reshape_text_for_shape(
+    text: &str,
+    font_system: &mut FontSystem,
+    metrics: WrapMetrics<'_>,
     shape: TextShape,
     min_width_percent: f32,
     shape_variant: u8,
-    strict_shape_fit: bool,
 ) -> String {
-    let base_width_px = base_width_px.max(1.0);
+    let metrics = WrapMetrics {
+        base_width_px: metrics.base_width_px.max(1.0),
+        ..metrics
+    };
+    let WrapMetrics {
+        attrs,
+        font_size_px,
+        line_height_px,
+        base_width_px,
+        ..
+    } = metrics;
     let shape_variant = shape_variant.clamp(1, 9);
     if shape == TextShape::Free {
         return text.to_string();
@@ -833,12 +852,8 @@ fn reshape_text_for_shape(
         let base_lines = wrap_text_with_targets(
             text,
             font_system,
-            attrs,
-            font_size_px,
-            line_height_px,
-            base_width_px,
+            metrics,
             None,
-            strict_shape_fit,
         );
         let target_width = rectangle_target_width(
             base_lines.as_slice(),
@@ -857,12 +872,8 @@ fn reshape_text_for_shape(
         let balanced = wrap_text_with_targets(
             text,
             font_system,
-            attrs,
-            font_size_px,
-            line_height_px,
-            base_width_px,
+            metrics,
             Some(profile.as_slice()),
-            strict_shape_fit,
         );
         return balanced.join("\n");
     }
@@ -871,12 +882,8 @@ fn reshape_text_for_shape(
     let mut lines = wrap_text_with_targets(
         text,
         font_system,
-        attrs,
-        font_size_px,
-        line_height_px,
-        base_width_px,
+        metrics,
         None,
-        strict_shape_fit,
     );
 
     const MAX_PASSES: usize = 3;
@@ -890,12 +897,8 @@ fn reshape_text_for_shape(
         lines = wrap_text_with_targets(
             text,
             font_system,
-            attrs,
-            font_size_px,
-            line_height_px,
-            base_width_px,
+            metrics,
             Some(profile.as_slice()),
-            strict_shape_fit,
         );
     }
 
@@ -964,17 +967,13 @@ fn compute_shape_line_widths(
     widths
 }
 
-// Text layout parameters are distinct rendering properties; grouping them would obscure intent.
-#[allow(clippy::too_many_arguments)]
+/// Greedy wrap of every paragraph of `text` against the per-line width targets
+/// (`None`: the base width for every line).
 fn wrap_text_with_targets(
     text: &str,
     font_system: &mut FontSystem,
-    attrs: &Attrs,
-    font_size_px: f32,
-    line_height_px: f32,
-    base_width_px: f32,
+    metrics: WrapMetrics<'_>,
     line_width_targets: Option<&[f32]>,
-    strict_shape_fit: bool,
 ) -> Vec<String> {
     let mut out = Vec::<String>::new();
     let mut global_line_idx = 0usize;
@@ -989,12 +988,8 @@ fn wrap_text_with_targets(
         let mut wrapped = wrap_paragraph_with_targets(
             paragraph,
             font_system,
-            attrs,
-            font_size_px,
-            line_height_px,
-            base_width_px,
+            metrics,
             line_width_targets,
-            strict_shape_fit,
             &mut global_line_idx,
         );
         out.append(&mut wrapped);
@@ -1006,19 +1001,22 @@ fn wrap_text_with_targets(
     out
 }
 
-// Text layout parameters are distinct rendering properties; grouping them would obscure intent.
-#[allow(clippy::too_many_arguments)]
+/// Greedy wrap of one paragraph; `global_line_idx` is the running line index the
+/// width targets are read at, advanced for every emitted line.
 fn wrap_paragraph_with_targets(
     paragraph: &str,
     font_system: &mut FontSystem,
-    attrs: &Attrs,
-    font_size_px: f32,
-    line_height_px: f32,
-    base_width_px: f32,
+    metrics: WrapMetrics<'_>,
     line_width_targets: Option<&[f32]>,
-    strict_shape_fit: bool,
     global_line_idx: &mut usize,
 ) -> Vec<String> {
+    let WrapMetrics {
+        attrs,
+        font_size_px,
+        line_height_px,
+        base_width_px,
+        strict_shape_fit,
+    } = metrics;
     let mut tokens = tokenize_paragraph(paragraph);
     let mut out = Vec::<String>::new();
     let mut current_line = String::new();
@@ -3095,14 +3093,17 @@ fn apply_shake_effect(image: &mut RenderedTextImage, shake: &ShakeEffectParams) 
 
         let mut base = vec![0u8; out_width as usize * out_height as usize * 4];
         draw_image_with_opacity(
-            &mut base,
-            out_width as usize,
-            out_height as usize,
-            source.as_slice(),
-            source_width,
-            source_height,
-            left_pad,
-            top_pad,
+            &mut RgbaTarget {
+                rgba: &mut base,
+                width: out_width as usize,
+                height: out_height as usize,
+            },
+            RgbaSource {
+                rgba: source.as_slice(),
+                width: source_width,
+                height: source_height,
+            },
+            [left_pad, top_pad],
             1.0,
         );
         image.width = out_width;
@@ -3127,14 +3128,17 @@ fn apply_shake_effect(image: &mut RenderedTextImage, shake: &ShakeEffectParams) 
             let dy = (unit_y * (shake.down_px * t)).round() as i32;
             let opacity = (opacity_start * step_factor.powi((i - 1) as i32)).clamp(0.0, 1.0);
             draw_image_with_opacity(
-                &mut trail,
-                trail_width,
-                trail_height,
-                source.as_slice(),
-                source_width_u32 as usize,
-                source_height_u32 as usize,
-                left_pad.saturating_add(dx),
-                top_pad.saturating_add(dy),
+                &mut RgbaTarget {
+                    rgba: &mut trail,
+                    width: trail_width,
+                    height: trail_height,
+                },
+                RgbaSource {
+                    rgba: source.as_slice(),
+                    width: source_width_u32 as usize,
+                    height: source_height_u32 as usize,
+                },
+                [left_pad.saturating_add(dx), top_pad.saturating_add(dy)],
                 opacity,
             );
         }
@@ -3147,14 +3151,17 @@ fn apply_shake_effect(image: &mut RenderedTextImage, shake: &ShakeEffectParams) 
             let dy = (-unit_y * (shake.up_px * t)).round() as i32;
             let opacity = (opacity_start * step_factor.powi((i - 1) as i32)).clamp(0.0, 1.0);
             draw_image_with_opacity(
-                &mut trail,
-                trail_width,
-                trail_height,
-                source.as_slice(),
-                source_width_u32 as usize,
-                source_height_u32 as usize,
-                left_pad.saturating_add(dx),
-                top_pad.saturating_add(dy),
+                &mut RgbaTarget {
+                    rgba: &mut trail,
+                    width: trail_width,
+                    height: trail_height,
+                },
+                RgbaSource {
+                    rgba: source.as_slice(),
+                    width: source_width_u32 as usize,
+                    height: source_height_u32 as usize,
+                },
+                [left_pad.saturating_add(dx), top_pad.saturating_add(dy)],
                 opacity,
             );
         }
@@ -3172,19 +3179,36 @@ fn apply_shake_effect(image: &mut RenderedTextImage, shake: &ShakeEffectParams) 
     blend_full_image_over(&mut image.rgba, trail.as_slice());
 }
 
-// Image compositing parameters are distinct pixel-buffer properties; grouping would obscure intent.
-#[allow(clippy::too_many_arguments)]
+/// A mutable straight-alpha RGBA8 canvas of `width * height` pixels.
+struct RgbaTarget<'a> {
+    rgba: &'a mut [u8],
+    width: usize,
+    height: usize,
+}
+
+/// A read-only straight-alpha RGBA8 image of `width * height` pixels.
+#[derive(Clone, Copy)]
+struct RgbaSource<'a> {
+    rgba: &'a [u8],
+    width: usize,
+    height: usize,
+}
+
+/// Composite `src` over `dst` with its top-left at `offset` (`[x, y]` in `dst` px),
+/// scaling every source alpha by `opacity` (clamped to `0..=1`); clipped to `dst`.
 fn draw_image_with_opacity(
-    dst: &mut [u8],
-    dst_width: usize,
-    dst_height: usize,
-    src: &[u8],
-    src_width: usize,
-    src_height: usize,
-    offset_x: i32,
-    offset_y: i32,
+    dst: &mut RgbaTarget<'_>,
+    src: RgbaSource<'_>,
+    offset: [i32; 2],
     opacity: f32,
 ) {
+    let (dst_width, dst_height) = (dst.width, dst.height);
+    let RgbaSource {
+        rgba: src,
+        width: src_width,
+        height: src_height,
+    } = src;
+    let [offset_x, offset_y] = offset;
     let opacity = opacity.clamp(0.0, 1.0);
     if opacity <= f32::EPSILON
         || dst_width == 0
@@ -3218,7 +3242,7 @@ fn draw_image_with_opacity(
 
             let dst_idx = (dy as usize * dst_width + dx as usize) * 4;
             blend_pixel_over(
-                &mut dst[dst_idx..dst_idx + 4],
+                &mut dst.rgba[dst_idx..dst_idx + 4],
                 src[src_idx],
                 src[src_idx + 1],
                 src[src_idx + 2],

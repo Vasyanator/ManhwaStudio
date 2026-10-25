@@ -13,8 +13,8 @@ Main responsibilities:
 - the matrix axes (`MATRIX_TEXTS`, `MATRIX_MODES`, `MATRIX_TRACKING`, `MATRIX_TABLES`,
   `MATRIX_EMS`), shared by both matrices so they describe the same grid;
 - `TrackedFont` / `LoadedFont`: the fixture fonts, taken ONLY from the tracked `fonts/ui` stack
-  (a fresh clone has them; the untracked Liberation Sans fixture other tests use does not
-  qualify);
+  (the matrices pin the SHIPPED stack; the other unit tests load the tracked Arimo caller
+  font of `test_fixtures.rs` instead);
 - `MatrixRow` + `check_against_fixture`: compare a computed matrix with its fixture, or rewrite
   the fixture on the explicit opt-in `MS_TEXT_RENDER_REGEN_CHARACTERIZATION=1`.
 

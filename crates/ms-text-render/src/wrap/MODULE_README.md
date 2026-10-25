@@ -167,7 +167,9 @@ A junction exactly ON a range boundary is not glued — the protected text stays
 `forms.rs` has two entry points into the break tree and they answer different
 questions. `enumerate_forms` is the original exhaustive walk: every form that
 matches the preset, in tree order, bounded only by `max_forms`, free memory and a
-node ceiling. It is what `choose_form` (the renderer's single-pick path) uses, and
+node ceiling. Free memory comes from the one OS probe `ms_memory::current_memory_availability`
+(checked once per `MEMORY_CHECK_INTERVAL_NODES` nodes); this directory never reads OS
+memory itself. It is what `choose_form` (the renderer's single-pick path) uses, and
 on a p99 text it is both too slow and meaningless — the set it returns is the DFS
 prefix, not a sample of good forms.
 

@@ -47,7 +47,9 @@ the line paths.
 - `t_start`, `t_end`, scale, offsets, user vars, glyph index variables, line variables,
   width, and font size are separate runtime inputs. Keep their meanings explicit.
 - Formula and custom-line rendering must preserve inline style, inline font, kerning,
-  glyph scale, glyph offset, and text color overrides supplied by the main pipeline.
+  glyph scale, glyph offset, and text color overrides supplied by the main pipeline. The
+  lookups themselves and the synthesized wrap hyphen are `pipeline`'s (one owner,
+  imported over `pipeline::RunShaping`); `render.rs` keeps no copies.
 - USER-AUTHORED KERNING PAIRS are applied here exactly as on the horizontal path (see
   the CUSTOM KERNING contract in `../MODULE_README.md`): a matching pair REPLACES the
   font's own value under every `KerningMode`, stepping by

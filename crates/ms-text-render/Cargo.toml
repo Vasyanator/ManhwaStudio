@@ -17,6 +17,9 @@ ms-raster = { path = "../ms-raster" }
 # base out of it instead of loading the operating system's fonts
 # (see src/font_base.rs and dev-docs/unicode_base_font_plan.md, decision 1).
 ms-fonts = { path = "../ms-fonts" }
+# The one OS memory probe (`current_memory_availability`): the exhaustive text-form
+# enumeration (`src/wrap/forms.rs`) stops early when available memory runs low.
+ms-memory = { path = "../ms-memory" }
 cosmic-text.workspace = true
 # `cosmic_text::Fallback` names writing systems with `unicode_script::Script` and
 # cosmic-text does not re-export the type, so it has to be a direct dependency.

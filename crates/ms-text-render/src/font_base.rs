@@ -913,8 +913,7 @@ mod tests {
     /// Path of a real font fixture, so database tests exercise actual fontdb
     /// parsing instead of a mock. Same fixture the pool/pipeline tests use.
     fn fixture_font_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf")
+        crate::test_fixtures::caller_font_path()
     }
 
     /// A synthetic stack entry. `family_name` is what the fallback tables address;

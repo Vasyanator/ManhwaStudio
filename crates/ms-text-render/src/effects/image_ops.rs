@@ -30,7 +30,7 @@ invalid shape onto the module's historical all-INF / empty fallback. Their outpu
 for bit by `edt_characterization_is_bit_exact`.
 */
 
-use super::super::raster::blend_pixel_over;
+use super::super::raster::{RgbaCanvasView, RgbaView, blend_pixel_over};
 #[cfg(test)]
 use super::super::types::RenderedTextImage;
 use rayon::prelude::*;
@@ -641,19 +641,22 @@ pub(crate) fn sample_rgba_premultiplied_bilinear(
     (accum_r, accum_g, accum_b, accum_a)
 }
 
-// All parameters are distinct pixel-buffer or layout properties; grouping would obscure rendering intent.
-#[allow(clippy::too_many_arguments)]
+/// Composite `src` over `dst` with its top-left at `offset` (`[x, y]` in `dst`
+/// px), scaling every source alpha by `opacity` (clamped to `0..=1`); pixels
+/// outside `dst` are clipped. A zero opacity or an empty image is a no-op.
 pub(crate) fn draw_image_with_opacity(
-    dst: &mut [u8],
-    dst_width: usize,
-    dst_height: usize,
-    src: &[u8],
-    src_width: usize,
-    src_height: usize,
-    offset_x: i32,
-    offset_y: i32,
+    dst: &mut RgbaCanvasView<'_>,
+    src: RgbaView<'_>,
+    offset: [i32; 2],
     opacity: f32,
 ) {
+    let (dst_width, dst_height) = (dst.width, dst.height);
+    let RgbaView {
+        rgba: src,
+        width: src_width,
+        height: src_height,
+    } = src;
+    let [offset_x, offset_y] = offset;
     let opacity = opacity.clamp(0.0, 1.0);
     if opacity <= f32::EPSILON
         || dst_width == 0
@@ -687,7 +690,7 @@ pub(crate) fn draw_image_with_opacity(
 
             let dst_idx = (dy as usize * dst_width + dx as usize) * 4;
             blend_pixel_over(
-                &mut dst[dst_idx..dst_idx + 4],
+                &mut dst.rgba[dst_idx..dst_idx + 4],
                 src[src_idx],
                 src[src_idx + 1],
                 src[src_idx + 2],

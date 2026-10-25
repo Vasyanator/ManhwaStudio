@@ -4245,6 +4245,7 @@ dependencies = [
  "image 0.25.10",
  "ms-fonts",
  "ms-log",
+ "ms-memory",
  "ms-platform",
  "ms-raster",
  "ms-text-util",

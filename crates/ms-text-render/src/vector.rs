@@ -55,8 +55,8 @@ correct. Parity with swash's own bottom-left-origin bitmap is verified by
 `rasterizer_matches_swash_reference` in the tests below.
 */
 
-use super::glyph_contour::{GlyphContour, PlacedContour};
-use super::raster::blend_pixel_over;
+use super::glyph_contour::{ContourAffine, GlyphContour, PlacedContour};
+use super::raster::{RgbaCanvasView, blend_pixel_over};
 use super::types::{AntiAliasingMode, VectorMeshWarp};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -225,15 +225,13 @@ impl GlyphTransform {
     #[must_use]
     pub(crate) fn place_contour(&self, contour: &GlyphContour) -> PlacedContour {
         let (cos, sin) = (self.rot.cos(), self.rot.sin());
-        contour.placed_sheared(
+        contour.placed_sheared(ContourAffine {
             cos,
             sin,
-            self.scale[0],
-            self.scale[1],
-            self.shear_x,
-            self.pos[0],
-            self.pos[1],
-        )
+            scale: self.scale,
+            shear_x: self.shear_x,
+            translate: self.pos,
+        })
     }
 }
 
@@ -1660,28 +1658,41 @@ fn mesh_is_identity(warp: &VectorMeshWarp) -> bool {
     true
 }
 
+/// How [`rasterize_outline_into`] tints one glyph: the monochrome colour, the
+/// coverage->alpha transfer table (`build_aa_lut`) and the optional per-render
+/// mesh warp. The table and the warp are built once per render and borrowed.
+#[derive(Clone, Copy)]
+pub(crate) struct OutlinePaint<'a> {
+    /// Straight-alpha tint; RGB replaces the output colour, A scales coverage.
+    pub(crate) color: [u8; 4],
+    /// Coverage->alpha transfer table (identity for `AntiAliasingMode::Smooth`).
+    pub(crate) aa_lut: &'a [u8; 256],
+    /// Optional layout-space mesh warp; `None` is the byte-identical fast path.
+    pub(crate) warp: Option<&'a MeshWarpContext>,
+}
+
 /// Rasterize a transformed glyph outline into a straight-alpha RGBA8 canvas.
 ///
 /// Coordinate flow: each glyph-local subpath point is transformed to world
 /// coords by `transform` (scale, then rotate, then translate by `pos`), then
-/// mapped to a canvas pixel by subtracting `(origin_x, origin_y)` (so a world
+/// mapped to a canvas pixel by subtracting `origin` (so a world
 /// point at the origin lands at pixel `(0, 0)`, matching how `formula/render.rs`
 /// blits with an x/y offset). The transformed polygons are filled to an 8-bit
 /// coverage mask with zeno over the integer bounding box of the path (clamped to
 /// the canvas), preserving sub-pixel AA (path points are not rounded).
 ///
 /// Anti-aliasing contract: each raw zeno coverage byte is first mapped through
-/// `aa_lut` (a coverage->alpha transfer table from `build_aa_lut`) BEFORE the tint
+/// `paint.aa_lut` (a coverage->alpha transfer table from `build_aa_lut`) BEFORE the tint
 /// multiply. Passing an identity table (`AntiAliasingMode::Smooth`) reproduces the
 /// pre-AA coverage byte-for-byte. This applies only to monochrome outline glyphs;
 /// the color-glyph bitmap fallback path does not go through this rasterizer.
 ///
 /// Tint contract (doc 4.1, monochrome case): output RGB is replaced by
-/// `color[0..3]`; output alpha is `transferred_coverage * color[3] / 255`. Each
+/// `paint.color[0..3]`; output alpha is `transferred_coverage * paint.color[3] / 255`. Each
 /// covered pixel is composited with `raster::blend_pixel_over`.
 ///
-/// `canvas` must be at least `canvas_w * canvas_h * 4` bytes; a shorter buffer
-/// is a no-op. Never panics and never indexes out of range for transforms that
+/// `canvas.rgba` must be at least `canvas.width * canvas.height * 4` bytes; a
+/// shorter buffer is a no-op. Never panics and never indexes out of range for transforms that
 /// push the glyph partly or fully off-canvas (such pixels are clipped).
 ///
 /// `scratch` supplies the reused per-glyph working buffers (subpaths, zeno
@@ -1689,29 +1700,27 @@ fn mesh_is_identity(warp: &VectorMeshWarp) -> bool {
 /// result is byte-identical to a freshly allocated render regardless of what the
 /// previous glyph left in it.
 ///
-/// `warp` optionally deforms each vertex AFTER `transform` (which already
+/// `paint.warp` optionally deforms each vertex AFTER `transform` (which already
 /// carries per-glyph placement and any global rotation) but BEFORE the mapping
 /// to canvas pixels: `world` is peeled of the global rotation, warped in
 /// pre-global-rotation layout space, and re-rotated (see [`MeshWarpContext`]).
 /// `None` keeps the vertex path byte-for-byte identical to the un-warped
 /// renderer (no extra float work runs).
-// The rasterizer call site naturally carries the scratch, canvas target, origin,
-// outline, transform, tint, the AA transfer table and the optional mesh warp;
-// splitting them would obscure the mapping.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn rasterize_outline_into(
     scratch: &mut RasterScratch,
-    canvas: &mut [u8],
-    canvas_w: usize,
-    canvas_h: usize,
-    origin_x: f32,
-    origin_y: f32,
+    canvas: &mut RgbaCanvasView<'_>,
+    origin: [f32; 2],
     outline: &Outline,
     transform: &GlyphTransform,
-    color: [u8; 4],
-    aa_lut: &[u8; 256],
-    warp: Option<&MeshWarpContext>,
+    paint: OutlinePaint<'_>,
 ) {
+    let (canvas_w, canvas_h) = (canvas.width, canvas.height);
+    let [origin_x, origin_y] = origin;
+    let OutlinePaint {
+        color,
+        aa_lut,
+        warp,
+    } = paint;
     if canvas_w == 0 || canvas_h == 0 {
         return;
     }
@@ -1721,7 +1730,7 @@ pub(crate) fn rasterize_outline_into(
     else {
         return;
     };
-    if canvas.len() < required {
+    if canvas.rgba.len() < required {
         return;
     }
 
@@ -1831,7 +1840,7 @@ pub(crate) fn rasterize_outline_into(
                 continue;
             }
             let idx = (canvas_y * canvas_w + canvas_x) * 4;
-            blend_pixel_over(&mut canvas[idx..idx + 4], color[0], color[1], color[2], out_a);
+            blend_pixel_over(&mut canvas.rgba[idx..idx + 4], color[0], color[1], color[2], out_a);
         }
     }
 }
@@ -1953,7 +1962,6 @@ fn douglas_peucker(points: &[[f32; 2]], tolerance: f32) -> Vec<[f32; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     /// Identity coverage table used by the geometry/parity tests so they keep
     /// asserting the raw (pre-AA) coverage the rasterizer produced before the
@@ -1971,10 +1979,7 @@ mod tests {
 
     /// Load the shared Latin+Cyrillic test face bytes.
     fn load_test_font_bytes() -> Vec<u8> {
-        // Fixture lives at the workspace root; this crate sits two levels down
-        // (crates/ms-text-render), so anchor CARGO_MANIFEST_DIR up two dirs.
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf");
+        let path = crate::test_fixtures::caller_font_path();
         std::fs::read(&path)
             .unwrap_or_else(|e| panic!("failed to read test font {}: {e}", path.display()))
     }
@@ -2049,7 +2054,7 @@ mod tests {
         let width = max[0] - min[0];
         let height = max[1] - min[1];
         assert!(width > 0.0, "positive width, got {width}");
-        // Cap height for LiberationSans is ~0.72 em; allow a generous band.
+        // Cap height of the Arimo fixture is ~0.72 em; allow a generous band.
         assert!(
             height > em * 0.5 && height < em * 0.9,
             "H height ~ cap height, got {height} at em {em}"
@@ -2164,16 +2169,19 @@ mod tests {
         let mut scratch = RasterScratch::new();
         rasterize_outline_into(
             &mut scratch,
-            &mut canvas,
-            ref_w,
-            ref_h,
-            placement.left as f32,
-            -(placement.top as f32),
+            &mut RgbaCanvasView {
+                rgba: &mut canvas,
+                width: ref_w,
+                height: ref_h,
+            },
+            [placement.left as f32, -(placement.top as f32)],
             &outline,
             &GlyphTransform::identity(),
-            [255, 255, 255, 255],
-            &identity_lut(),
-            None,
+            OutlinePaint {
+                color: [255, 255, 255, 255],
+                aa_lut: &identity_lut(),
+                warp: None,
+            },
         );
 
         // Extract our alpha channel and compare to the reference alpha.
@@ -2208,16 +2216,19 @@ mod tests {
         let mut canvas_full = vec![0u8; w * h * 4];
         rasterize_outline_into(
             &mut scratch,
-            &mut canvas_full,
-            w,
-            h,
-            min[0] - 2.0,
-            min[1] - 2.0,
+            &mut RgbaCanvasView {
+                rgba: &mut canvas_full,
+                width: w,
+                height: h,
+            },
+            [min[0] - 2.0, min[1] - 2.0],
             &outline,
             &GlyphTransform::identity(),
-            [200, 30, 30, 255],
-            &identity_lut(),
-            None,
+            OutlinePaint {
+                color: [200, 30, 30, 255],
+                aa_lut: &identity_lut(),
+                warp: None,
+            },
         );
         let mut covered = 0usize;
         for px in canvas_full.as_chunks::<4>().0 {
@@ -2232,16 +2243,19 @@ mod tests {
         let mut canvas_half = vec![0u8; w * h * 4];
         rasterize_outline_into(
             &mut scratch,
-            &mut canvas_half,
-            w,
-            h,
-            min[0] - 2.0,
-            min[1] - 2.0,
+            &mut RgbaCanvasView {
+                rgba: &mut canvas_half,
+                width: w,
+                height: h,
+            },
+            [min[0] - 2.0, min[1] - 2.0],
             &outline,
             &GlyphTransform::identity(),
-            [200, 30, 30, 128],
-            &identity_lut(),
-            None,
+            OutlinePaint {
+                color: [200, 30, 30, 128],
+                aa_lut: &identity_lut(),
+                warp: None,
+            },
         );
         for (full, half) in canvas_full.as_chunks::<4>().0.iter().zip(canvas_half.as_chunks::<4>().0) {
             let expected = (f32::from(full[3]) * (128.0 / 255.0)).round() as i32;
@@ -2275,16 +2289,19 @@ mod tests {
         let mut fresh_canvas = vec![0u8; w * h * 4];
         rasterize_outline_into(
             &mut fresh_scratch,
-            &mut fresh_canvas,
-            w,
-            h,
-            origin_x,
-            origin_y,
+            &mut RgbaCanvasView {
+                rgba: &mut fresh_canvas,
+                width: w,
+                height: h,
+            },
+            [origin_x, origin_y],
             &outline_b,
             &GlyphTransform::identity(),
-            [255, 255, 255, 255],
-            &lut,
-            None,
+            OutlinePaint {
+                color: [255, 255, 255, 255],
+                aa_lut: &lut,
+                warp: None,
+            },
         );
 
         // Shared scratch: dirty it with A (different bbox/window), then render B.
@@ -2292,30 +2309,36 @@ mod tests {
         let mut dirty_canvas = vec![0u8; w * h * 4];
         rasterize_outline_into(
             &mut shared_scratch,
-            &mut dirty_canvas,
-            w,
-            h,
-            origin_x,
-            origin_y,
+            &mut RgbaCanvasView {
+                rgba: &mut dirty_canvas,
+                width: w,
+                height: h,
+            },
+            [origin_x, origin_y],
             &outline_a,
             &GlyphTransform::identity(),
-            [255, 255, 255, 255],
-            &lut,
-            None,
+            OutlinePaint {
+                color: [255, 255, 255, 255],
+                aa_lut: &lut,
+                warp: None,
+            },
         );
         let mut reused_canvas = vec![0u8; w * h * 4];
         rasterize_outline_into(
             &mut shared_scratch,
-            &mut reused_canvas,
-            w,
-            h,
-            origin_x,
-            origin_y,
+            &mut RgbaCanvasView {
+                rgba: &mut reused_canvas,
+                width: w,
+                height: h,
+            },
+            [origin_x, origin_y],
             &outline_b,
             &GlyphTransform::identity(),
-            [255, 255, 255, 255],
-            &lut,
-            None,
+            OutlinePaint {
+                color: [255, 255, 255, 255],
+                aa_lut: &lut,
+                warp: None,
+            },
         );
 
         assert_eq!(
@@ -2342,16 +2365,19 @@ mod tests {
         let mut c_id = vec![0u8; big * big * 4];
         rasterize_outline_into(
             &mut scratch,
-            &mut c_id,
-            big,
-            big,
-            min[0] - 20.0,
-            min[1] - 20.0,
+            &mut RgbaCanvasView {
+                rgba: &mut c_id,
+                width: big,
+                height: big,
+            },
+            [min[0] - 20.0, min[1] - 20.0],
             &outline,
             &GlyphTransform::identity(),
-            [255, 255, 255, 255],
-            &identity_lut(),
-            None,
+            OutlinePaint {
+                color: [255, 255, 255, 255],
+                aa_lut: &identity_lut(),
+                warp: None,
+            },
         );
         let (idw, idh) = alpha_bbox_dims(&c_id, big, big);
 
@@ -2367,16 +2393,19 @@ mod tests {
         let mut c_rot = vec![0u8; big * big * 4];
         rasterize_outline_into(
             &mut scratch,
-            &mut c_rot,
-            big,
-            big,
-            -(max[1]) - 20.0,
-            min[0] - 20.0,
+            &mut RgbaCanvasView {
+                rgba: &mut c_rot,
+                width: big,
+                height: big,
+            },
+            [-(max[1]) - 20.0, min[0] - 20.0],
             &outline,
             &rot,
-            [255, 255, 255, 255],
-            &identity_lut(),
-            None,
+            OutlinePaint {
+                color: [255, 255, 255, 255],
+                aa_lut: &identity_lut(),
+                warp: None,
+            },
         );
         let (rw, rh) = alpha_bbox_dims(&c_rot, big, big);
 
@@ -2401,16 +2430,19 @@ mod tests {
         };
         rasterize_outline_into(
             &mut scratch,
-            &mut c_off,
-            big,
-            big,
-            0.0,
-            0.0,
+            &mut RgbaCanvasView {
+                rgba: &mut c_off,
+                width: big,
+                height: big,
+            },
+            [0.0, 0.0],
             &outline,
             &far,
-            [255, 255, 255, 255],
-            &identity_lut(),
-            None,
+            OutlinePaint {
+                color: [255, 255, 255, 255],
+                aa_lut: &identity_lut(),
+                warp: None,
+            },
         );
         assert_eq!(c_off, expected, "off-canvas render must leave the buffer intact");
     }
@@ -2483,11 +2515,12 @@ mod tests {
             let mut scratch = RasterScratch::new();
             rasterize_outline_into(
                 &mut scratch,
-                &mut canvas,
-                w,
-                h,
-                origin_x,
-                origin_y,
+                &mut RgbaCanvasView {
+                    rgba: &mut canvas,
+                    width: w,
+                    height: h,
+                },
+                [origin_x, origin_y],
                 &outline,
                 &GlyphTransform {
                     pos,
@@ -2495,9 +2528,11 @@ mod tests {
                     scale: [1.0, 1.0],
                     shear_x: 0.0,
                 },
-                [255, 255, 255, 255],
-                &identity_lut(),
-                None,
+                OutlinePaint {
+                    color: [255, 255, 255, 255],
+                    aa_lut: &identity_lut(),
+                    warp: None,
+                },
             );
             alpha_centroid(&canvas, w, h).expect("non-empty render")
         };

@@ -10,7 +10,7 @@ Main responsibilities:
 - держать локальные regression tests на deterministic/noise-sensitive helper'ы.
 */
 
-use super::super::raster::blend_pixel_over;
+use super::super::raster::{RgbaCanvasView, RgbaView, blend_pixel_over};
 use super::super::types::RenderedTextImage;
 use super::image_ops::{
     average_opaque_rgba, blend_full_image_over, draw_image_with_opacity,
@@ -52,14 +52,17 @@ pub(crate) fn apply_dry_media_effect(
     let source_height = image.height as usize;
     let mut expanded_source = vec![0u8; out_width_usize * out_height_usize * 4];
     draw_image_with_opacity(
-        expanded_source.as_mut_slice(),
-        out_width_usize,
-        out_height_usize,
-        source.as_slice(),
-        source_width,
-        source_height,
-        pad as i32,
-        pad as i32,
+        &mut RgbaCanvasView {
+            rgba: expanded_source.as_mut_slice(),
+            width: out_width_usize,
+            height: out_height_usize,
+        },
+        RgbaView {
+            rgba: source.as_slice(),
+            width: source_width,
+            height: source_height,
+        },
+        [pad as i32, pad as i32],
         1.0,
     );
 
@@ -359,6 +362,7 @@ mod tests {
         apply_dry_media_effect, dry_media_material_factors, dry_media_required_pad_px,
         dry_media_stripe_factor,
     };
+    use crate::raster::{RgbaCanvasView, RgbaView};
     use crate::types::RenderedTextImage;
 
     /// Sequential reference for dry-media erosion/dust, reusing the same private kernels
@@ -384,14 +388,17 @@ mod tests {
         let source = image.rgba.clone();
         let mut expanded_source = vec![0u8; out_width_usize * out_height_usize * 4];
         draw_image_with_opacity(
-            expanded_source.as_mut_slice(),
-            out_width_usize,
-            out_height_usize,
-            source.as_slice(),
-            image.width as usize,
-            image.height as usize,
-            pad as i32,
-            pad as i32,
+            &mut RgbaCanvasView {
+                rgba: expanded_source.as_mut_slice(),
+                width: out_width_usize,
+                height: out_height_usize,
+            },
+            RgbaView {
+                rgba: source.as_slice(),
+                width: image.width as usize,
+                height: image.height as usize,
+            },
+            [pad as i32, pad as i32],
             1.0,
         );
         let mut source_alpha = vec![0u8; out_width_usize * out_height_usize];
@@ -624,14 +631,17 @@ mod tests {
         // Rebuild the expanded source to recover the average color used for dust tint.
         let mut expanded_source = vec![0u8; out_width as usize * out_height as usize * 4];
         super::super::image_ops::draw_image_with_opacity(
-            expanded_source.as_mut_slice(),
-            out_width as usize,
-            out_height as usize,
-            image.rgba.as_slice(),
-            image.width as usize,
-            image.height as usize,
-            pad as i32,
-            pad as i32,
+            &mut RgbaCanvasView {
+                rgba: expanded_source.as_mut_slice(),
+                width: out_width as usize,
+                height: out_height as usize,
+            },
+            RgbaView {
+                rgba: image.rgba.as_slice(),
+                width: image.width as usize,
+                height: image.height as usize,
+            },
+            [pad as i32, pad as i32],
             1.0,
         );
         let source_average_color = average_opaque_rgba(expanded_source.as_slice());

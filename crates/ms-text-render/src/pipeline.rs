@@ -96,7 +96,7 @@ use super::inline_styles::{
     spans_have_attrs_overrides,
 };
 use super::glyph_blit::{
-    glyph_needs_bitmap_fallback, glyph_outline_has_counter, glyph_outline_transform,
+    GlyphBox, glyph_needs_bitmap_fallback, glyph_outline_has_counter, glyph_outline_transform,
     glyph_subpixel_offset, hash_font_id, resolve_outline_for_glyph,
 };
 use super::glyph_contour::PlacedContour;
@@ -110,14 +110,14 @@ use super::optical::{
     optical_base_advance, optical_delta, optical_pair_gap,
 };
 use super::raster::{
-    GlyphRgbaView, PixelBounds, RigidPlacement, RgbaCanvasView, build_glyph_rgba_buffer,
-    draw_rotated_scaled_glyph_rgba, draw_scaled_glyph_rgba, include_rotated_rect_bounds,
-    include_scaled_rect_bounds, is_cancelled, rasterize_unscaled_glyph,
+    PixelBounds, RgbaCanvasView, RgbaView, RigidPlacement, RotatedGlyphPose, RotatedRect,
+    SwashGlyphView, build_glyph_rgba_buffer, draw_rotated_scaled_glyph_rgba, draw_scaled_glyph_rgba,
+    include_rotated_rect_bounds, include_scaled_rect_bounds, is_cancelled, rasterize_unscaled_glyph,
     rotate_placements_about_centroid, trim_rendered_image_to_alpha_bounds,
 };
 use super::vector::{
-    FauxOutlineParams, MeshWarpContext, Outline, OutlineCache, RasterScratch, build_aa_lut,
-    faux_key_bits, glyph_contour_from_outline, rasterize_outline_into,
+    FauxOutlineParams, MeshWarpContext, Outline, OutlineCache, OutlinePaint, RasterScratch,
+    build_aa_lut, faux_key_bits, glyph_contour_from_outline, rasterize_outline_into,
 };
 use super::types::{
     FAUX_THICKEN_PERCENT_MAX, FAUX_THICKEN_PERCENT_MIN, FauxBoldParams, FontFallbackReport,
@@ -261,6 +261,69 @@ impl GlyphScaleSettings {
     }
 }
 
+/// The per-render glyph caches a draw or measure pass shares: swash bitmaps (the
+/// placement box that pins the outline pivot, colour fallbacks), resolution-
+/// independent outlines, and the optical ink contours (`KerningMode::Optical`).
+///
+/// Created together and dropped with the render; each glyph is extracted at most
+/// once per cache. Passed as `&mut` beside the `FontSystem`; callers borrow the
+/// fields disjointly (a swash image stays borrowed while an outline resolves).
+pub(crate) struct GlyphCaches {
+    pub(crate) swash: SwashCache,
+    pub(crate) outlines: OutlineCache,
+    pub(crate) contours: OpticalContourCache,
+}
+
+impl GlyphCaches {
+    /// Three empty caches.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            swash: SwashCache::new(),
+            outlines: OutlineCache::new(),
+            contours: OpticalContourCache::new(),
+        }
+    }
+}
+
+/// The geometric per-glyph style an outline is drawn AND measured with: the inline
+/// glyph scale and the faux bold/italic style. `Copy`, passed by value on the
+/// per-glyph path so the draw and the optical measurement cannot disagree.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GlyphStyle {
+    pub(crate) scale: GlyphScaleSettings,
+    pub(crate) faux: FauxGlyphStyle,
+}
+
+/// The inline lookups of one shaped buffer as a run walk reads them: the (possibly
+/// degraded) params, the remapped inline spans with the byte offset of every layout
+/// line, the render's face-keyed user-authored kerning and the block font size.
+///
+/// Built once per render (the wrap measure builds a span-less one with a single
+/// line); `Copy`, it only borrows.
+#[derive(Clone, Copy)]
+pub(crate) struct RunPen<'a> {
+    pub(crate) params: &'a TextRenderParams,
+    pub(crate) inline_style_spans: Option<&'a [InlineStyleSpan]>,
+    pub(crate) layout_line_offsets: &'a [usize],
+    pub(crate) custom_kerning: &'a CustomKerningMap,
+    pub(crate) font_size_px: f32,
+}
+
+/// [`RunPen`] plus what re-shaping text outside the buffer needs — the synthesized
+/// wrap hyphen ([`build_wrapped_hyphen_glyph`]): the base attrs, the selected face's
+/// faux fallback weight/style, the inline font registry and the line height of the
+/// hyphen's own one-line buffer (`hyphen_line_height_px`; every path passes its
+/// shaping metrics' line height). Built once per render; `Copy`, it only borrows.
+#[derive(Clone, Copy)]
+pub(crate) struct RunShaping<'a> {
+    pub(crate) pen: RunPen<'a>,
+    pub(crate) attrs: &'a Attrs<'a>,
+    pub(crate) faux_face_baseline: FauxFaceBaseline,
+    pub(crate) inline_font_registry: &'a InlineFontRegistry,
+    pub(crate) hyphen_line_height_px: f32,
+}
+
 /// One laid-out horizontal run: pen positions plus the metrics alignment needs.
 ///
 /// `leading_hang_px`/`trailing_hang_px` are the widths of the run's LEADING and
@@ -334,9 +397,7 @@ pub(crate) struct PenRunWidth<'a> {
     params: TextRenderParams,
     custom_kerning: &'a CustomKerningMap,
     font_size_px: f32,
-    swash_cache: SwashCache,
-    outline_cache: OutlineCache,
-    contour_cache: OpticalContourCache,
+    caches: GlyphCaches,
 }
 
 impl<'a> PenRunWidth<'a> {
@@ -348,45 +409,56 @@ impl<'a> PenRunWidth<'a> {
             params: params.clone(),
             custom_kerning,
             font_size_px,
-            swash_cache: SwashCache::new(),
-            outline_cache: OutlineCache::new(),
-            contour_cache: OpticalContourCache::new(),
+            caches: GlyphCaches::new(),
         }
     }
 }
 
 impl super::wrap::RunWidthMeasure for PenRunWidth<'_> {
     fn run_width_px(&mut self, font_system: &mut FontSystem, run: &LayoutRun<'_>) -> f32 {
-        horizontal_run_layout(
-            &self.params,
-            run,
-            font_system,
-            &mut self.swash_cache,
-            &mut self.outline_cache,
-            &mut self.contour_cache,
-            &[0],
-            None,
-            self.custom_kerning,
-            self.font_size_px,
-        )
-        .line_width_px
+        let pen = RunPen {
+            params: &self.params,
+            inline_style_spans: None,
+            layout_line_offsets: &[0],
+            custom_kerning: self.custom_kerning,
+            font_size_px: self.font_size_px,
+        };
+        horizontal_run_layout(pen, run, font_system, &mut self.caches).line_width_px
     }
 }
 
-// Layout comparison needs the same resolved render context as the main prepass.
-#[allow(clippy::too_many_arguments)]
-fn build_layout_text_for_shape_params(
-    params: &TextRenderParams,
-    source_text: &str,
-    shape_params: LayoutShapeParams,
-    font_system: &mut FontSystem,
-    attrs: &Attrs<'_>,
-    custom_kerning: &CustomKerningMap,
+/// The resolved render context the wrap prepass reshapes the source text in: the
+/// main layout and the optional compare layout (`compare_shape_with`) differ only
+/// in their `LayoutShapeParams`, so both read this one context.
+#[derive(Clone, Copy)]
+struct ShapeLayoutContext<'a> {
+    params: &'a TextRenderParams,
+    attrs: &'a Attrs<'a>,
+    custom_kerning: &'a CustomKerningMap,
     font_size_px: f32,
     base_line_height_px: f32,
     extra_line_spacing_px: f32,
     preserve_edge_spaces: bool,
+}
+
+/// Wrap / shape `source_text` for `shape_params` (horizontal: the scored shape wrap
+/// measured by the pen; vertical: the column wrap) and return the layout text plus
+/// its warnings.
+fn build_layout_text_for_shape_params(
+    context: ShapeLayoutContext<'_>,
+    font_system: &mut FontSystem,
+    source_text: &str,
+    shape_params: LayoutShapeParams,
 ) -> LayoutTextResult {
+    let ShapeLayoutContext {
+        params,
+        attrs,
+        custom_kerning,
+        font_size_px,
+        base_line_height_px,
+        extra_line_spacing_px,
+        preserve_edge_spaces,
+    } = context;
     // Dictionary bundle for the process-global typesetting language; thread-local
     // cached so this hot prepass path does not reload TeX patterns per render.
     let hyphen_dicts = needs_hyphenation_dicts(shape_params.text_wrap_mode)
@@ -715,32 +787,29 @@ pub fn render_text_to_image(
             shape_variant: params.shape_variant,
         }
     };
-    let layout_text_result = build_layout_text_for_shape_params(
+    let shape_layout_context = ShapeLayoutContext {
         params,
-        source_text,
-        layout_shape_params,
-        font_system,
-        &attrs,
-        &custom_kerning,
+        attrs: &attrs,
+        custom_kerning: &custom_kerning,
         font_size_px,
         base_line_height_px,
         extra_line_spacing_px,
         preserve_edge_spaces,
+    };
+    let layout_text_result = build_layout_text_for_shape_params(
+        shape_layout_context,
+        font_system,
+        source_text,
+        layout_shape_params,
     );
     warnings.extend(layout_text_result.warnings);
     let layout_text = layout_text_result.text;
     if let Some(compare_params) = params.compare_shape_with.as_ref() {
         let compare_layout_text = build_layout_text_for_shape_params(
-            params,
+            shape_layout_context,
+            font_system,
             source_text,
             LayoutShapeParams::from_compare(compare_params),
-            font_system,
-            &attrs,
-            &custom_kerning,
-            font_size_px,
-            base_line_height_px,
-            extra_line_spacing_px,
-            preserve_edge_spaces,
         )
         .text;
         if compare_layout_text == layout_text {
@@ -777,7 +846,7 @@ pub fn render_text_to_image(
     }
     let inline_line_aligns = compute_inline_line_aligns(
         params.align,
-        layout_text.as_str(),
+        compute_layout_line_offsets(layout_text.as_str()).as_slice(),
         mapped_inline_style_spans.as_deref(),
     );
     let requested_inline_fonts = mapped_inline_style_spans
@@ -1053,6 +1122,20 @@ pub fn render_text_to_image(
     // для таких overlay используем отдельный путь с обратной выборкой и поворотом.
     // Глобальный поворот всего блока использует тот же векторный путь: он поворачивает
     // контуры глифов до растеризации и растит холст под повёрнутый bbox.
+    // The inline-style context every run walk below reads (both horizontal paths).
+    let shaping = RunShaping {
+        pen: RunPen {
+            params,
+            inline_style_spans: mapped_inline_style_spans.as_deref(),
+            layout_line_offsets: layout_line_offsets.as_slice(),
+            custom_kerning: &custom_kerning,
+            font_size_px,
+        },
+        attrs: &attrs,
+        faux_face_baseline,
+        inline_font_registry: &inline_font_registry_build.registry,
+        hyphen_line_height_px: font_size_px,
+    };
     let has_global_rotation = params.global_rotation_deg.abs() > f32::EPSILON;
     if has_global_rotation
         || mapped_inline_style_spans
@@ -1061,21 +1144,11 @@ pub fn render_text_to_image(
     {
         ms_log::trace_log!(cat::RENDER, "render_text path=horizontal_rotated lines={} global_rotation_deg={}", layout_line_offsets.len(), params.global_rotation_deg);
         let mut rendered = render_horizontal_rotated(
-            params,
+            shaping,
             font_system,
             &buffer,
-            &attrs,
-            faux_face_baseline,
-            &inline_font_registry_build.registry,
-            mapped_inline_style_spans.as_deref(),
-            layout_text.as_str(),
-            layout_line_offsets.as_slice(),
             line_baselines.as_slice(),
-            &custom_kerning,
-            width_px,
-            font_size_px,
             line_height_px,
-            params.global_rotation_deg,
             cancel,
         )?;
         rendered.warnings.extend(warnings);
@@ -1086,14 +1159,12 @@ pub fn render_text_to_image(
     }
 
     ms_log::trace_log!(cat::RENDER, "render_text path=horizontal lines={} align={:?}", layout_line_offsets.len(), params.align);
-    let mut cache = SwashCache::new();
     // Single placement pass: layout and per-glyph placement are computed ONCE per
-    // run and reused for both the bounds box and the draw pass. One outline cache,
-    // one optical ink-contour cache (both no-ops for every non-Optical kerning
-    // mode) and one AA LUT serve the whole path — `horizontal_run_layout` and
-    // `get_image` run exactly once per glyph.
-    let mut outline_cache = OutlineCache::new();
-    let mut contour_cache = OpticalContourCache::new();
+    // run and reused for both the bounds box and the draw pass. One set of glyph
+    // caches (the outline and optical ink-contour caches are no-ops for every
+    // non-Optical kerning mode) and one AA LUT serve the whole path —
+    // `horizontal_run_layout` and `get_image` run exactly once per glyph.
+    let mut caches = GlyphCaches::new();
     // Reused per-glyph rasterizer buffers for the draw pass (see `RasterScratch`).
     let mut raster_scratch = RasterScratch::new();
     let aa_lut = build_aa_lut(params.anti_aliasing);
@@ -1121,18 +1192,7 @@ pub fn render_text_to_image(
         } else {
             (0, run.glyphs.len())
         };
-        let run_layout = horizontal_run_layout(
-            params,
-            &run,
-            font_system,
-            &mut cache,
-            &mut outline_cache,
-            &mut contour_cache,
-            layout_line_offsets.as_slice(),
-            mapped_inline_style_spans.as_deref(),
-            &custom_kerning,
-            font_size_px,
-        );
+        let run_layout = horizontal_run_layout(shaping.pen, &run, font_system, &mut caches);
         // Hanging punctuation is a WEIGHT on the line, not a glyph move: the pen
         // positions stay as shaped and only the width this line is aligned by, plus
         // its origin, lose the weighted part of the hanging edge runs.
@@ -1182,19 +1242,22 @@ pub fn render_text_to_image(
                     glyph,
                 ),
                 font_system,
-                &mut outline_cache,
+                &mut caches.outlines,
                 glyph,
             );
             if let Some(placement) = build_horizontal_placement(
                 font_system,
-                &mut cache,
-                &mut outline_cache,
+                &mut caches,
                 glyph,
-                line_offset_x + (glyph_x - glyph.x) + glyph_offset[0],
-                baseline_y + glyph_offset[1],
-                glyph_scale,
+                [
+                    line_offset_x + (glyph_x - glyph.x) + glyph_offset[0],
+                    baseline_y + glyph_offset[1],
+                ],
+                GlyphStyle {
+                    scale: glyph_scale,
+                    faux: glyph_faux,
+                },
                 glyph_text_color,
-                glyph_faux,
             ) {
                 // Feed the extra-info sampler from the SAME placement box the draw
                 // pass uses; skip glyphs in the line's hanging-punctuation edge runs
@@ -1216,18 +1279,8 @@ pub fn render_text_to_image(
         }
 
         if run_wraps_at_soft_hyphen(&run, runs.peek())
-            && let Some(hyphen_glyph) = build_wrapped_hyphen_glyph(
-                font_system,
-                &attrs,
-                faux_face_baseline,
-                mapped_inline_style_spans.as_deref(),
-                &inline_font_registry_build.registry,
-                layout_line_offsets.as_slice(),
-                &run,
-                runs.peek(),
-                font_size_px,
-                font_size_px,
-            )
+            && let Some(hyphen_glyph) =
+                build_wrapped_hyphen_glyph(font_system, shaping, &run, runs.peek())
         {
             let style_offset =
                 soft_hyphen_style_offset(&run, runs.peek(), layout_line_offsets.as_slice());
@@ -1266,7 +1319,7 @@ pub fn render_text_to_image(
                     })
                     .unwrap_or(FauxGlyphStyle::NONE),
                 font_system,
-                &mut outline_cache,
+                &mut caches.outlines,
                 &hyphen_glyph,
             );
             let hyphen_offset_x = line_offset_x
@@ -1279,14 +1332,14 @@ pub fn render_text_to_image(
                     .unwrap_or(0.0);
             if let Some(placement) = build_horizontal_placement(
                 font_system,
-                &mut cache,
-                &mut outline_cache,
+                &mut caches,
                 &hyphen_glyph,
-                hyphen_offset_x + hyphen_offset[0],
-                baseline_y + hyphen_offset[1],
-                hyphen_scale,
+                [hyphen_offset_x + hyphen_offset[0], baseline_y + hyphen_offset[1]],
+                GlyphStyle {
+                    scale: hyphen_scale,
+                    faux: hyphen_faux,
+                },
                 hyphen_text_color,
-                hyphen_faux,
             ) {
                 // The wrapped soft hyphen never hangs, so it contributes to the
                 // extra-info samples whenever it actually draws ink (a faux thinning
@@ -1372,12 +1425,13 @@ pub fn render_text_to_image(
         }
         draw_horizontal_placement(
             &mut raster_scratch,
-            rgba.as_mut_slice(),
-            out_width,
-            out_height,
+            &mut RgbaCanvasView {
+                rgba: rgba.as_mut_slice(),
+                width: out_width as usize,
+                height: out_height as usize,
+            },
             placement,
-            x_offset,
-            y_offset,
+            [x_offset, y_offset],
             &aa_lut,
             warp_ctx.as_ref(),
         );
@@ -1487,22 +1541,20 @@ impl HorizontalGlyphPlacement {
 /// Calls `get_image` ONCE to read the bitmap placement box (bounds/pivot source)
 /// and resolve the fill outline; returns `None` for glyphs `get_image` cannot
 /// produce or for zero-size (space) glyphs, which never contribute to bounds or
-/// pixels. `pos_x`/`pos_y` are the glyph pen position in layout pixels (already
-/// carrying the inline glyph offset).
-#[allow(clippy::too_many_arguments)]
+/// pixels. `pos` is the glyph pen position in layout pixels (already carrying the
+/// inline glyph offset); `style` is its inline scale and faux style.
 fn build_horizontal_placement(
     font_system: &mut FontSystem,
-    cache: &mut SwashCache,
-    outline_cache: &mut OutlineCache,
+    caches: &mut GlyphCaches,
     glyph: &LayoutGlyph,
-    pos_x: f32,
-    pos_y: f32,
-    scale: GlyphScaleSettings,
+    pos: [f32; 2],
+    style: GlyphStyle,
     text_color: [u8; 4],
-    faux: FauxGlyphStyle,
 ) -> Option<HorizontalGlyphPlacement> {
+    let [pos_x, pos_y] = pos;
+    let GlyphStyle { scale, faux } = style;
     let physical = glyph.physical((pos_x, pos_y), 1.0);
-    let image = cache.get_image(font_system, physical.cache_key).as_ref()?;
+    let image = caches.swash.get_image(font_system, physical.cache_key).as_ref()?;
     let glyph_w = image.placement.width as usize;
     let glyph_h = image.placement.height as usize;
     if glyph_w == 0 || glyph_h == 0 {
@@ -1514,13 +1566,13 @@ fn build_horizontal_placement(
     let src_left_i = physical.x + image.placement.left;
     let src_top_i = physical.y - image.placement.top;
     let subpixel = glyph_subpixel_offset(physical.cache_key);
-    let outline = resolve_outline_for_glyph(font_system, outline_cache, glyph, faux.bold);
+    let outline = resolve_outline_for_glyph(font_system, &mut caches.outlines, glyph, faux.bold);
     // Capture the swash bitmap only for genuinely outline-less glyphs (real
     // color/emoji or a monochrome embedded-bitmap glyph); a glyph whose outline
     // was CONSUMED by a faux thinning offset must draw nothing rather than pop
     // back to its full-weight bitmap.
     let fallback = if outline.is_none()
-        && glyph_needs_bitmap_fallback(font_system, outline_cache, glyph, faux.bold)
+        && glyph_needs_bitmap_fallback(font_system, &mut caches.outlines, glyph, faux.bold)
     {
         Some((image.content, image.data.clone()))
     } else {
@@ -1554,28 +1606,22 @@ fn build_horizontal_placement(
 ///
 /// Rasterizes the glyph's true font outline at exactly the pixels the bitmap blit
 /// used: scaled about the bitmap center (`dst_center`), no rotation, world mapped
-/// to the canvas by the `x_offset`/`y_offset` derived from the bounds box.
+/// to the canvas by the `canvas_offset` (`[x, y]`) derived from the bounds box.
 /// Color/emoji glyphs (captured `fallback`) keep the bitmap blit (identity or
 /// center-scaled). `aa_lut` is the coverage->alpha transfer table applied only on
 /// the outline path; the bitmap fallback is unaffected. `scratch` supplies the
 /// reused per-glyph rasterizer buffers. `warp` is the optional vector mesh warp,
 /// applied only on the outline path (the bitmap fallback is not warped in
 /// Phase 1); `None` keeps the byte-identical fast path.
-// The draw call naturally carries the scratch, canvas target + dimensions, the
-// collected placement, the bounds-derived offsets and the AA table; splitting
-// them would only obscure the 1:1 mapping to `rasterize_outline_into`.
-#[allow(clippy::too_many_arguments)]
 fn draw_horizontal_placement(
     scratch: &mut RasterScratch,
-    rgba: &mut [u8],
-    out_width: u32,
-    out_height: u32,
+    canvas: &mut RgbaCanvasView<'_>,
     placement: &HorizontalGlyphPlacement,
-    x_offset: i32,
-    y_offset: i32,
+    canvas_offset: [i32; 2],
     aa_lut: &[u8; 256],
     warp: Option<&MeshWarpContext>,
 ) {
+    let [x_offset, y_offset] = canvas_offset;
     let glyph_w = placement.glyph_w;
     let glyph_h = placement.glyph_h;
     // Content-space top-left of the (unscaled) glyph bitmap.
@@ -1599,30 +1645,29 @@ fn draw_horizontal_placement(
         // Re-add the subpixel fraction cosmic-text baked into the bitmap coverage
         // (physical.x/y carried only the integer pen), so the outline matches it.
         let transform = glyph_outline_transform(
-            dst_center_x,
-            dst_center_y,
+            GlyphBox {
+                placement_left: placement.placement_left,
+                placement_top: placement.placement_top,
+                glyph_w: glyph_w as f32,
+                glyph_h: glyph_h as f32,
+                scale: placement.scale,
+                subpixel: placement.subpixel,
+                shear_x: placement.faux.shear_x,
+            },
+            [dst_center_x, dst_center_y],
             0.0,
-            placement.placement_left,
-            placement.placement_top,
-            glyph_w as f32,
-            glyph_h as f32,
-            placement.scale.width_mul,
-            placement.scale.height_mul,
-            placement.subpixel,
-            placement.faux.shear_x,
         );
         rasterize_outline_into(
             scratch,
-            rgba,
-            out_width as usize,
-            out_height as usize,
-            -(x_offset as f32),
-            -(y_offset as f32),
+            canvas,
+            [-(x_offset as f32), -(y_offset as f32)],
             outline,
             &transform,
-            placement.text_color,
-            aa_lut,
-            warp,
+            OutlinePaint {
+                color: placement.text_color,
+                aa_lut,
+                warp,
+            },
         );
         return;
     }
@@ -1638,25 +1683,19 @@ fn draw_horizontal_placement(
     let draw_y = placement.src_top_i + y_offset;
     if placement.scale.is_identity() {
         rasterize_unscaled_glyph(
-            rgba,
-            out_width,
-            out_height,
-            *content,
-            data.as_slice(),
-            glyph_w,
-            glyph_h,
-            draw_x,
-            draw_y,
+            canvas,
+            SwashGlyphView {
+                content: *content,
+                data: data.as_slice(),
+                width: glyph_w,
+                height: glyph_h,
+            },
+            [draw_x, draw_y],
             placement.text_color,
         );
     } else {
         let glyph_rgba =
             build_glyph_rgba_buffer(content, data.as_slice(), glyph_w, glyph_h, placement.text_color);
-        let mut canvas = RgbaCanvasView {
-            rgba,
-            width: out_width as usize,
-            height: out_height as usize,
-        };
         // Same baseline anchor as the outline path above, shifted into canvas px
         // by the bounds offsets — the bitmap fallback must land in the same box
         // the bounds pass reserved for it.
@@ -1668,8 +1707,8 @@ fn draw_horizontal_placement(
             placement.baseline_y() + y_offset as f32,
         );
         draw_scaled_glyph_rgba(
-            &mut canvas,
-            GlyphRgbaView {
+            canvas,
+            RgbaView {
                 rgba: glyph_rgba.as_slice(),
                 width: glyph_w,
                 height: glyph_h,
@@ -1757,23 +1796,33 @@ impl RotatedGlyphPlacement {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The inline rotation of one glyph on the rotated horizontal path: its own turn
+/// and, when it belongs to an inline rotation group, the group key and the group's
+/// turn (applied later about the group centroid, `apply_rotated_group_rotations`).
+#[derive(Debug, Clone, Copy)]
+struct InlineGlyphRotation {
+    glyph_rad: f32,
+    group_key: Option<(usize, usize)>,
+    group_rad: f32,
+}
+
+/// Collect one glyph placement for the rotated horizontal path: the bitmap
+/// placement box (bounds and pivot source), the fill outline or the RGBA
+/// fallback, the baseline-anchored rotation centre and the inline rotation.
+/// `None` for glyphs `get_image` cannot produce and zero-size (space) glyphs.
 fn build_rotated_placement(
     font_system: &mut FontSystem,
-    cache: &mut SwashCache,
-    outline_cache: &mut OutlineCache,
+    caches: &mut GlyphCaches,
     glyph: &LayoutGlyph,
-    pos_x: f32,
-    pos_y: f32,
-    scale: GlyphScaleSettings,
+    pos: [f32; 2],
+    style: GlyphStyle,
     text_color: [u8; 4],
-    faux: FauxGlyphStyle,
-    glyph_rotation_rad: f32,
-    group_key: Option<(usize, usize)>,
-    group_rotation_rad: f32,
+    rotation: InlineGlyphRotation,
 ) -> Option<RotatedGlyphPlacement> {
+    let [pos_x, pos_y] = pos;
+    let GlyphStyle { scale, faux } = style;
     let physical = glyph.physical((pos_x, pos_y), 1.0);
-    let Some(image) = cache.get_image(font_system, physical.cache_key) else {
+    let Some(image) = caches.swash.get_image(font_system, physical.cache_key) else {
         return None;
     };
     let glyph_w = image.placement.width as usize;
@@ -1786,13 +1835,13 @@ fn build_rotated_placement(
     let src_left = (physical.x + image.placement.left) as f32;
     let src_top = (physical.y - image.placement.top) as f32;
     let subpixel = glyph_subpixel_offset(physical.cache_key);
-    let outline = resolve_outline_for_glyph(font_system, outline_cache, glyph, faux.bold);
+    let outline = resolve_outline_for_glyph(font_system, &mut caches.outlines, glyph, faux.bold);
     // Build the bitmap RGBA for any outline-less glyph fallback: real color glyphs
     // and monochrome embedded-bitmap / sbix / CBDT-mono glyphs alike (the zero-size
     // skip above already filtered spaces). A glyph whose outline was CONSUMED by a
     // faux thinning offset gets no bitmap — it must draw nothing.
     let glyph_rgba = if outline.is_none()
-        && glyph_needs_bitmap_fallback(font_system, outline_cache, glyph, faux.bold)
+        && glyph_needs_bitmap_fallback(font_system, &mut caches.outlines, glyph, faux.bold)
     {
         build_glyph_rgba_buffer(&image.content, image.data.as_slice(), glyph_w, glyph_h, text_color)
     } else {
@@ -1832,9 +1881,9 @@ fn build_rotated_placement(
         bounds_pad,
         center_x,
         center_y,
-        rotation_rad: glyph_rotation_rad,
-        group_key,
-        group_rotation_rad,
+        rotation_rad: rotation.glyph_rad,
+        group_key: rotation.group_key,
+        group_rotation_rad: rotation.group_rad,
         // Set by the collection loop when hanging punctuation is enabled.
         hanging_excluded: false,
         // Overwritten by the collection loop, which knows the run's line. A placement
@@ -1904,32 +1953,30 @@ fn apply_global_rotation(placements: &mut [RotatedGlyphPlacement], angle_rad: f3
 /// Собирает размещения всех глифов, применяет повороты групп, считает повёрнутый
 /// bbox и выводит каждый глиф обратной выборкой с поворотом.
 ///
-/// `faux_face_baseline` — weight/style выбранного face: fallback для faux-спанов
-/// в attrs переносимого мягкого переноса (см. `apply_inline_style_to_attrs`).
-#[allow(clippy::too_many_arguments)]
+/// `shaping` — inline-контекст рендера (params, спаны, смещения строк, кернинг,
+/// attrs и faux-fallback для переносимого мягкого переноса); ширина блока и
+/// глобальный поворот берутся из `shaping.pen.params`. `line_height_px` — высота
+/// пустого (прозрачного) результата.
 fn render_horizontal_rotated(
-    params: &TextRenderParams,
+    shaping: RunShaping<'_>,
     font_system: &mut FontSystem,
     buffer: &Buffer,
-    attrs: &Attrs<'_>,
-    faux_face_baseline: FauxFaceBaseline,
-    inline_font_registry: &super::font_registry::InlineFontRegistry,
-    inline_style_spans: Option<&[InlineStyleSpan]>,
-    layout_text: &str,
-    layout_line_offsets: &[usize],
     line_baselines: &[f32],
-    custom_kerning: &CustomKerningMap,
-    width_px: u32,
-    font_size_px: f32,
     line_height_px: f32,
-    global_rotation_deg: f32,
     cancel: Option<(&Arc<AtomicU64>, u64)>,
 ) -> Result<RenderedTextImage, String> {
-    let mut cache = SwashCache::new();
-    // Per-render outline cache: each glyph outline is extracted at most once.
-    let mut outline_cache = OutlineCache::new();
-    // Per-render glyph ink-contour cache for optical horizontal kerning.
-    let mut contour_cache = OpticalContourCache::new();
+    let RunPen {
+        params,
+        inline_style_spans,
+        layout_line_offsets,
+        font_size_px,
+        ..
+    } = shaping.pen;
+    let width_px = params.width_px.max(1);
+    let global_rotation_deg = params.global_rotation_deg;
+    // Per-render swash / outline / optical ink-contour caches: each glyph is
+    // extracted at most once per cache.
+    let mut caches = GlyphCaches::new();
     // Reused per-glyph rasterizer buffers for the draw pass (see `RasterScratch`).
     let mut raster_scratch = RasterScratch::new();
     // Coverage->alpha transfer table for the selected AA mode, built once per render.
@@ -1940,7 +1987,7 @@ fn render_horizontal_rotated(
     let extra_active = extra_acc.is_active();
     let mut placements: Vec<RotatedGlyphPlacement> = Vec::new();
     let inline_line_aligns =
-        compute_inline_line_aligns(params.align, layout_text, inline_style_spans);
+        compute_inline_line_aligns(params.align, layout_line_offsets, inline_style_spans);
     let mut line_idx = 0usize;
     // Normalized once per render: `0.0` disables the hang, `1.0` is the full hang.
     let hanging_weight = params.hanging_weight();
@@ -1955,18 +2002,7 @@ fn render_horizontal_rotated(
         } else {
             (0, run.glyphs.len())
         };
-        let run_layout = horizontal_run_layout(
-            params,
-            &run,
-            font_system,
-            &mut cache,
-            &mut outline_cache,
-            &mut contour_cache,
-            layout_line_offsets,
-            inline_style_spans,
-            custom_kerning,
-            font_size_px,
-        );
+        let run_layout = horizontal_run_layout(shaping.pen, &run, font_system, &mut caches);
         // Hanging punctuation is a WEIGHT on the line, not a glyph move: the pen
         // positions stay as shaped and only the width this line is aligned by, plus
         // its origin, lose the weighted part of the hanging edge runs.
@@ -2016,7 +2052,7 @@ fn render_horizontal_rotated(
                     glyph,
                 ),
                 font_system,
-                &mut outline_cache,
+                &mut caches.outlines,
                 glyph,
             );
             let group_key = if offset.group_rotation_rad.abs() > f32::EPSILON {
@@ -2031,17 +2067,22 @@ fn render_horizontal_rotated(
             };
             if let Some(mut placement) = build_rotated_placement(
                 font_system,
-                &mut cache,
-                &mut outline_cache,
+                &mut caches,
                 glyph,
-                line_offset_x + (glyph_x - glyph.x) + offset.global_px[0],
-                baseline_y + offset.global_px[1],
-                glyph_scale,
+                [
+                    line_offset_x + (glyph_x - glyph.x) + offset.global_px[0],
+                    baseline_y + offset.global_px[1],
+                ],
+                GlyphStyle {
+                    scale: glyph_scale,
+                    faux: glyph_faux,
+                },
                 glyph_text_color,
-                glyph_faux,
-                offset.glyph_rotation_rad,
-                group_key,
-                offset.group_rotation_rad,
+                InlineGlyphRotation {
+                    glyph_rad: offset.glyph_rotation_rad,
+                    group_key,
+                    group_rad: offset.group_rotation_rad,
+                },
             ) {
                 placement.hanging_excluded = is_edge_run_hanging(hanging_bounds, glyph_idx);
                 placement.line_idx = line_idx;
@@ -2050,18 +2091,8 @@ fn render_horizontal_rotated(
         }
 
         if run_wraps_at_soft_hyphen(&run, runs.peek())
-            && let Some(hyphen_glyph) = build_wrapped_hyphen_glyph(
-                font_system,
-                attrs,
-                faux_face_baseline,
-                inline_style_spans,
-                inline_font_registry,
-                layout_line_offsets,
-                &run,
-                runs.peek(),
-                font_size_px,
-                font_size_px,
-            )
+            && let Some(hyphen_glyph) =
+                build_wrapped_hyphen_glyph(font_system, shaping, &run, runs.peek())
         {
             let style_offset = soft_hyphen_style_offset(&run, runs.peek(), layout_line_offsets);
             let hyphen_text_color = style_offset
@@ -2087,7 +2118,7 @@ fn render_horizontal_rotated(
                     })
                     .unwrap_or(FauxGlyphStyle::NONE),
                 font_system,
-                &mut outline_cache,
+                &mut caches.outlines,
                 &hyphen_glyph,
             );
             let group_key = if hyphen_offset.group_rotation_rad.abs() > f32::EPSILON {
@@ -2106,17 +2137,22 @@ fn render_horizontal_rotated(
                     .unwrap_or(0.0);
             if let Some(placement) = build_rotated_placement(
                 font_system,
-                &mut cache,
-                &mut outline_cache,
+                &mut caches,
                 &hyphen_glyph,
-                hyphen_offset_x + hyphen_offset.global_px[0],
-                baseline_y + hyphen_offset.global_px[1],
-                hyphen_scale,
+                [
+                    hyphen_offset_x + hyphen_offset.global_px[0],
+                    baseline_y + hyphen_offset.global_px[1],
+                ],
+                GlyphStyle {
+                    scale: hyphen_scale,
+                    faux: hyphen_faux,
+                },
                 hyphen_text_color,
-                hyphen_faux,
-                hyphen_offset.glyph_rotation_rad,
-                group_key,
-                hyphen_offset.group_rotation_rad,
+                InlineGlyphRotation {
+                    glyph_rad: hyphen_offset.glyph_rotation_rad,
+                    group_key,
+                    group_rad: hyphen_offset.group_rotation_rad,
+                },
             ) {
                 placements.push(placement);
             }
@@ -2146,13 +2182,11 @@ fn render_horizontal_rotated(
                 placement.padded_scaled_rect();
             include_rotated_rect_bounds(
                 &mut pre_box,
-                scaled_left,
-                scaled_top,
-                scaled_width,
-                scaled_height,
-                placement.center_x,
-                placement.center_y,
-                placement.rotation_rad,
+                RotatedRect {
+                    rect: (scaled_left, scaled_top, scaled_width, scaled_height),
+                    dst_center: [placement.center_x, placement.center_y],
+                    rotation_rad: placement.rotation_rad,
+                },
             );
             sum_x += placement.center_x;
             sum_y += placement.center_y;
@@ -2185,13 +2219,11 @@ fn render_horizontal_rotated(
             placement.padded_scaled_rect();
         include_rotated_rect_bounds(
             &mut bounds,
-            scaled_left,
-            scaled_top,
-            scaled_width,
-            scaled_height,
-            placement.center_x,
-            placement.center_y,
-            placement.rotation_rad,
+            RotatedRect {
+                rect: (scaled_left, scaled_top, scaled_width, scaled_height),
+                dst_center: [placement.center_x, placement.center_y],
+                rotation_rad: placement.rotation_rad,
+            },
         );
     }
     // Grow the canvas to the warped extent (peel->warp->reapply of the lattice
@@ -2252,30 +2284,33 @@ fn render_horizontal_rotated(
         // placement.center after group rotation).
         if let Some(outline) = placement.outline.as_ref() {
             let transform = glyph_outline_transform(
-                placement.center_x,
-                placement.center_y,
+                GlyphBox {
+                    placement_left: placement.placement_left,
+                    placement_top: placement.placement_top,
+                    glyph_w: placement.glyph_w as f32,
+                    glyph_h: placement.glyph_h as f32,
+                    scale: placement.scale,
+                    subpixel: placement.subpixel,
+                    shear_x: placement.faux.shear_x,
+                },
+                [placement.center_x, placement.center_y],
                 placement.rotation_rad,
-                placement.placement_left,
-                placement.placement_top,
-                placement.glyph_w as f32,
-                placement.glyph_h as f32,
-                placement.scale.width_mul,
-                placement.scale.height_mul,
-                placement.subpixel,
-                placement.faux.shear_x,
             );
             rasterize_outline_into(
                 &mut raster_scratch,
-                rgba.as_mut_slice(),
-                out_width as usize,
-                out_height as usize,
-                -(x_offset as f32),
-                -(y_offset as f32),
+                &mut RgbaCanvasView {
+                    rgba: rgba.as_mut_slice(),
+                    width: out_width as usize,
+                    height: out_height as usize,
+                },
+                [-(x_offset as f32), -(y_offset as f32)],
                 outline,
                 &transform,
-                placement.text_color,
-                &aa_lut,
-                warp_ctx.as_ref(),
+                OutlinePaint {
+                    color: placement.text_color,
+                    aa_lut: &aa_lut,
+                    warp: warp_ctx.as_ref(),
+                },
             );
             continue;
         }
@@ -2296,19 +2331,19 @@ fn render_horizontal_rotated(
         };
         draw_rotated_scaled_glyph_rgba(
             &mut canvas,
-            GlyphRgbaView {
+            RgbaView {
                 rgba: placement.glyph_rgba.as_slice(),
                 width: placement.glyph_w,
                 height: placement.glyph_h,
             },
-            placement.src_left,
-            placement.src_top,
-            placement.scale,
-            placement.center_x,
-            placement.center_y,
-            placement.rotation_rad,
-            x_offset,
-            y_offset,
+            RotatedGlyphPose {
+                src_left: placement.src_left,
+                src_top: placement.src_top,
+                scale: placement.scale,
+                dst_center: [placement.center_x, placement.center_y],
+                rotation_rad: placement.rotation_rad,
+            },
+            [x_offset, y_offset],
         );
     }
 
@@ -2382,9 +2417,10 @@ fn faux_floored_advance(base_advance: f32, faux_extra: f32) -> f32 {
 /// and normalizing them toward the run's median gap; a run with fewer than one
 /// finite gap (e.g. a single inked glyph) falls back to the metric accumulation.
 ///
-/// `font_system` is also read by `Fixed` (nominal own-advance lookup);
-/// `cache`/`outline_cache`/`contour_cache` are used only by the optical path
-/// (outline extraction + ink measurement) and are untouched for `Auto`/`Fixed`.
+/// `pen` carries the params, inline spans, line offsets, user-authored kerning and
+/// font size of the render. `font_system` is also read by `Fixed` (nominal
+/// own-advance lookup); `caches` are used only by the optical path (outline
+/// extraction + ink measurement) and are untouched for `Auto`/`Fixed`.
 /// Never panics; a glyph without a fillable outline is treated as non-kernable
 /// (delta 0) rather than an error.
 ///
@@ -2411,19 +2447,19 @@ fn faux_floored_advance(base_advance: f32, faux_extra: f32) -> f32 {
 /// That is what makes an authored pair indistinguishable from a built-in one.
 /// Uniform tracking (`extra_spacing_px`) is a separate setting and is still added
 /// on top, unchanged.
-#[allow(clippy::too_many_arguments)]
 fn horizontal_run_layout(
-    params: &TextRenderParams,
+    pen: RunPen<'_>,
     run: &LayoutRun<'_>,
     font_system: &mut FontSystem,
-    cache: &mut SwashCache,
-    outline_cache: &mut OutlineCache,
-    contour_cache: &mut OpticalContourCache,
-    layout_line_offsets: &[usize],
-    inline_style_spans: Option<&[InlineStyleSpan]>,
-    custom_kerning: &CustomKerningMap,
-    font_size_px: f32,
+    caches: &mut GlyphCaches,
 ) -> HorizontalRunLayout {
+    let RunPen {
+        params,
+        inline_style_spans,
+        layout_line_offsets,
+        custom_kerning,
+        font_size_px,
+    } = pen;
     if run.glyphs.is_empty() {
         return HorizontalRunLayout {
             glyph_xs: Vec::new(),
@@ -2477,7 +2513,7 @@ fn horizontal_run_layout(
                 glyph,
             ),
             font_system,
-            outline_cache,
+            &mut caches.outlines,
             glyph,
         );
         faux_extras.push(faux_advance_extra_px_for_glyph(
@@ -2510,19 +2546,8 @@ fn horizontal_run_layout(
     // A run that cannot be optically kerned (fewer than one finite gap) returns
     // None and falls through to the metric accumulation below.
     if params.kerning_mode == KerningMode::Optical
-        && let Some(layout) = optical_horizontal_run_layout(
-            params,
-            run,
-            glyph_kernings.as_slice(),
-            font_system,
-            cache,
-            outline_cache,
-            contour_cache,
-            layout_line_offsets,
-            inline_style_spans,
-            custom_kerning,
-            font_size_px,
-        )
+        && let Some(layout) =
+            optical_horizontal_run_layout(pen, run, glyph_kernings.as_slice(), font_system, caches)
     {
         return layout;
     }
@@ -2682,22 +2707,20 @@ fn anchor_rtl_run_at_its_left_edge(run: &LayoutRun<'_>, glyph_xs: &mut [f32]) {
 ///    remaining pairs of the run are still optical.
 ///
 /// Returns `None` to signal "cannot optically kern this run".
-// Threads the full per-run layout and per-glyph kernings plus the font system, both
-// per-render caches, and layout params; a wrapper struct would just hide the wiring.
-#[allow(clippy::too_many_arguments)]
 fn optical_horizontal_run_layout(
-    params: &TextRenderParams,
+    pen: RunPen<'_>,
     run: &LayoutRun<'_>,
     glyph_kernings: &[KerningSettings],
     font_system: &mut FontSystem,
-    cache: &mut SwashCache,
-    outline_cache: &mut OutlineCache,
-    contour_cache: &mut OpticalContourCache,
-    layout_line_offsets: &[usize],
-    inline_style_spans: Option<&[InlineStyleSpan]>,
-    custom_kerning: &CustomKerningMap,
-    font_size_px: f32,
+    caches: &mut GlyphCaches,
 ) -> Option<HorizontalRunLayout> {
+    let RunPen {
+        params,
+        inline_style_spans,
+        layout_line_offsets,
+        custom_kerning,
+        font_size_px,
+    } = pen;
     let glyph_count = run.glyphs.len();
     if glyph_count < 2 {
         return None;
@@ -2764,22 +2787,22 @@ fn optical_horizontal_run_layout(
         let prev_placed = place_optical_horizontal_contour(
             prev,
             0.0,
-            glyph_scales[idx - 1],
-            glyph_fauxes[idx - 1],
+            GlyphStyle {
+                scale: glyph_scales[idx - 1],
+                faux: glyph_fauxes[idx - 1],
+            },
             font_system,
-            cache,
-            outline_cache,
-            contour_cache,
+            caches,
         );
         let cur_placed = place_optical_horizontal_contour(
             cur,
             cur_pen_x,
-            glyph_scales[idx],
-            glyph_fauxes[idx],
+            GlyphStyle {
+                scale: glyph_scales[idx],
+                faux: glyph_fauxes[idx],
+            },
             font_system,
-            cache,
-            outline_cache,
-            contour_cache,
+            caches,
         );
         let gap = match (prev_placed, cur_placed, orientation) {
             (Some(p), Some(c), RunOrientation::LeftToRight) => {
@@ -2878,23 +2901,22 @@ fn optical_horizontal_run_layout(
 /// drawn ink exactly. Returns `None` for a space/empty glyph (zero-size
 /// placement), an outline-less color glyph, or an empty contour — all of which
 /// are treated as non-kernable by the caller. Never panics.
-// Mirrors the draw-pass inputs; a wrapper struct would just hide the wiring.
-#[allow(clippy::too_many_arguments)]
 fn place_optical_horizontal_contour(
     glyph: &LayoutGlyph,
     pen_x: f32,
-    glyph_scale: GlyphScaleSettings,
-    faux: FauxGlyphStyle,
+    style: GlyphStyle,
     font_system: &mut FontSystem,
-    cache: &mut SwashCache,
-    outline_cache: &mut OutlineCache,
-    contour_cache: &mut OpticalContourCache,
+    caches: &mut GlyphCaches,
 ) -> Option<PlacedContour> {
+    let GlyphStyle {
+        scale: glyph_scale,
+        faux,
+    } = style;
     let physical = glyph.physical((pen_x, 0.0), 1.0);
     let cache_key = physical.cache_key;
-    // Copy the bitmap placement box out before the `cache` image borrow ends.
+    // Copy the bitmap placement box out before the swash image borrow ends.
     let (glyph_w, glyph_h, placement_left, placement_top, src_left, src_top) = {
-        let Some(image) = cache.get_image(font_system, cache_key) else {
+        let Some(image) = caches.swash.get_image(font_system, cache_key) else {
             return None;
         };
         let gw = image.placement.width;
@@ -2921,10 +2943,10 @@ fn place_optical_horizontal_contour(
         glyph.font_size.to_bits(),
         faux.bold_key_bits(),
     );
-    let contour = match contour_cache.entry(contour_key) {
+    let contour = match caches.contours.entry(contour_key) {
         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
         std::collections::hash_map::Entry::Vacant(entry) => {
-            let outline = resolve_outline_for_glyph(font_system, outline_cache, glyph, faux.bold)?;
+            let outline = resolve_outline_for_glyph(font_system, &mut caches.outlines, glyph, faux.bold)?;
             entry.insert(glyph_contour_from_outline(
                 &outline,
                 OPTICAL_CONTOUR_SIMPLIFY_TOLERANCE_PX,
@@ -2946,17 +2968,17 @@ fn place_optical_horizontal_contour(
         src_top + placement_top,
     );
     let transform = glyph_outline_transform(
-        dst_center_x,
-        dst_center_y,
+        GlyphBox {
+            placement_left,
+            placement_top,
+            glyph_w,
+            glyph_h,
+            scale: glyph_scale,
+            subpixel: glyph_subpixel_offset(cache_key),
+            shear_x: faux.shear_x,
+        },
+        [dst_center_x, dst_center_y],
         0.0,
-        placement_left,
-        placement_top,
-        glyph_w,
-        glyph_h,
-        glyph_scale.width_mul,
-        glyph_scale.height_mul,
-        glyph_subpixel_offset(cache_key),
-        faux.shear_x,
     );
     Some(transform.place_contour(contour))
 }
@@ -3025,16 +3047,18 @@ fn justify_alignment_option(align: HorizontalAlign) -> Option<Align> {
     }
 }
 
-fn compute_inline_line_aligns(
+/// Resolve per-line alignment from inline style spans (the span active at each
+/// line's first byte), falling back to the block alignment `base_align`. One entry
+/// per layout line, at least one.
+pub(crate) fn compute_inline_line_aligns(
     base_align: HorizontalAlign,
-    layout_text: &str,
-    spans: Option<&[InlineStyleSpan]>,
+    layout_line_offsets: &[usize],
+    inline_style_spans: Option<&[InlineStyleSpan]>,
 ) -> Vec<HorizontalAlign> {
-    let line_offsets = compute_layout_line_offsets(layout_text);
-    let Some(spans) = spans else {
-        return vec![base_align; line_offsets.len()];
+    let Some(spans) = inline_style_spans else {
+        return vec![base_align; layout_line_offsets.len().max(1)];
     };
-    line_offsets
+    layout_line_offsets
         .iter()
         .map(|offset| {
             inline_style_at_offset(spans, *offset)
@@ -3070,7 +3094,7 @@ pub(crate) fn horizontal_line_offset(
     (free * align.offset_fraction()).round() as i32
 }
 
-fn compute_layout_line_offsets(text: &str) -> Vec<usize> {
+pub(crate) fn compute_layout_line_offsets(text: &str) -> Vec<usize> {
     let mut offsets = vec![0usize];
     for (idx, ch) in text.char_indices() {
         if ch == '\n' {
@@ -3080,7 +3104,7 @@ fn compute_layout_line_offsets(text: &str) -> Vec<usize> {
     offsets
 }
 
-fn spans_have_inline_size_overrides(spans: &[InlineStyleSpan]) -> bool {
+pub(crate) fn spans_have_inline_size_overrides(spans: &[InlineStyleSpan]) -> bool {
     spans.iter().any(|span| span.font_size_px.is_some())
 }
 
@@ -3090,7 +3114,7 @@ fn inline_style_at_offset(spans: &[InlineStyleSpan], offset: usize) -> Option<&I
         .find(|span| span.start <= offset && offset < span.end)
 }
 
-fn inline_text_color_at_offset(
+pub(crate) fn inline_text_color_at_offset(
     default_text_color: [u8; 4],
     spans: Option<&[InlineStyleSpan]>,
     offset: usize,
@@ -3116,7 +3140,7 @@ pub(crate) fn inline_text_color_for_glyph(
     )
 }
 
-fn inline_glyph_offset_at_offset(spans: Option<&[InlineStyleSpan]>, offset: usize) -> [f32; 2] {
+pub(crate) fn inline_glyph_offset_at_offset(spans: Option<&[InlineStyleSpan]>, offset: usize) -> [f32; 2] {
     inline_glyph_offset_style_at_offset(spans, offset).global_px
 }
 
@@ -3140,7 +3164,7 @@ pub(crate) fn inline_glyph_offset_for_glyph(
     inline_glyph_offset_at_offset(spans, line_offset + glyph.start.min(glyph.end))
 }
 
-fn inline_glyph_offset_style_for_glyph(
+pub(crate) fn inline_glyph_offset_style_for_glyph(
     spans: Option<&[InlineStyleSpan]>,
     layout_line_offsets: &[usize],
     line_idx: usize,
@@ -3152,7 +3176,7 @@ fn inline_glyph_offset_style_for_glyph(
 
 /// Диапазон inline-спана, задающего смещение для глифа, — ключ для группировки
 /// глифов, поворачиваемых как единая группа.
-fn inline_glyph_offset_span_at_offset(
+pub(crate) fn inline_glyph_offset_span_at_offset(
     spans: Option<&[InlineStyleSpan]>,
     offset: usize,
 ) -> Option<(usize, usize)> {
@@ -3162,7 +3186,7 @@ fn inline_glyph_offset_span_at_offset(
         .map(|style| (style.start, style.end))
 }
 
-fn inline_glyph_offset_span_for_glyph(
+pub(crate) fn inline_glyph_offset_span_for_glyph(
     spans: Option<&[InlineStyleSpan]>,
     layout_line_offsets: &[usize],
     line_idx: usize,
@@ -3604,7 +3628,7 @@ pub(crate) fn faux_bounds_pads(
     [pad_x, overhang]
 }
 
-fn inline_glyph_scale_at_offset(
+pub(crate) fn inline_glyph_scale_at_offset(
     params: &TextRenderParams,
     spans: Option<&[InlineStyleSpan]>,
     offset: usize,
@@ -3630,7 +3654,7 @@ pub(crate) fn inline_glyph_scale_for_glyph(
     inline_glyph_scale_at_offset(params, spans, line_offset + glyph.start.min(glyph.end))
 }
 
-fn inline_kerning_at_offset(
+pub(crate) fn inline_kerning_at_offset(
     params: &TextRenderParams,
     spans: Option<&[InlineStyleSpan]>,
     offset: usize,
@@ -3997,45 +4021,48 @@ fn build_hard_hyphen_glyph(
         .and_then(|run| run.glyphs.first().cloned())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_wrapped_hyphen_glyph(
+/// The hard hyphen drawn at the end of a line that wrapped at a consumed soft
+/// hyphen, shaped in its own one-line buffer with the inline style active at that
+/// soft hyphen ([`wrapped_hyphen_attrs`]). `next` is the following layout run (the
+/// soft hyphen may sit at its start). `None` when the face has no hyphen glyph.
+/// The one owner for the horizontal and the formula / custom-line paths.
+pub(crate) fn build_wrapped_hyphen_glyph(
     font_system: &mut FontSystem,
-    base_attrs: &Attrs<'_>,
-    faux_face_baseline: FauxFaceBaseline,
-    inline_style_spans: Option<&[InlineStyleSpan]>,
-    inline_font_registry: &super::font_registry::InlineFontRegistry,
-    layout_line_offsets: &[usize],
+    shaping: RunShaping<'_>,
     run: &LayoutRun<'_>,
     next: Option<&LayoutRun<'_>>,
-    font_size_px: f32,
-    line_height_px: f32,
 ) -> Option<LayoutGlyph> {
-    let hyphen_attrs = wrapped_hyphen_attrs(
-        base_attrs,
-        faux_face_baseline,
-        inline_style_spans,
-        inline_font_registry,
-        layout_line_offsets,
-        run,
-        next,
-    );
+    let hyphen_attrs = wrapped_hyphen_attrs(shaping, run, next);
     let hyphen_attrs = hyphen_attrs.as_attrs();
-    build_hard_hyphen_glyph(font_system, &hyphen_attrs, font_size_px, line_height_px)
+    build_hard_hyphen_glyph(
+        font_system,
+        &hyphen_attrs,
+        shaping.pen.font_size_px,
+        shaping.hyphen_line_height_px,
+    )
 }
 
-/// Attrs of the synthesized wrap hyphen: `base_attrs` plus the inline style
-/// active at the consumed soft hyphen. `faux_face_baseline` is the selected
-/// face's weight/style a faux span falls back to, so the hyphen matches exactly
-/// the same face as the text around it.
-fn wrapped_hyphen_attrs<'a>(
-    base_attrs: &Attrs<'a>,
-    faux_face_baseline: FauxFaceBaseline,
-    inline_style_spans: Option<&[InlineStyleSpan]>,
-    inline_font_registry: &super::font_registry::InlineFontRegistry,
-    layout_line_offsets: &[usize],
+/// Attrs of the synthesized wrap hyphen: the base attrs plus the inline style
+/// active at the consumed soft hyphen. The selected face's faux fallback
+/// weight/style (`RunShaping::faux_face_baseline`) is what a faux span resolves
+/// to, so the hyphen matches exactly the same face as the text around it.
+fn wrapped_hyphen_attrs(
+    shaping: RunShaping<'_>,
     run: &LayoutRun<'_>,
     next: Option<&LayoutRun<'_>>,
 ) -> AttrsOwned {
+    let RunShaping {
+        pen,
+        attrs: base_attrs,
+        faux_face_baseline,
+        inline_font_registry,
+        ..
+    } = shaping;
+    let RunPen {
+        inline_style_spans,
+        layout_line_offsets,
+        ..
+    } = pen;
     let Some(spans) = inline_style_spans else {
         return AttrsOwned::new(base_attrs);
     };
@@ -4048,7 +4075,7 @@ fn wrapped_hyphen_attrs<'a>(
     apply_inline_style_to_attrs(base_attrs, style, inline_font_registry, faux_face_baseline)
 }
 
-fn soft_hyphen_style_offset(
+pub(crate) fn soft_hyphen_style_offset(
     run: &LayoutRun<'_>,
     next: Option<&LayoutRun<'_>>,
     layout_line_offsets: &[usize],
@@ -4077,7 +4104,7 @@ fn soft_hyphen_style_offset(
         .map(|idx| line_offset + idx)
 }
 
-fn run_wraps_at_soft_hyphen(run: &LayoutRun<'_>, next: Option<&LayoutRun<'_>>) -> bool {
+pub(crate) fn run_wraps_at_soft_hyphen(run: &LayoutRun<'_>, next: Option<&LayoutRun<'_>>) -> bool {
     let Some(next_run) = next else {
         return false;
     };
@@ -4107,7 +4134,7 @@ fn run_wraps_at_soft_hyphen(run: &LayoutRun<'_>, next: Option<&LayoutRun<'_>>) -
     false
 }
 
-fn trailing_hyphen_x(run: &LayoutRun<'_>) -> f32 {
+pub(crate) fn trailing_hyphen_x(run: &LayoutRun<'_>) -> f32 {
     let mut right = run.line_w;
     for glyph in run.glyphs {
         right = right.max(glyph.x + glyph.w);
@@ -4401,10 +4428,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_font_path() -> PathBuf {
-        // Fixture lives at the workspace root; this crate sits two levels down
-        // (crates/ms-text-render), so anchor CARGO_MANIFEST_DIR up two dirs.
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf")
+        crate::test_fixtures::caller_font_path()
     }
 
     /// Builds a single-font provider that resolves `params.font_name` to the test
@@ -4489,7 +4513,7 @@ mod tests {
 
     #[test]
     fn fixed_kerning_drops_font_pair_kerning_versus_auto() {
-        // Text loaded with negative-kern pairs (AV/VA/To/Yo/Wa in LiberationSans).
+        // Text loaded with negative-kern pairs (AV/VA/To/Yo/Wa in the Arimo fixture).
         // `Auto` applies the font's GPOS/`kern` pair kerning (shaped positions);
         // `Fixed` steps by each glyph's OWN advance, so the pairs are NOT pulled
         // together. With kern pairs present, the two renders must differ.
@@ -4890,21 +4914,19 @@ mod tests {
         buffer.set_text(&mut font_system, text, &attrs, Shaping::Advanced);
         buffer.shape_until_scroll(&mut font_system, false);
 
-        let mut swash_cache = cosmic_text::SwashCache::new();
-        let mut outline_cache = crate::vector::OutlineCache::new();
-        let mut contour_cache = crate::optical::OpticalContourCache::new();
+        let mut caches = super::GlyphCaches::new();
         let run = buffer.layout_runs().next().expect("one layout run");
         let layout = super::horizontal_run_layout(
-            params,
+            super::RunPen {
+                params,
+                inline_style_spans: None,
+                layout_line_offsets: &[0],
+                custom_kerning: &custom_kerning,
+                font_size_px: em,
+            },
             &run,
             &mut font_system,
-            &mut swash_cache,
-            &mut outline_cache,
-            &mut contour_cache,
-            &[0],
-            None,
-            &custom_kerning,
-            em,
+            &mut caches,
         );
         (layout.glyph_xs, layout.line_width_px)
     }
@@ -4923,7 +4945,7 @@ mod tests {
     #[test]
     fn a_fully_consumed_glyph_does_not_vote_on_the_extra_info_centers() {
         // At the minimum strength and em 48 the contraction (2*|d| = 4.8 px)
-        // exceeds a Liberation Sans stem, so `l` loses every contour and draws
+        // exceeds an Arimo stem, so `l` loses every contour and draws
         // NOTHING while `o` survives. The reported ink centers must therefore
         // describe the `o` alone. Before the exclusion the phantom `l` box
         // dragged them to mean [5.25, 8.21] / median [1.25, 8.75] — the median
@@ -6416,11 +6438,11 @@ mod tests {
     }
 
     /// Path of a secondary fixture face, used to build a MIXED-face line. Its
-    /// ink extents differ from `LiberationSans-Regular`, which is the whole
+    /// ink extents differ from the Arimo caller-font fixture, which is the whole
     /// point: the grow-only room must follow the face that carries the stretch.
     fn second_test_font_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test/PanelCleaner/pcleaner/data/NotoMono-Regular.ttf")
+            .join("../../fonts/ui/core/00-NotoSans-Regular.ttf")
     }
 
     /// The grow-only inline height room follows the glyphs that ACTUALLY carry
@@ -7922,8 +7944,8 @@ mod tests {
         // delta — the pair REPLACES the font's value rather than adding to it. So
         // the authored offsets must map onto the pen linearly, in exact px: at em
         // 100 the three entries -100 / 0 / +100 per mille sit 10 px apart, anchored
-        // on the un-kerned advance. `plain_xs[1]` is NOT that anchor — Liberation
-        // Sans kerns `AV` itself, which is precisely the value being replaced.
+        // on the un-kerned advance. `plain_xs[1]` is NOT that anchor — the Arimo
+        // fixture kerns `AV` itself, which is precisely the value being replaced.
         let (neutral_xs, _) =
             fixture_run_layout_with_custom_kerning("AV", &params, &[('A', 'V', 0.0)]);
         let (widened_xs, _) =
@@ -8019,7 +8041,7 @@ mod tests {
     /// WIDENED the pair instead of tightening it.
     #[test]
     fn an_overridden_pair_follows_an_rtl_run_leftwards() {
-        // Hebrew alef + bet: the fixture (Liberation Sans) covers both, so the pair
+        // Hebrew alef + bet: the fixture (Arimo) covers both, so the pair
         // is same-face and single-cluster on each side, i.e. genuinely overridable.
         const RTL_PAIR: &str = "\u{05D0}\u{05D1}";
         let mut params = base_params();
@@ -8176,21 +8198,19 @@ mod tests {
         buffer.set_text(font_system, text, &attrs, Shaping::Advanced);
         buffer.shape_until_scroll(font_system, false);
 
-        let mut swash_cache = cosmic_text::SwashCache::new();
-        let mut outline_cache = crate::vector::OutlineCache::new();
-        let mut contour_cache = crate::optical::OpticalContourCache::new();
+        let mut caches = super::GlyphCaches::new();
         let run = buffer.layout_runs().next().expect("one layout run");
         let layout = super::horizontal_run_layout(
-            params,
+            super::RunPen {
+                params,
+                inline_style_spans: None,
+                layout_line_offsets: &[0],
+                custom_kerning: &custom_kerning,
+                font_size_px: em,
+            },
             &run,
             font_system,
-            &mut swash_cache,
-            &mut outline_cache,
-            &mut contour_cache,
-            &[0],
-            None,
-            &custom_kerning,
-            em,
+            &mut caches,
         );
         (layout.glyph_xs, layout.line_width_px)
     }

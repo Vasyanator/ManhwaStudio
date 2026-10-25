@@ -131,158 +131,23 @@ pub const DEFAULT_MAX_FORMS: usize = 600;
 /// отрисовку результатов, чтобы остановиться заметно раньше OOM-killer'а.
 const MIN_AVAILABLE_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Как часто (в узлах DFS) проверять свободную память. Чтение `/proc/meminfo`
-/// на каждом узле было бы дорого, поэтому проверяем раз в N узлов.
+/// How often (in DFS nodes) free memory is checked: the OS probe is a file read or
+/// a few syscalls, too costly for every node, so it runs once per N nodes.
 const MEMORY_CHECK_INTERVAL_NODES: u64 = 8192;
 
-/// Аварийный потолок числа узлов DFS — гарантия завершения для случая, когда
-/// свободную память наблюдать нельзя (`available_memory_bytes()` вернул `None`,
-/// напр. не-Linux) ИЛИ память просто никогда не падает ниже порога. На Linux с
-/// читаемым `MemAvailable` практический ограничитель — память, а не этот потолок
-/// (то есть фактически «без лимита по количеству, только по памяти»).
+/// Emergency ceiling on DFS nodes: guarantees termination when free memory cannot
+/// be observed (`available_memory_bytes()` returned `None`) OR never drops below the
+/// threshold. When memory is measurable it is the practical limit, not this ceiling
+/// (in effect "no count limit, only a memory limit").
 const SAFETY_NODE_CEILING: u64 = 50_000_000;
 
-/// Доступная («OOM-релевантная») память процесса в байтах. На Linux читает
-/// `MemAvailable:` из `/proc/meminfo` (значение в кБ → ×1024); эта метрика
-/// учитывает освобождаемый кеш, поэтому точнее, чем `MemFree`. На macOS запускает
-/// `vm_stat` и приближает доступную память как (free+inactive+speculative) страниц
-/// × размер страницы — reclaimable-аналог `MemAvailable`. Возвращает `None`, если
-/// источник нельзя прочитать/распарсить (прочие ОС или ошибка).
-#[cfg(target_os = "linux")]
+/// Available ("OOM-relevant", reclaimable) memory in bytes, from the one OS memory
+/// probe `ms_memory::current_memory_availability` (Linux/Android `MemAvailable`,
+/// Windows `ullAvailPhys`, macOS free+inactive+speculative pages; no subprocess).
+/// `None` means unknown (the probe logs why); then only `SAFETY_NODE_CEILING`
+/// bounds the enumeration.
 fn available_memory_bytes() -> Option<u64> {
-    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            return Some(kb.saturating_mul(1024));
-        }
-    }
-    None
-}
-
-/// TTL для кеша macOS-замера памяти. `available_memory_bytes` дёргается из DFS
-/// перебора форм (раз в `MEMORY_CHECK_INTERVAL_NODES` узлов, а перечислений может
-/// быть много подряд). На Linux это дешёвое чтение `/proc/meminfo`, а на macOS —
-/// fork+exec `vm_stat` (несколько мс). 750мс схлопывает частые вызовы в один
-/// замер за окно, не мешая защите по памяти вовремя останавливать перебор.
-#[cfg(target_os = "macos")]
-const MACOS_MEM_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(750);
-
-/// macOS: приближение доступной памяти через `vm_stat` (см. общий doc выше),
-/// с коротким TTL-кешем (`MACOS_MEM_CACHE_TTL`) поверх подпроцесса, чтобы частые
-/// вызовы из перебора форм не форкали `vm_stat` каждый раз. Контракт возврата тот
-/// же, что у сырого замера: `None` — память неизвестна. Кеш только на macOS;
-/// Linux/прочие ОС вызывают свой путь без кеша.
-#[cfg(target_os = "macos")]
-fn available_memory_bytes() -> Option<u64> {
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Instant;
-
-    // Локальный TTL-кеш: обоснованное ограниченное исключение из правила «без
-    // глобального мутабельного состояния» (чистый временной кеш). Отравленный
-    // (poisoned) lock не паникует, а откатывается к свежему замеру. Почти дубль
-    // кешей в `memory_manager.rs` / `clean_overlays_model.rs` — они в других
-    // крейтах, поэтому реализация повторяется локально.
-    static CACHE: OnceLock<Mutex<Option<(Instant, Option<u64>)>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Ok(guard) = cache.lock()
-        && let Some((stamped_at, value)) = guard.as_ref()
-        && stamped_at.elapsed() < MACOS_MEM_CACHE_TTL
-    {
-        return *value;
-    }
-    // Замер БЕЗ удержания lock: никогда не fork+exec под Mutex.
-    let value = probe_available_memory_bytes();
-    if let Ok(mut guard) = cache.lock() {
-        *guard = Some((Instant::now(), value));
-    }
-    value
-}
-
-/// Сырой (без кеша) macOS-замер доступной памяти через `vm_stat`. `None`, если
-/// команда не запустилась/вышла с ошибкой или вывод не распарсился. Вызывающие
-/// идут через [`available_memory_bytes`], который кеширует результат на TTL.
-#[cfg(target_os = "macos")]
-fn probe_available_memory_bytes() -> Option<u64> {
-    let out = std::process::Command::new("vm_stat").output().ok()?;
-    if !out.status.success() {
-        ms_log::runtime_log::log_warn("[wrap/forms] `vm_stat` exited with failure status");
-        return None;
-    }
-    parse_vm_stat_available_bytes(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// На прочих (не-Linux, не-macOS) ОС метрика недоступна — память не наблюдаем,
-/// работает только аварийный потолок узлов (`SAFETY_NODE_CEILING`).
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn available_memory_bytes() -> Option<u64> {
-    None
-}
-
-/// Extracts the page size in bytes from the `vm_stat` header line ending with
-/// "(page size of N bytes)". Returns `None` if the marker is absent or unparseable.
-#[cfg(any(target_os = "macos", test))]
-fn parse_vm_stat_page_size(line: &str) -> Option<u64> {
-    line.split("page size of")
-        .nth(1)?
-        .split_whitespace()
-        .next()?
-        .parse::<u64>()
-        .ok()
-}
-
-/// Parses a `vm_stat` "Pages <name>:" row into its page count, stripping the
-/// trailing '.'. Returns `None` when the prefix does not match or the number
-/// cannot be parsed.
-#[cfg(any(target_os = "macos", test))]
-fn parse_vm_stat_pages(line: &str, key: &str) -> Option<u64> {
-    line.strip_prefix(key)?
-        .trim()
-        .trim_end_matches('.')
-        .parse::<u64>()
-        .ok()
-}
-
-/// Approximates macOS available memory (bytes) from `vm_stat` output as
-/// (free+inactive+speculative) pages * page size — the reclaimable-memory analog
-/// of Linux `MemAvailable`. Inactive/speculative pages are included because they
-/// are reclaimable under pressure. Uses checked arithmetic; on the physically
-/// unreachable overflow it warns and returns `None`. Returns `None` if the page
-/// size or any required page count is missing/unparseable.
-#[cfg(any(target_os = "macos", test))]
-fn parse_vm_stat_available_bytes(text: &str) -> Option<u64> {
-    let mut page_size: Option<u64> = None;
-    let mut free: Option<u64> = None;
-    let mut inactive: Option<u64> = None;
-    let mut speculative: Option<u64> = None;
-
-    for raw in text.lines() {
-        let line = raw.trim();
-        if page_size.is_none()
-            && let Some(size) = parse_vm_stat_page_size(line)
-        {
-            page_size = Some(size);
-        }
-        if let Some(v) = parse_vm_stat_pages(line, "Pages free:") {
-            free = Some(v);
-        } else if let Some(v) = parse_vm_stat_pages(line, "Pages inactive:") {
-            inactive = Some(v);
-        } else if let Some(v) = parse_vm_stat_pages(line, "Pages speculative:") {
-            speculative = Some(v);
-        }
-    }
-
-    let page_size = page_size?;
-    let pages = free?.checked_add(inactive?)?.checked_add(speculative?)?;
-    match pages.checked_mul(page_size) {
-        Some(bytes) => Some(bytes),
-        None => {
-            ms_log::runtime_log::log_warn(
-                "[wrap/forms] vm_stat page count * page size overflowed u64; reporting unknown",
-            );
-            None
-        }
-    }
+    ms_memory::current_memory_availability().map(|availability| availability.available_bytes)
 }
 
 /// Источник свободной памяти, который консультирует `enumerate_dfs`. В обычной
@@ -625,10 +490,6 @@ impl GlyphWidths {
     ///
     /// Only pairs that occur are measured (plus `(ch, '-')` for the wrap hyphen), so an
     /// unused table entry costs nothing.
-    // The override map is one more independent axis of the metric, not a variant of an
-    // existing parameter; folding it into `attrs` is impossible (it is not a
-    // font-matching property).
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn build(
         font_system: &mut FontSystem,
@@ -1983,17 +1844,7 @@ pub fn enumerate_forms(
             truncated: false,
         };
         let mut trail = LineTrail::new();
-        enumerate_dfs(
-            &mut ctx,
-            0,
-            PhaseState::START,
-            0,
-            0,
-            Conservatism::Safe,
-            0,
-            u32::MAX,
-            &mut trail,
-        );
+        enumerate_dfs(&mut ctx, 0, DfsPath::START, &mut trail);
         FormEnumeration {
             forms: ctx.out,
             truncated: ctx.truncated,
@@ -2002,24 +1853,22 @@ pub fn enumerate_forms(
     })
 }
 
-/// Ограничитель перебора: свободная память плюс аварийный потолок узлов.
+/// Enumeration limiter: free memory plus the emergency node ceiling.
 ///
-/// Два независимых условия:
-/// - **Память**: не чаще одного раза на `MEMORY_CHECK_INTERVAL_NODES` узлов
-///   запрашиваем свободную память; если её удалось измерить и она ниже
-///   `MIN_AVAILABLE_MEMORY_BYTES` — останавливаемся (на Linux это и есть
-///   практический ограничитель: «перечисляем, пока есть память»).
-/// - **Аварийный потолок узлов** (`SAFETY_NODE_CEILING`): гарантия завершения,
-///   когда память измерить нельзя (`None`, напр. не-Linux) или она никогда не
-///   падает ниже порога.
+/// Two independent conditions:
+/// - **Memory**: at most once per `MEMORY_CHECK_INTERVAL_NODES` nodes free memory is
+///   probed; when it is measurable and below `MIN_AVAILABLE_MEMORY_BYTES` the
+///   enumeration stops (the practical limit: "enumerate while memory lasts").
+/// - **Emergency node ceiling** (`SAFETY_NODE_CEILING`): guarantees termination when
+///   memory cannot be measured (`None`) or never drops below the threshold.
 ///
-/// Отдельный счётчик `next_check_at` (а не `nodes % N == 0`) нужен потому, что
-/// проверку вызывают после каждого возврата из ребёнка, а счётчик узлов внутри
-/// цикла `for end` не растёт: с проверкой по остатку один «узел из 8192» заново
-/// читал и парсил `/proc/meminfo` до `n` раз подряд.
+/// A separate `next_check_at` counter (not `nodes % N == 0`) is needed because the
+/// check runs after every return from a child while the node counter does not grow
+/// inside the `for end` loop: with a modulo test one "node out of 8192" probed the
+/// OS memory up to `n` times in a row.
 ///
-/// Сработавшая защита по памяти «залипает» (`exhausted`): раскрутка стека обязана
-/// продолжать останавливаться, а не возобновлять перебор до следующей проверки.
+/// A tripped memory guard latches (`exhausted`): the stack unwind must keep
+/// stopping instead of resuming the enumeration until the next check.
 #[derive(Debug)]
 struct MemoryProbe {
     /// Номер узла, начиная с которого разрешён следующий замер памяти.
@@ -2084,18 +1933,48 @@ impl LineTrail {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn enumerate_dfs(
-    ctx: &mut EnumContext<'_>,
-    start: usize,
+/// The accumulated state of one enumeration branch: the pruning phase, the summed
+/// break cost, the in-word break count, the worst joint conservatism and the width
+/// range of the lines placed so far (`min_width == u32::MAX`: no line yet). Small
+/// and `Copy`: the recursion passes it by value, each child gets its own copy.
+#[derive(Clone, Copy)]
+struct DfsPath {
     phase: PhaseState,
     cost_acc: u32,
     break_count: usize,
     cons_acc: Conservatism,
     max_width: u32,
     min_width: u32,
+}
+
+impl DfsPath {
+    /// The empty branch: no line yet, the start phase.
+    const START: Self = Self {
+        phase: PhaseState::START,
+        cost_acc: 0,
+        break_count: 0,
+        cons_acc: Conservatism::Safe,
+        max_width: 0,
+        min_width: u32::MAX,
+    };
+}
+
+/// Recursive enumeration: extends branch `path` with every line that starts at
+/// block `start`; complete forms go to `finalize`.
+fn enumerate_dfs(
+    ctx: &mut EnumContext<'_>,
+    start: usize,
+    path: DfsPath,
     trail: &mut LineTrail,
 ) {
+    let DfsPath {
+        phase,
+        cost_acc,
+        break_count,
+        cons_acc,
+        max_width,
+        min_width,
+    } = path;
     if ctx.out.len() >= ctx.max_forms {
         ctx.truncated = true;
         return;
@@ -2120,19 +1999,28 @@ fn enumerate_dfs(
                 trail.push(line_text, width);
                 if end == n {
                     finalize(
-                        ctx, next_phase, cost_acc, break_count, cons_acc, new_max, new_min, trail,
+                        ctx,
+                        DfsPath {
+                            phase: next_phase,
+                            max_width: new_max,
+                            min_width: new_min,
+                            ..path
+                        },
+                        trail,
                     );
                 } else {
                     let joint = &ctx.blocks[end - 1].joint;
                     enumerate_dfs(
                         ctx,
                         end,
-                        next_phase,
-                        cost_acc + joint.break_cost,
-                        break_count + usize::from(joint.word_break),
-                        cons_acc.max(joint.conservatism),
-                        new_max,
-                        new_min,
+                        DfsPath {
+                            phase: next_phase,
+                            cost_acc: cost_acc + joint.break_cost,
+                            break_count: break_count + usize::from(joint.word_break),
+                            cons_acc: cons_acc.max(joint.conservatism),
+                            max_width: new_max,
+                            min_width: new_min,
+                        },
                         trail,
                     );
                 }
@@ -2146,17 +2034,17 @@ fn enumerate_dfs(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn finalize(
-    ctx: &mut EnumContext<'_>,
-    phase: PhaseState,
-    cost_acc: u32,
-    break_count: usize,
-    cons_acc: Conservatism,
-    max_width: u32,
-    min_width: u32,
-    trail: &LineTrail,
-) {
+/// Records the complete branch `path` (its lines and widths in `trail`) as a form
+/// when it passes the preset's final check and was not seen before.
+fn finalize(ctx: &mut EnumContext<'_>, path: DfsPath, trail: &LineTrail) {
+    let DfsPath {
+        phase,
+        cost_acc,
+        break_count,
+        cons_acc,
+        max_width,
+        min_width,
+    } = path;
     if ctx.preset == TextFormPreset::Lens && !(phase.ascended && phase.descended) {
         return;
     }
@@ -4113,38 +4001,6 @@ mod tests {
         assert!(result.truncated, "more than 5 forms exist → truncated");
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn available_memory_parses_meminfo() {
-        let bytes = available_memory_bytes().expect("MemAvailable readable on Linux");
-        assert!(bytes > 0);
-    }
-
-    #[test]
-    fn parses_macos_vm_stat_available_bytes() {
-        // 16 KiB pages: (8000 free + 4000 inactive + 1000 speculative) * 16384.
-        let sample = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
-Pages free:                                8000.\n\
-Pages active:                            234567.\n\
-Pages inactive:                            4000.\n\
-Pages speculative:                         1000.\n\
-Pages wired down:                        333333.\n";
-        assert_eq!(
-            super::parse_vm_stat_available_bytes(sample),
-            Some(13_000 * 16_384)
-        );
-    }
-
-    #[test]
-    fn macos_vm_stat_bad_input_is_none_not_panic() {
-        assert_eq!(super::parse_vm_stat_available_bytes(""), None);
-        // No page-size header => unknown, never a wrong number.
-        assert_eq!(
-            super::parse_vm_stat_available_bytes("Pages free: 10.\nPages inactive: 5.\nPages speculative: 2.\n"),
-            None
-        );
-    }
-
     // --- Ранжированный поиск форм (`search_forms`) --------------------------
 
     /// Высота строки для `CHAR_METRIC` в единицах ЭТОЙ метрики: ~2 символа на em
@@ -5392,13 +5248,12 @@ Pages wired down:                        333333.\n";
         assert_eq!(blend_hanging_width(42, 42, 0.37), 42);
     }
 
-    /// Fixture font for the width metric: the same Liberation Sans the pipeline
-    /// tests use. Returns the system, the family name and the registered face id (what
+    /// Fixture font for the width metric: the same tracked Arimo caller font the
+    /// pipeline tests use (`crate::test_fixtures`). Returns the system, the family name and the registered face id (what
     /// an override table binds to).
     fn metric_fixture_system() -> (cosmic_text::FontSystem, String, cosmic_text::fontdb::ID) {
         use cosmic_text::{FontSystem, fontdb};
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf");
+        let path = crate::test_fixtures::caller_font_path();
         let bytes = std::fs::read(path).expect("fixture font bytes");
         let mut db = fontdb::Database::new();
         db.load_font_data(bytes);
@@ -5462,7 +5317,7 @@ Pages wired down:                        333333.\n";
         // The font's own `AV` kern is what gets replaced, so it must be non-zero for
         // this test to mean anything.
         let own = plain.kerns.get(&('A', 'V')).copied().unwrap_or(0);
-        assert!(own < 0, "Liberation Sans must kern 'AV' itself; got {own}");
+        assert!(own < 0, "the Arimo fixture must kern 'AV' itself; got {own}");
         assert_eq!(
             kerned.kerns.get(&('A', 'V')).copied(),
             Some(-120),

@@ -21,6 +21,7 @@ Main responsibilities:
 
 Key structures:
 - GlyphContour: glyph-local closed outer contour(s).
+- ContourAffine: the scale / shear / rotate / translate placement of `placed_sheared`.
 - PlacedContour: GlyphContour after an affine transform, with a cached AABB.
 
 Key functions:
@@ -67,6 +68,25 @@ pub struct PlacedContour {
     pub aabb_max: [f32; 2],
 }
 
+/// The affine placement [`GlyphContour::placed_sheared`] applies, in the order
+/// scale, baseline shear, rotate, translate (the `vector::GlyphTransform` convention).
+///
+/// `cos`/`sin` are supplied directly (not required to be a unit vector; the
+/// caller owns that invariant). `shear_x = 0.0` is bit-exact to no shear.
+#[derive(Debug, Clone, Copy)]
+pub struct ContourAffine {
+    /// Cosine of the rotation.
+    pub cos: f32,
+    /// Sine of the rotation.
+    pub sin: f32,
+    /// Per-axis scale `[scale_x, scale_y]` applied first.
+    pub scale: [f32; 2],
+    /// Baseline shear `x' = x - shear_x * y` in the scaled local frame.
+    pub shear_x: f32,
+    /// World-space translation `[tx, ty]` applied last.
+    pub translate: [f32; 2],
+}
+
 impl GlyphContour {
     /// Apply a local->world transform to every vertex and compute the AABB.
     ///
@@ -88,7 +108,13 @@ impl GlyphContour {
         tx: f32,
         ty: f32,
     ) -> PlacedContour {
-        self.placed_sheared(cos, sin, scale_x, scale_y, 0.0, tx, ty)
+        self.placed_sheared(ContourAffine {
+            cos,
+            sin,
+            scale: [scale_x, scale_y],
+            shear_x: 0.0,
+            translate: [tx, ty],
+        })
     }
 
     /// [`GlyphContour::placed`] with an additional baseline shear between the
@@ -99,17 +125,14 @@ impl GlyphContour {
     /// contours land on the exact pixels the (possibly faux-italic) outline is
     /// rasterized to.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // Mirrors `placed` plus the one shear scalar.
-    pub fn placed_sheared(
-        &self,
-        cos: f32,
-        sin: f32,
-        scale_x: f32,
-        scale_y: f32,
-        shear_x: f32,
-        tx: f32,
-        ty: f32,
-    ) -> PlacedContour {
+    pub fn placed_sheared(&self, affine: ContourAffine) -> PlacedContour {
+        let ContourAffine {
+            cos,
+            sin,
+            scale: [scale_x, scale_y],
+            shear_x,
+            translate: [tx, ty],
+        } = affine;
         let mut placed = PlacedContour::default();
         let mut min = [f32::INFINITY, f32::INFINITY];
         let mut max = [f32::NEG_INFINITY, f32::NEG_INFINITY];

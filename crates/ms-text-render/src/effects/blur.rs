@@ -11,6 +11,7 @@ Main responsibilities:
 */
 
 use super::super::types::RenderedTextImage;
+use super::super::raster::{RgbaCanvasView, RgbaView};
 use super::image_ops::{
     blend_full_image_over, draw_image_with_opacity, gaussian_blur_rgba_in_place,
     sample_rgba_premultiplied_bilinear,
@@ -31,14 +32,17 @@ pub(crate) fn apply_blur_effect(image: &mut RenderedTextImage, blur: &BlurEffect
         if out_width > 0 && out_height > 0 {
             let mut expanded = vec![0u8; out_width as usize * out_height as usize * 4];
             draw_image_with_opacity(
-                expanded.as_mut_slice(),
-                out_width as usize,
-                out_height as usize,
-                image.rgba.as_slice(),
-                image.width as usize,
-                image.height as usize,
-                pad,
-                pad,
+                &mut RgbaCanvasView {
+                    rgba: expanded.as_mut_slice(),
+                    width: out_width as usize,
+                    height: out_height as usize,
+                },
+                RgbaView {
+                    rgba: image.rgba.as_slice(),
+                    width: image.width as usize,
+                    height: image.height as usize,
+                },
+                [pad, pad],
                 1.0,
             );
             image.width = out_width;
@@ -85,14 +89,17 @@ pub(crate) fn apply_motion_blur_effect(
     let source = image.rgba.clone();
     let mut base = vec![0u8; out_width as usize * out_height as usize * 4];
     draw_image_with_opacity(
-        base.as_mut_slice(),
-        out_width as usize,
-        out_height as usize,
-        source.as_slice(),
-        source_width,
-        source_height,
-        pad_x,
-        pad_y,
+        &mut RgbaCanvasView {
+            rgba: base.as_mut_slice(),
+            width: out_width as usize,
+            height: out_height as usize,
+        },
+        RgbaView {
+            rgba: source.as_slice(),
+            width: source_width,
+            height: source_height,
+        },
+        [pad_x, pad_y],
         1.0,
     );
 
@@ -217,6 +224,7 @@ mod tests {
         apply_motion_blur_effect, motion_blur_sample_count, motion_blur_sample_t,
         motion_blur_sample_weight,
     };
+    use crate::raster::{RgbaCanvasView, RgbaView};
     use crate::types::RenderedTextImage;
 
     /// Verbatim sequential reference of `apply_motion_blur_effect`: identical body with the
@@ -252,14 +260,17 @@ mod tests {
         let source = image.rgba.clone();
         let mut base = vec![0u8; out_width as usize * out_height as usize * 4];
         draw_image_with_opacity(
-            base.as_mut_slice(),
-            out_width as usize,
-            out_height as usize,
-            source.as_slice(),
-            source_width,
-            source_height,
-            pad_x,
-            pad_y,
+            &mut RgbaCanvasView {
+                rgba: base.as_mut_slice(),
+                width: out_width as usize,
+                height: out_height as usize,
+            },
+            RgbaView {
+                rgba: source.as_slice(),
+                width: source_width,
+                height: source_height,
+            },
+            [pad_x, pad_y],
             1.0,
         );
 

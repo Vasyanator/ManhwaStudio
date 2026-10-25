@@ -8,6 +8,10 @@ composite pass (`formula/render.rs`) resolve a glyph's true font outline and
 place it with the same pen-relative pivot, so a glyph rasterized from its
 outline lands on exactly the pixels the old bitmap blit would have drawn.
 
+Key structures:
+- GlyphBox: a glyph's bitmap box + scale / subpixel / shear, the placement input
+  of `glyph_outline_transform`.
+
 Key functions:
 - hash_font_id: stable `u64` identity for a `fontdb::ID` (slotmap key with no
   public numeric accessor) to key the `OutlineCache`.
@@ -32,6 +36,7 @@ glyph's shaped `font_size` (the exact ppem the bitmap path feeds to swash);
 per-glyph scale is applied later as a transform, never baked into the outline.
 */
 
+use super::pipeline::GlyphScaleSettings;
 use super::vector::{FauxOutlineParams, GlyphTransform, Outline, OutlineCache, OutlineKey};
 use cosmic_text::{CacheKey, FontSystem, LayoutGlyph};
 use std::sync::Arc;
@@ -164,6 +169,29 @@ pub(crate) fn nominal_glyph_advance_px(
     advance.is_finite().then_some(advance)
 }
 
+/// A glyph's swash bitmap box in the outline's pen-relative frame, with the
+/// per-glyph scale, subpixel fraction and faux-italic shear the outline is placed
+/// with. The one input of [`glyph_outline_transform`] besides the world centre
+/// and rotation; small and `Copy`, passed by value on the per-glyph hot path.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GlyphBox {
+    /// Bitmap placement left (`placement.left`) in px.
+    pub(crate) placement_left: f32,
+    /// Bitmap placement top (`placement.top`, y-up from the pen) in px.
+    pub(crate) placement_top: f32,
+    /// Bitmap width in px.
+    pub(crate) glyph_w: f32,
+    /// Bitmap height in px.
+    pub(crate) glyph_h: f32,
+    /// Per-axis glyph scale.
+    pub(crate) scale: GlyphScaleSettings,
+    /// Subpixel fraction baked into the bitmap coverage (`[0.0, 0.0]` for the
+    /// colour-glyph fallback, see [`glyph_outline_transform`]).
+    pub(crate) subpixel: [f32; 2],
+    /// Faux-italic baseline shear (`tan(slant)`); `0.0` = none.
+    pub(crate) shear_x: f32,
+}
+
 /// Build the local->world [`GlyphTransform`] that places a glyph outline on
 /// exactly the pixels the bitmap blit drew.
 ///
@@ -193,24 +221,29 @@ pub(crate) fn nominal_glyph_advance_px(
 /// glyph baseline. The pivot/`pos` math below is deliberately NOT sheared: the
 /// pen sits on the baseline, so the baseline (and the pen anchor) stays fixed
 /// while the ink leans — the contract of a baseline shear.
-// The placement is an irreducible list of independent scalars (bitmap center,
-// rotation, per-axis scale, bitmap placement/size, subpixel fraction, shear);
-// bundling them into a one-off struct would not add clarity.
-#[allow(clippy::too_many_arguments)]
+///
+/// `glyph_box` carries the bitmap placement/size, scale, `subpixel` and
+/// `shear_x` described above; `dst_center` is the world bitmap centre and
+/// `rotation_rad` the glyph's world rotation.
 #[must_use]
 pub(crate) fn glyph_outline_transform(
-    dst_center_x: f32,
-    dst_center_y: f32,
+    glyph_box: GlyphBox,
+    dst_center: [f32; 2],
     rotation_rad: f32,
-    placement_left: f32,
-    placement_top: f32,
-    glyph_w: f32,
-    glyph_h: f32,
-    width_mul: f32,
-    height_mul: f32,
-    subpixel: [f32; 2],
-    shear_x: f32,
 ) -> GlyphTransform {
+    let GlyphBox {
+        placement_left,
+        placement_top,
+        glyph_w,
+        glyph_h,
+        scale: GlyphScaleSettings {
+            width_mul,
+            height_mul,
+        },
+        subpixel,
+        shear_x,
+    } = glyph_box;
+    let [dst_center_x, dst_center_y] = dst_center;
     let (sin_a, cos_a) = rotation_rad.sin_cos();
     // pivot = -scale * O_center (bitmap center in the outline's pen-relative frame).
     let pivot_x = -(placement_left + glyph_w * 0.5) * width_mul;
@@ -234,17 +267,30 @@ pub(crate) fn glyph_outline_transform(
 mod tests {
     use super::*;
 
+    /// Test box: `[placement_left, placement_top, glyph_w, glyph_h]`, `[width_mul, height_mul]`.
+    fn glyph_box(placement: [f32; 4], scale: [f32; 2], subpixel: [f32; 2], shear_x: f32) -> GlyphBox {
+        let [placement_left, placement_top, glyph_w, glyph_h] = placement;
+        GlyphBox {
+            placement_left,
+            placement_top,
+            glyph_w,
+            glyph_h,
+            scale: GlyphScaleSettings {
+                width_mul: scale[0],
+                height_mul: scale[1],
+            },
+            subpixel,
+            shear_x,
+        }
+    }
+
     /// A zero subpixel offset must reproduce the exact pen pivot (no shift versus
     /// the pre-fix placement), and a non-zero offset at identity rotation/scale
     /// must translate `pos` by exactly that offset.
     #[test]
     fn subpixel_translates_pos_at_identity() {
-        let base = glyph_outline_transform(
-            100.0, 50.0, 0.0, 2.0, 3.0, 10.0, 12.0, 1.0, 1.0, [0.0, 0.0], 0.0,
-        );
-        let shifted = glyph_outline_transform(
-            100.0, 50.0, 0.0, 2.0, 3.0, 10.0, 12.0, 1.0, 1.0, [0.5, 0.75], 0.0,
-        );
+        let base = glyph_outline_transform(glyph_box([2.0, 3.0, 10.0, 12.0], [1.0, 1.0], [0.0, 0.0], 0.0), [100.0, 50.0], 0.0);
+        let shifted = glyph_outline_transform(glyph_box([2.0, 3.0, 10.0, 12.0], [1.0, 1.0], [0.5, 0.75], 0.0), [100.0, 50.0], 0.0);
         assert!((shifted.pos[0] - base.pos[0] - 0.5).abs() < 1e-5);
         assert!((shifted.pos[1] - base.pos[1] - 0.75).abs() < 1e-5);
     }
@@ -253,10 +299,8 @@ mod tests {
     /// the bitmap path, which scales the whole pre-shifted bitmap).
     #[test]
     fn subpixel_scales_with_glyph() {
-        let base =
-            glyph_outline_transform(0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 8.0, 2.0, 3.0, [0.0, 0.0], 0.0);
-        let shifted =
-            glyph_outline_transform(0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 8.0, 2.0, 3.0, [0.5, 0.5], 0.0);
+        let base = glyph_outline_transform(glyph_box([0.0, 0.0, 8.0, 8.0], [2.0, 3.0], [0.0, 0.0], 0.0), [0.0, 0.0], 0.0);
+        let shifted = glyph_outline_transform(glyph_box([0.0, 0.0, 8.0, 8.0], [2.0, 3.0], [0.5, 0.5], 0.0), [0.0, 0.0], 0.0);
         assert!((shifted.pos[0] - base.pos[0] - 0.5 * 2.0).abs() < 1e-5);
         assert!((shifted.pos[1] - base.pos[1] - 0.5 * 3.0).abs() < 1e-5);
     }
@@ -266,10 +310,8 @@ mod tests {
     #[test]
     fn subpixel_rotates_with_glyph() {
         let rot = std::f32::consts::FRAC_PI_2;
-        let base =
-            glyph_outline_transform(0.0, 0.0, rot, 0.0, 0.0, 8.0, 8.0, 1.0, 1.0, [0.0, 0.0], 0.0);
-        let shifted =
-            glyph_outline_transform(0.0, 0.0, rot, 0.0, 0.0, 8.0, 8.0, 1.0, 1.0, [1.0, 0.0], 0.0);
+        let base = glyph_outline_transform(glyph_box([0.0, 0.0, 8.0, 8.0], [1.0, 1.0], [0.0, 0.0], 0.0), [0.0, 0.0], rot);
+        let shifted = glyph_outline_transform(glyph_box([0.0, 0.0, 8.0, 8.0], [1.0, 1.0], [1.0, 0.0], 0.0), [0.0, 0.0], rot);
         assert!((shifted.pos[0] - base.pos[0]).abs() < 1e-5, "x ~ unchanged at 90deg");
         assert!((shifted.pos[1] - base.pos[1] - 1.0).abs() < 1e-5, "x fraction maps to +y");
     }
@@ -278,12 +320,8 @@ mod tests {
     /// and only flow into `GlyphTransform.shear_x` — the baseline stays fixed.
     #[test]
     fn shear_flows_into_transform_without_moving_pos() {
-        let base = glyph_outline_transform(
-            100.0, 50.0, 0.3, 2.0, 3.0, 10.0, 12.0, 1.5, 0.8, [0.25, 0.5], 0.0,
-        );
-        let sheared = glyph_outline_transform(
-            100.0, 50.0, 0.3, 2.0, 3.0, 10.0, 12.0, 1.5, 0.8, [0.25, 0.5], 0.4,
-        );
+        let base = glyph_outline_transform(glyph_box([2.0, 3.0, 10.0, 12.0], [1.5, 0.8], [0.25, 0.5], 0.0), [100.0, 50.0], 0.3);
+        let sheared = glyph_outline_transform(glyph_box([2.0, 3.0, 10.0, 12.0], [1.5, 0.8], [0.25, 0.5], 0.4), [100.0, 50.0], 0.3);
         assert_eq!(base.pos, sheared.pos, "shear must not move the pen anchor");
         assert_eq!(sheared.shear_x, 0.4);
         assert_eq!(base.shear_x, 0.0);

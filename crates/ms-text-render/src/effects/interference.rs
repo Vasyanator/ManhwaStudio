@@ -29,6 +29,7 @@ Notes:
 */
 
 use super::super::types::RenderedTextImage;
+use super::super::raster::{RgbaCanvasView, RgbaView};
 use super::image_ops::{
     draw_image_with_opacity, hash_noise_signed, sample_rgba_premultiplied_bilinear,
     value_noise_signed,
@@ -224,14 +225,17 @@ fn apply_digital(image: &mut RenderedTextImage, params: &InterferenceEffectParam
     let source = image.rgba.clone();
     let mut expanded = vec![0u8; out_width_usize * out_height_usize * 4];
     draw_image_with_opacity(
-        expanded.as_mut_slice(),
-        out_width_usize,
-        out_height_usize,
-        source.as_slice(),
-        width,
-        height,
-        pad_i32,
-        0,
+        &mut RgbaCanvasView {
+            rgba: expanded.as_mut_slice(),
+            width: out_width_usize,
+            height: out_height_usize,
+        },
+        RgbaView {
+            rgba: source.as_slice(),
+            width,
+            height,
+        },
+        [pad_i32, 0],
         1.0,
     );
 
@@ -385,14 +389,17 @@ fn apply_rgb_split(image: &mut RenderedTextImage, params: &InterferenceEffectPar
     let source = image.rgba.clone();
     let mut expanded = vec![0u8; out_width_usize * out_height_usize * 4];
     draw_image_with_opacity(
-        expanded.as_mut_slice(),
-        out_width_usize,
-        out_height_usize,
-        source.as_slice(),
-        width,
-        height,
-        pad_i32,
-        pad_i32,
+        &mut RgbaCanvasView {
+            rgba: expanded.as_mut_slice(),
+            width: out_width_usize,
+            height: out_height_usize,
+        },
+        RgbaView {
+            rgba: source.as_slice(),
+            width,
+            height,
+        },
+        [pad_i32, pad_i32],
         1.0,
     );
 
@@ -506,14 +513,17 @@ fn apply_scanlines(image: &mut RenderedTextImage, params: &InterferenceEffectPar
     let source = image.rgba.clone();
     let mut expanded = vec![0u8; out_width_usize * out_height_usize * 4];
     draw_image_with_opacity(
-        expanded.as_mut_slice(),
-        out_width_usize,
-        out_height_usize,
-        source.as_slice(),
-        width,
-        height,
-        pad_i32,
-        0,
+        &mut RgbaCanvasView {
+            rgba: expanded.as_mut_slice(),
+            width: out_width_usize,
+            height: out_height_usize,
+        },
+        RgbaView {
+            rgba: source.as_slice(),
+            width,
+            height,
+        },
+        [pad_i32, 0],
         1.0,
     );
 
@@ -610,6 +620,7 @@ mod tests {
         apply_interference_effect, digital_fill_row, digital_row_transforms, rgb_split_fill_row,
         scanline_row_state, scanlines_fill_row, white_noise_fill_row,
     };
+    use crate::raster::{RgbaCanvasView, RgbaView};
     use crate::types::RenderedTextImage;
 
     /// Builds a small opaque test image with a spatial color/alpha pattern that exercises every
@@ -699,14 +710,17 @@ mod tests {
         let out_height = height;
         let mut expanded = vec![0u8; out_width * out_height * 4];
         super::draw_image_with_opacity(
-            expanded.as_mut_slice(),
-            out_width,
-            out_height,
-            image.rgba.as_slice(),
-            width,
-            height,
-            i32::try_from(pad).unwrap_or(i32::MAX),
-            0,
+            &mut RgbaCanvasView {
+                rgba: expanded.as_mut_slice(),
+                width: out_width,
+                height: out_height,
+            },
+            RgbaView {
+                rgba: image.rgba.as_slice(),
+                width,
+                height,
+            },
+            [i32::try_from(pad).unwrap_or(i32::MAX), 0],
             1.0,
         );
         let (row_shift, row_split) = digital_row_transforms(params, out_height);
@@ -739,14 +753,17 @@ mod tests {
         let pad_i32 = i32::try_from(pad).unwrap_or(i32::MAX);
         let mut expanded = vec![0u8; out_width * out_height * 4];
         super::draw_image_with_opacity(
-            expanded.as_mut_slice(),
-            out_width,
-            out_height,
-            image.rgba.as_slice(),
-            width,
-            height,
-            pad_i32,
-            pad_i32,
+            &mut RgbaCanvasView {
+                rgba: expanded.as_mut_slice(),
+                width: out_width,
+                height: out_height,
+            },
+            RgbaView {
+                rgba: image.rgba.as_slice(),
+                width,
+                height,
+            },
+            [pad_i32, pad_i32],
             1.0,
         );
         let mut out = vec![0u8; expanded.len()];
@@ -775,14 +792,17 @@ mod tests {
         let out_height = height;
         let mut expanded = vec![0u8; out_width * out_height * 4];
         super::draw_image_with_opacity(
-            expanded.as_mut_slice(),
-            out_width,
-            out_height,
-            image.rgba.as_slice(),
-            width,
-            height,
-            i32::try_from(pad).unwrap_or(i32::MAX),
-            0,
+            &mut RgbaCanvasView {
+                rgba: expanded.as_mut_slice(),
+                width: out_width,
+                height: out_height,
+            },
+            RgbaView {
+                rgba: image.rgba.as_slice(),
+                width,
+                height,
+            },
+            [i32::try_from(pad).unwrap_or(i32::MAX), 0],
             1.0,
         );
         let mut out = vec![0u8; expanded.len()];

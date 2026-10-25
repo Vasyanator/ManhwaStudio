@@ -11,6 +11,7 @@ Main responsibilities:
 */
 
 use super::super::types::RenderedTextImage;
+use super::super::raster::{RgbaCanvasView, RgbaView};
 use super::image_ops::{
     blend_full_image_over, draw_image_with_opacity, gaussian_blur_rgba_in_place,
 };
@@ -133,14 +134,17 @@ pub(crate) fn apply_shake_effect(image: &mut RenderedTextImage, shake: &ShakeEff
 
         let mut base = vec![0u8; out_width as usize * out_height as usize * 4];
         draw_image_with_opacity(
-            &mut base,
-            out_width as usize,
-            out_height as usize,
-            source.as_slice(),
-            source_width,
-            source_height,
-            left_pad,
-            top_pad,
+            &mut RgbaCanvasView {
+                rgba: &mut base,
+                width: out_width as usize,
+                height: out_height as usize,
+            },
+            RgbaView {
+                rgba: source.as_slice(),
+                width: source_width,
+                height: source_height,
+            },
+            [left_pad, top_pad],
             1.0,
         );
         image.width = out_width;
@@ -169,14 +173,17 @@ pub(crate) fn apply_shake_effect(image: &mut RenderedTextImage, shake: &ShakeEff
             let dy = (unit_y * (shake.down_px * t)).round() as i32;
             let opacity = (opacity_start * step_factor.powi((i - 1) as i32)).clamp(0.0, 1.0);
             draw_image_with_opacity(
-                &mut trail,
-                trail_width,
-                trail_height,
-                source.as_slice(),
-                source_width_u32 as usize,
-                source_height_u32 as usize,
-                left_pad.saturating_add(dx),
-                top_pad.saturating_add(dy),
+                &mut RgbaCanvasView {
+                    rgba: &mut trail,
+                    width: trail_width,
+                    height: trail_height,
+                },
+                RgbaView {
+                    rgba: source.as_slice(),
+                    width: source_width_u32 as usize,
+                    height: source_height_u32 as usize,
+                },
+                [left_pad.saturating_add(dx), top_pad.saturating_add(dy)],
                 opacity,
             );
         }
@@ -189,14 +196,17 @@ pub(crate) fn apply_shake_effect(image: &mut RenderedTextImage, shake: &ShakeEff
             let dy = (-unit_y * (shake.up_px * t)).round() as i32;
             let opacity = (opacity_start * step_factor.powi((i - 1) as i32)).clamp(0.0, 1.0);
             draw_image_with_opacity(
-                &mut trail,
-                trail_width,
-                trail_height,
-                source.as_slice(),
-                source_width_u32 as usize,
-                source_height_u32 as usize,
-                left_pad.saturating_add(dx),
-                top_pad.saturating_add(dy),
+                &mut RgbaCanvasView {
+                    rgba: &mut trail,
+                    width: trail_width,
+                    height: trail_height,
+                },
+                RgbaView {
+                    rgba: source.as_slice(),
+                    width: source_width_u32 as usize,
+                    height: source_height_u32 as usize,
+                },
+                [left_pad.saturating_add(dx), top_pad.saturating_add(dy)],
                 opacity,
             );
         }

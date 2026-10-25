@@ -60,7 +60,15 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - `types.rs`: public render parameter/result types and enums shared with `typing/tab.rs`
   and `typing/panel.rs`.
 - `pipeline.rs`: central orchestration, horizontal rendering, line metrics, inline glyph
-  overrides, shape comparison, cancellation handling, and post-effect application.
+  overrides, shape comparison, cancellation handling, and post-effect application. Also
+  the ONE owner of the per-glyph inline lookups (`inline_*_for_glyph` / `_at_offset`,
+  `compute_inline_line_aligns`, `compute_layout_line_offsets`) and of the wrap hyphen
+  (`build_wrapped_hyphen_glyph`, `soft_hyphen_style_offset`, `trailing_hyphen_x`) that
+  the formula / custom-line path imports instead of keeping copies, and of the shared
+  run-walk context: `GlyphCaches` (swash / outline / optical-contour caches, created
+  together per render), `GlyphStyle` (inline scale + faux style), `RunPen` (params,
+  spans, line offsets, user kerning, font size) and `RunShaping` (`RunPen` + what the
+  wrap hyphen re-shapes with).
 - `font_provider.rs`: the caller-supplied font source. Fonts reach the render
   path by WORKING NAME through the `FontProvider` trait (`FontContent` payload,
   `FontContentSet` in-memory impl, `font_content_id` cache-key hash). The renderer
@@ -123,12 +131,14 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   form. Never grow a second dispatch table — the two would drift and the restored tags would
   land next to the wrong words.
 - `raster.rs`: low-level swash sampling, alpha/source-over blending, glyph drawing,
-  bilinear image sampling, and alpha-bounds trimming. Owns the color-glyph bitmap
+  bilinear image sampling, and alpha-bounds trimming. Owns the buffer views every
+  blit takes (`RgbaCanvasView` mutable, `RgbaView` read-only, also used by the effect
+  layers; `SwashGlyphView`) and the Copy geometry `RotatedRect` / `RotatedGlyphPose`. Owns the color-glyph bitmap
   fallback and bitmap-based measurement/bounds only; monochrome glyphs on all
   three modes (horizontal, vertical, on-path/formula) are rasterized from outlines
   instead.
 - `glyph_blit.rs`: shared outline-blit helpers (`hash_font_id`,
-  `resolve_outline_for_glyph`, `glyph_outline_transform`) used by the horizontal
+  `resolve_outline_for_glyph`, `glyph_outline_transform` over a Copy `GlyphBox`) used by the horizontal
   path (`pipeline.rs`), the vertical path (`layout/vertical.rs`), and the
   on-path/formula path (`formula/render.rs`) so the outline->world pivot lives in
   one place.
@@ -205,6 +215,9 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - `characterization.rs` (`cfg(test)`): the recorded pen / seed characterization
   matrices of the pair advance — shared axes, the tracked fixture fonts and the
   bit-exact fixture compare (see Testing Guidance).
+- `test_fixtures.rs` (`cfg(test)`): the one path of the tracked caller-font fixture the
+  other unit tests load (Arimo Regular, `fonts/простой V2.ttf`; why not `fonts/ui`: its
+  header).
 - `pair_gap.rs`: THE single owner of "what is the gap between these two placed
   glyph contours" — `directional_pair_gap(prev, cur, GapAxis)`, the minimum
   directional projected ink whitespace along an arbitrary oriented axis. `GapAxis`
@@ -780,7 +793,8 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   spans EXPLICITLY reset attrs to the SELECTED face's own weight/style
   (`inline_styles.rs`, `FauxFaceBaseline::from_registered_face`, threaded from
   `pipeline.rs`'s `selected_face` into every `apply_inline_style_to_attrs` call
-  site — rich-text spans, both `wrapped_hyphen_attrs`, and the
+  site — rich-text spans, the one `pipeline::wrapped_hyphen_attrs` (wrap hyphen of
+  every layout path), and the
   `FormulaRenderRequest`), so a global real bold/italic can never leak under the
   faux geometry. INVARIANT — FAUX NEVER CHANGES FONT MATCHING: a faux span must
   resolve to exactly the same face as the surrounding non-forced text (or, when
@@ -1238,6 +1252,10 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   glyph so a reachability test can tell "drawn by font X" from `.notdef` tofu. Keep
   the production-constructor assertion next to it where it still proves something
   (an empty database proves nothing scanned the OS fonts).
+- A unit test that needs a real "caller" font (an upright-only family outside the
+  bundled base, Latin/Cyrillic/Greek/Hebrew, GPOS pair kerning) loads
+  `test_fixtures::caller_font_path()` (tracked Arimo Regular). Never point a test at an
+  untracked file: a fresh clone must run the whole suite.
 - A test that needs a font which actually carries a `... -> ellipsis` ligature uses
   `font_ligature_patch::test_fixture` (`tests/fixtures/ellipsis_ligature.ttf`, a
   ~3 KB committed subset built by `tools/make_ellipsis_ligature_fixture.py`). No

@@ -9,6 +9,13 @@ Main responsibilities:
 - собрать общие pixel/image helper'ы для horizontal/vertical/formula режимов;
 - стать целевым местом для переноса общих RGBA helper-функций из старого рендера.
 
+Key structures:
+- RgbaCanvasView / RgbaView: mutable canvas and read-only RGBA8 image views
+  (also the effect layers' blit views, `effects::image_ops`).
+- SwashGlyphView: a borrowed swash glyph image for the unscaled blit.
+- RotatedRect / RotatedGlyphPose: Copy geometry of the rotated bounds and the
+  rotated bitmap draw (passed by value on the per-glyph path).
+
 Notes:
 - `include_scaled_rect_bounds` and `draw_scaled_glyph_rgba` take the glyph's
   ALREADY SCALED rect, never the unscaled box plus a scale. The vertical anchor of
@@ -223,16 +230,53 @@ pub(crate) fn include_scaled_rect_bounds(
     );
 }
 
+/// A mutable straight-alpha RGBA8 canvas: `rgba` holds `width * height * 4`
+/// bytes, row-major. Writers clip to `width` x `height`.
 pub(crate) struct RgbaCanvasView<'a> {
     pub(crate) rgba: &'a mut [u8],
     pub(crate) width: usize,
     pub(crate) height: usize,
 }
 
-pub(crate) struct GlyphRgbaView<'a> {
+/// A read-only straight-alpha RGBA8 image (a glyph bitmap or an effect layer):
+/// `rgba` holds `width * height * 4` bytes, row-major.
+#[derive(Clone, Copy)]
+pub(crate) struct RgbaView<'a> {
     pub(crate) rgba: &'a [u8],
     pub(crate) width: usize,
     pub(crate) height: usize,
+}
+
+/// A swash glyph image (mask, subpixel mask or colour bitmap) borrowed for an
+/// unscaled blit: `data` is `width * height` texels in `content`'s format.
+#[derive(Clone, Copy)]
+pub(crate) struct SwashGlyphView<'a> {
+    pub(crate) content: SwashContent,
+    pub(crate) data: &'a [u8],
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+}
+
+/// An axis-aligned glyph rect `(left, top, width, height)` in content px,
+/// turned rigidly by `rotation_rad` about its own centre and re-pinned so that
+/// centre sits at `dst_center` (world px).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RotatedRect {
+    pub(crate) rect: (f32, f32, f32, f32),
+    pub(crate) dst_center: [f32; 2],
+    pub(crate) rotation_rad: f32,
+}
+
+/// Where [`draw_rotated_scaled_glyph_rgba`] puts a glyph bitmap: the unscaled
+/// bitmap's top-left in content px (`src_left`/`src_top`), its per-axis scale,
+/// and the world centre and rotation it is turned to.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RotatedGlyphPose {
+    pub(crate) src_left: f32,
+    pub(crate) src_top: f32,
+    pub(crate) scale: GlyphScaleSettings,
+    pub(crate) dst_center: [f32; 2],
+    pub(crate) rotation_rad: f32,
 }
 
 /// Blit a color/bitmap-fallback glyph into `dst_rect` by reverse bilinear sampling.
@@ -245,7 +289,7 @@ pub(crate) struct GlyphRgbaView<'a> {
 /// the mapping back into glyph-local pixels.
 pub(crate) fn draw_scaled_glyph_rgba(
     canvas: &mut RgbaCanvasView<'_>,
-    glyph: GlyphRgbaView<'_>,
+    glyph: RgbaView<'_>,
     dst_rect: (f32, f32, f32, f32),
     glyph_scale: GlyphScaleSettings,
 ) {
@@ -291,27 +335,9 @@ pub(crate) fn draw_scaled_glyph_rgba(
     }
 }
 
-/// Включить в bounds повёрнутый (и масштабированный) прямоугольник глифа.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn include_rotated_rect_bounds(
-    bounds: &mut PixelBounds,
-    src_left: f32,
-    src_top: f32,
-    src_width: f32,
-    src_height: f32,
-    dst_center_x: f32,
-    dst_center_y: f32,
-    rotation_rad: f32,
-) {
-    let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(
-        src_left,
-        src_top,
-        src_width,
-        src_height,
-        dst_center_x,
-        dst_center_y,
-        rotation_rad,
-    );
+/// Grow `bounds` to the integer world box of a rotated (and scaled) glyph rect.
+pub(crate) fn include_rotated_rect_bounds(bounds: &mut PixelBounds, rotated: RotatedRect) {
+    let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(rotated);
     let min_x_i = min_x.floor() as i32;
     let min_y_i = min_y.floor() as i32;
     let max_x_i = max_x.ceil() as i32;
@@ -324,17 +350,14 @@ pub(crate) fn include_rotated_rect_bounds(
     );
 }
 
-/// Мировой bbox прямоугольника, повёрнутого вокруг своего центра и помещённого в `dst_center`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn rotated_rect_world_bounds(
-    src_left: f32,
-    src_top: f32,
-    src_width: f32,
-    src_height: f32,
-    dst_center_x: f32,
-    dst_center_y: f32,
-    rotation_rad: f32,
-) -> (f32, f32, f32, f32) {
+/// World `(min_x, min_y, max_x, max_y)` of a rect turned about its own centre and
+/// placed at its `dst_center`.
+pub(crate) fn rotated_rect_world_bounds(rotated: RotatedRect) -> (f32, f32, f32, f32) {
+    let RotatedRect {
+        rect: (src_left, src_top, src_width, src_height),
+        dst_center: [dst_center_x, dst_center_y],
+        rotation_rad,
+    } = rotated;
     let src_center_x = src_left + src_width * 0.5;
     let src_center_y = src_top + src_height * 0.5;
     let corners = [
@@ -417,22 +440,22 @@ pub(crate) fn rotate_placements_about_centroid(
     }
 }
 
-/// Нарисовать глиф с масштабом и поворотом вокруг точки `dst_center` (обратная выборка).
-/// `src_left`/`src_top` — левый верх немасштабированного глифа в координатах контента;
-/// `x_offset`/`y_offset` переводят координаты контента в пиксели холста.
-#[allow(clippy::too_many_arguments)]
+/// Draw a glyph bitmap scaled and turned about `pose.dst_center` (reverse sampling).
+/// `canvas_offset` (`[x_offset, y_offset]`) maps content coordinates to canvas pixels.
 pub(crate) fn draw_rotated_scaled_glyph_rgba(
     canvas: &mut RgbaCanvasView<'_>,
-    glyph: GlyphRgbaView<'_>,
-    src_left: f32,
-    src_top: f32,
-    glyph_scale: GlyphScaleSettings,
-    dst_center_x: f32,
-    dst_center_y: f32,
-    rotation_rad: f32,
-    x_offset: i32,
-    y_offset: i32,
+    glyph: RgbaView<'_>,
+    pose: RotatedGlyphPose,
+    canvas_offset: [i32; 2],
 ) {
+    let RotatedGlyphPose {
+        src_left,
+        src_top,
+        scale: glyph_scale,
+        dst_center: [dst_center_x, dst_center_y],
+        rotation_rad,
+    } = pose;
+    let [x_offset, y_offset] = canvas_offset;
     if glyph.width == 0 || glyph.height == 0 {
         return;
     }
@@ -444,15 +467,11 @@ pub(crate) fn draw_rotated_scaled_glyph_rgba(
     let sin_a = rotation_rad.sin();
     let (scaled_left, scaled_top, scaled_width, scaled_height) =
         glyph_scale.scaled_rect(src_left, src_top, glyph_w as f32, glyph_h as f32);
-    let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(
-        scaled_left,
-        scaled_top,
-        scaled_width,
-        scaled_height,
-        dst_center_x,
-        dst_center_y,
+    let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(RotatedRect {
+        rect: (scaled_left, scaled_top, scaled_width, scaled_height),
+        dst_center: [dst_center_x, dst_center_y],
         rotation_rad,
-    );
+    });
     let out_width = canvas.width as i32;
     let out_height = canvas.height as i32;
     let dst_min_x = ((min_x + x_offset as f32).floor() as i32 - 1).max(0);
@@ -488,25 +507,26 @@ pub(crate) fn draw_rotated_scaled_glyph_rgba(
     }
 }
 
-// The glyph blit call site naturally carries raster target, glyph bitmap and draw position.
-#[allow(clippy::too_many_arguments)]
+/// Blit a swash glyph image 1:1 with its top-left at canvas pixel `draw`
+/// (`[x, y]`), tinting monochrome masks with `text_color`; clips to the canvas.
 pub(crate) fn rasterize_unscaled_glyph(
-    rgba: &mut [u8],
-    out_width: u32,
-    out_height: u32,
-    content: SwashContent,
-    data: &[u8],
-    glyph_w: usize,
-    glyph_h: usize,
-    draw_x: i32,
-    draw_y: i32,
+    canvas: &mut RgbaCanvasView<'_>,
+    glyph: SwashGlyphView<'_>,
+    draw: [i32; 2],
     text_color: [u8; 4],
 ) {
+    let SwashGlyphView {
+        content,
+        data,
+        width: glyph_w,
+        height: glyph_h,
+    } = glyph;
+    let [draw_x, draw_y] = draw;
     for gy in 0..glyph_h {
         for gx in 0..glyph_w {
             let dst_x = draw_x + i32::try_from(gx).unwrap_or(i32::MAX);
             let dst_y = draw_y + i32::try_from(gy).unwrap_or(i32::MAX);
-            if dst_x < 0 || dst_y < 0 || dst_x >= out_width as i32 || dst_y >= out_height as i32 {
+            if dst_x < 0 || dst_y < 0 || dst_x >= canvas.width as i32 || dst_y >= canvas.height as i32 {
                 continue;
             }
 
@@ -516,8 +536,8 @@ pub(crate) fn rasterize_unscaled_glyph(
                 continue;
             }
 
-            let dst_idx = ((dst_y as usize * out_width as usize) + dst_x as usize) * 4;
-            blend_pixel_over(&mut rgba[dst_idx..dst_idx + 4], src_r, src_g, src_b, src_a);
+            let dst_idx = ((dst_y as usize * canvas.width) + dst_x as usize) * 4;
+            blend_pixel_over(&mut canvas.rgba[dst_idx..dst_idx + 4], src_r, src_g, src_b, src_a);
         }
     }
 }

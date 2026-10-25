@@ -776,8 +776,7 @@ mod tests {
 
     /// The upright-only test fixture, the same one the pipeline/pool tests use.
     fn fixture_font_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf")
+        crate::test_fixtures::caller_font_path()
     }
 
     /// Builds a render `FontSystem` with the upright-only fixture registered as

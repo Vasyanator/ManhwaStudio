@@ -125,6 +125,13 @@ outline (`glyph_contour_from_outline`, cached by cosmic-text `CacheKey`) plus th
 PLACEMENT; `place_seed_ink_for_transform` maps it into a frame with the same
 `glyph_outline_transform` pivot the rasterizer uses.
 
+Inline lookups and the wrap hyphen:
+- Not implemented here. Every per-glyph inline override (`inline_*_for_glyph` /
+  `_at_offset`), the per-line alignment (`compute_inline_line_aligns`) and the synthesized
+  wrap hyphen (`build_wrapped_hyphen_glyph`, `soft_hyphen_style_offset`,
+  `trailing_hyphen_x`) are imported from `pipeline`, their one owner, over the same
+  `RunShaping` context; do not fork them here.
+
 Line stacking:
 - Not implemented here. `pipeline::line_baseline_advance_table`,
   `compute_horizontal_line_baselines` and `horizontal_run_baseline_y` are imported,
@@ -154,19 +161,17 @@ use crate::drawn_lines::{
 use crate::extra_info::{ExtraInfoAccumulator, rotated_box_samples};
 use crate::font_registry::{CustomKerningMap, InlineFontRegistry};
 use crate::glyph_blit::{
-    glyph_needs_bitmap_fallback, glyph_outline_transform, glyph_subpixel_offset,
+    GlyphBox, glyph_needs_bitmap_fallback, glyph_outline_transform, glyph_subpixel_offset,
     resolve_outline_for_glyph,
 };
 use crate::glyph_contour::{
     GlyphContour, PlacedContour, min_placed_distance, placed_aabb_gap,
 };
 use crate::vector::{
-    MeshWarpContext, Outline, OutlineCache, RasterScratch, build_aa_lut,
+    MeshWarpContext, Outline, OutlineCache, OutlinePaint, RasterScratch, build_aa_lut,
     glyph_contour_from_outline, rasterize_outline_into,
 };
-use crate::inline_styles::{
-    FauxFaceBaseline, InlineGlyphOffset, InlineStyleSpan, apply_inline_style_to_attrs,
-};
+use crate::inline_styles::{FauxFaceBaseline, InlineGlyphOffset, InlineStyleSpan};
 use crate::optical::{median_of_gaps, optical_delta};
 use crate::pair_gap::{GapAxis, directional_pair_gap};
 use crate::pair_advance::{
@@ -174,29 +179,33 @@ use crate::pair_advance::{
     effective_spacing_percent, single_char_cluster,
 };
 use crate::pipeline::{
-    FauxGlyphStyle, GlyphScaleSettings, InlineHeightRoom,
-    compute_horizontal_line_baselines,
-    hanging_edge_run_bounds, horizontal_run_baseline_y, is_edge_run_hanging,
-    line_baseline_advance_table,
-    faux_bounds_pads, faux_style_at_offset, faux_style_for_glyph, horizontal_line_offset,
-    resolve_faux_counter_flag,
+    FauxGlyphStyle, GlyphScaleSettings, InlineHeightRoom, RunPen, RunShaping,
+    build_wrapped_hyphen_glyph, compute_horizontal_line_baselines,
+    compute_inline_line_aligns, compute_layout_line_offsets, faux_bounds_pads, faux_style_at_offset,
+    faux_style_for_glyph, hanging_edge_run_bounds, horizontal_line_offset,
+    horizontal_run_baseline_y, inline_glyph_offset_at_offset, inline_glyph_offset_for_glyph,
+    inline_glyph_offset_span_at_offset, inline_glyph_offset_span_for_glyph,
+    inline_glyph_offset_style_at_offset, inline_glyph_offset_style_for_glyph,
+    inline_glyph_scale_at_offset, inline_glyph_scale_for_glyph, inline_kerning_at_offset,
+    inline_kerning_for_glyph, inline_text_color_at_offset,
+    inline_text_color_for_glyph, is_edge_run_hanging, line_baseline_advance_table,
+    resolve_faux_counter_flag, run_wraps_at_soft_hyphen, soft_hyphen_style_offset,
+    spans_have_inline_size_overrides, trailing_hyphen_x,
 };
 use crate::raster::{
-    PixelBounds, RigidPlacement, bilinear_sample_rgba, blend_pixel_over, build_glyph_rgba_buffer,
-    include_rotated_rect_bounds, rotate_placements_about_centroid, rotated_rect_world_bounds,
-    sample_swash_alpha, trim_rendered_image_to_alpha_bounds,
+    PixelBounds, RgbaCanvasView, RigidPlacement, RotatedRect, bilinear_sample_rgba,
+    blend_pixel_over, build_glyph_rgba_buffer, include_rotated_rect_bounds,
+    rotate_placements_about_centroid, rotated_rect_world_bounds, sample_swash_alpha,
+    trim_rendered_image_to_alpha_bounds,
 };
 use crate::types::{
     HorizontalAlign, KerningMode, LinePlacementReference, RenderedTextImage, TextLayoutMode,
     TextRenderParams, TextVectorLineDistanceMode, TextVectorLineTextDirection,
 };
 use cosmic_text::{
-    Attrs, AttrsOwned, Buffer, CacheKey, FontSystem, LayoutGlyph, LayoutRun, Metrics, Shaping,
-    SwashCache, SwashContent,
+    Attrs, Buffer, CacheKey, FontSystem, LayoutGlyph, SwashCache, SwashContent,
 };
 use std::collections::HashMap;
-
-const SOFT_HYPHEN: char = '\u{00AD}';
 
 /// Douglas-Peucker tolerance (glyph-local pixels) applied when simplifying a
 /// glyph's outline-derived contour. Small enough that the polygon still hugs the
@@ -425,6 +434,35 @@ pub(crate) struct FormulaRenderRequest<'a, 'font> {
     /// gated by mode in the pipeline router (0.0 for HIDE modes `Shape` /
     /// `CustomRasterLines`, the panel value for `Formula` / `CustomVectorLines`).
     pub(crate) line_placement_frac: f32,
+}
+
+/// Line stacking of one formula / shape / custom-line render: the base line
+/// height, the grow-only baseline-advance table and the GLOBAL default extra line
+/// spacing the table was built around.
+///
+/// The default is carried separately on purpose: re-deriving it as
+/// `extra_spacing_table.first()` is wrong — with the grow-only inline height room,
+/// entry 0 can carry extra px that would then be SUBTRACTED from every later gap in
+/// the `has_inline_size_overrides` branch of `compute_horizontal_line_baselines`,
+/// pulling lines closer.
+#[derive(Clone, Copy)]
+struct FormulaLines<'a> {
+    base_line_height_px: f32,
+    extra_spacing_table: &'a [f32],
+    default_extra_spacing_px: f32,
+}
+
+impl FormulaLines<'_> {
+    /// The baseline of every layout line of `buffer` under this stacking.
+    fn baselines(self, buffer: &Buffer, has_inline_size_overrides: bool) -> Vec<f32> {
+        compute_horizontal_line_baselines(
+            buffer,
+            self.base_line_height_px,
+            self.default_extra_spacing_px,
+            self.extra_spacing_table,
+            has_inline_size_overrides,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -717,22 +755,27 @@ pub(crate) fn render_text_with_formula_layout(
         ),
     );
 
-    if params.text_layout_mode == TextLayoutMode::Shape
-        && let Some(warning) = detect_shape_layout_fallback_reason(
+    let shaping = RunShaping {
+        pen: RunPen {
             params,
-            font_system,
-            buffer,
-            attrs,
-            faux_face_baseline,
             inline_style_spans,
-            inline_font_registry,
+            layout_line_offsets: layout_line_offsets.as_slice(),
             custom_kerning,
-            layout_line_offsets.as_slice(),
             font_size_px,
-            base_line_height_px,
-            line_extra_spacing_table.as_slice(),
-            default_extra_line_spacing_px,
-        )?
+        },
+        attrs,
+        faux_face_baseline,
+        inline_font_registry,
+        hyphen_line_height_px: base_line_height_px,
+    };
+    let lines = FormulaLines {
+        base_line_height_px,
+        extra_spacing_table: line_extra_spacing_table.as_slice(),
+        default_extra_spacing_px: default_extra_line_spacing_px,
+    };
+
+    if params.text_layout_mode == TextLayoutMode::Shape
+        && let Some(warning) = detect_shape_layout_fallback_reason(shaping, font_system, buffer, lines)?
     {
         return Ok(FormulaRenderOutcome::FallbackToStandard(warning));
     }
@@ -743,19 +786,10 @@ pub(crate) fn render_text_with_formula_layout(
 
     for _ in 0..4 {
         let image = render_text_with_formula_layout_once(
-            params,
+            shaping,
             font_system,
             buffer,
-            attrs,
-            faux_face_baseline,
-            inline_style_spans,
-            inline_font_registry,
-            custom_kerning,
-            layout_line_offsets.as_slice(),
-            font_size_px,
-            base_line_height_px,
-            line_extra_spacing_table.as_slice(),
-            default_extra_line_spacing_px,
+            lines,
             render_margin_pad,
             line_placement_frac,
         )?;
@@ -867,34 +901,39 @@ fn render_text_with_drawn_lines_layout_once(
             inline_style_spans,
         ),
     );
+    let shaping = RunShaping {
+        pen: RunPen {
+            params,
+            inline_style_spans,
+            layout_line_offsets: layout_line_offsets.as_slice(),
+            custom_kerning,
+            font_size_px,
+        },
+        attrs,
+        faux_face_baseline,
+        inline_font_registry,
+        hyphen_line_height_px: base_line_height_px,
+    };
+    let lines = FormulaLines {
+        base_line_height_px,
+        extra_spacing_table: line_extra_spacing_table.as_slice(),
+        default_extra_spacing_px: default_extra_line_spacing_px,
+    };
     let has_inline_size_overrides =
         inline_style_spans.is_some_and(spans_have_inline_size_overrides);
-    let line_baselines = compute_horizontal_line_baselines(
-        buffer,
-        base_line_height_px,
-        default_extra_line_spacing_px,
-        line_extra_spacing_table.as_slice(),
-        has_inline_size_overrides,
-    );
+    let line_baselines = lines.baselines(buffer, has_inline_size_overrides);
     // Resolution-independent glyph outlines: shared by the faux counter-flag
     // lookup during seed collection, the ink-distance search (via the transforms
     // below) and the composite pass, so each glyph is extracted at most once per
     // render.
-    let mut outline_cache = OutlineCache::new();
+    let mut caches = OnPathInkCaches::new();
     let mut seeds = collect_formula_glyph_seeds(
-        params,
+        shaping,
         font_system,
-        &mut outline_cache,
+        &mut caches.outlines,
         buffer,
-        attrs,
-        faux_face_baseline,
-        inline_style_spans,
-        inline_font_registry,
-        custom_kerning,
-        layout_line_offsets.as_slice(),
-        font_size_px,
-        base_line_height_px,
         line_baselines.as_slice(),
+        base_line_height_px,
     );
     if seeds.is_empty() {
         return Ok(RenderedTextImage::transparent(
@@ -903,11 +942,9 @@ fn render_text_with_drawn_lines_layout_once(
         ));
     }
 
-    // The swash cache and the glyph-contour cache both live for the whole
-    // render so glyph rasterization and ink-contour tracing happen at most once
-    // per distinct glyph, and are reused by the bounds and composite passes.
-    let mut cache = SwashCache::new();
-    let mut contour_cache: HashMap<(CacheKey, u32), CachedGlyphInk> = HashMap::new();
+    // `caches` lives for the whole render, so glyph rasterization and ink-contour
+    // tracing happen at most once per distinct glyph and are reused by the bounds
+    // and composite passes.
     // Reused per-glyph rasterizer buffers for the composite pass (see `RasterScratch`).
     let mut raster_scratch = RasterScratch::new();
     // Coverage->alpha transfer table for the selected AA mode, built once per render.
@@ -942,11 +979,8 @@ fn render_text_with_drawn_lines_layout_once(
         paths,
         custom_kerning,
         font_system,
-        &mut cache,
-        &mut contour_cache,
-        &mut outline_cache,
-        line_placement_frac,
-        ascent_scaled,
+        &mut caches,
+        custom_line_layout_settings(params, line_placement_frac, ascent_scaled),
     );
     let skipped = transforms.iter().filter(|item| item.is_none()).count();
     // Global block rotation (vector level): rotate every placed line-glyph rigidly
@@ -978,7 +1012,7 @@ fn render_text_with_drawn_lines_layout_once(
                 ),
                 1.0,
             );
-            let Some(image) = cache.get_image(font_system, physical.cache_key) else {
+            let Some(image) = caches.swash.get_image(font_system, physical.cache_key) else {
                 continue;
             };
             let glyph_w = i32::try_from(image.placement.width).unwrap_or(i32::MAX);
@@ -1012,13 +1046,11 @@ fn render_text_with_drawn_lines_layout_once(
             );
             include_rotated_rect_bounds(
                 &mut pre_box,
-                padded_left,
-                padded_top,
-                padded_width,
-                padded_height,
-                dst_center_x,
-                dst_center_y,
-                transform.rotation_rad,
+                RotatedRect {
+                    rect: (padded_left, padded_top, padded_width, padded_height),
+                    dst_center: [dst_center_x, dst_center_y],
+                    rotation_rad: transform.rotation_rad,
+                },
             );
         }
         let inv = 1.0 / count.max(1) as f32;
@@ -1048,7 +1080,7 @@ fn render_text_with_drawn_lines_layout_once(
             ),
             1.0,
         );
-        let Some(image) = cache.get_image(font_system, physical.cache_key) else {
+        let Some(image) = caches.swash.get_image(font_system, physical.cache_key) else {
             continue;
         };
         let glyph_w = i32::try_from(image.placement.width).unwrap_or(i32::MAX);
@@ -1084,13 +1116,11 @@ fn render_text_with_drawn_lines_layout_once(
         );
         include_rotated_rect_bounds(
             &mut bounds,
-            padded_left,
-            padded_top,
-            padded_width,
-            padded_height,
-            dst_center_x,
-            dst_center_y,
-            transform.rotation_rad,
+            RotatedRect {
+                rect: (padded_left, padded_top, padded_width, padded_height),
+                dst_center: [dst_center_x, dst_center_y],
+                rotation_rad: transform.rotation_rad,
+            },
         );
     }
 
@@ -1195,7 +1225,7 @@ fn render_text_with_drawn_lines_layout_once(
             ),
             1.0,
         );
-        let Some(image) = cache.get_image(font_system, physical.cache_key) else {
+        let Some(image) = caches.swash.get_image(font_system, physical.cache_key) else {
             continue;
         };
         let glyph_w = image.placement.width as usize;
@@ -1222,7 +1252,7 @@ fn render_text_with_drawn_lines_layout_once(
 
         // Resolve the outline up front so the extra-info sample knows whether this
         // glyph draws warped (outline) or as an UNWARPED color-glyph bitmap fallback.
-        let glyph_outline = resolve_glyph_outline(&seed, font_system, &mut outline_cache);
+        let glyph_outline = resolve_glyph_outline(&seed, font_system, &mut caches.outlines);
         // Whether this glyph puts ink on the canvas at all: it either has an
         // outline, or it is an outline-less glyph whose bitmap still gets blitted.
         // `false` only for a glyph a faux THINNING offset consumed entirely, which
@@ -1232,7 +1262,7 @@ fn render_text_with_drawn_lines_layout_once(
         let draws_ink = glyph_outline.is_some()
             || glyph_needs_bitmap_fallback(
                 font_system,
-                &mut outline_cache,
+                &mut caches.outlines,
                 &seed.glyph,
                 seed.faux.bold,
             );
@@ -1259,30 +1289,33 @@ fn render_text_with_drawn_lines_layout_once(
         // glyphs have no monochrome outline and keep the bitmap blit below.
         if let Some(outline) = glyph_outline {
             let glyph_transform = glyph_outline_transform(
-                dst_center_x,
-                dst_center_y,
+                GlyphBox {
+                    placement_left,
+                    placement_top,
+                    glyph_w: glyph_w as f32,
+                    glyph_h: glyph_h as f32,
+                    scale: seed.glyph_scale,
+                    subpixel: glyph_subpixel_offset(physical.cache_key),
+                    shear_x: seed.faux.shear_x,
+                },
+                [dst_center_x, dst_center_y],
                 transform.rotation_rad,
-                placement_left,
-                placement_top,
-                glyph_w as f32,
-                glyph_h as f32,
-                seed.glyph_scale.width_mul,
-                seed.glyph_scale.height_mul,
-                glyph_subpixel_offset(physical.cache_key),
-                seed.faux.shear_x,
             );
             rasterize_outline_into(
                 &mut raster_scratch,
-                rgba.as_mut_slice(),
-                out_width as usize,
-                out_height as usize,
-                -(x_offset as f32),
-                -(y_offset as f32),
+                &mut RgbaCanvasView {
+                    rgba: rgba.as_mut_slice(),
+                    width: out_width as usize,
+                    height: out_height as usize,
+                },
+                [-(x_offset as f32), -(y_offset as f32)],
                 &outline,
                 &glyph_transform,
-                seed.text_color,
-                &aa_lut,
-                warp_ctx.as_ref(),
+                OutlinePaint {
+                    color: seed.text_color,
+                    aa_lut: &aa_lut,
+                    warp: warp_ctx.as_ref(),
+                },
             );
             continue;
         }
@@ -1310,15 +1343,11 @@ fn render_text_with_drawn_lines_layout_once(
         let (scaled_left, scaled_top, scaled_width, scaled_height) =
             seed.glyph_scale
                 .scaled_rect(src_left, src_top, glyph_w as f32, glyph_h as f32);
-        let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(
-            scaled_left,
-            scaled_top,
-            scaled_width,
-            scaled_height,
-            dst_center_x,
-            dst_center_y,
-            transform.rotation_rad,
-        );
+        let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(RotatedRect {
+            rect: (scaled_left, scaled_top, scaled_width, scaled_height),
+            dst_center: [dst_center_x, dst_center_y],
+            rotation_rad: transform.rotation_rad,
+        });
         let dst_min_x = ((min_x + x_offset as f32).floor() as i32 - 1).max(0);
         let dst_max_x = ((max_x + x_offset as f32).ceil() as i32 + 1).min(out_width as i32);
         let dst_min_y = ((min_y + y_offset as f32).floor() as i32 - 1).max(0);
@@ -1649,9 +1678,6 @@ struct StraightReferenceGaps {
 ///
 /// The replay must use the SAME `spacing` as the real walk, for the same reason
 /// [`drawn_line_start_offsets`] must.
-// The pre-pass needs the layout inputs plus all four rasterization caches;
-// bundling them would only move the same list one call deeper.
-#[allow(clippy::too_many_arguments)]
 fn straight_reference_target_gaps(
     params: &TextRenderParams,
     seeds: &[FormulaGlyphSeed],
@@ -1659,9 +1685,7 @@ fn straight_reference_target_gaps(
     spacing: OnPathStepSpacing,
     custom_kerning: &CustomKerningMap,
     font_system: &mut FontSystem,
-    cache: &mut SwashCache,
-    contour_cache: &mut HashMap<(CacheKey, u32), CachedGlyphInk>,
-    outline_cache: &mut OutlineCache,
+    caches: &mut OnPathInkCaches,
 ) -> HashMap<usize, f32> {
     let mut lines = HashMap::<usize, StraightReferenceGaps>::new();
     for (seed_idx, seed) in seeds.iter().enumerate() {
@@ -1679,7 +1703,7 @@ fn straight_reference_target_gaps(
         line.walk.commit(x, center_s);
         line.cursor.commit(seeds, seed, advance, center_s);
 
-        let Some(geom) = seed_ink_geometry(seed, font_system, cache, contour_cache, outline_cache)
+        let Some(geom) = seed_ink_geometry(seed, font_system, caches)
         else {
             // Inkless glyph (a space): it ends the pair chain, so no inter-word
             // distance ever enters the target.
@@ -1745,9 +1769,10 @@ fn drawn_line_drop_side(
 /// Compute the per-glyph on-path transforms for every seed of a custom line
 /// layout.
 ///
-/// `font_system`/`cache`/`contour_cache`/`outline_cache` are only touched for
-/// lines that use `MinimumPreviousDistance` spacing, which needs the glyph's ink
-/// contour (derived from its outline); `ByLineLength` lines never extract here.
+/// `layout_settings` is the mode's `custom_line_layout_settings`. `font_system` and
+/// `caches` are only touched for lines that use `MinimumPreviousDistance` spacing,
+/// which needs the glyph's ink contour (derived from its outline); `ByLineLength`
+/// lines never extract here.
 /// The returned vector is index-aligned with `seeds`; `None` means the glyph
 /// could not be placed (outside its line path or missing sample) and is dropped
 /// by callers.
@@ -1759,23 +1784,16 @@ fn drawn_line_drop_side(
 /// line that offset is then REFINED against the run's real length
 /// ([`refine_min_distance_start_offsets`]), because the pre-pass can only
 /// estimate it there.
-// The placement context needs all four immutable/mutable dependencies; bundling
-// the three caches would not simplify the call site.
-#[allow(clippy::too_many_arguments)]
 fn build_drawn_line_transforms(
     params: &TextRenderParams,
     seeds: &[FormulaGlyphSeed],
     paths: &[Option<DrawnLinePath>],
     custom_kerning: &CustomKerningMap,
     font_system: &mut FontSystem,
-    cache: &mut SwashCache,
-    contour_cache: &mut HashMap<(CacheKey, u32), CachedGlyphInk>,
-    outline_cache: &mut OutlineCache,
-    line_placement_frac: f32,
-    ascent_scaled: f32,
+    caches: &mut OnPathInkCaches,
+    layout_settings: CustomLineLayoutSettings,
 ) -> Vec<Option<DrawnLineTransform>> {
     let mut line_offsets = HashMap::<usize, DrawnLinePlacementState>::new();
-    let layout_settings = custom_line_layout_settings(params, line_placement_frac, ascent_scaled);
     let spacing = OnPathStepSpacing::for_custom_lines(
         layout_settings.letter_spacing_mul,
         layout_settings.letter_spacing_px,
@@ -1794,9 +1812,7 @@ fn build_drawn_line_transforms(
         spacing,
         custom_kerning,
         font_system,
-        cache,
-        contour_cache,
-        outline_cache,
+        caches,
     );
     let mut ctx = DrawnLinePlacementCtx {
         params,
@@ -1806,9 +1822,7 @@ fn build_drawn_line_transforms(
         custom_kerning,
         line_target_gaps,
         font_system,
-        cache,
-        contour_cache,
-        outline_cache,
+        caches,
     };
     // The estimate above is EXACT for `ByLineLength` and only an estimate for
     // `MinimumPreviousDistance`; replace it there by the measured run length.
@@ -1964,9 +1978,7 @@ struct DrawnLinePlacementCtx<'a> {
     /// its plain arc-length walk.
     line_target_gaps: HashMap<usize, f32>,
     font_system: &'a mut FontSystem,
-    cache: &'a mut SwashCache,
-    contour_cache: &'a mut HashMap<(CacheKey, u32), CachedGlyphInk>,
-    outline_cache: &'a mut OutlineCache,
+    caches: &'a mut OnPathInkCaches,
 }
 
 /// Place one glyph seed along its line path and advance the line's state.
@@ -2031,13 +2043,7 @@ fn drawn_line_seed_transform(
         == TextVectorLineDistanceMode::MinimumPreviousDistance;
     // Only the ink-distance mode needs the glyph's rasterized contour.
     let geom = if use_ink {
-        seed_ink_geometry(
-            seed,
-            ctx.font_system,
-            ctx.cache,
-            ctx.contour_cache,
-            ctx.outline_cache,
-        )
+        seed_ink_geometry(seed, ctx.font_system, ctx.caches)
     } else {
         None
     };
@@ -2266,6 +2272,28 @@ struct CachedGlyphInk {
     placement_top: f32,
 }
 
+/// The glyph caches one custom-line render shares between seed collection, the
+/// `MinimumPreviousDistance` ink search and the composite pass: swash bitmaps
+/// (placement boxes, colour fallbacks), the traced ink per [`CacheKey`] and faux
+/// variant, and the resolution-independent outlines. Each glyph is extracted at
+/// most once per cache per render.
+struct OnPathInkCaches {
+    swash: SwashCache,
+    ink: HashMap<(CacheKey, u32), CachedGlyphInk>,
+    outlines: OutlineCache,
+}
+
+impl OnPathInkCaches {
+    /// Three empty caches.
+    fn new() -> Self {
+        Self {
+            swash: SwashCache::new(),
+            ink: HashMap::new(),
+            outlines: OutlineCache::new(),
+        }
+    }
+}
+
 /// Per-seed ink geometry: the cached glyph contour plus the seed-specific
 /// scaled vertical placement needed to map the contour into world space.
 #[derive(Debug, Clone)]
@@ -2291,7 +2319,7 @@ struct SeedInkGeometry {
 /// Build (or reuse) the ink geometry for a seed's glyph.
 ///
 /// The ink contour is derived from the glyph's true font outline (cached in
-/// `contour_cache` on a miss). Nothing about the ink is measured from the
+/// `caches.ink` on a miss). Nothing about the ink is measured from the
 /// rasterized bitmap: the bitmap is consulted ONLY for its placement box
 /// (`placement_left`/`placement_top`, size), which pins the contour to the exact
 /// pixels the outline rasterizer draws on. Returns `None` for glyphs with no
@@ -2301,9 +2329,7 @@ struct SeedInkGeometry {
 fn seed_ink_geometry(
     seed: &FormulaGlyphSeed,
     font_system: &mut FontSystem,
-    cache: &mut SwashCache,
-    contour_cache: &mut HashMap<(CacheKey, u32), CachedGlyphInk>,
-    outline_cache: &mut OutlineCache,
+    caches: &mut OnPathInkCaches,
 ) -> Option<SeedInkGeometry> {
     let physical = seed.glyph.physical(
         (
@@ -2317,7 +2343,7 @@ fn seed_ink_geometry(
     // faux span's offset contour never aliases the plain one within a render.
     let ink_key = (key, seed.faux.bold_key_bits());
 
-    // Bitmap placement, copied out before the image borrow of `cache` ends.
+    // Bitmap placement, copied out before the swash image borrow ends.
     // Only the PLACEMENT is read here: the ink itself comes from the outline
     // below, and the spacing target is measured on that contour, so no
     // bitmap-derived ink extent is needed.
@@ -2326,7 +2352,7 @@ fn seed_ink_geometry(
     let glyph_w;
     let glyph_h;
     {
-        let Some(image) = cache.get_image(font_system, key) else {
+        let Some(image) = caches.swash.get_image(font_system, key) else {
             return None;
         };
         let gw = image.placement.width as usize;
@@ -2343,8 +2369,8 @@ fn seed_ink_geometry(
     // Trace the ink contour from the true outline once per distinct glyph key
     // (and faux-bold variant). A glyph with no fillable monochrome outline is
     // treated as "no ink".
-    if let std::collections::hash_map::Entry::Vacant(entry) = contour_cache.entry(ink_key) {
-        let outline = resolve_glyph_outline(seed, font_system, outline_cache)?;
+    if let std::collections::hash_map::Entry::Vacant(entry) = caches.ink.entry(ink_key) {
+        let outline = resolve_glyph_outline(seed, font_system, &mut caches.outlines)?;
         let contour = glyph_contour_from_outline(&outline, CONTOUR_SIMPLIFY_TOLERANCE_PX);
         entry.insert(CachedGlyphInk {
             contour,
@@ -2355,7 +2381,7 @@ fn seed_ink_geometry(
         });
     }
 
-    let cached = contour_cache.get(&ink_key)?;
+    let cached = caches.ink.get(&ink_key)?;
     let src_left = physical.x as f32 + placement_left;
     let src_top = physical.y as f32 - placement_top;
     let (_scaled_left, _scaled_top, _scaled_width, scaled_height) =
@@ -2401,9 +2427,6 @@ fn drawn_line_transform_at(
 /// ([`straight_reference_transform`]) composes the normal offset, rotation,
 /// flip and glyph offset through the very same expression instead of a second
 /// copy of it. The tangent need not be unit length; it is normalized here.
-// The sample is an irreducible list of independent scalars (point + tangent);
-// bundling them into a one-off struct would not add clarity.
-#[allow(clippy::too_many_arguments)]
 fn on_path_transform_from_sample(
     params: &TextRenderParams,
     seed: &FormulaGlyphSeed,
@@ -2496,18 +2519,17 @@ fn place_seed_ink_for_transform(
     );
     let contour = placed_contour_for_transform(
         &geom.contour,
-        geom.placement_left,
-        geom.placement_top,
-        geom.glyph_w,
-        geom.glyph_h,
-        seed.glyph_scale.width_mul,
-        seed.glyph_scale.height_mul,
-        seed.faux.shear_x,
+        GlyphBox {
+            placement_left: geom.placement_left,
+            placement_top: geom.placement_top,
+            glyph_w: geom.glyph_w,
+            glyph_h: geom.glyph_h,
+            scale: seed.glyph_scale,
+            subpixel: geom.subpixel,
+            shear_x: seed.faux.shear_x,
+        },
         geom.scaled_height,
-        layout.line_placement_frac,
-        layout.line_placement_reference,
-        layout.ascent_scaled,
-        geom.subpixel,
+        layout.placement_band(),
         transform,
     );
     PlacedGlyphInk {
@@ -2623,51 +2645,27 @@ fn pair_clearance_floor(straight_prev: &PlacedContour, straight_cur: &PlacedCont
 /// destination center from the on-path transform and reuses
 /// [`glyph_outline_transform`] — the single source of truth for the pivot — so
 /// the measured contour lands on the exact pixels the outline is rasterized to.
-// The geometry is an irreducible list of independent scalars (bitmap
-// placement/size, per-axis scale, scaled ink height, line placement, transform);
-// bundling them into a one-off struct would not add clarity.
-#[allow(clippy::too_many_arguments)]
 fn placed_contour_for_transform(
     contour: &GlyphContour,
-    placement_left: f32,
-    placement_top: f32,
-    glyph_w: f32,
-    glyph_h: f32,
-    width_mul: f32,
-    height_mul: f32,
-    shear_x: f32,
+    glyph_box: GlyphBox,
     scaled_height: f32,
-    line_frac: f32,
-    reference: LinePlacementReference,
-    ascent_scaled: f32,
-    subpixel: [f32; 2],
+    band: LinePlacementBand,
     transform: &DrawnLineTransform,
 ) -> PlacedContour {
     // Same per-glyph scaled top bearing the placement uses to convert baseline->center.
-    let placement_top_scaled = placement_top * height_mul;
+    let placement_top_scaled = glyph_box.placement_top * glyph_box.scale.height_mul;
     let (dst_center_x, dst_center_y) = drawn_line_glyph_destination_center_raw(
         transform,
         scaled_height,
         placement_top_scaled,
-        line_frac,
-        reference,
-        ascent_scaled,
+        band.frac,
+        band.reference,
+        band.ascent_scaled,
     );
     // Same subpixel-corrected pivot (and faux-italic shear) the outline
     // rasterizer uses, so the measured contour matches the drawn ink exactly.
-    let glyph_transform = glyph_outline_transform(
-        dst_center_x,
-        dst_center_y,
-        transform.rotation_rad,
-        placement_left,
-        placement_top,
-        glyph_w,
-        glyph_h,
-        width_mul,
-        height_mul,
-        subpixel,
-        shear_x,
-    );
+    let glyph_transform =
+        glyph_outline_transform(glyph_box, [dst_center_x, dst_center_y], transform.rotation_rad);
     glyph_transform.place_contour(contour)
 }
 
@@ -2689,6 +2687,27 @@ struct CustomLineLayoutSettings {
     /// the glyph `scaled_height`) used by the `LineBox` reference; `0` under
     /// `GlyphHeight` where it is ignored.
     ascent_scaled: f32,
+}
+
+/// Where a glyph sits ACROSS its line: the perpendicular placement fraction in
+/// `[-1, 1]`, the reference band it snaps to, and the shared scaled ascent the
+/// `LineBox` reference reads (ignored under `GlyphHeight`).
+#[derive(Debug, Clone, Copy)]
+struct LinePlacementBand {
+    frac: f32,
+    reference: LinePlacementReference,
+    ascent_scaled: f32,
+}
+
+impl CustomLineLayoutSettings {
+    /// This layout's cross-line placement band.
+    fn placement_band(&self) -> LinePlacementBand {
+        LinePlacementBand {
+            frac: self.line_placement_frac,
+            reference: self.line_placement_reference,
+            ascent_scaled: self.ascent_scaled,
+        }
+    }
 }
 
 fn custom_line_layout_settings(
@@ -3177,30 +3196,24 @@ fn sample_drawn_line_path(path: &DrawnLinePath, target_s: f32) -> Option<(f32, f
     Some((last.x, last.y, last.x - prev.x, last.y - prev.y))
 }
 
-// Formula rendering needs explicit access to the shaped buffer, inline spans and raster bounds.
-#[allow(clippy::too_many_arguments)]
+/// One formula / shape render at canvas margin `render_margin_pad` (the caller
+/// retries with a larger margin while ink touches the edge). `line_placement_frac`
+/// is the mode-gated perpendicular line placement.
 fn render_text_with_formula_layout_once(
-    params: &TextRenderParams,
+    shaping: RunShaping<'_>,
     font_system: &mut FontSystem,
     buffer: &mut Buffer,
-    attrs: &Attrs<'_>,
-    faux_face_baseline: FauxFaceBaseline,
-    inline_style_spans: Option<&[InlineStyleSpan]>,
-    inline_font_registry: &InlineFontRegistry,
-    custom_kerning: &CustomKerningMap,
-    layout_line_offsets: &[usize],
-    font_size_px: f32,
-    base_line_height_px: f32,
-    line_extra_spacing_table: &[f32],
-    // The GLOBAL default extra line spacing the caller built the table around.
-    // Re-deriving it as `line_extra_spacing_table.first()` is wrong: with the
-    // grow-only inline height room, entry 0 can carry extra px that would then be
-    // SUBTRACTED from every later gap in the `has_inline_size_overrides` branch
-    // of `compute_horizontal_line_baselines`, pulling lines closer.
-    default_extra_line_spacing_px: f32,
+    lines: FormulaLines<'_>,
     render_margin_pad: u32,
     line_placement_frac: f32,
 ) -> Result<RenderedTextImage, String> {
+    let RunPen {
+        params,
+        inline_style_spans,
+        font_size_px,
+        ..
+    } = shaping.pen;
+    let base_line_height_px = lines.base_line_height_px;
     let width_px = params.width_px.max(1);
     let formula_program = FormulaProgramBundle::compile(&params.formula_layout)?;
     let mut cache = SwashCache::new();
@@ -3218,27 +3231,14 @@ fn render_text_with_formula_layout_once(
     let extra_active = extra_acc.is_active();
     let has_inline_size_overrides =
         inline_style_spans.is_some_and(spans_have_inline_size_overrides);
-    let line_baselines = compute_horizontal_line_baselines(
-        buffer,
-        base_line_height_px,
-        default_extra_line_spacing_px,
-        line_extra_spacing_table,
-        has_inline_size_overrides,
-    );
+    let line_baselines = lines.baselines(buffer, has_inline_size_overrides);
     let mut seeds = collect_formula_glyph_seeds(
-        params,
+        shaping,
         font_system,
         &mut outline_cache,
         buffer,
-        attrs,
-        faux_face_baseline,
-        inline_style_spans,
-        inline_font_registry,
-        custom_kerning,
-        layout_line_offsets,
-        font_size_px,
-        base_line_height_px,
         line_baselines.as_slice(),
+        base_line_height_px,
     );
     if seeds.is_empty() {
         return Ok(RenderedTextImage::transparent(
@@ -3381,13 +3381,11 @@ fn render_text_with_formula_layout_once(
             );
             include_rotated_rect_bounds(
                 &mut pre_box,
-                padded_left,
-                padded_top,
-                padded_width,
-                padded_height,
-                placed_center_x,
-                placed_center_y,
-                transform.rotation_rad,
+                RotatedRect {
+                    rect: (padded_left, padded_top, padded_width, padded_height),
+                    dst_center: [placed_center_x, placed_center_y],
+                    rotation_rad: transform.rotation_rad,
+                },
             );
         }
         let inv = 1.0 / count.max(1) as f32;
@@ -3453,13 +3451,11 @@ fn render_text_with_formula_layout_once(
         );
         include_rotated_rect_bounds(
             &mut bounds,
-            padded_left,
-            padded_top,
-            padded_width,
-            padded_height,
-            placed_center_x,
-            placed_center_y,
-            transform.rotation_rad,
+            RotatedRect {
+                rect: (padded_left, padded_top, padded_width, padded_height),
+                dst_center: [placed_center_x, placed_center_y],
+                rotation_rad: transform.rotation_rad,
+            },
         );
     }
 
@@ -3594,30 +3590,33 @@ fn render_text_with_formula_layout_once(
         // world space, so it is the outline destination center directly.
         if let Some(outline) = glyph_outline {
             let glyph_transform = glyph_outline_transform(
-                placed_center_x,
-                placed_center_y,
+                GlyphBox {
+                    placement_left,
+                    placement_top,
+                    glyph_w: glyph_w as f32,
+                    glyph_h: glyph_h as f32,
+                    scale: seed.glyph_scale,
+                    subpixel: glyph_subpixel_offset(physical.cache_key),
+                    shear_x: seed.faux.shear_x,
+                },
+                [placed_center_x, placed_center_y],
                 transform.rotation_rad,
-                placement_left,
-                placement_top,
-                glyph_w as f32,
-                glyph_h as f32,
-                seed.glyph_scale.width_mul,
-                seed.glyph_scale.height_mul,
-                glyph_subpixel_offset(physical.cache_key),
-                seed.faux.shear_x,
             );
             rasterize_outline_into(
                 &mut raster_scratch,
-                rgba.as_mut_slice(),
-                out_width as usize,
-                out_height as usize,
-                -(x_offset as f32),
-                -(y_offset as f32),
+                &mut RgbaCanvasView {
+                    rgba: rgba.as_mut_slice(),
+                    width: out_width as usize,
+                    height: out_height as usize,
+                },
+                [-(x_offset as f32), -(y_offset as f32)],
                 &outline,
                 &glyph_transform,
-                seed.text_color,
-                &aa_lut,
-                warp_ctx.as_ref(),
+                OutlinePaint {
+                    color: seed.text_color,
+                    aa_lut: &aa_lut,
+                    warp: warp_ctx.as_ref(),
+                },
             );
             continue;
         }
@@ -3645,15 +3644,11 @@ fn render_text_with_formula_layout_once(
         let (scaled_left, scaled_top, scaled_width, scaled_height) =
             seed.glyph_scale
                 .scaled_rect(src_left, src_top, glyph_w as f32, glyph_h as f32);
-        let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(
-            scaled_left,
-            scaled_top,
-            scaled_width,
-            scaled_height,
-            placed_center_x,
-            placed_center_y,
-            transform.rotation_rad,
-        );
+        let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(RotatedRect {
+            rect: (scaled_left, scaled_top, scaled_width, scaled_height),
+            dst_center: [placed_center_x, placed_center_y],
+            rotation_rad: transform.rotation_rad,
+        });
         let dst_min_x = ((min_x + x_offset as f32).floor() as i32 - 1).max(0);
         let dst_max_x = ((max_x + x_offset as f32).ceil() as i32 + 1).min(out_width as i32);
         let dst_min_y = ((min_y + y_offset as f32).floor() as i32 - 1).max(0);
@@ -3703,53 +3698,36 @@ fn render_text_with_formula_layout_once(
     })
 }
 
-// Shape fallback depends on shaped glyph metrics, formula arc length and inline-size-aware baselines.
-#[allow(clippy::too_many_arguments)]
+/// Why the `Shape` layout cannot draw this text on its formula curve (too short a
+/// curve, too strong a compression), or `None` when it can.
 fn detect_shape_layout_fallback_reason(
-    params: &TextRenderParams,
+    shaping: RunShaping<'_>,
     font_system: &mut FontSystem,
     buffer: &mut Buffer,
-    attrs: &Attrs<'_>,
-    faux_face_baseline: FauxFaceBaseline,
-    inline_style_spans: Option<&[InlineStyleSpan]>,
-    inline_font_registry: &InlineFontRegistry,
-    custom_kerning: &CustomKerningMap,
-    layout_line_offsets: &[usize],
-    font_size_px: f32,
-    base_line_height_px: f32,
-    line_extra_spacing_table: &[f32],
-    // The GLOBAL default the table was built around; see
-    // `render_text_with_formula_layout_once`.
-    default_extra_line_spacing_px: f32,
+    lines: FormulaLines<'_>,
 ) -> Result<Option<String>, String> {
+    let RunPen {
+        params,
+        inline_style_spans,
+        font_size_px,
+        ..
+    } = shaping.pen;
+    let base_line_height_px = lines.base_line_height_px;
     let has_inline_size_overrides =
         inline_style_spans.is_some_and(spans_have_inline_size_overrides);
-    let line_baselines = compute_horizontal_line_baselines(
-        buffer,
-        base_line_height_px,
-        default_extra_line_spacing_px,
-        line_extra_spacing_table,
-        has_inline_size_overrides,
-    );
+    let line_baselines = lines.baselines(buffer, has_inline_size_overrides);
     // This probe only measures shaped advances, but the seeds it builds carry a
     // resolved faux style, so it needs an outline cache of its own. It stays EMPTY
     // unless faux bold in the counter-preserving mode is active (the only case
     // that looks a glyph up), so the no-faux probe costs exactly nothing.
     let mut outline_cache = OutlineCache::new();
     let seeds = collect_formula_glyph_seeds(
-        params,
+        shaping,
         font_system,
         &mut outline_cache,
         buffer,
-        attrs,
-        faux_face_baseline,
-        inline_style_spans,
-        inline_font_registry,
-        custom_kerning,
-        layout_line_offsets,
-        font_size_px,
-        base_line_height_px,
         line_baselines.as_slice(),
+        base_line_height_px,
     );
     if seeds.len() <= 1 {
         return Ok(None);
@@ -3809,23 +3787,25 @@ fn detect_shape_layout_fallback_reason(
     }
 }
 
-// Formula seed collection needs the shaped buffer, inline spans and soft-hyphen reconstruction.
-#[allow(clippy::too_many_arguments)]
+/// One seed per shaped glyph (plus the synthesized wrap hyphen) with every inline
+/// override resolved and its line origin (`line_baselines`, falling back to the
+/// run's own baseline at `base_line_height_px`); advances are assigned afterwards
+/// by `assign_formula_seed_advances`.
 fn collect_formula_glyph_seeds(
-    params: &TextRenderParams,
+    shaping: RunShaping<'_>,
     font_system: &mut FontSystem,
     outline_cache: &mut OutlineCache,
     buffer: &mut Buffer,
-    attrs: &Attrs<'_>,
-    faux_face_baseline: FauxFaceBaseline,
-    inline_style_spans: Option<&[InlineStyleSpan]>,
-    inline_font_registry: &InlineFontRegistry,
-    custom_kerning: &CustomKerningMap,
-    layout_line_offsets: &[usize],
-    font_size_px: f32,
-    base_line_height_px: f32,
     line_baselines: &[f32],
+    base_line_height_px: f32,
 ) -> Vec<FormulaGlyphSeed> {
+    let RunPen {
+        params,
+        inline_style_spans,
+        layout_line_offsets,
+        custom_kerning,
+        font_size_px,
+    } = shaping.pen;
     let width_px = params.width_px.max(1);
     let has_inline_size_overrides =
         inline_style_spans.is_some_and(spans_have_inline_size_overrides);
@@ -3958,18 +3938,8 @@ fn collect_formula_glyph_seeds(
         }
 
         if run_wraps_at_soft_hyphen(&run, runs.peek())
-            && let Some(mut hyphen_glyph) = build_wrapped_hyphen_glyph(
-                font_system,
-                attrs,
-                faux_face_baseline,
-                inline_style_spans,
-                inline_font_registry,
-                layout_line_offsets,
-                &run,
-                runs.peek(),
-                font_size_px,
-                base_line_height_px,
-            )
+            && let Some(mut hyphen_glyph) =
+                build_wrapped_hyphen_glyph(font_system, shaping, &run, runs.peek())
         {
             hyphen_glyph.x = trailing_hyphen_x(&run);
             let glyph_idx_in_line = line_seen
@@ -4224,68 +4194,11 @@ fn assign_formula_seed_advances(
     }
 }
 
-fn compute_layout_line_offsets(text: &str) -> Vec<usize> {
-    let mut offsets = vec![0usize];
-    for (idx, ch) in text.char_indices() {
-        if ch == '\n' {
-            offsets.push(idx + ch.len_utf8());
-        }
-    }
-    offsets
-}
 
-/// Resolve per-line alignment from inline style spans, falling back to the block alignment.
-fn compute_inline_line_aligns(
-    base_align: HorizontalAlign,
-    layout_line_offsets: &[usize],
-    inline_style_spans: Option<&[InlineStyleSpan]>,
-) -> Vec<HorizontalAlign> {
-    let Some(spans) = inline_style_spans else {
-        return vec![base_align; layout_line_offsets.len().max(1)];
-    };
-    layout_line_offsets
-        .iter()
-        .map(|offset| {
-            inline_style_at_offset(spans, *offset)
-                .and_then(|span| span.align)
-                .unwrap_or(base_align)
-        })
-        .collect()
-}
 
-fn spans_have_inline_size_overrides(spans: &[InlineStyleSpan]) -> bool {
-    spans.iter().any(|span| span.font_size_px.is_some())
-}
 
-fn inline_text_color_at_offset(
-    default_text_color: [u8; 4],
-    spans: Option<&[InlineStyleSpan]>,
-    offset: usize,
-) -> [u8; 4] {
-    spans
-        .and_then(|value| inline_style_at_offset(value, offset))
-        .and_then(|style| style.text_color)
-        .unwrap_or(default_text_color)
-}
 
-fn inline_text_color_for_glyph(
-    default_text_color: [u8; 4],
-    spans: Option<&[InlineStyleSpan]>,
-    layout_line_offsets: &[usize],
-    line_idx: usize,
-    glyph: &LayoutGlyph,
-) -> [u8; 4] {
-    let line_offset = layout_line_offsets.get(line_idx).copied().unwrap_or(0);
-    inline_text_color_at_offset(
-        default_text_color,
-        spans,
-        line_offset + glyph.start.min(glyph.end),
-    )
-}
 
-fn inline_glyph_offset_at_offset(spans: Option<&[InlineStyleSpan]>, offset: usize) -> [f32; 2] {
-    inline_glyph_offset_style_at_offset(spans, offset).global_px
-}
 
 fn glyph_style_offset(
     layout_line_offsets: &[usize],
@@ -4295,265 +4208,21 @@ fn glyph_style_offset(
     layout_line_offsets.get(line_idx).copied().unwrap_or(0) + glyph.start.min(glyph.end)
 }
 
-fn inline_glyph_offset_style_at_offset(
-    spans: Option<&[InlineStyleSpan]>,
-    offset: usize,
-) -> InlineGlyphOffset {
-    spans
-        .and_then(|value| inline_style_at_offset(value, offset))
-        .and_then(|style| style.glyph_offset)
-        .unwrap_or_else(|| InlineGlyphOffset::global_only([0.0, 0.0]))
-}
 
-fn inline_glyph_offset_span_at_offset(
-    spans: Option<&[InlineStyleSpan]>,
-    offset: usize,
-) -> Option<(usize, usize)> {
-    spans
-        .and_then(|value| inline_style_at_offset(value, offset))
-        .filter(|style| style.glyph_offset.is_some())
-        .map(|style| (style.start, style.end))
-}
 
-fn inline_glyph_offset_style_for_glyph(
-    spans: Option<&[InlineStyleSpan]>,
-    layout_line_offsets: &[usize],
-    line_idx: usize,
-    glyph: &LayoutGlyph,
-) -> InlineGlyphOffset {
-    inline_glyph_offset_style_at_offset(
-        spans,
-        glyph_style_offset(layout_line_offsets, line_idx, glyph),
-    )
-}
 
-fn inline_glyph_offset_span_for_glyph(
-    spans: Option<&[InlineStyleSpan]>,
-    layout_line_offsets: &[usize],
-    line_idx: usize,
-    glyph: &LayoutGlyph,
-) -> Option<(usize, usize)> {
-    inline_glyph_offset_span_at_offset(
-        spans,
-        glyph_style_offset(layout_line_offsets, line_idx, glyph),
-    )
-}
 
-fn inline_glyph_offset_for_glyph(
-    spans: Option<&[InlineStyleSpan]>,
-    layout_line_offsets: &[usize],
-    line_idx: usize,
-    glyph: &LayoutGlyph,
-) -> [f32; 2] {
-    inline_glyph_offset_style_for_glyph(spans, layout_line_offsets, line_idx, glyph).global_px
-}
 
-fn inline_glyph_scale_at_offset(
-    params: &TextRenderParams,
-    spans: Option<&[InlineStyleSpan]>,
-    offset: usize,
-) -> GlyphScaleSettings {
-    let stretch = spans
-        .and_then(|value| inline_style_at_offset(value, offset))
-        .and_then(|style| style.glyph_stretch_percent)
-        .unwrap_or([params.glyph_width_percent, params.glyph_height_percent]);
-    GlyphScaleSettings {
-        width_mul: (stretch[0] / 100.0).clamp(0.01, 3.0),
-        height_mul: (stretch[1] / 100.0).clamp(0.01, 3.0),
-    }
-}
 
-fn inline_glyph_scale_for_glyph(
-    params: &TextRenderParams,
-    spans: Option<&[InlineStyleSpan]>,
-    layout_line_offsets: &[usize],
-    line_idx: usize,
-    glyph: &LayoutGlyph,
-) -> GlyphScaleSettings {
-    let line_offset = layout_line_offsets.get(line_idx).copied().unwrap_or(0);
-    inline_glyph_scale_at_offset(params, spans, line_offset + glyph.start.min(glyph.end))
-}
 
-fn inline_kerning_at_offset(
-    params: &TextRenderParams,
-    spans: Option<&[InlineStyleSpan]>,
-    offset: usize,
-) -> KerningSettings {
-    let style = spans.and_then(|value| inline_style_at_offset(value, offset));
-    let stretch_x_percent = style
-        .and_then(|value| value.glyph_stretch_percent)
-        .map(|value| value[0])
-        .unwrap_or(params.glyph_width_percent);
-    let kerning_percent = style
-        .and_then(|value| value.kerning_percent)
-        .unwrap_or(params.kerning_percent);
-    KerningSettings {
-        mode: params.kerning_mode,
-        spacing_px: style
-            .and_then(|value| value.kerning_px)
-            .unwrap_or(params.kerning_px)
-            .clamp(-300.0, 300.0),
-        spacing_percent: effective_spacing_percent(kerning_percent, stretch_x_percent),
-        // Purely style-driven; the per-FONT override flag is stamped on afterwards
-        // by `with_custom_pairs`, which is the only thing that knows the face.
-        custom_pairs: false,
-    }
-}
 
-fn inline_kerning_for_glyph(
-    params: &TextRenderParams,
-    spans: Option<&[InlineStyleSpan]>,
-    layout_line_offsets: &[usize],
-    line_idx: usize,
-    glyph: &LayoutGlyph,
-) -> KerningSettings {
-    let line_offset = layout_line_offsets.get(line_idx).copied().unwrap_or(0);
-    inline_kerning_at_offset(params, spans, line_offset + glyph.start.min(glyph.end))
-}
 
-fn inline_style_at_offset(spans: &[InlineStyleSpan], offset: usize) -> Option<&InlineStyleSpan> {
-    spans
-        .iter()
-        .find(|span| span.start <= offset && offset < span.end)
-}
 
-fn build_hard_hyphen_glyph(
-    font_system: &mut FontSystem,
-    attrs: &Attrs<'_>,
-    font_size_px: f32,
-    line_height_px: f32,
-) -> Option<LayoutGlyph> {
-    let mut buffer = Buffer::new(
-        font_system,
-        Metrics::new(font_size_px.max(1.0), line_height_px.max(1.0)),
-    );
-    buffer.set_size(font_system, None, None);
-    buffer.set_text(font_system, "-", attrs, Shaping::Advanced);
-    buffer.shape_until_scroll(font_system, false);
-    buffer
-        .layout_runs()
-        .next()
-        .and_then(|run| run.glyphs.first().cloned())
-}
 
-// Wrapped hyphen synthesis depends on shaped line boundaries, inline attrs and fallback font selection.
-#[allow(clippy::too_many_arguments)]
-fn build_wrapped_hyphen_glyph(
-    font_system: &mut FontSystem,
-    base_attrs: &Attrs<'_>,
-    faux_face_baseline: FauxFaceBaseline,
-    inline_style_spans: Option<&[InlineStyleSpan]>,
-    inline_font_registry: &InlineFontRegistry,
-    layout_line_offsets: &[usize],
-    run: &LayoutRun<'_>,
-    next: Option<&LayoutRun<'_>>,
-    font_size_px: f32,
-    line_height_px: f32,
-) -> Option<LayoutGlyph> {
-    let hyphen_attrs = wrapped_hyphen_attrs(
-        base_attrs,
-        faux_face_baseline,
-        inline_style_spans,
-        inline_font_registry,
-        layout_line_offsets,
-        run,
-        next,
-    );
-    let hyphen_attrs = hyphen_attrs.as_attrs();
-    build_hard_hyphen_glyph(font_system, &hyphen_attrs, font_size_px, line_height_px)
-}
 
-/// Attrs of the synthesized wrap hyphen: `base_attrs` plus the inline style
-/// active at the consumed soft hyphen. `faux_face_baseline` is the selected
-/// face's weight/style a faux span falls back to, so the hyphen matches exactly
-/// the same face as the text around it.
-fn wrapped_hyphen_attrs<'a>(
-    base_attrs: &Attrs<'a>,
-    faux_face_baseline: FauxFaceBaseline,
-    inline_style_spans: Option<&[InlineStyleSpan]>,
-    inline_font_registry: &InlineFontRegistry,
-    layout_line_offsets: &[usize],
-    run: &LayoutRun<'_>,
-    next: Option<&LayoutRun<'_>>,
-) -> AttrsOwned {
-    let Some(spans) = inline_style_spans else {
-        return AttrsOwned::new(base_attrs);
-    };
-    let Some(style_offset) = soft_hyphen_style_offset(run, next, layout_line_offsets) else {
-        return AttrsOwned::new(base_attrs);
-    };
-    let Some(style) = inline_style_at_offset(spans, style_offset) else {
-        return AttrsOwned::new(base_attrs);
-    };
-    apply_inline_style_to_attrs(base_attrs, style, inline_font_registry, faux_face_baseline)
-}
 
-fn soft_hyphen_style_offset(
-    run: &LayoutRun<'_>,
-    next: Option<&LayoutRun<'_>>,
-    layout_line_offsets: &[usize],
-) -> Option<usize> {
-    let next_run = next?;
-    if next_run.line_i != run.line_i {
-        return None;
-    }
 
-    let line_offset = layout_line_offsets.get(run.line_i).copied().unwrap_or(0);
-    let last_glyph = run.glyphs.last()?;
-    let next_first_glyph = next_run.glyphs.first()?;
-    let end = last_glyph.end.min(run.text.len());
-    let next_start = next_first_glyph.start.min(run.text.len());
 
-    if next_start >= end
-        && let Some(slice) = run.text.get(end..next_start)
-        && let Some(rel_idx) = slice.find(SOFT_HYPHEN)
-    {
-        return Some(line_offset + end + rel_idx);
-    }
-
-    run.text[..end]
-        .rfind(SOFT_HYPHEN)
-        .filter(|idx| *idx < end)
-        .map(|idx| line_offset + idx)
-}
-
-fn run_wraps_at_soft_hyphen(run: &LayoutRun<'_>, next: Option<&LayoutRun<'_>>) -> bool {
-    let Some(next_run) = next else {
-        return false;
-    };
-    if next_run.line_i != run.line_i {
-        return false;
-    }
-
-    let Some(last_glyph) = run.glyphs.last() else {
-        return false;
-    };
-    let Some(next_first_glyph) = next_run.glyphs.first() else {
-        return false;
-    };
-
-    let end = last_glyph.end.min(run.text.len());
-    let next_start = next_first_glyph.start.min(run.text.len());
-    if next_start >= end {
-        if let Some(slice) = run.text.get(end..next_start)
-            && slice.contains(SOFT_HYPHEN)
-        {
-            return true;
-        }
-        if run.text[..end].ends_with(SOFT_HYPHEN) {
-            return true;
-        }
-    }
-    false
-}
-
-fn trailing_hyphen_x(run: &LayoutRun<'_>) -> f32 {
-    let mut right = run.line_w;
-    for glyph in run.glyphs {
-        right = right.max(glyph.x + glyph.w);
-    }
-    right
-}
 
 fn image_has_alpha_on_edge(image: &RenderedTextImage, inset_px: u32) -> bool {
     if image.width == 0 || image.height == 0 {
@@ -4663,9 +4332,11 @@ fn build_formula_arc_length_table(
         .collect())
 }
 
-// Formula rotated bounds are clearer with explicit source/destination coordinates than with
-// a one-off wrapper struct used only by this helper.
-#[allow(clippy::too_many_arguments)]
+/// The formula seeds' own `Optical` nudge (px) for one pair, from the two glyphs'
+/// bitmap ink profiles: pulls the pair's ink gap toward a size-relative target,
+/// clamped; `0.0` for a non-positive or non-finite `metric_advance` and for
+/// nudges under a quarter pixel. Not the shared `optical.rs` formula (a kept
+/// divergence, see MODULE_README).
 fn optical_horizontal_pair_adjustment(
     prev: GlyphInkProfile,
     next: GlyphInkProfile,
@@ -4756,8 +4427,9 @@ fn glyph_ink_profile_from_image(
 #[cfg(test)]
 mod tests {
     use super::{
-        DrawnLineDropSide, DrawnLineTransform, FormulaGlyphSeed, GlyphScaleSettings,
-        HorizontalAlign, KerningSettings, LinePlacementReference, OnPathStepSpacing,
+        DrawnLineDropSide, DrawnLineTransform, FormulaGlyphSeed, GlyphBox, GlyphScaleSettings,
+        HorizontalAlign, KerningSettings, LinePlacementBand, LinePlacementReference,
+        OnPathStepSpacing,
         apply_line_placement,
         drawn_line_center_s, drawn_line_drop_side, drawn_line_glyph_destination_center_raw,
         drawn_line_next_cursor, drawn_line_start_offset, drawn_line_start_offsets,
@@ -4775,7 +4447,7 @@ mod tests {
     use crate::glyph_contour::{
         GlyphContour, PlacedContour, min_placed_distance,
     };
-    use crate::raster::rotated_rect_world_bounds;
+    use crate::raster::{RotatedRect, rotated_rect_world_bounds};
     use crate::types::TextVectorLineTextDirection;
 
     /// Axis-aligned square contour of side `2 * half` centered on the origin.
@@ -5572,30 +5244,32 @@ mod tests {
             LinePlacementReference::GlyphHeight,
             0.0,
         );
-        let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(
-            scaled_left,
-            scaled_top,
-            scaled_width,
-            scaled_height,
-            dst_cx,
-            dst_cy,
-            transform.rotation_rad,
-        );
+        let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(RotatedRect {
+            rect: (scaled_left, scaled_top, scaled_width, scaled_height),
+            dst_center: [dst_cx, dst_cy],
+            rotation_rad: transform.rotation_rad,
+        });
 
         let placed = placed_contour_for_transform(
             &contour,
-            placement_left,
-            placement_top,
-            glyph_w,
-            glyph_h,
-            width_mul,
-            height_mul,
-            0.0,
+            GlyphBox {
+                placement_left,
+                placement_top,
+                glyph_w,
+                glyph_h,
+                scale: GlyphScaleSettings {
+                    width_mul,
+                    height_mul,
+                },
+                subpixel: [0.0, 0.0],
+                shear_x: 0.0,
+            },
             scaled_height,
-            line_frac,
-            LinePlacementReference::GlyphHeight,
-            0.0,
-            [0.0, 0.0],
+            LinePlacementBand {
+                frac: line_frac,
+                reference: LinePlacementReference::GlyphHeight,
+                ascent_scaled: 0.0,
+            },
             &transform,
         );
 
@@ -6008,12 +5682,11 @@ mod tests {
         assert!((last_end - 80.0).abs() < 1e-3, "run length={last_end}");
     }
 
-    /// Fixture font for the seed-advance contract: the same Liberation Sans the
-    /// pipeline tests use. A test binary cannot reach the shipped `fonts/ui` bundle,
+    /// Fixture font for the seed-advance contract: the same tracked Arimo caller font
+    /// the pipeline tests use (`crate::test_fixtures`). A test binary cannot reach the shipped `fonts/ui` bundle,
     /// and this contract is about the advance arithmetic, not about the bundle.
     fn seed_fixture_font_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf")
+        crate::test_fixtures::caller_font_path()
     }
 
     /// Shapes `text` with the fixture font and turns its first layout run into the
@@ -6256,9 +5929,7 @@ mod tests {
         let params = min_distance_line_params();
         let layout = super::custom_line_layout_settings(&params, 0.0, 0.0);
         let spacing = OnPathStepSpacing::for_custom_lines(1.0, 0.0);
-        let mut cache = cosmic_text::SwashCache::new();
-        let mut contour_cache = std::collections::HashMap::new();
-        let mut outline_cache = crate::vector::OutlineCache::new();
+        let mut caches = super::OnPathInkCaches::new();
         super::straight_reference_target_gaps(
             &params,
             seeds.as_slice(),
@@ -6266,9 +5937,7 @@ mod tests {
             spacing,
             &custom_kerning,
             &mut font_system,
-            &mut cache,
-            &mut contour_cache,
-            &mut outline_cache,
+            &mut caches,
         )
         .get(&0)
         .copied()
@@ -6326,9 +5995,7 @@ mod tests {
         if let Some(line) = params.vector_lines_layout.lines.first_mut() {
             line.distance_mode = distance_mode;
         }
-        let mut cache = cosmic_text::SwashCache::new();
-        let mut contour_cache = std::collections::HashMap::new();
-        let mut outline_cache = crate::vector::OutlineCache::new();
+        let mut caches = super::OnPathInkCaches::new();
         let paths = vec![Some(path.clone())];
         super::build_drawn_line_transforms(
             &params,
@@ -6336,11 +6003,8 @@ mod tests {
             paths.as_slice(),
             &custom_kerning,
             &mut font_system,
-            &mut cache,
-            &mut contour_cache,
-            &mut outline_cache,
-            0.0,
-            0.0,
+            &mut caches,
+            super::custom_line_layout_settings(&params, 0.0, 0.0),
         )
     }
 
@@ -6357,9 +6021,7 @@ mod tests {
     ) -> Vec<f32> {
         let (mut font_system, custom_kerning, seeds) = min_distance_fixture(text, pairs);
         let params = min_distance_line_params();
-        let mut cache = cosmic_text::SwashCache::new();
-        let mut contour_cache = std::collections::HashMap::new();
-        let mut outline_cache = crate::vector::OutlineCache::new();
+        let mut caches = super::OnPathInkCaches::new();
         let paths = vec![Some(path.clone())];
         let transforms = super::build_drawn_line_transforms(
             &params,
@@ -6367,11 +6029,8 @@ mod tests {
             paths.as_slice(),
             &custom_kerning,
             &mut font_system,
-            &mut cache,
-            &mut contour_cache,
-            &mut outline_cache,
-            0.0,
-            0.0,
+            &mut caches,
+            super::custom_line_layout_settings(&params, 0.0, 0.0),
         );
         let centers = transforms
             .iter()
@@ -6439,9 +6098,7 @@ mod tests {
             line.distance_mode = distance_mode;
         }
         let layout = super::custom_line_layout_settings(&params, 0.0, 0.0);
-        let mut cache = cosmic_text::SwashCache::new();
-        let mut contour_cache = std::collections::HashMap::new();
-        let mut outline_cache = crate::vector::OutlineCache::new();
+        let mut caches = super::OnPathInkCaches::new();
         let paths = vec![Some(path.clone())];
         let transforms = super::build_drawn_line_transforms(
             &params,
@@ -6449,11 +6106,8 @@ mod tests {
             paths.as_slice(),
             &custom_kerning,
             &mut font_system,
-            &mut cache,
-            &mut contour_cache,
-            &mut outline_cache,
-            0.0,
-            0.0,
+            &mut caches,
+            super::custom_line_layout_settings(&params, 0.0, 0.0),
         );
 
         let mut gaps = Vec::new();
@@ -6465,9 +6119,7 @@ mod tests {
             let ink = super::seed_ink_geometry(
                 seed,
                 &mut font_system,
-                &mut cache,
-                &mut contour_cache,
-                &mut outline_cache,
+                &mut caches,
             )
             .map(|geom| super::place_seed_ink_for_transform(seed, &geom, &layout, placed));
             if let (Some(prev), Some(cur)) = (previous.as_ref(), ink.as_ref())

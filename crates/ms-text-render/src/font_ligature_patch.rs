@@ -953,10 +953,9 @@ mod tests {
 
     #[test]
     fn a_font_without_the_rule_is_returned_untouched() {
-        // Liberation Sans has a GSUB but no ligature producing the ellipsis, so
+        // The Arimo fixture has a GSUB but no ligature producing the ellipsis, so
         // it must take the no-copy fast path.
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf");
+        let path = crate::test_fixtures::caller_font_path();
         let Ok(bytes) = std::fs::read(&path) else {
             eprintln!(
                 "skipping a_font_without_the_rule_is_returned_untouched: {} is missing",
@@ -968,7 +967,7 @@ mod tests {
             remove_ellipsis_ligatures(&bytes).err(),
             Some(EllipsisPatchSkip::NoLigatureProducesEllipsis)
         );
-        assert_patch_invariants("LiberationSans-Regular", &bytes);
+        assert_patch_invariants("Arimo-Regular", &bytes);
     }
 
     #[test]

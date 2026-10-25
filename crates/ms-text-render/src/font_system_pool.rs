@@ -619,8 +619,7 @@ mod tests {
     /// Returns the path to a real font fixture so the test exercises actual
     /// fontdb loading, not a mock. Same fixture the pipeline tests use.
     fn test_font_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf")
+        crate::test_fixtures::caller_font_path()
     }
 
     /// Builds a `FontContent` over the fixture bytes with an EXPLICIT `content_id`

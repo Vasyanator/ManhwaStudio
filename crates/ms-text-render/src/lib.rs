@@ -24,6 +24,8 @@ Public surface:
 // Test-only: the recorded pen / seed characterization matrices (fixtures under `tests/fixtures/`).
 #[cfg(test)]
 mod characterization;
+#[cfg(test)]
+mod test_fixtures;
 pub mod drawn_lines;
 mod effects;
 mod extra_info;
@@ -151,19 +153,13 @@ const _: fn(&glyph_contour::PlacedContour, &glyph_contour::PlacedContour) -> f32
 // at runtime. See `vector.rs` and `VECTOR_ENGINE_REFACTOR.md`.
 const _: fn(&mut swash::scale::ScaleContext, &swash::FontRef, u16, f32) -> Option<vector::Outline> =
     vector::extract_glyph_outline;
-#[allow(clippy::type_complexity)]
 const _: fn(
     &mut vector::RasterScratch,
-    &mut [u8],
-    usize,
-    usize,
-    f32,
-    f32,
+    &mut raster::RgbaCanvasView<'_>,
+    [f32; 2],
     &vector::Outline,
     &vector::GlyphTransform,
-    [u8; 4],
-    &[u8; 256],
-    Option<&vector::MeshWarpContext>,
+    vector::OutlinePaint<'_>,
 ) = vector::rasterize_outline_into;
 const _: fn() -> vector::RasterScratch = vector::RasterScratch::new;
 const _: fn(types::AntiAliasingMode) -> [u8; 256] = vector::build_aa_lut;

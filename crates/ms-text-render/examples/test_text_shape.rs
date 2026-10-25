@@ -331,7 +331,6 @@ fn wrap_text_with_targets(
     out
 }
 
-#[allow(clippy::too_many_arguments)]
 fn solve_wrap_paragraph_dp(
     remaining_blocks: Vec<WrapBlock>,
     line_idx: usize,
@@ -476,7 +475,6 @@ fn apply_line_break_candidate(
     remaining
 }
 
-#[allow(clippy::too_many_arguments)]
 fn compute_line_fit_penalty(
     line_unit_targets: Option<&[usize]>,
     base_units: usize,
