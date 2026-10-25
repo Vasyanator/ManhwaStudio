@@ -2451,25 +2451,29 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r0",
-            "Bottom",
-            true,
-            1.0,
-            tf(10.0, 20.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r0",
+                name: "Bottom",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(10.0, 20.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r1",
-            "Top",
-            false,
-            0.5,
-            tf(30.0, 40.0, 2.0),
-            &img([3, 3], Color32::BLUE),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r1",
+                name: "Top",
+                visible: false,
+                opacity: 0.5,
+                transform: tf(30.0, 40.0, 2.0),
+                image: &img([3, 3], Color32::BLUE),
+            },
         )
         .unwrap();
 
@@ -2504,13 +2508,15 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r",
-            "Raster",
-            true,
-            1.0,
-            tf(0.0, 0.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r",
+                name: "Raster",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(0.0, 0.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
 
@@ -2578,13 +2584,15 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r",
-            "Pic",
-            true,
-            1.0,
-            tf(1.0, 1.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r",
+                name: "Pic",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(1.0, 1.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
 
@@ -2620,25 +2628,29 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r0",
-            "A",
-            true,
-            1.0,
-            tf(0.0, 0.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r0",
+                name: "A",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(0.0, 0.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r1",
-            "B",
-            true,
-            1.0,
-            tf(0.0, 0.0, 1.0),
-            &img([2, 2], Color32::BLUE),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r1",
+                name: "B",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(0.0, 0.0, 1.0),
+                image: &img([2, 2], Color32::BLUE),
+            },
         )
         .unwrap();
 
@@ -2673,13 +2685,15 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r",
-            "Pic",
-            true,
-            1.0,
-            tf(1.0, 1.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r",
+                name: "Pic",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(1.0, 1.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
 
@@ -2746,13 +2760,15 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r",
-            "Pic",
-            true,
-            1.0,
-            tf(1.0, 1.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r",
+                name: "Pic",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(1.0, 1.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
 
@@ -2812,13 +2828,15 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r",
-            "Pic",
-            true,
-            1.0,
-            tf(1.0, 1.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r",
+                name: "Pic",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(1.0, 1.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
 
@@ -2885,25 +2903,29 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r0",
-            "A",
-            true,
-            1.0,
-            tf(0.0, 0.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r0",
+                name: "A",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(0.0, 0.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r1",
-            "B",
-            true,
-            1.0,
-            tf(0.0, 0.0, 1.0),
-            &img([2, 2], Color32::BLUE),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r1",
+                name: "B",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(0.0, 0.0, 1.0),
+                image: &img([2, 2], Color32::BLUE),
+            },
         )
         .unwrap();
 
@@ -3054,7 +3076,6 @@ mod tests {
     /// inline `render_data`) onto page 0 of an existing `layers.json`, for the legacy-load tests. The
     /// production text writer (`write_page_text_payload`) always writes the inline v3 payload, so it
     /// can't produce a reference-only node; this mutates the manifest JSON directly.
-    #[allow(clippy::too_many_arguments)]
     fn add_legacy_text_ref_node(
         dir: &std::path::Path,
         uid: &str,
@@ -3115,13 +3136,15 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r0",
-            "R",
-            true,
-            1.0,
-            tf(50.0, 50.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r0",
+                name: "R",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(50.0, 50.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
         // Both groups at the SAME band Z = 5 (degenerate; normally distinct).
@@ -3191,13 +3214,15 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r0",
-            "R",
-            true,
-            1.0,
-            tf(50.0, 50.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r0",
+                name: "R",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(50.0, 50.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
         // Text group 0 band ABOVE the raster (z = 5). Three unpinned members.
@@ -3275,13 +3300,15 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r0",
-            "R",
-            true,
-            1.0,
-            tf(50.0, 50.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r0",
+                name: "R",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(50.0, 50.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
         add_legacy_text_ref_node(&dir, "t0", 5, 0, true, true, 1.0);
@@ -3358,13 +3385,15 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r0",
-            "R",
-            true,
-            1.0,
-            tf(50.0, 50.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r0",
+                name: "R",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(50.0, 50.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
         add_legacy_text_ref_node(&dir, "t0", 5, 0, true, true, 1.0);
@@ -3427,13 +3456,15 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r0",
-            "Bottom",
-            true,
-            1.0,
-            tf(10.0, 20.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r0",
+                name: "Bottom",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(10.0, 20.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
 
@@ -3622,13 +3653,15 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r0",
-            "Bottom",
-            true,
-            1.0,
-            tf(0.0, 0.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r0",
+                name: "Bottom",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(0.0, 0.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
         // A text node whose payload has no matching text_info.json entry → skipped (warned).
@@ -3875,13 +3908,15 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r0",
-            "Pic",
-            true,
-            1.0,
-            tf(5.0, 5.0, 1.0),
-            &img([2, 2], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r0",
+                name: "Pic",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(5.0, 5.0, 1.0),
+                image: &img([2, 2], Color32::RED),
+            },
         )
         .unwrap();
         let mut doc = LayerDoc::new();
@@ -4783,7 +4818,7 @@ mod tests {
     #[test]
     fn set_group_meta_round_trips_through_flush_and_the_saver() {
         let dir = temp_dir("group_meta");
-        persist::add_page_raster(&dir, None, 0, "r", "Pic", true, 1.0, tf(1.0, 1.0, 1.0), &img([2, 2], Color32::RED))
+        persist::add_page_raster(&dir, None, &persist::PageRasterSpec { page_idx: 0, uid: "r", name: "Pic", visible: true, opacity: 1.0, transform: tf(1.0, 1.0, 1.0), image: &img([2, 2], Color32::RED) })
             .unwrap();
         let mut doc = LayerDoc::new();
         doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100])).unwrap();
@@ -5032,13 +5067,15 @@ mod tests {
         persist::add_page_raster(
             &dir,
             None,
-            0,
-            "r0",
-            "R",
-            true,
-            1.0,
-            tf(50.0, 50.0, 1.0),
-            &img([3, 3], Color32::RED),
+            &persist::PageRasterSpec {
+                page_idx: 0,
+                uid: "r0",
+                name: "R",
+                visible: true,
+                opacity: 1.0,
+                transform: tf(50.0, 50.0, 1.0),
+                image: &img([3, 3], Color32::RED),
+            },
         )
         .unwrap();
         add_text_group_band(&dir, 0, 5);
@@ -5394,7 +5431,7 @@ mod tests {
     fn enqueue_page_save_dropping_raster_removes_it_from_disk() {
         let dir = temp_dir("enqueue_drop_raster");
         for (uid, c) in [("r0", Color32::RED), ("r1", Color32::BLUE)] {
-            persist::add_page_raster(&dir, None, 0, uid, uid, true, 1.0, tf(0.0, 0.0, 1.0), &img([2, 2], c)).expect("seed raster");
+            persist::add_page_raster(&dir, None, &persist::PageRasterSpec { page_idx: 0, uid, name: uid, visible: true, opacity: 1.0, transform: tf(0.0, 0.0, 1.0), image: &img([2, 2], c) }).expect("seed raster");
         }
         let mut doc = LayerDoc::new();
         doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100])).expect("load");
@@ -5421,7 +5458,7 @@ mod tests {
     fn structural_ack_does_not_settle_unwritten_raster_pixels() {
         let dir = temp_dir("structural_ack");
         for uid in ["a", "b"] {
-            persist::add_page_raster(&dir, None, 0, uid, uid, true, 1.0, tf(0.0, 0.0, 1.0), &img([2, 2], Color32::RED)).expect("seed raster");
+            persist::add_page_raster(&dir, None, &persist::PageRasterSpec { page_idx: 0, uid, name: uid, visible: true, opacity: 1.0, transform: tf(0.0, 0.0, 1.0), image: &img([2, 2], Color32::RED) }).expect("seed raster");
         }
         let mut doc = LayerDoc::new();
         doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100])).expect("load");
@@ -5490,7 +5527,7 @@ mod tests {
             assert!(!doc.has_pending_saves());
         } else {
             doc.flush_page_text(3, &unsaved, Some(&committed)).expect("pre-flush text");
-            persist::add_page_raster(&unsaved, Some(&committed), 3, "img1", "Картинка", true, 1.0, transform, &pic).expect("add raster");
+            persist::add_page_raster(&unsaved, Some(&committed), &persist::PageRasterSpec { page_idx: 3, uid: "img1", name: "Картинка", visible: true, opacity: 1.0, transform, image: &pic }).expect("add raster");
             doc.evict_page(3);
             doc.ensure_page_loaded(3, &unsaved, Some(&committed), None, &sizes).expect("reload");
         }

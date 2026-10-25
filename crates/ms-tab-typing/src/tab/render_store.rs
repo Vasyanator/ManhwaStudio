@@ -226,13 +226,15 @@ pub(super) fn render_and_store_created_raster(
     ms_models::layer_model::persist::add_page_raster(
         &target.layers_dir,
         target.fallback_dir.as_deref(),
-        request.page_idx,
-        &uid,
-        &name,
-        true,
-        1.0,
-        transform,
-        &image,
+        &ms_models::layer_model::persist::PageRasterSpec {
+            page_idx: request.page_idx,
+            uid: &uid,
+            name: &name,
+            visible: true,
+            opacity: 1.0,
+            transform,
+            image: &image,
+        },
     )?;
     Ok(TypingCreatedRaster {
         page_idx: request.page_idx,

@@ -6,8 +6,9 @@ single tab: low-level primitives (mask brush, polygon rasterization, the SOR ker
 pixel solver, the AI-backend wire PNG encoders) and, in `patch/`, a whole host-neutral TOOL that several tabs can drive.
 
 ## Architecture
-`lib.rs` is the crate root and the public boundary. It exports `MaskBrush` from `mask_brush.rs`,
-`red_black_sor_sweeps` from `sor.rs` and `overlay_pixel_for_final_color` from `overlay_pixel.rs`,
+`lib.rs` is the crate root and the public boundary. It exports `MaskBrush` (with the binary-mask
+view `BinaryMaskMut` and the stroke segment `LineSegmentPx`) from `mask_brush.rs`,
+`red_black_sor_sweeps` (inputs `SorProblem` + `SorSchedule`) from `sor.rs` and `overlay_pixel_for_final_color` from `overlay_pixel.rs`,
 exposes `png_wire` as a public submodule, re-exports `fill_polygon_spans` from `ms-raster` (its owner since it moved down to level 0, so
 lower crates can use it), and re-exports `patch` as a public submodule.
 
@@ -57,9 +58,9 @@ images. They perform bounds clipping and return early on invalid binary-mask dim
 ## Contracts and invariants
 - `MaskBrush` is UI/tool state, not durable project state. Do not serialize it into project files.
 - `paint_mask_segment` writes transparent pixels when erasing and white pixels when painting.
-- `paint_binary_mask_segment` writes `0` when erasing and `255` when painting. The caller must pass
-  a buffer whose logical length is at least `mask_width * mask_height`; invalid dimensions are a
-  no-op.
+- `paint_binary_mask_segment` writes `0` when erasing and `255` when painting into a
+  `BinaryMaskMut` whose `data` holds at least `width * height` bytes; a shorter buffer or a zero
+  dimension is a no-op.
 - `fill_polygon_spans` emits `span(y, x0, x1)` with an INCLUSIVE `x0..=x1`, already clamped to the
   caller's `width`/`height`, in increasing `y`, and never inverted. Insideness is sampled at the
   scanline centre `y + 0.5` under the even-odd rule. These sampling rules are a CONTRACT, not an
@@ -69,7 +70,7 @@ images. They perform bounds clipping and return early on invalid binary-mask dim
   coordinates before calling them.
 - These helpers must not perform file I/O, model access, backend calls, or shared-model mutation.
 - `red_black_sor_sweeps` updates only the INTERIOR of its grid: a caller must pad its region by at
-  least one pixel, and `rw`/`rh` below 3 make the call a no-op. `lam[i] == 0` is a free
+  least one pixel, and a `SorProblem` width/height below 3 makes the call a no-op. `lam[i] == 0` is a free
   (membrane-like) cell, a large `lam[i]` a soft Dirichlet pin. A second SOR implementation anywhere
   in the project is a defect.
 - `overlay_pixel_for_final_color` returns the DENSE solution, not the minimum-alpha one; its

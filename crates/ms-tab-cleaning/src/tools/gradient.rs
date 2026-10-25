@@ -28,7 +28,7 @@ use crate::input::CleaningLabels;
 use ms_input::{ContextId, InputFrame};
 use ms_canvas::CanvasView;
 use ms_project::ProjectData;
-use ms_tools::red_black_sor_sweeps;
+use ms_tools::{red_black_sor_sweeps, SorProblem, SorSchedule};
 use ms_region_postprocess::{LabTables, encode_srgb};
 use eframe::egui;
 use egui::Color32;
@@ -794,7 +794,8 @@ fn screened_poisson_refine(
     }
 
     if rw >= 3 && rh >= 3 {
-        red_black_sor_sweeps(&mut u, &u0, &lam, &denom, rw, rh, iters, omega);
+        let problem = SorProblem { u0: &u0, lam: &lam, denom: &denom, width: rw, height: rh };
+        red_black_sor_sweeps(&mut u, &problem, SorSchedule { iters, omega });
     }
 
     let mut out = channel_pred.to_vec();

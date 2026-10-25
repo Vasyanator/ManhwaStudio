@@ -34,7 +34,7 @@ module only builds its `lam`/`denom`/`u0` buffers and the multigrid schedule aro
 needs iterations on the order of the region's DIAMETER, so a 1500-px selection would stall a worker for many seconds — the
 cascadic pyramid below is what keeps the tool interactive.
 */
-use crate::red_black_sor_sweeps;
+use crate::{red_black_sor_sweeps, SorProblem, SorSchedule};
 use rayon::prelude::*;
 
 /// Colour channels solved independently. RGB only; alpha is not part of the membrane.
@@ -533,16 +533,8 @@ fn solve_channel(levels: &[MaskLevel], fine_diff: &[f32]) -> Vec<f32> {
         } else {
             SWEEPS_PER_LEVEL
         };
-        red_black_sor_sweeps(
-            &mut u,
-            diff,
-            &level.lam,
-            &level.denom,
-            level.w,
-            level.h,
-            iters,
-            SOR_OMEGA,
-        );
+        let problem = SorProblem { u0: diff, lam: &level.lam, denom: &level.denom, width: level.w, height: level.h };
+        red_black_sor_sweeps(&mut u, &problem, SorSchedule { iters, omega: SOR_OMEGA });
         solution = Some(u);
     }
     solution.unwrap_or_else(|| fine_diff.to_vec())

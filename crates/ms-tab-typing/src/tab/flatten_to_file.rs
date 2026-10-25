@@ -926,7 +926,7 @@ mod tests {
         image::RgbaImage::from_pixel(PAGE_PX, PAGE_PX, image::Rgba([40, 80, 120, 255])).save(&project.pages[0].path).expect("write page");
         let transform = ms_models::layer_model::manifest::TransformRec { cx: 8.0, cy: 8.0, rotation: 0.0, scale: 1.0 };
         let blue = egui::ColorImage::filled([4, 4], egui::Color32::from_rgb(0, 0, 255));
-        ms_models::layer_model::persist::add_page_raster(&project.paths.unsaved_layers_dir, None, 0, "r0", "R", true, 1.0, transform, &blue).expect("seed raster");
+        ms_models::layer_model::persist::add_page_raster(&project.paths.unsaved_layers_dir, None, &ms_models::layer_model::persist::PageRasterSpec { page_idx: 0, uid: "r0", name: "R", visible: true, opacity: 1.0, transform, image: &blue }).expect("seed raster");
         let doc = Arc::new(Mutex::new(LayerDoc::new()));
         let mut state = TypingTabState::default();
         state.set_layer_doc(Arc::clone(&doc));
@@ -1064,7 +1064,7 @@ mod tests {
         let blue = egui::ColorImage::filled([4, 4], egui::Color32::from_rgb(0, 0, 255));
         for page in &project.pages {
             image::RgbaImage::from_pixel(PAGE_PX, PAGE_PX, image::Rgba([40, 80, 120, 255])).save(&page.path).expect("write page");
-            ms_models::layer_model::persist::add_page_raster(&project.paths.unsaved_layers_dir, None, page.idx, &format!("r{}", page.idx), "R", true, 1.0, transform, &blue).expect("seed raster");
+            ms_models::layer_model::persist::add_page_raster(&project.paths.unsaved_layers_dir, None, &ms_models::layer_model::persist::PageRasterSpec { page_idx: page.idx, uid: &format!("r{}", page.idx), name: "R", visible: true, opacity: 1.0, transform, image: &blue }).expect("seed raster");
         }
         let doc = Arc::new(Mutex::new(LayerDoc::new()));
         let mut state = TypingTabState::default();
@@ -1119,7 +1119,7 @@ mod tests {
         for (page, uids) in project.pages.iter().zip(rasters_per_page) {
             image::RgbaImage::from_pixel(PAGE_PX, PAGE_PX, image::Rgba([40, 80, 120, 255])).save(&page.path).expect("write page");
             for uid in *uids {
-                ms_models::layer_model::persist::add_page_raster(&project.paths.unsaved_layers_dir, None, page.idx, uid, "R", true, 1.0, transform, &blue).expect("seed raster");
+                ms_models::layer_model::persist::add_page_raster(&project.paths.unsaved_layers_dir, None, &ms_models::layer_model::persist::PageRasterSpec { page_idx: page.idx, uid, name: "R", visible: true, opacity: 1.0, transform, image: &blue }).expect("seed raster");
             }
         }
     }

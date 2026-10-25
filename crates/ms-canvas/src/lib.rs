@@ -256,7 +256,6 @@ use self::types::{
 use ms_models::page_view::{PageImageInfo, PageTexture};
 use ms_widgets::bubble_status::BubbleBorderStyle;
 use ms_memory::{CacheEvictionReport, CacheEvictionRequest};
-use ms_models::bubbles_model::runtime_bubble_to_record;
 use ms_models::clean_overlays_model::CleanOverlaysModel;
 use ms_project::{Bubble, ProjectData};
 use ms_input::{ActionId, GesturePhase, InputFrame, InputRegistry, ViewSurface, view};
@@ -2317,18 +2316,18 @@ impl CanvasView {
         }
         upsert_rect_coords_into_extra(&mut extra, runtime.rect_coords);
 
-        let rec = runtime_bubble_to_record(
-            runtime.id,
-            runtime.img_idx,
-            runtime.img_u,
-            runtime.img_v,
-            Some(side_to_string(runtime.side)),
-            Some(runtime.bubble_class.as_str().to_string()),
-            Some(runtime.bubble_type.as_str().to_string()),
-            runtime.text,
-            runtime.original_text,
-            Some(extra),
-        );
+        let rec = Bubble {
+            id: runtime.id,
+            img_idx: runtime.img_idx,
+            img_u: runtime.img_u,
+            img_v: runtime.img_v,
+            side: Some(side_to_string(runtime.side)),
+            bubble_class: Some(runtime.bubble_class.as_str().to_string()),
+            bubble_type: Some(runtime.bubble_type.as_str().to_string()),
+            text: runtime.text,
+            original_text: runtime.original_text,
+            extra,
+        };
 
         let Some(model) = self.bubble_runtime.bubbles_model.as_ref().map(Arc::clone) else {
             runtime_log::log_warn(format!(

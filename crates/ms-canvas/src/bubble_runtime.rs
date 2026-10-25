@@ -55,7 +55,7 @@ use super::{
     DUPLICATE_BUBBLE_OFFSET_PX, TEXT_UPSERT_DEBOUNCE_SECS, read_system_clipboard_text,
     rect_coords_from_bubble,
 };
-use ms_models::bubbles_model::{BubblesModel, SharedCanvasSettings, runtime_bubble_to_record};
+use ms_models::bubbles_model::{BubblesModel, SharedCanvasSettings};
 use ms_project::{Bubble, ProjectData, Side};
 use ms_log::runtime_log;
 use eframe::egui;
@@ -805,18 +805,18 @@ impl CanvasView {
         }
         self.capture_bubble_history_before_mutation();
 
-        let rec = runtime_bubble_to_record(
-            rt_id,
-            rt_img_idx,
-            rt_img_u,
-            rt_img_v,
-            Some(side_to_string(rt_side)),
-            Some(rt_bubble_class.as_str().to_string()),
-            Some(rt_bubble_type.as_str().to_string()),
-            rt_text,
-            rt_original_text,
-            Some(extra),
-        );
+        let rec = Bubble {
+            id: rt_id,
+            img_idx: rt_img_idx,
+            img_u: rt_img_u,
+            img_v: rt_img_v,
+            side: Some(side_to_string(rt_side)),
+            bubble_class: Some(rt_bubble_class.as_str().to_string()),
+            bubble_type: Some(rt_bubble_type.as_str().to_string()),
+            text: rt_text,
+            original_text: rt_original_text,
+            extra,
+        };
 
         // When the patch changes the image-area rect (e.g. a Shift+Q crop selection sets `crop_rect`
         // + `rect_coords`), the runtime rect must be updated too: this call advances the model
@@ -1094,18 +1094,18 @@ impl CanvasView {
             self.capture_bubble_history_before_mutation();
             match model.lock() {
                 Ok(mut locked) => {
-                    let rec = runtime_bubble_to_record(
-                        updated_rt.id,
-                        updated_rt.img_idx,
-                        updated_rt.img_u,
-                        updated_rt.img_v,
-                        Some(side_to_string(updated_rt.side)),
-                        Some(updated_rt.bubble_class.as_str().to_string()),
-                        Some(updated_rt.bubble_type.as_str().to_string()),
-                        updated_rt.text.clone(),
-                        updated_rt.original_text.clone(),
-                        Some(extra),
-                    );
+                    let rec = Bubble {
+                        id: updated_rt.id,
+                        img_idx: updated_rt.img_idx,
+                        img_u: updated_rt.img_u,
+                        img_v: updated_rt.img_v,
+                        side: Some(side_to_string(updated_rt.side)),
+                        bubble_class: Some(updated_rt.bubble_class.as_str().to_string()),
+                        bubble_type: Some(updated_rt.bubble_type.as_str().to_string()),
+                        text: updated_rt.text.clone(),
+                        original_text: updated_rt.original_text.clone(),
+                        extra,
+                    };
                     match locked.create_or_replace(rec) {
                         Ok(()) => {
                             self.bubble_runtime.synced_bubbles_revision = locked.revision();
@@ -2134,18 +2134,18 @@ impl CanvasView {
             } else {
                 extra.remove("hint_show_outside_translation");
             }
-            let rec = runtime_bubble_to_record(
-                rt.id,
-                rt.img_idx,
-                rt.img_u,
-                rt.img_v,
-                Some(side_to_string(rt.side)),
-                Some(rt.bubble_class.as_str().to_string()),
-                Some(rt.bubble_type.as_str().to_string()),
-                record_text,
-                record_original,
-                Some(extra),
-            );
+            let rec = Bubble {
+                id: rt.id,
+                img_idx: rt.img_idx,
+                img_u: rt.img_u,
+                img_v: rt.img_v,
+                side: Some(side_to_string(rt.side)),
+                bubble_class: Some(rt.bubble_class.as_str().to_string()),
+                bubble_type: Some(rt.bubble_type.as_str().to_string()),
+                text: record_text,
+                original_text: record_original,
+                extra,
+            };
             match locked.create_or_replace(rec) {
                 Ok(()) => {
                     had_success = true;
@@ -2286,18 +2286,18 @@ impl CanvasView {
                 serialize_image_text_areas(&rt.text_areas),
             );
             if let Some(model) = self.bubble_runtime.bubbles_model.as_ref().map(Arc::clone) {
-                let rec = runtime_bubble_to_record(
-                    rt.id,
-                    rt.img_idx,
-                    rt.img_u,
-                    rt.img_v,
-                    Some(side_to_string(rt.side)),
-                    Some(rt.bubble_class.as_str().to_string()),
-                    Some(rt.bubble_type.as_str().to_string()),
-                    rt.text.clone(),
-                    rt.original_text.clone(),
-                    Some(extra),
-                );
+                let rec = Bubble {
+                    id: rt.id,
+                    img_idx: rt.img_idx,
+                    img_u: rt.img_u,
+                    img_v: rt.img_v,
+                    side: Some(side_to_string(rt.side)),
+                    bubble_class: Some(rt.bubble_class.as_str().to_string()),
+                    bubble_type: Some(rt.bubble_type.as_str().to_string()),
+                    text: rt.text.clone(),
+                    original_text: rt.original_text.clone(),
+                    extra,
+                };
                 if let Ok(mut locked) = model.lock()
                     && locked.create_or_replace(rec).is_ok()
                 {
@@ -2881,18 +2881,18 @@ mod tests {
 
     /// Builds a persisted text `Bubble` record at the given page/anchor.
     fn text_bubble_record(id: i64, img_idx: usize, u: f32, v: f32, side: Side) -> Bubble {
-        runtime_bubble_to_record(
+        Bubble {
             id,
             img_idx,
-            u,
-            v,
-            Some(side_to_string(side)),
-            Some("text".to_string()),
-            Some("aside".to_string()),
-            String::new(),
-            String::new(),
-            None,
-        )
+            img_u: u,
+            img_v: v,
+            side: Some(side_to_string(side)),
+            bubble_class: Some("text".to_string()),
+            bubble_type: Some("aside".to_string()),
+            text: String::new(),
+            original_text: String::new(),
+            extra: Map::new(),
+        }
     }
 
     /// Inserts a plain text runtime bubble (no image areas) into `canvas`.
@@ -3618,18 +3618,18 @@ mod tests {
             "hint_show_outside_translation".to_string(),
             Value::Bool(true),
         );
-        let record = runtime_bubble_to_record(
-            1,
-            0,
-            0.30,
-            0.30,
-            Some(side_to_string(Side::Left)),
-            Some("hint".to_string()),
-            Some("aside".to_string()),
-            "подсказка".to_string(),
-            String::new(),
-            Some(extra),
-        );
+        let record = Bubble {
+            id: 1,
+            img_idx: 0,
+            img_u: 0.30,
+            img_v: 0.30,
+            side: Some(side_to_string(Side::Left)),
+            bubble_class: Some("hint".to_string()),
+            bubble_type: Some("aside".to_string()),
+            text: "подсказка".to_string(),
+            original_text: String::new(),
+            extra,
+        };
         let model = test_model(vec![record]);
         let mut canvas = CanvasView::default();
         canvas.set_bubbles_model(Arc::clone(&model));

@@ -9,6 +9,10 @@ this instead of copying it.
 Main responsibilities:
 - Run `iters` red-black SOR iterations over the interior of a padded ROI, in place.
 
+Key structures:
+- `SorProblem`: the fixed inputs of one solve (`u0`, `lam`, `denom`, grid size).
+- `SorSchedule`: how long and how hard to relax (`iters`, `omega`).
+
 Key functions:
 - `red_black_sor_sweeps()`.
 
@@ -19,7 +23,36 @@ re-verified together when this kernel changes.
 */
 use rayon::prelude::*;
 
-/// Runs `iters` red-black SOR iterations over the interior of an `rw`×`rh` ROI in place.
+/// The fixed inputs of one red-black SOR solve over a row-major `width`×`height` grid.
+///
+/// `u0` is the data-fidelity reference, `lam` the per-cell fidelity weight and `denom` the
+/// precomputed `4 + lam[i]`; each slice holds at least `width * height` cells. Borrowed views
+/// only, so building one per call copies no buffer.
+#[derive(Clone, Copy, Debug)]
+pub struct SorProblem<'a> {
+    /// Data-fidelity reference value per cell.
+    pub u0: &'a [f32],
+    /// Per-cell fidelity weight (`0` = free cell, large = soft Dirichlet pin).
+    pub lam: &'a [f32],
+    /// Precomputed `4 + lam[i]` per cell.
+    pub denom: &'a [f32],
+    /// Grid width in cells (row stride of every buffer).
+    pub width: usize,
+    /// Grid height in cells.
+    pub height: usize,
+}
+
+/// Iteration schedule of a red-black SOR solve: `iters` full iterations (each a red and a black
+/// half-sweep) with over-relaxation factor `omega` (convergent for `0 < omega < 2`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SorSchedule {
+    /// Number of full red + black iterations.
+    pub iters: usize,
+    /// Over-relaxation factor.
+    pub omega: f32,
+}
+
+/// Runs `schedule.iters` red-black SOR iterations over the interior of the `problem` grid in place.
 ///
 /// Each iteration performs two half-sweeps (red then black). A half-sweep updates only the
 /// cells of one color, where a cell's color is `(x + y) & 1`. The 5-point Laplacian stencil
@@ -28,9 +61,10 @@ use rayon::prelude::*;
 /// mutually independent and order-invariant, which makes a row-parallel sweep numerically
 /// identical to the sequential one.
 ///
-/// `u` is the working buffer (interior updated in place), `u0` the data-fidelity reference,
-/// `lam` the per-cell fidelity weight, `denom` the precomputed `4 + lam[i]`. The two half-sweeps
-/// stay sequential w.r.t. each other; parallelism is only within a half-sweep, across rows.
+/// `u` is the working buffer (interior updated in place, `problem.width * problem.height`
+/// cells); `problem` carries the fidelity reference, weights and grid size (see `SorProblem`).
+/// The two half-sweeps stay sequential w.r.t. each other; parallelism is only within a
+/// half-sweep, across rows.
 ///
 /// This is the SHARED Laplacian/SOR kernel of the whole project (`ms-tools`), not a
 /// gradient-only helper: any tool needing a screened-Poisson or harmonic solve calls this one
@@ -41,21 +75,14 @@ use rayon::prelude::*;
 /// condition, exact in the limit. A harmonic membrane is therefore obtained by setting `lam` to
 /// `0` inside the region and to a large value on the boundary band that holds the known values.
 ///
-/// Only the INTERIOR of the `rw`×`rh` grid is updated: the 1-pixel border is never written and
-/// acts as fixed data. A caller must pad its region by at least one pixel (and `rw`/`rh` must be
+/// Only the INTERIOR of the grid is updated: the 1-pixel border is never written and acts as
+/// fixed data. A caller must pad its region by at least one pixel (and the width/height must be
 /// at least 3, otherwise there is no interior and the call is a no-op).
-// All parameters are distinct solver buffers or ROI dimensions; grouping would obscure the kernel.
-#[allow(clippy::too_many_arguments)]
-pub fn red_black_sor_sweeps(
-    u: &mut [f32],
-    u0: &[f32],
-    lam: &[f32],
-    denom: &[f32],
-    rw: usize,
-    rh: usize,
-    iters: usize,
-    omega: f32,
-) {
+pub fn red_black_sor_sweeps(u: &mut [f32], problem: &SorProblem<'_>, schedule: SorSchedule) {
+    // Unpack once into locals so the hot per-cell loop below reads plain slices, exactly as
+    // before the inputs were grouped.
+    let SorProblem { u0, lam, denom, width: rw, height: rh } = *problem;
+    let SorSchedule { iters, omega } = schedule;
     // Scratch holds the newly computed value for each updated cell of the current half-sweep.
     // Because updated cells are never read within the same half-sweep, computing into scratch
     // from the immutable snapshot `u` and copying back yields the exact in-place result while
@@ -116,18 +143,10 @@ mod tests {
 
     /// Reference sequential red-black SOR, copied verbatim from the pre-parallel implementation.
     /// Used as the golden baseline that the parallel `red_black_sor_sweeps` must reproduce.
-    // Mirrors the production kernel signature so the comparison is one-to-one.
-    #[allow(clippy::too_many_arguments)]
-    fn sequential_sor_reference(
-        u: &mut [f32],
-        u0: &[f32],
-        lam: &[f32],
-        denom: &[f32],
-        rw: usize,
-        rh: usize,
-        iters: usize,
-        omega: f32,
-    ) {
+    /// Takes the production kernel's inputs so the comparison is one-to-one.
+    fn sequential_sor_reference(u: &mut [f32], problem: &SorProblem<'_>, schedule: SorSchedule) {
+        let SorProblem { u0, lam, denom, width: rw, height: rh } = *problem;
+        let SorSchedule { iters, omega } = schedule;
         if rw < 3 || rh < 3 {
             return;
         }
@@ -189,14 +208,14 @@ mod tests {
         // `take(rh - 2)` row range and the sequential reference must agree at the smallest ROI.
         for &(rw, rh) in &[(3usize, 3usize), (5, 4), (17, 23), (40, 9), (33, 33)] {
             let (u0, lam, denom) = build_sor_fixture(rw, rh);
-            let iters = 64usize;
-            let omega = 1.95f32;
+            let problem = SorProblem { u0: &u0, lam: &lam, denom: &denom, width: rw, height: rh };
+            let schedule = SorSchedule { iters: 64, omega: 1.95 };
 
             let mut u_seq = u0.clone();
-            sequential_sor_reference(&mut u_seq, &u0, &lam, &denom, rw, rh, iters, omega);
+            sequential_sor_reference(&mut u_seq, &problem, schedule);
 
             let mut u_par = u0.clone();
-            red_black_sor_sweeps(&mut u_par, &u0, &lam, &denom, rw, rh, iters, omega);
+            red_black_sor_sweeps(&mut u_par, &problem, schedule);
 
             assert_eq!(u_seq.len(), u_par.len());
             for (i, (a, b)) in u_seq.iter().zip(u_par.iter()).enumerate() {

@@ -574,22 +574,38 @@ pub fn load_page_rasters(
     })
 }
 
-/// Appends a single new raster node to `page_idx` on top of the current band stack and writes its
-/// PNG (`ps_p{page:04}_{uid}.png`), preserving every other node / group / text-group. Returns the
-/// PNG file name. Used by tabs (e.g. the typing tab adding an external image as a raster) that need
-/// to add one raster without rewriting the whole page like `save_page_rasters` does.
-#[allow(clippy::too_many_arguments)]
+/// One new raster node for [`add_page_raster`]: where it goes, its node fields and its pixels.
+pub struct PageRasterSpec<'a> {
+    /// Page the raster is appended to.
+    pub page_idx: usize,
+    /// Stable node uid; also names the PNG (`ps_p{page:04}_{uid}.png`).
+    pub uid: &'a str,
+    /// Display name of the node.
+    pub name: &'a str,
+    pub visible: bool,
+    /// Node opacity in `0.0..=1.0`.
+    pub opacity: f32,
+    pub transform: TransformRec,
+    /// The raster pixels, written as the node's base PNG.
+    pub image: &'a ColorImage,
+}
+
+/// Appends a single new raster node (`spec`) on top of its page's current band stack and writes its
+/// PNG (`ps_p{page:04}_{uid}.png`) into `layers_dir`, preserving every other node / group /
+/// text-group. A page absent from `layers_dir`'s manifest is first seeded from `fallback_dir`'s
+/// (the committed tree). Returns the PNG file name. Used by tabs (e.g. the typing tab adding an
+/// external image as a raster) that need to add one raster without rewriting the whole page like
+/// `save_page_rasters` does.
+///
+/// # Errors
+/// A message naming the path when the manifest cannot be read or written, or the directory or
+/// PNG cannot be created.
 pub fn add_page_raster(
     layers_dir: &Path,
     fallback_dir: Option<&Path>,
-    page_idx: usize,
-    uid: &str,
-    name: &str,
-    visible: bool,
-    opacity: f32,
-    transform: TransformRec,
-    image: &ColorImage,
+    spec: &PageRasterSpec<'_>,
 ) -> Result<String, String> {
+    let PageRasterSpec { page_idx, uid, name, visible, opacity, transform, image } = *spec;
     let _span = ms_log::trace_scope!(
         cat::PERSIST,
         "add_page_raster page={} uid={} size={}x{}",
@@ -3291,18 +3307,20 @@ mod tests {
         add_page_raster(
             &unsaved,
             Some(committed.as_path()),
-            3,
-            "img1",
-            "Картинка",
-            true,
-            1.0,
-            TransformRec {
-                cx: 1.0,
-                cy: 1.0,
-                rotation: 0.0,
-                scale: 1.0,
+            &PageRasterSpec {
+                page_idx: 3,
+                uid: "img1",
+                name: "Картинка",
+                visible: true,
+                opacity: 1.0,
+                transform: TransformRec {
+                    cx: 1.0,
+                    cy: 1.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
+                image: &img([2, 2], Color32::BLUE),
             },
-            &img([2, 2], Color32::BLUE),
         )
         .unwrap();
         // The staged page now carries BOTH the new raster AND the committed text.
@@ -3448,18 +3466,20 @@ mod tests {
         add_page_raster(
             &unsaved,
             Some(committed.as_path()),
-            3,
-            "img1",
-            "Картинка",
-            true,
-            1.0,
-            TransformRec {
-                cx: 1.0,
-                cy: 1.0,
-                rotation: 0.0,
-                scale: 1.0,
+            &PageRasterSpec {
+                page_idx: 3,
+                uid: "img1",
+                name: "Картинка",
+                visible: true,
+                opacity: 1.0,
+                transform: TransformRec {
+                    cx: 1.0,
+                    cy: 1.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
+                image: &img([2, 2], Color32::BLUE),
             },
-            &img([2, 2], Color32::BLUE),
         )
         .unwrap();
         assert_eq!(
@@ -4069,13 +4089,15 @@ mod tests {
         let file = add_page_raster(
             &dir,
             None,
-            0,
-            "img",
-            "Картинка",
-            true,
-            1.0,
-            t0,
-            &img([3, 4], Color32::BLUE),
+            &PageRasterSpec {
+                page_idx: 0,
+                uid: "img",
+                name: "Картинка",
+                visible: true,
+                opacity: 1.0,
+                transform: t0,
+                image: &img([3, 4], Color32::BLUE),
+            },
         )
         .unwrap();
         assert!(file.contains("img"));
@@ -4121,18 +4143,20 @@ mod tests {
         add_page_raster(
             &dir,
             None,
-            0,
-            "r",
-            "Pic",
-            true,
-            1.0,
-            TransformRec {
-                cx: 1.0,
-                cy: 1.0,
-                rotation: 0.0,
-                scale: 1.0,
+            &PageRasterSpec {
+                page_idx: 0,
+                uid: "r",
+                name: "Pic",
+                visible: true,
+                opacity: 1.0,
+                transform: TransformRec {
+                    cx: 1.0,
+                    cy: 1.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
+                image: &img([2, 2], Color32::RED),
             },
-            &img([2, 2], Color32::RED),
         )
         .unwrap();
 
@@ -4355,18 +4379,20 @@ mod tests {
         add_page_raster(
             &dir,
             None,
-            0,
-            "typing",
-            "Картинка",
-            true,
-            1.0,
-            TransformRec {
-                cx: 1.0,
-                cy: 1.0,
-                rotation: 0.0,
-                scale: 1.0,
+            &PageRasterSpec {
+                page_idx: 0,
+                uid: "typing",
+                name: "Картинка",
+                visible: true,
+                opacity: 1.0,
+                transform: TransformRec {
+                    cx: 1.0,
+                    cy: 1.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
+                image: &img([2, 2], Color32::RED),
             },
-            &img([2, 2], Color32::RED),
         )
         .unwrap();
         let effects = vec![serde_json::json!({"type":"shadow"})];
@@ -4504,18 +4530,20 @@ mod tests {
         add_page_raster(
             &committed,
             None,
-            0,
-            "r",
-            "R",
-            true,
-            1.0,
-            TransformRec {
-                cx: 1.0,
-                cy: 1.0,
-                rotation: 0.0,
-                scale: 1.0,
+            &PageRasterSpec {
+                page_idx: 0,
+                uid: "r",
+                name: "R",
+                visible: true,
+                opacity: 1.0,
+                transform: TransformRec {
+                    cx: 1.0,
+                    cy: 1.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
+                image: &img([2, 2], Color32::RED),
             },
-            &img([2, 2], Color32::RED),
         )
         .unwrap();
 

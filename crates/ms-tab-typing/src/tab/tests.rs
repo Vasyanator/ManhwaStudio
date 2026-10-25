@@ -24,18 +24,20 @@ fn flatten_composites_raster_from_disk_fallback() {
     persist::add_page_raster(
         &layers,
         None,
-        0,
-        "r0",
-        "R",
-        true,
-        1.0,
-        ms_models::layer_model::manifest::TransformRec {
-            cx: 10.0,
-            cy: 10.0,
-            rotation: 0.0,
-            scale: 1.0,
+        &persist::PageRasterSpec {
+            page_idx: 0,
+            uid: "r0",
+            name: "R",
+            visible: true,
+            opacity: 1.0,
+            transform: ms_models::layer_model::manifest::TransformRec {
+                cx: 10.0,
+                cy: 10.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
+            image: &red,
         },
-        &red,
     )
     .unwrap();
     let job = TypingExportPageJob {
@@ -71,35 +73,39 @@ fn flatten_composites_raster_from_disk_fallback() {
     persist::add_page_raster(
         &committed,
         None,
-        0,
-        "rc",
-        "R",
-        true,
-        1.0,
-        ms_models::layer_model::manifest::TransformRec {
-            cx: 10.0,
-            cy: 10.0,
-            rotation: 0.0,
-            scale: 1.0,
+        &persist::PageRasterSpec {
+            page_idx: 0,
+            uid: "rc",
+            name: "R",
+            visible: true,
+            opacity: 1.0,
+            transform: ms_models::layer_model::manifest::TransformRec {
+                cx: 10.0,
+                cy: 10.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
+            image: &red,
         },
-        &red,
     )
     .unwrap();
     persist::add_page_raster(
         &unsaved,
         None,
-        5,
-        "rs",
-        "R",
-        true,
-        1.0,
-        ms_models::layer_model::manifest::TransformRec {
-            cx: 10.0,
-            cy: 10.0,
-            rotation: 0.0,
-            scale: 1.0,
+        &persist::PageRasterSpec {
+            page_idx: 5,
+            uid: "rs",
+            name: "R",
+            visible: true,
+            opacity: 1.0,
+            transform: ms_models::layer_model::manifest::TransformRec {
+                cx: 10.0,
+                cy: 10.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
+            image: &red,
         },
-        &red,
     )
     .unwrap();
     let base2 = dir.join("page2.png");
@@ -899,8 +905,8 @@ fn raster_selection_tracks_by_uid_across_a_reorder() {
     };
     let pic = ColorImage::filled([2, 2], Color32::WHITE);
     // Add order is bottom-to-top: r0 (bottom), r1 (top).
-    persist::add_page_raster(&dir, None, 0, "r0", "Bottom", true, 1.0, tf, &pic).unwrap();
-    persist::add_page_raster(&dir, None, 0, "r1", "Top", true, 1.0, tf, &pic).unwrap();
+    persist::add_page_raster(&dir, None, &persist::PageRasterSpec { page_idx: 0, uid: "r0", name: "Bottom", visible: true, opacity: 1.0, transform: tf, image: &pic }).unwrap();
+    persist::add_page_raster(&dir, None, &persist::PageRasterSpec { page_idx: 0, uid: "r1", name: "Top", visible: true, opacity: 1.0, transform: tf, image: &pic }).unwrap();
 
     let mut doc = LayerDoc::new();
     let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
@@ -1050,8 +1056,8 @@ fn remove_raster_clears_page_when_it_empties_the_selected_index() {
         scale: 1.0,
     };
     let pic = ColorImage::filled([2, 2], Color32::WHITE);
-    persist::add_page_raster(&dir, None, 0, "r0", "Bottom", true, 1.0, tf, &pic).unwrap();
-    persist::add_page_raster(&dir, None, 0, "r1", "Top", true, 1.0, tf, &pic).unwrap();
+    persist::add_page_raster(&dir, None, &persist::PageRasterSpec { page_idx: 0, uid: "r0", name: "Bottom", visible: true, opacity: 1.0, transform: tf, image: &pic }).unwrap();
+    persist::add_page_raster(&dir, None, &persist::PageRasterSpec { page_idx: 0, uid: "r1", name: "Top", visible: true, opacity: 1.0, transform: tf, image: &pic }).unwrap();
 
     let mut doc = LayerDoc::new();
     let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
@@ -3782,18 +3788,20 @@ fn deferred_raster_geometry_enqueues_and_barrier_persists_transform_and_deform()
     persist::add_page_raster(
         &dir,
         None,
-        0,
-        "raster",
-        "Raster",
-        true,
-        1.0,
-        TransformRec {
-            cx: 1.0,
-            cy: 2.0,
-            rotation: 0.0,
-            scale: 1.0,
+        &persist::PageRasterSpec {
+            page_idx: 0,
+            uid: "raster",
+            name: "Raster",
+            visible: true,
+            opacity: 1.0,
+            transform: TransformRec {
+                cx: 1.0,
+                cy: 2.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
+            image: &image,
         },
-        &image,
     )
     .unwrap();
 
@@ -5564,13 +5572,15 @@ fn reproject_reapplies_an_open_raster_move() {
     persist::add_page_raster(
         &dir,
         None,
-        0,
-        "r0",
-        "R",
-        true,
-        1.0,
-        start,
-        &ColorImage::filled([2, 2], Color32::WHITE),
+        &persist::PageRasterSpec {
+            page_idx: 0,
+            uid: "r0",
+            name: "R",
+            visible: true,
+            opacity: 1.0,
+            transform: start,
+            image: &ColorImage::filled([2, 2], Color32::WHITE),
+        },
     )
     .unwrap();
 
@@ -5769,13 +5779,15 @@ fn deferred_raster_persist_is_not_enqueued_when_the_document_rejects_it() {
     persist::add_page_raster(
         &dir,
         None,
-        0,
-        "r0",
-        "R",
-        true,
-        1.0,
-        transform,
-        &ColorImage::filled([2, 2], Color32::WHITE),
+        &persist::PageRasterSpec {
+            page_idx: 0,
+            uid: "r0",
+            name: "R",
+            visible: true,
+            opacity: 1.0,
+            transform,
+            image: &ColorImage::filled([2, 2], Color32::WHITE),
+        },
     )
     .unwrap();
     let mut doc = LayerDoc::new();
@@ -5832,13 +5844,15 @@ fn a_failed_raster_write_is_queued_and_retried_at_the_next_flush_point() {
     persist::add_page_raster(
         &good,
         None,
-        0,
-        "r0",
-        "R",
-        true,
-        1.0,
-        transform,
-        &ColorImage::filled([2, 2], Color32::WHITE),
+        &persist::PageRasterSpec {
+            page_idx: 0,
+            uid: "r0",
+            name: "R",
+            visible: true,
+            opacity: 1.0,
+            transform,
+            image: &ColorImage::filled([2, 2], Color32::WHITE),
+        },
     )
     .unwrap();
     let mut doc = LayerDoc::new();
@@ -6843,7 +6857,7 @@ fn typing_raster_create_outcome(root: &std::path::Path, doc_first: bool, delete_
             Err(_) => panic!("the test layer still shares the doc"),
         };
         doc.flush_page_text(3, &unsaved, Some(&committed)).unwrap();
-        persist::add_page_raster(&unsaved, Some(&committed), 3, "img1", "Картинка", true, 1.0, transform, &pic).unwrap();
+        persist::add_page_raster(&unsaved, Some(&committed), &persist::PageRasterSpec { page_idx: 3, uid: "img1", name: "Картинка", visible: true, opacity: 1.0, transform, image: &pic }).unwrap();
         doc.evict_page(3);
         doc.ensure_page_loaded(3, &unsaved, Some(&committed), None, &sizes).unwrap();
         doc
@@ -6930,8 +6944,8 @@ fn raster_delete_is_enqueued_and_removed_on_disk_after_the_barrier() {
     remove_fixture_dir(&dir);
     let tf = ms_models::layer_model::manifest::TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 };
     let pic = ColorImage::filled([2, 2], Color32::WHITE);
-    persist::add_page_raster(&dir, None, 0, "r0", "Bottom", true, 1.0, tf, &pic).unwrap();
-    persist::add_page_raster(&dir, None, 0, "r1", "Top", true, 1.0, tf, &pic).unwrap();
+    persist::add_page_raster(&dir, None, &persist::PageRasterSpec { page_idx: 0, uid: "r0", name: "Bottom", visible: true, opacity: 1.0, transform: tf, image: &pic }).unwrap();
+    persist::add_page_raster(&dir, None, &persist::PageRasterSpec { page_idx: 0, uid: "r1", name: "Top", visible: true, opacity: 1.0, transform: tf, image: &pic }).unwrap();
     let sizes: HashMap<usize, [usize; 2]> = [(0, [100, 100])].into_iter().collect();
     let mut doc = LayerDoc::new();
     doc.ensure_page_loaded(0, &dir, None, None, &sizes).unwrap();

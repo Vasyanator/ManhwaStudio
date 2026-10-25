@@ -45,7 +45,7 @@ use ms_project::ProjectData;
 use crate::tab::PageView;
 use crate::tab::input::{self, TypingInputLabels};
 use ms_input::{HitPhase, InputFrame};
-use ms_tools::MaskBrush;
+use ms_tools::{BinaryMaskMut, LineSegmentPx, MaskBrush};
 use ms_widgets::WheelSlider;
 use eframe::egui;
 use egui::{Color32, CursorIcon, Id, Pos2, Rect, Sense};
@@ -1244,16 +1244,13 @@ fn paint_mask_segment(
     if !has_change {
         return false;
     }
-    brush.paint_binary_mask_segment(
-        &mut mask.data,
-        mask.width,
-        mask.height,
-        x0.round() as i32,
-        y0.round() as i32,
-        x1.round() as i32,
-        y1.round() as i32,
-        erase,
-    );
+    let segment = LineSegmentPx {
+        x0: x0.round() as i32,
+        y0: y0.round() as i32,
+        x1: x1.round() as i32,
+        y1: y1.round() as i32,
+    };
+    brush.paint_binary_mask_segment(BinaryMaskMut { data: &mut mask.data, width: mask.width, height: mask.height }, segment, erase);
     true
 }
 

@@ -1465,7 +1465,8 @@ mod tests {
         let mut brush = ms_tools::MaskBrush::default();
         brush.set_radius_px(radius);
         let mut mask = vec![if erase { 255u8 } else { 0u8 }; w * h];
-        brush.paint_binary_mask_segment(&mut mask, w, h, from.0, from.1, to.0, to.1, erase);
+        let segment = ms_tools::LineSegmentPx { x0: from.0, y0: from.1, x1: to.0, y1: to.1 };
+        brush.paint_binary_mask_segment(ms_tools::BinaryMaskMut { data: &mut mask, width: w, height: h }, segment, erase);
         mask
     }
 

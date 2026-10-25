@@ -15,9 +15,9 @@ FILE HEADER (crates/ms-tools/src/lib.rs)
   - `fill_polygon_spans`: re-export of `ms_raster::fill_polygon_spans`, the one even-odd
     scanline polygon rasterizer (PS-editor lasso, cleaning tools, the patch core). It lives in
     `ms-raster` (level 0) so lower crates can use it; this path is kept for existing callers.
-  - `red_black_sor_sweeps`: the ONE red-black SOR kernel of the project. Shared by the cleaning
-    tab's gradient fill and by the patch tool's membrane solve; a second implementation anywhere
-    is a defect.
+  - `red_black_sor_sweeps` (inputs `SorProblem` + `SorSchedule`): the ONE red-black SOR kernel of
+    the project. Shared by the cleaning tab's gradient fill and by the patch tool's membrane
+    solve; a second implementation anywhere is a defect.
   - `overlay_pixel_for_final_color`: solves the DENSE overlay pixel that reproduces a desired
     final colour over a known, opaque backdrop at an alpha of at least the given coverage.
   - `png_wire`: the ONE codec of the region/mask PNGs exchanged over the AI backend wire
@@ -43,7 +43,7 @@ pub mod patch;
 pub mod png_wire;
 mod sor;
 
-pub use mask_brush::MaskBrush;
+pub use mask_brush::{BinaryMaskMut, LineSegmentPx, MaskBrush};
 pub use overlay_pixel::overlay_pixel_for_final_color;
 pub use ms_raster::fill_polygon_spans;
-pub use sor::red_black_sor_sweeps;
+pub use sor::{red_black_sor_sweeps, SorProblem, SorSchedule};

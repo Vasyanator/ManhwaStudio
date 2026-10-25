@@ -3,6 +3,8 @@ FILE HEADER (tools/mask_brush.rs)
 - Назначение: общий примитив кисти для рисования маски в `egui::ColorImage`.
 - Ключевые сущности:
   - `MaskBrush`: хранит радиус кисти и его границы.
+  - `BinaryMaskMut`: mutable view of a row-major binary (`0/255`) mask with its size.
+  - `LineSegmentPx`: a stroke segment in image pixel coordinates.
 - Input (the shared brush owner of the unified input system, `ms-input`):
   - `declarations()`: the brush actions every brush host shares — axis `brush.size` (Shift+wheel),
     commands `brush.smaller` (-) / `brush.larger` (= / Shift+= / numpad +); scope `Sub(None)`,
@@ -159,42 +161,15 @@ impl MaskBrush {
         to_y: i32,
         erase: bool,
     ) {
-        paint_line_with_brush(
-            dst,
-            from_x,
-            from_y,
-            to_x,
-            to_y,
-            self.radius_px.max(1) as i32,
-            Color32::WHITE,
-            erase,
-        );
+        let segment = LineSegmentPx { x0: from_x, y0: from_y, x1: to_x, y1: to_y };
+        paint_line_with_brush(dst, segment, self.radius_px.max(1) as i32, Color32::WHITE, erase);
     }
 
-    // All parameters are independent brush stroke properties; grouping would obscure painting intent.
-    #[allow(clippy::too_many_arguments)]
-    pub fn paint_binary_mask_segment(
-        &self,
-        mask_data: &mut [u8],
-        mask_width: usize,
-        mask_height: usize,
-        from_x: i32,
-        from_y: i32,
-        to_x: i32,
-        to_y: i32,
-        erase: bool,
-    ) {
-        paint_line_on_binary_mask(
-            mask_data,
-            mask_width,
-            mask_height,
-            from_x,
-            from_y,
-            to_x,
-            to_y,
-            self.radius_px.max(1) as i32,
-            erase,
-        );
+    /// Paints (`255`) or erases (`0`) `segment` into the binary `mask` with this brush's radius
+    /// (at least one pixel). Pixels outside the mask are clipped; a mask whose `data` is shorter
+    /// than `width * height`, or with a zero dimension, makes the call a no-op.
+    pub fn paint_binary_mask_segment(&self, mask: BinaryMaskMut<'_>, segment: LineSegmentPx, erase: bool) {
+        paint_line_on_binary_mask(mask, segment, self.radius_px.max(1) as i32, erase);
     }
 
     pub fn draw_circle_cursor_on_image(
@@ -228,18 +203,38 @@ impl MaskBrush {
     }
 }
 
-// All parameters are independent brush stroke properties; grouping would obscure painting intent.
-#[allow(clippy::too_many_arguments)]
-pub fn paint_line_with_brush(
-    dst: &mut egui::ColorImage,
-    x0: i32,
-    y0: i32,
-    x1: i32,
-    y1: i32,
-    radius: i32,
-    color: Color32,
-    erase: bool,
-) {
+/// Mutable view of a row-major binary mask (`0` = off, `255` = on) of `width`×`height` pixels.
+///
+/// `data` must hold at least `width * height` bytes; the painters treat a shorter buffer or a
+/// zero dimension as an invalid mask and do nothing.
+#[derive(Debug)]
+pub struct BinaryMaskMut<'a> {
+    /// Mask bytes, row stride `width`.
+    pub data: &'a mut [u8],
+    /// Mask width in pixels.
+    pub width: usize,
+    /// Mask height in pixels.
+    pub height: usize,
+}
+
+/// A straight brush-stroke segment from `(x0, y0)` to `(x1, y1)` in image pixel coordinates.
+/// A zero-length segment stamps a single circle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineSegmentPx {
+    /// Start x.
+    pub x0: i32,
+    /// Start y.
+    pub y0: i32,
+    /// End x.
+    pub x1: i32,
+    /// End y.
+    pub y1: i32,
+}
+
+/// Stamps filled circles of `radius` (at least one pixel) along `segment` into `dst`, writing
+/// `color`, or transparent pixels when `erase` is set. Pixels outside `dst` are clipped.
+pub fn paint_line_with_brush(dst: &mut egui::ColorImage, segment: LineSegmentPx, radius: i32, color: Color32, erase: bool) {
+    let LineSegmentPx { x0, y0, x1, y1 } = segment;
     let r = radius.max(1);
     let dx = (x1 - x0) as f32;
     let dy = (y1 - y0) as f32;
@@ -301,19 +296,11 @@ fn paint_circle(
     }
 }
 
-// All parameters are independent brush stroke properties; grouping would obscure painting intent.
-#[allow(clippy::too_many_arguments)]
-fn paint_line_on_binary_mask(
-    mask_data: &mut [u8],
-    mask_width: usize,
-    mask_height: usize,
-    x0: i32,
-    y0: i32,
-    x1: i32,
-    y1: i32,
-    radius: i32,
-    erase: bool,
-) {
+/// Binary-mask twin of `paint_line_with_brush`: writes `255` (or `0` when `erase`) along
+/// `segment`; an invalid mask (see `BinaryMaskMut`) is a no-op.
+fn paint_line_on_binary_mask(mask: BinaryMaskMut<'_>, segment: LineSegmentPx, radius: i32, erase: bool) {
+    let BinaryMaskMut { data: mask_data, width: mask_width, height: mask_height } = mask;
+    let LineSegmentPx { x0, y0, x1, y1 } = segment;
     if mask_width == 0
         || mask_height == 0
         || mask_data.len() < mask_width.saturating_mul(mask_height)
@@ -430,6 +417,35 @@ mod tests {
         assert!(big.grow_one_step());
         assert_eq!(big.radius_px(), 200, "clamped at the maximum");
         assert!(!big.grow_one_step());
+    }
+
+    /// A click (zero-length segment) stamps one disc; a horizontal segment covers both ends and
+    /// the span between them; erasing writes `0` over the same pixels.
+    #[test]
+    fn binary_mask_segment_paints_discs_along_the_segment() {
+        let b = brush(1);
+        let mut data = vec![0u8; 7 * 5];
+        b.paint_binary_mask_segment(BinaryMaskMut { data: &mut data, width: 7, height: 5 }, LineSegmentPx { x0: 3, y0: 2, x1: 3, y1: 2 }, false);
+        let set: Vec<usize> = data.iter().enumerate().filter(|(_, v)| **v == 255).map(|(i, _)| i).collect();
+        assert_eq!(set, vec![3 + 7, 2 + 2 * 7, 3 + 2 * 7, 4 + 2 * 7, 3 + 3 * 7], "radius-1 disc = centre + 4 neighbours");
+
+        let mut line = vec![0u8; 7 * 5];
+        b.paint_binary_mask_segment(BinaryMaskMut { data: &mut line, width: 7, height: 5 }, LineSegmentPx { x0: 1, y0: 2, x1: 5, y1: 2 }, false);
+        assert!((0..7).all(|x| line[x + 2 * 7] == 255), "the whole middle row is covered");
+        b.paint_binary_mask_segment(BinaryMaskMut { data: &mut line, width: 7, height: 5 }, LineSegmentPx { x0: 1, y0: 2, x1: 5, y1: 2 }, true);
+        assert!(line.iter().all(|v| *v == 0), "erasing the same segment clears it");
+    }
+
+    /// A buffer shorter than `width * height`, or a zero dimension, is an invalid mask: no-op.
+    #[test]
+    fn binary_mask_segment_ignores_an_invalid_mask() {
+        let b = brush(2);
+        let mut short = vec![0u8; 10];
+        b.paint_binary_mask_segment(BinaryMaskMut { data: &mut short, width: 4, height: 4 }, LineSegmentPx { x0: 1, y0: 1, x1: 2, y1: 2 }, false);
+        assert!(short.iter().all(|v| *v == 0));
+        let mut empty = vec![0u8; 4];
+        b.paint_binary_mask_segment(BinaryMaskMut { data: &mut empty, width: 0, height: 4 }, LineSegmentPx { x0: 0, y0: 0, x1: 0, y1: 0 }, false);
+        assert!(empty.iter().all(|v| *v == 0));
     }
 
     /// The brush set registers next to the view set without conflicts (its keys sit on another

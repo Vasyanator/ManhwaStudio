@@ -2554,14 +2554,15 @@ impl TranslationTabState {
                         return false;
                     }
                     dirty_rect = Some((min_x, min_y, max_x, max_y));
+                    let segment = ms_tools::LineSegmentPx {
+                        x0: src0.x.round() as i32,
+                        y0: src0.y.round() as i32,
+                        x1: src1.x.round() as i32,
+                        y1: src1.y.round() as i32,
+                    };
                     brush.paint_binary_mask_segment(
-                        mask_alpha,
-                        mask_w,
-                        mask_h,
-                        src0.x.round() as i32,
-                        src0.y.round() as i32,
-                        src1.x.round() as i32,
-                        src1.y.round() as i32,
+                        ms_tools::BinaryMaskMut { data: mask_alpha, width: mask_w, height: mask_h },
+                        segment,
                         erase,
                     );
                     true

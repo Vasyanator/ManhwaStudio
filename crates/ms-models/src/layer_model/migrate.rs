@@ -1291,7 +1291,6 @@ mod tests {
     /// Writes a v3 inline text node into `dir`'s page (test setup for the unsaved staging page).
     ///
     /// `centering` seeds the schema-v4 centering-assist state on the node (`None` ⇒ never measured).
-    #[allow(clippy::too_many_arguments)]
     fn seed_inline_text(
         dir: &Path,
         page: usize,

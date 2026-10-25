@@ -9,8 +9,6 @@ Main items:
   applied to shared settings); its `Default` takes them from `ms_project::BASE_BUILTIN`.
 - `BubblesModel`: thread-safe mutable bubbles store with revisions, async saver, and
   flush/hold barriers for destructive staging operations.
-- `runtime_bubble_to_record`: adapter from canvas runtime fields to persisted `Bubble`,
-  including per-bubble `bubble_class` and text display `bubble_type`.
 
 Threading/persistence:
 - Bubble writes are coalesced through `spawn_bubbles_saver_thread` so GUI thread only
@@ -563,45 +561,6 @@ impl BubblesModel {
         self.touch_and_save()
     }
 
-    // Parameters represent distinct required inputs with no natural grouping.
-    #[allow(clippy::too_many_arguments)]
-    pub fn update_patch(
-        &mut self,
-        bid: i64,
-        text: Option<String>,
-        original_text: Option<String>,
-        img_idx: Option<usize>,
-        img_u: Option<f32>,
-        img_v: Option<f32>,
-        side: Option<Option<String>>,
-    ) -> Result<()> {
-        let Some(index) = self.bubble_index_by_id.get(&bid).copied() else {
-            return Ok(());
-        };
-        let Some(existing) = Arc::make_mut(&mut self.bubbles).get_mut(index) else {
-            return Ok(());
-        };
-        if let Some(v) = text {
-            existing.text = v;
-        }
-        if let Some(v) = original_text {
-            existing.original_text = v;
-        }
-        if let Some(v) = img_idx {
-            existing.img_idx = v;
-        }
-        if let Some(v) = img_u {
-            existing.img_u = v;
-        }
-        if let Some(v) = img_v {
-            existing.img_v = v;
-        }
-        if let Some(v) = side {
-            existing.side = v;
-        }
-        self.touch_and_save()
-    }
-
     pub fn update_translation_result(
         &mut self,
         bid: i64,
@@ -953,34 +912,6 @@ pub fn write_bubbles_snapshot_to(path: &Path, bubbles: &[Bubble]) -> Result<()> 
     Ok(())
 }
 
-// Parameters represent distinct required inputs with no natural grouping.
-#[allow(clippy::too_many_arguments)]
-pub fn runtime_bubble_to_record(
-    id: i64,
-    img_idx: usize,
-    img_u: f32,
-    img_v: f32,
-    side: Option<String>,
-    bubble_class: Option<String>,
-    bubble_type: Option<String>,
-    text: String,
-    original_text: String,
-    extra: Option<Map<String, Value>>,
-) -> Bubble {
-    Bubble {
-        id,
-        img_idx,
-        img_u,
-        img_v,
-        side,
-        bubble_class,
-        bubble_type,
-        text,
-        original_text,
-        extra: extra.unwrap_or_default(),
-    }
-}
-
 fn build_bubble_index(bubbles: &[Bubble]) -> HashMap<i64, usize> {
     bubbles
         .iter()
@@ -1099,18 +1030,18 @@ mod tests {
     fn bubble_with_extra(id: i64, key: &str, value: &str) -> Bubble {
         let mut extra = Map::new();
         extra.insert(key.to_string(), Value::String(value.to_string()));
-        runtime_bubble_to_record(
+        Bubble {
             id,
-            0,
-            0.5,
-            0.5,
-            None,
-            None,
-            None,
-            String::new(),
-            String::new(),
-            Some(extra),
-        )
+            img_idx: 0,
+            img_u: 0.5,
+            img_v: 0.5,
+            side: None,
+            bubble_class: None,
+            bubble_type: None,
+            text: String::new(),
+            original_text: String::new(),
+            extra,
+        }
     }
 
     /// Builds a model from `bubbles` with isolated temporary save paths.

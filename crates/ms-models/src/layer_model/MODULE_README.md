@@ -237,7 +237,7 @@ own runtime and draws the returned `CompositeStep`s; none re-implements a band-Z
     committed dir and never seeds (callers with a staging dir should use the transaction form).
   - Targeted single-raster ops (both tabs, e.g. the typing tab adding/moving/effecting an external
     image as a raster without rewriting the whole page): `add_page_raster` (append one node + PNG on
-    top), `update_raster_geometry` (transform + deform mesh together, no PNG — the ONE targeted
+    top; the node is described by `PageRasterSpec`), `update_raster_geometry` (transform + deform mesh together, no PNG — the ONE targeted
     geometry writer, used by the typing raster perspective transform mode; `deform` is written
     verbatim, so `None` CLEARS an existing mesh and a transform-only edit must pass the node's current
     mesh), and `update_raster_effects`

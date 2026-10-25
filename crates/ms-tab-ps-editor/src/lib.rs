@@ -1737,7 +1737,8 @@ impl PsEditorTabState {
         // Read the revision BEFORE our write so the adoption below can tell our own bump apart from
         // a foreign one that landed while this tab was not syncing.
         let revision_before = locked.revision();
-        let accepted = locked.replace_region(page_idx, page_size, x0, y0, cw, ch, &chunk);
+        let region = ms_models::clean_overlays_model::RegionPx { x: x0, y: y0, w: cw, h: ch };
+        let accepted = locked.replace_region(page_idx, page_size, region, &chunk);
         // Same lock scope as the write: adopt the revision our own write just produced, so the next
         // `sync_view_from_canvas` does not mistake it for another tab's edit and reload the page.
         // Conditional on purpose — see the doc comment: if a foreign writer bumped the revision

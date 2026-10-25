@@ -49,7 +49,7 @@ use ms_memory::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
     CacheResourceKind, select_eviction_candidates,
 };
-use ms_models::clean_overlays_model::CleanOverlaysModel;
+use ms_models::clean_overlays_model::{CleanOverlaysModel, RegionPx};
 use ms_log::runtime_log;
 use eframe::egui;
 use egui::{Color32, Pos2, Rect};
@@ -740,7 +740,7 @@ impl OverlayRuntimeState {
             && let Ok(mut locked) = model.lock()
         {
             write_own_change(&mut locked, &mut self.synced_overlays_revision, &mut self.own_write_stamps, Some(page_idx), |model| {
-                model.replace_region(page_idx, size_px, target.x, target.y, target.w, target.h, chunk)
+                model.replace_region(page_idx, size_px, RegionPx { x: target.x, y: target.y, w: target.w, h: target.h }, chunk)
             });
         }
         self.mark_dirty_rect(page_idx, target.x, target.y, target.w, target.h);
@@ -774,7 +774,7 @@ impl OverlayRuntimeState {
             && let Ok(mut locked) = model.lock()
         {
             write_own_change(&mut locked, &mut self.synced_overlays_revision, &mut self.own_write_stamps, Some(page_idx), |model| {
-                model.replace_region(page_idx, size_px, clipped.x, clipped.y, clipped.w, clipped.h, chunk)
+                model.replace_region(page_idx, size_px, RegionPx { x: clipped.x, y: clipped.y, w: clipped.w, h: clipped.h }, chunk)
             });
         }
         self.mark_dirty_rect(page_idx, clipped.x, clipped.y, clipped.w, clipped.h);
@@ -1119,7 +1119,7 @@ mod tests {
     /// A write to the shared model made by someone other than the canvas under test.
     fn foreign_write(model: &Arc<Mutex<CleanOverlaysModel>>, page_idx: usize) {
         match model.lock() {
-            Ok(mut locked) => assert!(locked.replace_region(page_idx, [1, 1], 0, 0, 1, 1, &opaque_pixel())),
+            Ok(mut locked) => assert!(locked.replace_region(page_idx, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &opaque_pixel())),
             Err(err) => panic!("test failed to lock CleanOverlaysModel: {err}"),
         }
     }
@@ -1228,8 +1228,8 @@ mod tests {
 
         match model.lock() {
             Ok(mut locked) => {
-                assert!(locked.replace_region(0, [1, 1], 0, 0, 1, 1, &red_pixel()));
-                assert!(locked.replace_region(1, [1, 1], 0, 0, 1, 1, &red_pixel()));
+                assert!(locked.replace_region(0, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &red_pixel()));
+                assert!(locked.replace_region(1, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &red_pixel()));
             }
             Err(err) => panic!("test failed to lock CleanOverlaysModel: {err}"),
         }

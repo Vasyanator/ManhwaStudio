@@ -124,9 +124,7 @@ impl ReversibleAction for BubbleSnapshotOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ms_models::bubbles_model::{
-        SharedCanvasSettings, runtime_bubble_to_record,
-    };
+    use ms_models::bubbles_model::SharedCanvasSettings;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -145,18 +143,18 @@ mod tests {
     }
 
     fn bubble(id: i64, u: f32) -> Bubble {
-        runtime_bubble_to_record(
+        Bubble {
             id,
-            0,
-            u,
-            0.5,
-            Some("left".to_string()),
-            Some("text".to_string()),
-            Some("aside".to_string()),
-            String::new(),
-            String::new(),
-            None,
-        )
+            img_idx: 0,
+            img_u: u,
+            img_v: 0.5,
+            side: Some("left".to_string()),
+            bubble_class: Some("text".to_string()),
+            bubble_type: Some("aside".to_string()),
+            text: String::new(),
+            original_text: String::new(),
+            extra: serde_json::Map::new(),
+        }
     }
 
     #[test]

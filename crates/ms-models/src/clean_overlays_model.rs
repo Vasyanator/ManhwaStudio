@@ -82,6 +82,18 @@ const DEFAULT_PAGE_CACHE_BYTE_LIMIT: u64 = 512 * 1024 * 1024;
 const DEFAULT_PAGE_CACHE_ITEM_LIMIT: usize = 64;
 const LOW_PAGE_CACHE_ITEM_LIMIT: usize = 24;
 
+/// A pixel rectangle in page coordinates: top-left `(x, y)` and size `w` x `h`.
+///
+/// No invariant is enforced: [`CleanOverlaysModel::replace_region`] clips it to the page and
+/// rejects an empty or fully outside rect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionPx {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageCacheWindow {
     pub center_idx: usize,
@@ -777,18 +789,20 @@ impl CleanOverlaysModel {
         true
     }
 
-    // Parameters represent distinct required inputs with no natural grouping.
-    #[allow(clippy::too_many_arguments)]
+    /// Writes `chunk` into `region` of page `idx` as one committed, undoable edit.
+    ///
+    /// `size` is the writer's page size; the model normalizes it to the page's remembered size
+    /// ([`Self::overlay_size`]) and materializes the overlay if needed. `region` is clipped to that
+    /// size and `chunk` is scaled into the clipped rect. Returns `false` (nothing changed) for an
+    /// empty `region` or `chunk`, an unknown page, or a rect fully outside the page.
     pub fn replace_region(
         &mut self,
         idx: usize,
         size: [usize; 2],
-        x: usize,
-        y: usize,
-        w: usize,
-        h: usize,
+        region: RegionPx,
         chunk: &ColorImage,
     ) -> bool {
+        let RegionPx { x, y, w, h } = region;
         if w == 0 || h == 0 || chunk.size[0] == 0 || chunk.size[1] == 0 {
             return false;
         }
@@ -1861,7 +1875,7 @@ mod tests {
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 128),
         );
 
-        assert!(model.replace_region(0, [1, 1], 0, 0, 1, 1, &chunk));
+        assert!(model.replace_region(0, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &chunk));
 
         let Some(rgba) = model.overlay_rgba(0) else {
             panic!("overlay rgba cache was not populated");
@@ -1877,7 +1891,7 @@ mod tests {
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 128),
         );
 
-        assert!(model.replace_region(0, [1, 1], 0, 0, 1, 1, &chunk));
+        assert!(model.replace_region(0, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &chunk));
         assert!(model.undo_overlay_history());
         assert!(model.redo_overlay_history());
 
@@ -1905,7 +1919,7 @@ mod tests {
         assert!(model.get(0).is_none());
 
         // Forward edit mutates BOTH representations.
-        assert!(model.replace_region(0, [2, 2], 0, 0, 1, 1, &chunk));
+        assert!(model.replace_region(0, [2, 2], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &chunk));
         let Some(color) = model.get(0) else {
             panic!("overlay color image was not populated");
         };
@@ -1972,7 +1986,7 @@ mod tests {
         assert!(model.ensure_overlay(0, [2, 2]));
         let transparent = ColorImage::filled([2, 2], egui::Color32::TRANSPARENT);
         // Overwriting transparent with transparent changes nothing.
-        assert!(model.replace_region(0, [2, 2], 0, 0, 2, 2, &transparent));
+        assert!(model.replace_region(0, [2, 2], RegionPx { x: 0, y: 0, w: 2, h: 2 }, &transparent));
         assert!(!model.can_undo_overlay_history());
     }
 
@@ -1982,12 +1996,12 @@ mod tests {
         let a = solid_chunk(255, 0, 0, 255);
         let b = solid_chunk(0, 255, 0, 255);
         let c = solid_chunk(0, 0, 255, 255);
-        assert!(model.replace_region(0, [4, 4], 0, 0, 1, 1, &a));
-        assert!(model.replace_region(0, [4, 4], 0, 0, 1, 1, &b));
+        assert!(model.replace_region(0, [4, 4], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &a));
+        assert!(model.replace_region(0, [4, 4], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &b));
         assert!(model.undo_overlay_history());
         assert!(model.can_redo_overlay_history());
         // A fresh commit abandons the redoable future.
-        assert!(model.replace_region(0, [4, 4], 1, 1, 1, 1, &c));
+        assert!(model.replace_region(0, [4, 4], RegionPx { x: 1, y: 1, w: 1, h: 1 }, &c));
         assert!(!model.can_redo_overlay_history());
     }
 
@@ -2002,7 +2016,7 @@ mod tests {
             solid_chunk(0, 255, 0, 255),
             solid_chunk(0, 0, 255, 255),
         ] {
-            assert!(model.replace_region(0, [4, 4], 0, 0, 1, 1, &color));
+            assert!(model.replace_region(0, [4, 4], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &color));
         }
         assert!(model.can_undo_overlay_history());
         assert_eq!(model.history.undo_len(), 1);
@@ -2219,8 +2233,8 @@ mod tests {
         let mut cleaning = model.revision();
         let mut typing = model.revision();
 
-        assert!(model.replace_region(1, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
-        assert!(model.replace_region(3, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        assert!(model.replace_region(1, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &opaque_pixel()));
+        assert!(model.replace_region(3, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &opaque_pixel()));
 
         assert_eq!(consume(&model, &mut cleaning), vec![1, 3]);
         assert_eq!(consume(&model, &mut typing), vec![1, 3], "first reader must not drain the second");
@@ -2233,7 +2247,7 @@ mod tests {
         let mut cleaning = model.revision();
         let mut typing = model.revision();
 
-        assert!(model.replace_region(2, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        assert!(model.replace_region(2, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &opaque_pixel()));
         assert_eq!(consume(&model, &mut cleaning), vec![2]);
         assert!(model.undo_overlay_history());
         assert_eq!(consume(&model, &mut cleaning), vec![2]);
@@ -2247,9 +2261,9 @@ mod tests {
     fn delta_since_reports_only_pages_changed_after_the_known_revision() {
         let mut model = multi_page_model(3);
         let mut early = model.revision();
-        assert!(model.replace_region(0, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        assert!(model.replace_region(0, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &opaque_pixel()));
         let mut late = model.revision();
-        assert!(model.replace_region(1, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        assert!(model.replace_region(1, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &opaque_pixel()));
 
         assert_eq!(consume(&model, &mut late), vec![1]);
         assert_eq!(consume(&model, &mut early), vec![0, 1]);
@@ -2272,7 +2286,7 @@ mod tests {
         }
 
         let after_visibility = model.revision();
-        assert!(model.replace_region(0, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        assert!(model.replace_region(0, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &opaque_pixel()));
         let Some(delta) = model.delta_since(after_visibility) else {
             panic!("page change must produce a delta");
         };
@@ -2287,7 +2301,7 @@ mod tests {
         model.set_visible(true);
         assert!(model.delta_since(known).is_none(), "setting the same visibility is not a change");
 
-        assert!(model.replace_region(0, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        assert!(model.replace_region(0, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &opaque_pixel()));
         let first = model.delta_since(known);
         assert_eq!(model.delta_since(known), first, "reading a delta must not consume it");
     }
@@ -2296,7 +2310,7 @@ mod tests {
     fn delta_since_reports_runtime_only_changes() {
         let mut model = multi_page_model(2);
         let known = model.revision();
-        assert!(model.replace_region(1, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        assert!(model.replace_region(1, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &opaque_pixel()));
         let mut after_edit = model.revision();
         assert!(model.detach_page_overlay(1));
         assert_eq!(consume(&model, &mut after_edit), vec![1]);
@@ -2309,10 +2323,10 @@ mod tests {
         let mut model = multi_page_model(3);
         let mut known = model.revision();
         model.lock_updates();
-        assert!(model.replace_region(0, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        assert!(model.replace_region(0, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &opaque_pixel()));
         assert!(model.delta_since(known).is_none(), "no revision bump while locked");
         model.unlock_updates();
-        assert!(model.replace_region(2, [1, 1], 0, 0, 1, 1, &opaque_pixel()));
+        assert!(model.replace_region(2, [1, 1], RegionPx { x: 0, y: 0, w: 1, h: 1 }, &opaque_pixel()));
         assert_eq!(consume(&model, &mut known), vec![0, 2]);
     }
 }
