@@ -47,6 +47,8 @@ Submodules:
 - `native` (desktop only): native ONNX PaddleOCR route read and runner.
 - `region`: in-memory region helpers for the Cleaning tools.
 - `region_detect`: an OCR selection's region detection (worker side) and its page merge.
+- `storage`: the one owner of the per-chapter `text_detection` storage format (file names,
+  `read_text_detection_page`, `write_text_detection_page`); used by the tab and by Cleaning.
 - `neurolate`: the NeuroLate cloud detector (page and crop requests) and the one owner of its
   answer -> mask + blocks conversion (also used by the NeuroLate OCR engine).
 
@@ -65,6 +67,7 @@ pub(crate) mod neurolate;
 mod pipeline;
 mod region;
 mod region_detect;
+mod storage;
 #[cfg(test)]
 mod tests;
 
@@ -72,6 +75,8 @@ mod tests;
 pub use ms_text_detect::DetectRect as TextDetectorRect;
 pub use pipeline::DetectFailure;
 pub use region::{detect_ai_ctd_mask_for_image, detect_paddle_mask_for_image, detect_surya_mask_for_image};
+// The one owner of the `text_detection` storage format (the tab's load / Save, Cleaning's mask reads).
+pub use storage::{read_text_detection_page, stored_detection_file_page, text_detection_blocks_file_path, text_detection_mask_file_path, write_text_detection_page};
 
 use ms_ai_api::neurolate::OcrParams;
 use ms_config as config;

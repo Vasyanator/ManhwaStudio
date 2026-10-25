@@ -78,6 +78,10 @@ local detector, and the region-image helpers the Cleaning tab reuses for its mas
   `neurolate::region_from_image`), `RegionDetectRequest`, `RegionDetection`,
   `run_region_detection` (worker), the pure `merge_region_into_page` / `empty_page_result`, and
   their unit tests.
+- `storage.rs` (+ `storage/tests.rs`): the ONE owner of the per-chapter `text_detection` storage
+  format — `{idx:05}_blocks.json` (`source_size`, `blocks`, `mask_size`, `mask_file`) +
+  `{idx:05}_mask.png`, the reader `read_text_detection_page` and the writer
+  `write_text_detection_page`. GUI-free, worker threads only.
 - `tests.rs`: unit tests (routing, gate, batch sizing, IPC runner over a fake transport, fallback
   decision, error texts, region contract) and the Phase 1 characterization tests of `classic.rs`
   and the dilation adapter.
@@ -88,6 +92,10 @@ local detector, and the region-image helpers the Cleaning tab reuses for its mas
   re-exports from `mod.rs` when moving code between submodules. Region helpers return the mask at
   the REGION size (`[0, 0]` for an empty region).
 - `TextDetectorRect` IS `ms_text_detect::DetectRect` (re-export, not a copy).
+- The `text_detection` storage format has one reader and one writer (`storage.rs`): the tab's
+  load / Save (`tab/detection_storage.rs`, directory policy only) and Cleaning's stored-mask
+  reads (`ms-tab-cleaning` `text_mask_storage.rs`, an adapter) both go through them. A page whose
+  files exist but cannot be read is an error, never "no detection".
 - Every engine returns blocks finalized by `ms_text_detect` and a mask that is either empty
   (`[0, 0]`) or exactly `w * h` bytes of 0/255 at source size.
 - Mask dilation has ONE owner, Rust (`dilate_mask_alpha` over `ms_raster::dilate_square`): the batch

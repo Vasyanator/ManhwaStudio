@@ -253,6 +253,10 @@ impl ProjectSession {
         let spawned = thread::Builder::new().name("save-to-project".to_owned()).spawn(move || {
             // Declared first so it drops last: after the result was sent, on every return path.
             let _wake_gui = wake_gui;
+            // Rebound so the sender drops before the wake (a moved-in capture would drop with
+            // the closure, after every local): a lost job then reads as `Disconnected` on the
+            // frame the wake causes.
+            let tx = tx;
             // Hold later bubble snapshots until every destructive staging operation below is done.
             // Dropping this guard on any return path resumes the saver.
             let bubbles_barrier = match bubbles_saver_handle.barrier_and_hold_blocking() {

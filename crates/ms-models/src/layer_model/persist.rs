@@ -855,9 +855,9 @@ struct TextIdent {
 }
 
 /// A TEXT node with its full inline payload, handed in for the schema-v3 whole-page text flush
-/// (`write_page_text_payload`). Unlike [`TextNodeOut`] (identity/order only, payload referenced into
-/// `text_info.json`), this carries the render params, geometry, the rendered PNG name, and mask-clip
-/// inline so `layers.json` is self-sufficient for text.
+/// (`write_page_text_payload`). Unlike a legacy text node (identity/order only, payload referenced
+/// into `text_info.json`), this carries the render params, geometry, the rendered PNG name, and
+/// mask-clip inline so `layers.json` is self-sufficient for text.
 #[derive(Debug, Clone)]
 pub struct TextPayloadOut {
     pub uid: String,
@@ -933,14 +933,14 @@ pub struct TextInlineIn {
 /// rendered PNG name + `mask_clip` inline, making `layers.json` self-sufficient for text. This is the
 /// single text writer (the former reference-only `text_info.json` writers were removed in A4–D).
 ///
-/// The page is first seeded from the committed fallback (via [`ensure_page_staged`]) when the staging
+/// The page is first seeded from the committed fallback (via `ensure_page_staged`) when the staging
 /// manifest has no record of it, so rasters living ONLY in committed (the first text flush after a
 /// chapter re-open, when the previous save removed the `_unsaved` dir) are carried onto the staged
 /// page — otherwise the owned-page merge would whole-page-replace the committed page with a text-only
 /// one and DROP the rasters.
 ///
 /// PS-owned fields (`pinned` / `z` / `group_uid`) on an existing text node are carried onto the
-/// incoming node by [`merge_preserved_text_fields`] (same as the typing rewrite), so a doc flush does
+/// incoming node by `merge_preserved_text_fields` (same as the typing rewrite), so a doc flush does
 /// not clobber a pin / Z / PS group set in the PS editor; the incoming `pinned_by_group` (doc-owned)
 /// is written as given. Does NO PNG IO: it only
 /// records each node's rendered-PNG NAME in `rendered_file` and writes the manifest. Writing those

@@ -5,10 +5,8 @@ use std::collections::HashSet;
 use std::fs;
 
 use super::{TextDetectorPageResult, TextDetectorRect};
-use super::detection_storage::{
-    load_text_detection_storage, save_text_detection_storage, stored_detection_file_page,
-    text_detection_blocks_file_path, text_detection_mask_file_path,
-};
+use super::detection_storage::{load_text_detection_storage, save_text_detection_storage};
+use crate::text_detector::{stored_detection_file_page, text_detection_blocks_file_path, text_detection_mask_file_path};
 
 fn page(blocks: usize) -> TextDetectorPageResult {
     let rect = TextDetectorRect::from_xyxy(0.0, 0.0, 1.0, 1.0).expect("valid rect");

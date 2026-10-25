@@ -457,7 +457,9 @@ impl TranslationTabState {
             last_page_idx: &mut self.last_page_idx,
             last_bubble_order: &mut self.last_bubble_order,
             image_bubble_pick: &mut self.image_bubble_pick,
+            image_bubble_save: &mut self.image_bubble_save,
             input: self.input_frame.as_ref(),
+            known_page_sizes: &self.known_page_sizes,
         };
         draw_bubbles_panel(
             &mut self.bubbles_panel,

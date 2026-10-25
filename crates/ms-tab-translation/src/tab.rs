@@ -133,7 +133,7 @@ use crate::ocr::{OcrEngine, OcrLoadState, OcrRecognizeRequest, TranslationOcrCon
 use crate::model_download_status::ModelDownloadStatus;
 use crate::ocr_model_download::OcrModelDownloadController;
 use ms_ai_api::AiApiTaskRunner;
-use crate::panels::bubbles::{BubbleFooterState, BubblesPanelState, ImageBubbleFilePick};
+use crate::panels::bubbles::{BubbleFooterState, BubblesPanelState, ImageBubbleFilePick, ImageBubbleSave};
 use crate::panels::composition::{CompositionPanelOptions, CompositionPanelState};
 use crate::panels::composition_presets::{CompositionPresetRef, CompositionPresets};
 use crate::panels::machine_translation::{MtPanelOptions, MtPanelProgress, MtStopNotice};
@@ -588,6 +588,10 @@ pub struct TranslationTabState {
     /// The one open «choose file» dialog of an external image bubble, started by the canvas
     /// footer or a bubbles-panel card and resolved by [`Self::poll_image_bubble_pick`].
     image_bubble_pick: Option<ImageBubbleFilePick>,
+    /// The one running image-bubble file job (clipboard paste or picked-file copy), started
+    /// from the canvas footer, a bubbles-panel card or a finished pick, and resolved by
+    /// [`Self::poll_image_bubble_save`].
+    image_bubble_save: Option<ImageBubbleSave>,
     pending_footer_patches: HashMap<i64, Map<String, Value>>,
     pending_footer_patch_changed_at: HashMap<i64, f64>,
     footer_character_autocomplete: HashMap<i64, AutocompleteLine>,
@@ -743,6 +747,7 @@ impl TranslationTabState {
             footer_known_ids: HashSet::new(),
             footer_overrides: HashMap::new(),
             image_bubble_pick: None,
+            image_bubble_save: None,
             pending_footer_patches: HashMap::new(),
             pending_footer_patch_changed_at: HashMap::new(),
             footer_character_autocomplete: HashMap::new(),

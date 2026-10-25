@@ -31,8 +31,8 @@ confirmed through the in-app `ConfirmModal` (`overwrite_confirm`).
 */
 
 use egui::{
-    Align, Button, CentralPanel, ComboBox, Frame, Layout, ProgressBar, RichText, ScrollArea,
-    Slider, Stroke, TextEdit, TextureHandle, TextureOptions, Ui, Window,
+    Align, Button, CentralPanel, Frame, Layout, ProgressBar, RichText, ScrollArea,
+    Stroke, TextEdit, TextureHandle, TextureOptions, Ui, Window,
     WindowLevel,
 };
 use image::{DynamicImage, RgbaImage};
@@ -87,7 +87,7 @@ use ms_settings_ui::tutorial::{TutorialController, TutorialId, TutorialProgressH
 use ms_sysprobe::screen_capture::{self, ScreenRect};
 use ms_widgets::{
     ArrowStyle, EditableComboBox, EmbeddedWindow, EmbeddedWindowState, GutterItem, MarkedScrollArea,
-    MarkedScrollOutput, ScrollSpan, arrow,
+    MarkedScrollOutput, ScrollSpan, WheelComboBox, WheelSlider, arrow, cycle_wrapped_index,
 };
 use crate::new_project::batch_processing::BatchProcessingWindowState;
 

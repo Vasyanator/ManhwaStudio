@@ -248,15 +248,25 @@ impl AiBackendHandle {
         }
     }
 
+    /// Sends `command` to the health / device probe thread (non-blocking). Without a probe
+    /// (backend unavailable for this process) it is a no-op; a probe thread that is gone is
+    /// logged with the lost command, and the health snapshot simply stops refreshing.
     pub fn send_probe(&self, command: AiBackendProbeCommand) {
-        if let Some(tx) = self.probe_tx.as_ref() {
-            let _ = tx.send(command);
+        if let Some(tx) = self.probe_tx.as_ref()
+            && let Err(err) = tx.send(command)
+        {
+            runtime_log::log_warn(format!("[ai-backend] probe command {:?} not delivered: the probe thread is gone", err.0));
         }
     }
 
+    /// Sends `command` to the backend process thread (non-blocking). Without one it is a no-op;
+    /// a process thread that is gone is logged with the lost command (the backend then cannot
+    /// be started, stopped or restarted from this process).
     pub fn send_process(&self, command: AiBackendProcessCommand) {
-        if let Some(tx) = self.process_tx.as_ref() {
-            let _ = tx.send(command);
+        if let Some(tx) = self.process_tx.as_ref()
+            && let Err(err) = tx.send(command)
+        {
+            runtime_log::log_error(format!("[ai-backend] process command {:?} not delivered: the process thread is gone", err.0));
         }
     }
 

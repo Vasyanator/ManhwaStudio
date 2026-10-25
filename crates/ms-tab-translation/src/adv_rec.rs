@@ -9,7 +9,8 @@ Main responsibilities:
 - hold editable recognition result text and emit UI actions back to Translation tab;
 - support local quick-selection OCR inside the floating preview when brush mode is disabled;
 - resize its brush from the shared brush actions (`ms_tools::mask_brush`) while brush mode is on
-  (`brush_input_active` / `apply_brush_input`, called by the tab before drawing);
+  (`brush_input_active` / `apply_brush_input`, called by the tab before drawing); stroke masks
+  are painted by the shared `ms_tools::paint_soft_line_mask` (dab centres snapped to pixels);
 - take all input from the frame (`ms_input::InputFrame`): the window publishes its own view
   surface (`adv_rec_view_id`) and zooms by the shared `view.*` set (commands, wheel axis, zoom
   drag) when its focus is this view; select / paint / erase are the gestures
@@ -27,7 +28,7 @@ Notes:
 */
 
 use ms_input::{AxisSource, HitPhase, InputFrame, ViewId, ViewSurface, publish_view_surface, view};
-use ms_tools::{LineSegmentPx, MaskBrush};
+use ms_tools::{MaskBrush, SoftDabSampling, SoftDabTip, paint_soft_line_mask};
 use ms_widgets::WheelSlider;
 use eframe::egui;
 use egui::color_picker::{self, Alpha};
@@ -935,12 +936,18 @@ fn paint_adv_rec_brush_to(session: &mut AdvancedRecognitionSession, pointer_pos:
         _ => (to_x, to_y),
     };
     begin_adv_rec_brush_stroke(session, erase);
-    paint_line_mask_with_hardness(
+    // The working image is an integer pixel grid: dab centres snap to whole pixels. Pixel
+    // coordinates stay far below 2^24, so the `as f32` conversions are exact.
+    paint_soft_line_mask(
         &mut session.brush_stroke_mask,
         session.working_overlay_image.size,
-        LineSegmentPx { x0: from_x, y0: from_y, x1: to_x, y1: to_y },
-        i32::try_from(session.brush.radius_px().max(1)).unwrap_or(i32::MAX),
-        session.brush_hardness,
+        Pos2::new(from_x as f32, from_y as f32),
+        Pos2::new(to_x as f32, to_y as f32),
+        SoftDabTip {
+            radius: i32::try_from(session.brush.radius_px().max(1)).unwrap_or(i32::MAX),
+            hardness: session.brush_hardness,
+            sampling: SoftDabSampling::SnappedPixelCentres,
+        },
     );
     apply_adv_rec_brush_stroke(session);
     session.refresh_preview_overlay();
@@ -1269,78 +1276,6 @@ fn apply_adv_rec_brush_stroke(session: &mut AdvancedRecognitionSession) {
     }
 }
 
-/// Stamps soft circles of `radius` (at least one pixel) and `hardness` (0..=1) along `segment`
-/// into the stroke strength mask `dst` (`image_size` = `[width, height]`, row-major); a
-/// zero-length segment stamps one circle. Pixels outside the image are clipped.
-fn paint_line_mask_with_hardness(dst: &mut [f32], image_size: [usize; 2], segment: LineSegmentPx, radius: i32, hardness: f32) {
-    let LineSegmentPx { x0, y0, x1, y1 } = segment;
-    let r = radius.max(1);
-    let dx = (x1 - x0) as f32;
-    let dy = (y1 - y0) as f32;
-    let distance = (dx * dx + dy * dy).sqrt();
-    if distance <= f32::EPSILON {
-        paint_circle_mask_with_hardness(dst, image_size, x0, y0, r, hardness);
-        return;
-    }
-    let step = (r as f32 * 0.45).max(1.0);
-    let stamps = (distance / step).ceil() as usize;
-    let mut last = (i32::MIN, i32::MIN);
-    for i in 0..=stamps {
-        let t = i as f32 / stamps.max(1) as f32;
-        let sx = (x0 as f32 + dx * t).round() as i32;
-        let sy = (y0 as f32 + dy * t).round() as i32;
-        if (sx, sy) == last {
-            continue;
-        }
-        paint_circle_mask_with_hardness(dst, image_size, sx, sy, r, hardness);
-        last = (sx, sy);
-    }
-}
-
-fn paint_circle_mask_with_hardness(
-    dst: &mut [f32],
-    image_size: [usize; 2],
-    cx: i32,
-    cy: i32,
-    radius: i32,
-    hardness: f32,
-) {
-    let r = radius.max(1);
-    let w_usize = image_size[0];
-    let w = w_usize as i32;
-    let h = image_size[1] as i32;
-    let x0 = (cx - r).max(0);
-    let x1 = (cx + r).min(w - 1);
-    let y0 = (cy - r).max(0);
-    let y1 = (cy + r).min(h - 1);
-    let radius_f = r as f32;
-    let hardness = hardness.clamp(0.0, 1.0);
-    let hard_radius = (radius_f * hardness).clamp(0.0, radius_f);
-    let soft_span = (radius_f - hard_radius).max(f32::EPSILON);
-
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            let dx = x - cx;
-            let dy = y - cy;
-            let dist = ((dx * dx + dy * dy) as f32).sqrt();
-            if dist > radius_f {
-                continue;
-            }
-            let strength = if dist <= hard_radius || hardness >= 1.0 {
-                1.0
-            } else {
-                let t = ((dist - hard_radius) / soft_span).clamp(0.0, 1.0);
-                1.0 - smoothstep(t)
-            };
-            if strength <= f32::EPSILON {
-                continue;
-            }
-            let idx = (y as usize).saturating_mul(w_usize) + x as usize;
-            dst[idx] = dst[idx].max(strength);
-        }
-    }
-}
-
 fn paint_overlay_pixel(dst: &mut Color32, src: Color32, strength: f32, erase: bool) {
     let pressure = strength.clamp(0.0, 1.0);
     if pressure <= f32::EPSILON {
@@ -1411,11 +1346,6 @@ fn erase_overlay_pixel(dst: &mut Color32, pressure: f32) {
         dst_b,
         (dst_alpha * keep * 255.0).round().clamp(0.0, 255.0) as u8,
     );
-}
-
-fn smoothstep(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
 }
 
 fn adv_rec_target_window_size(content_size: egui::Vec2, max_size: egui::Vec2) -> egui::Vec2 {

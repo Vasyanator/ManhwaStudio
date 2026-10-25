@@ -54,6 +54,10 @@ impl ProjectSession {
         let _detached = thread::Builder::new().name("discard-staging".to_owned()).spawn(move || {
             // Declared first so it drops last: after the result was sent, on every return path.
             let _wake_gui = wake_gui;
+            // Rebound so the sender drops before the wake (a moved-in capture would drop with
+            // the closure, after every local): a lost job then reads as `Disconnected` on the
+            // frame the wake causes.
+            let tx = tx;
             // A closed start channel means `start_exit_cleanup` dropped the job without releasing
             // it; nothing was quiesced for it, so it must not delete anything. Dropping `tx` reports
             // that as a lost worker.

@@ -449,7 +449,8 @@ saving, and export.
   `tab/`. All child modules are DESCENDANTS of `tab`, so they read the model's private
   fields directly; moved methods/free-fns are `pub(super)` (or `pub(crate)`
   when a typing-level sibling like `panel.rs`/`psd_export.rs` calls them).
-- `tab/` submodules (each an `impl TypingTextOverlayLayer` method group and/or free-fn slab):
+- `tab/` submodules (each an `impl TypingTextOverlayLayer` method group and/or free-fn slab; directory
+  map: `tab/MODULE_README.md`):
   - `studio_tab.rs`: `impl ms_studio_tab::StudioTab for TypingTabState` — the studio root's
     order-free per-tab hooks: dock builder, GPU eviction (canvas clean overlay, then the tab's own
     `evict_gpu_caches`), canvas source-page window / NEAREST sampling, the exit-only settings

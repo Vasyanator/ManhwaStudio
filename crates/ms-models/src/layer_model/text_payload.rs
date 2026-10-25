@@ -567,12 +567,12 @@ fn legacy_overlay_page_idx(obj: &Map<String, Value>, page_count: usize) -> Optio
 /// per-entry [`decode_overlay_placement`] resolves them correctly. Modern entries pass through
 /// unchanged. Two cross-entry families are handled:
 /// - absolute ribbon `x`/`y` (+ optional `region_w`/`region_h`) with no `img_idx`/`u`/`v`: the
-///   chapter's continuous-ribbon scale is recovered via [`LegacyRibbonGeometry`] from all such entries,
+///   chapter's continuous-ribbon scale is recovered via [`LegacyRibbonGeometry`](ms_project::LegacyRibbonGeometry) from all such entries,
 ///   then each region center maps to normalized `img_u`/`img_v`;
 /// - normalized `u`/`v`: already a CENTER anchor for the two newest legacy generations, and copied to
 ///   `img_u`/`img_v` verbatim. The two top-left generations [`legacy_uv_anchor`] recognizes are
 ///   shifted by half their anchor box, which differs per generation (see [`LegacyUvAnchor`] and
-///   [`legacy_top_left_geometry`]).
+///   `legacy_top_left_geometry`).
 ///
 /// Deliberate migration-time NORMALIZATION of the displayed size, for the two top-left generations
 /// only: both drew the strip at `w_frac * page_w * user_scale`, while the modern decoder sizes an
@@ -585,7 +585,7 @@ fn legacy_overlay_page_idx(obj: &Map<String, Value>, page_count: usize) -> Optio
 ///
 /// `png_size(obj)` supplies the overlay PNG `(width, height)` in pixels for the top-left cases (the
 /// caller owns image IO; return `(0.0, 0.0)` when unknown — the entry then keeps whatever half-shift
-/// `w_frac` alone determines, and gets no injected `scale`; see [`legacy_top_left_geometry`]).
+/// `w_frac` alone determines, and gets no injected `scale`; see `legacy_top_left_geometry`).
 /// `page_sizes[idx] = [w, h]` are page pixels. An entry whose resolved page index is ABSENT from
 /// `page_sizes` has no known page geometry: a top-left `u`/`v` is then copied verbatim rather than
 /// shifted by a half-extent derived from a placeholder page.

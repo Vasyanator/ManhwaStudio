@@ -583,7 +583,7 @@ fn managed_relative<'p>(path: &'p Path, root: &Path) -> Option<&'p Path> {
 /// `{chapter}/.pageop_trash/{millis}/`, preserving their title-relative tree layout.
 ///
 /// Security contract: `path` must resolve strictly inside one of the two managed clean
-/// folders under lexical component validation (see [`managed_relative`]); any `..`/root
+/// folders under lexical component validation (see `managed_relative`); any `..`/root
 /// re-anchoring or a path outside both roots is rejected with
 /// [`TrashCleanError::OutsideManagedRoots`] before any filesystem access.
 ///
@@ -879,7 +879,7 @@ pub fn write_new_clean_png(paths: &ProjectPaths, destination: &Path, image: &Rgb
 /// rename) and the source removed afterwards. File bytes are preserved exactly.
 ///
 /// Synchronous I/O: worker threads only. Check-then-rename, relying on the caller's serialization
-/// (see [`write_bytes_no_replace`]).
+/// (see `write_bytes_no_replace`).
 ///
 /// # Errors
 /// `OutsideManagedRoots`, `SourceMissing`, `DestinationExists` before anything is touched;

@@ -16,15 +16,6 @@ const TR: Scope = Scope::Tab(AppTab::Translation);
 const SUB: Scope = Scope::Sub(Some(AppTab::Translation));
 const WINDOW: Scope = Scope::Window(Some(AppTab::Translation));
 
-/// Installs the embedded English catalog for label assertions, serialized on the process-global
-/// locale lock (the active catalog is one `ArcSwap`).
-fn english_locale() -> std::sync::MutexGuard<'static, ()> {
-    let guard = ms_config::locale_store::GLOBAL_LOCALE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let tag = ms_i18n::LocaleTag::parse("en").expect("the `en` tag parses");
-    ms_i18n::set_locale(&tag).expect("the embedded English catalog installs");
-    guard
-}
-
 /// The Translation set together with everything else declared where the Translation canvas
 /// runs: the shared view set, the canvas set and the shared brush set.
 fn studio_like_registry() -> InputRegistry {
@@ -40,7 +31,7 @@ fn studio_like_registry() -> InputRegistry {
 #[test]
 fn declarations_golden() {
     use ActionKind::{Command, Gesture, Mode};
-    let _locale = english_locale();
+    let _locale = crate::english_locale_for_test();
     let registry = studio_like_registry();
     let expected: Vec<(&str, ActionKind, Scope, &str)> = vec![
         ("translation.bubble.delete_selected", Command, TR, "Del"),
@@ -157,7 +148,7 @@ fn recent_char_rank_reads_the_lowest_held_rank() {
 /// recent-character group reads "1-6" (all six ranks), and the lines edit adds its two rows.
 #[test]
 fn hint_rows_are_built_from_the_registry() {
-    let _locale = english_locale();
+    let _locale = crate::english_locale_for_test();
     let labels = TranslationInputLabels::from_registry(&studio_like_registry());
     assert_eq!(labels.recent_chars, "1-6");
     assert_eq!(labels.recent_char_keys, ["1", "2", "3", "4", "5", "6"]);
@@ -186,7 +177,7 @@ fn hint_rows_are_built_from_the_registry() {
 /// registry's "not assigned" text.
 #[test]
 fn unbound_actions_read_as_such() {
-    let _locale = english_locale();
+    let _locale = crate::english_locale_for_test();
     let mut registry = studio_like_registry();
     registry.set_bindings(super::TOGGLE_OCR_PANEL, Vec::new()).expect("a panel toggle may be unbound");
     registry.set_bindings(super::CREATE_IMAGE_BUBBLE, Vec::new()).expect("a command may be unbound");

@@ -867,6 +867,9 @@ mod tests {
     /// status line; nothing is merged.
     #[test]
     fn failed_cancelled_or_unusable_ocr_regions_clear_the_wait_and_the_status() {
+        // The refusal text interpolates the error into a catalog template: without an installed
+        // catalog `tf!` yields the bare key and the error text would be missing.
+        let _locale = crate::english_locale_for_test();
         let (mut tab, _model) = tab_with_model();
         let ctx = egui::Context::default();
         tab.text_detection_storage_loaded_for = Some(PathBuf::from("/home/u/title/chapter"));

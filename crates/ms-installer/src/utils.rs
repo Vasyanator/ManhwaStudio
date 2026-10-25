@@ -13,6 +13,10 @@ Main responsibilities:
 - decide which specs an existing environment still lacks (`missing_dependency_specs`: absent,
   or installed outside the spec's version pin, read through `pip_spec`), shared by repair,
   update continuation and the `--check-venv` readiness view;
+- before repair / update continuation installs into an existing environment, uninstall the
+  distributions that collide with a required one on the `cv2` module
+  (`conflicting_module_distributions`: an older installer's `opencv-python` beside the
+  required `opencv-python-headless`);
 - sequence the Torch stage (owned by `torch/`: pins, options, command, readiness) inside the
   install, repair and update workers, and provide it the pip / uv runner, retry loop and
   progress helpers (`pub(crate)`);
@@ -816,7 +820,9 @@ fn ensure_repair_python_environment(
 }
 
 /// Installs only the dependencies of `request` that `installed` does not provide, or provides
-/// at a version outside the spec's pin (see [`missing_dependency_specs`]).
+/// at a version outside the spec's pin (see [`missing_dependency_specs`]), after uninstalling
+/// distributions that collide with one of them on a module
+/// ([`conflicting_module_distributions`]; the required one is then reinstalled).
 ///
 /// `installed` is a `pip freeze` snapshot (see [`freeze_installed_packages`]). When
 /// nothing is missing the request is skipped entirely — including the pip/wheel
@@ -826,7 +832,16 @@ fn install_missing_static_dependencies(
     request: DependencyInstallRequest<'_>,
     installed: &HashMap<String, String>,
 ) -> Result<(), String> {
-    let missing = missing_dependency_specs(request.dependencies, installed);
+    let installed = uninstall_conflicting_module_distributions(
+        request.pip_runner,
+        request.python_exe,
+        request.root_dir,
+        request.dependencies,
+        installed,
+        request.tx,
+        request.cancel,
+    )?;
+    let missing = missing_dependency_specs(request.dependencies, &installed);
     if missing.is_empty() {
         send_progress(
             request.tx,
@@ -1489,10 +1504,23 @@ fn install_missing_dependencies_for_update(
     // or refreshes it through the dedicated Torch stage (`maybe_update_torch`), which
     // needs the right wheel index.
     let required = required_dependency_specs(install_type);
-    let missing = missing_dependency_specs(&required, &installed);
     // Keep the installed torch (any flavour) through these PyPI installs.
     let constraints = write_torch_constraints(root_dir, &installed)?;
     let constraint_args = constraint_args(constraints.as_deref());
+    let install_tx = UpdateToInstallEventBridge { tx }.sender();
+    // An environment from an older installer may hold `opencv-python` beside the required
+    // headless build: remove the colliding cv2 distributions first, so the pass below
+    // (re)installs the required one into a clean `cv2`.
+    let installed = uninstall_conflicting_module_distributions(
+        pip_runner,
+        python_exe,
+        root_dir,
+        &required,
+        &installed,
+        &install_tx,
+        cancel,
+    )?;
+    let missing = missing_dependency_specs(&required, &installed);
 
     if missing.is_empty() {
         send_update_progress(
@@ -1505,7 +1533,6 @@ fn install_missing_dependencies_for_update(
         return Ok(());
     }
 
-    let install_tx = UpdateToInstallEventBridge { tx }.sender();
     let total = missing.len().max(1) as f32;
     for (idx, dep) in missing.iter().enumerate() {
         let start_ratio = idx as f32 / total;
@@ -1841,6 +1868,97 @@ pub fn missing_specs_for_readiness<'a>(
         .into_iter()
         .filter(|dep| !dependency_satisfied_by_equivalent(dep, installed))
         .collect()
+}
+
+/// Installed distributions that must be uninstalled before the dependencies `required` are
+/// installed into the environment `installed` describes (a `pip freeze` snapshot).
+///
+/// Only the OpenCV family is cleaned ([`OPENCV_DISTRIBUTIONS`]): an environment built by an
+/// older installer holds `opencv-python`, and installing the `opencv-python-headless` that
+/// `required` names beside it leaves two distributions writing one `cv2` package. The
+/// onnxruntime family is NOT cleaned: a GPU build there is a legitimate user choice.
+///
+/// Empty unless `required` holds an OpenCV-family spec whose marker applies to this platform
+/// AND `installed` holds a family member other than that spec's. Then it is EVERY installed
+/// family member, the required one included: colliding distributions overwrite each other's
+/// files, so a survivor cannot be trusted after its sibling's uninstall removed shared files,
+/// and it is reinstalled from scratch. Names are the normalized `installed` keys, sorted.
+#[must_use]
+fn conflicting_module_distributions(required: &[&str], installed: &HashMap<String, String>) -> Vec<String> {
+    let family: Vec<String> = OPENCV_DISTRIBUTIONS.iter().map(|name| normalize_package_name(name)).collect();
+    // An unparsable spec is left to `missing_dependency_specs`, which logs it and installs it.
+    let wanted = required
+        .iter()
+        .filter(|dep| dependency_marker_matches_current_platform(dep))
+        .filter_map(|dep| Requirement::parse(dep).ok())
+        .map(|requirement| normalize_package_name(requirement.name))
+        .find(|name| family.contains(name));
+    let Some(wanted) = wanted else {
+        return Vec::new();
+    };
+    let mut present: Vec<String> = family.into_iter().filter(|name| installed.contains_key(name)).collect();
+    if present.iter().all(|name| *name == wanted) {
+        return Vec::new();
+    }
+    present.sort_unstable();
+    present
+}
+
+/// Uninstalls [`conflicting_module_distributions`] of `required` through `uninstall` (the
+/// pip / uv runner in production) and returns the snapshot the missing-spec computation must
+/// use from then on: `installed` without the removed names, so the caller's install pass
+/// (re)installs the required distribution. `uninstall` is not called when nothing conflicts.
+///
+/// # Errors
+/// The error of `uninstall`; the snapshot is then unknown and the caller stops.
+fn remove_conflicting_module_distributions(
+    required: &[&str],
+    installed: &HashMap<String, String>,
+    uninstall: impl FnOnce(&[String]) -> Result<(), String>,
+) -> Result<HashMap<String, String>, String> {
+    let conflicting = conflicting_module_distributions(required, installed);
+    if conflicting.is_empty() {
+        return Ok(installed.clone());
+    }
+    ms_log::runtime_log::log_info(format!(
+        "[Deps] removing colliding cv2 distributions before installing the required one: {}",
+        conflicting.join(", ")
+    ));
+    uninstall(&conflicting)?;
+    let mut remaining = installed.clone();
+    for name in &conflicting {
+        remaining.remove(name);
+    }
+    Ok(remaining)
+}
+
+/// Runs [`remove_conflicting_module_distributions`] with the real pip / uv uninstall,
+/// reporting the step on `tx`.
+///
+/// # Errors
+/// The localized cancel text or the last output of the failed uninstall command.
+fn uninstall_conflicting_module_distributions(
+    pip_runner: &PipInstallRunner,
+    python_exe: &Path,
+    root_dir: &Path,
+    required: &[&str],
+    installed: &HashMap<String, String>,
+    tx: &mpsc::Sender<InstallEvent>,
+    cancel: &AtomicBool,
+) -> Result<HashMap<String, String>, String> {
+    remove_conflicting_module_distributions(required, installed, |names| {
+        send_console_line(tx, format!("[Deps] removing colliding cv2 distributions: {}", names.join(", ")));
+        if tx.send(InstallEvent::Step(t!("installer.utils.removing_conflicting_opencv_status").to_string())).is_err() {
+            ms_log::runtime_log::log_warn("[Deps] installer window gone; removing colliding cv2 distributions without a status line");
+        }
+        run_pip_uninstall_with_retry(
+            pip_runner,
+            python_exe,
+            root_dir,
+            names,
+            RetryRun { action_name: t!("installer.utils.remove_conflicting_opencv_action"), attempts: 3, tx: Some(tx), cancel },
+        )
+    })
 }
 
 /// Whether `dep`'s PEP 508 environment marker applies to the platform this binary
@@ -3800,7 +3918,8 @@ mod tests {
         MACOS_BINARY_ASSET_NAME_AARCH64, MACOS_BINARY_ASSET_NAME_X86_64,
         WINDOWS_BINARY_ASSET_NAME_AARCH64, WINDOWS_BINARY_ASSET_NAME_X86_64,
         BASE_DEPENDENCIES, ONNXRUNTIME_DISTRIBUTIONS, TORCH_DEPENDENCIES,
-        OPENCV_DISTRIBUTIONS, Requirement, missing_dependency_specs,
+        OPENCV_DISTRIBUTIONS, Requirement, conflicting_module_distributions, missing_dependency_specs,
+        remove_conflicting_module_distributions,
         missing_specs_for_readiness, normalize_package_name,
         parse_executable_version_output, parse_pip_freeze_packages, platform_binary_asset_name,
         platform_executable_file_name, required_dependency_specs,
@@ -3973,6 +4092,76 @@ mod tests {
                 "{variant} provides cv2 and must satisfy readiness"
             );
         }
+    }
+
+    #[test]
+    fn old_opencv_python_is_removed_before_the_headless_build_is_installed() {
+        // The environment of an older installer: only `opencv-python` provides cv2.
+        let installed = installed_map(&[("opencv-python", "4.10.0.84"), ("numpy", "2.1.0")]);
+        let mut uninstalled = Vec::new();
+        let remaining = remove_conflicting_module_distributions(BASE_DEPENDENCIES, &installed, |names| {
+            uninstalled.extend_from_slice(names);
+            Ok(())
+        })
+        .expect("the stub uninstall succeeds");
+        assert_eq!(uninstalled, vec!["opencv-python".to_string()]);
+        assert!(!remaining.contains_key("opencv-python"));
+        assert!(remaining.contains_key("numpy"), "unrelated packages stay in the snapshot");
+        assert_eq!(
+            missing_dependency_specs(&["opencv-python-headless"], &remaining),
+            vec!["opencv-python-headless"],
+            "the headless build must still be installed after the cleanup"
+        );
+    }
+
+    #[test]
+    fn a_headless_build_beside_a_sibling_is_removed_too_and_reinstalled() {
+        // Both distributions wrote one `cv2` package: removing the sibling deletes shared files,
+        // so the headless build is uninstalled as well and reinstalled by the install pass.
+        let installed = installed_map(&[
+            ("opencv-python-headless", "4.12.0.88"),
+            ("opencv-contrib-python", "4.12.0.88"),
+        ]);
+        assert_eq!(
+            conflicting_module_distributions(&["opencv-python-headless"], &installed),
+            vec!["opencv-contrib-python".to_string(), "opencv-python-headless".to_string()]
+        );
+        let mut calls = 0;
+        let remaining = remove_conflicting_module_distributions(&["opencv-python-headless"], &installed, |_| {
+            calls += 1;
+            Ok(())
+        })
+        .expect("the stub uninstall succeeds");
+        assert_eq!(calls, 1);
+        assert_eq!(missing_dependency_specs(&["opencv-python-headless"], &remaining), vec!["opencv-python-headless"]);
+    }
+
+    #[test]
+    fn a_clean_or_unrelated_environment_uninstalls_nothing() {
+        for installed in [
+            installed_map(&[("opencv-python-headless", "4.12.0.88")]),
+            installed_map(&[("numpy", "2.1.0")]),
+            // A GPU onnxruntime build is a user choice, never cleaned up.
+            installed_map(&[("onnxruntime-gpu", "1.20.0"), ("onnxruntime", "1.20.0")]),
+        ] {
+            let remaining = remove_conflicting_module_distributions(BASE_DEPENDENCIES, &installed, |names| {
+                panic!("nothing collides, yet the stub was asked to uninstall {names:?}")
+            })
+            .expect("no uninstall runs");
+            assert_eq!(remaining, installed);
+        }
+        // No OpenCV spec required: a stray `opencv-python` is not this request's business.
+        let installed = installed_map(&[("opencv-python", "4.10.0.84")]);
+        assert!(conflicting_module_distributions(&["numpy", "Pillow"], &installed).is_empty());
+    }
+
+    #[test]
+    fn a_failed_uninstall_stops_the_cleanup_with_its_error() {
+        let installed = installed_map(&[("opencv-python", "4.10.0.84")]);
+        let result = remove_conflicting_module_distributions(&["opencv-python-headless"], &installed, |_| {
+            Err("uninstall failed".to_string())
+        });
+        assert_eq!(result, Err("uninstall failed".to_string()));
     }
 
     #[test]

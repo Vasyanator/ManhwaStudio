@@ -3,8 +3,7 @@ File: crates/ms-tab-translation/src/tab/detection_storage.rs
 
 Purpose:
 The text detector's event drain and the per-chapter `text_detection` disk storage: lazy load,
-Save, their worker jobs and results, and the page file layout (`<page>_blocks.json` +
-`<page>_mask.png`).
+Save, their worker jobs and results (the file format itself: `text_detector/storage.rs`).
 
 Key functions:
 - TranslationTabState::poll_text_detector_events: detector controller events (pages, progress,
@@ -12,8 +11,9 @@ Key functions:
 - ensure_text_detection_storage_loaded / start_text_detection_storage_load /
   start_text_detection_storage_save / poll_text_detection_storage_events: the storage jobs.
 - clear_detector_result_stores / apply_loaded_detection_pages: result-store resets and fills.
-- load_text_detection_storage / save_text_detection_storage (+ per-page helpers),
-  stored_detection_file_page, text_detection_*_file_path: worker-side file IO.
+- load_text_detection_storage / save_text_detection_storage: worker-side directory policy
+  (which pages load, stale-file removal, protected pages, logging). The FORMAT — file names,
+  the page reader and writer — is owned by `text_detector::storage`.
 
 Notes:
 - A page whose stored files exist but cannot be read is reported, never treated as empty, and
@@ -23,13 +23,15 @@ Notes:
 use ms_canvas::CanvasView;
 use ms_project::ProjectData;
 use crate::panels::text_detector::TextDetectorAlgorithm;
-use crate::text_detector::{SURYA_DETECTOR_SPECS, TextDetectorControllerEvent, TextDetectorPageResult, TextDetectorRect};
+use crate::text_detector::{
+    SURYA_DETECTOR_SPECS, TextDetectorControllerEvent, TextDetectorPageResult, read_text_detection_page,
+    stored_detection_file_page, text_detection_blocks_file_path, write_text_detection_page,
+};
 use eframe::egui;
 use ms_theme::Severity;
-use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc;
 use ms_thread as thread;
 use super::{DetectionLoad, TextDetectionStorageEvent, TranslationTabState};
@@ -352,18 +354,6 @@ impl TranslationTabState {
     }
 }
 
-pub(super) fn text_detection_blocks_file_path(dir: &Path, page_idx: usize) -> PathBuf {
-    dir.join(format!("{page_idx:05}_blocks.json"))
-}
-
-fn text_detection_mask_file_name(page_idx: usize) -> String {
-    format!("{page_idx:05}_mask.png")
-}
-
-pub(super) fn text_detection_mask_file_path(dir: &Path, page_idx: usize) -> PathBuf {
-    dir.join(text_detection_mask_file_name(page_idx))
-}
-
 /// Reads the stored detection of `page_indices` from `storage_dir` (worker thread). A page with
 /// no blocks file has none; a page whose files exist but cannot be read is logged and listed in
 /// [`DetectionLoad::failed_pages`] (never treated as empty).
@@ -377,7 +367,7 @@ pub(super) fn load_text_detection_storage(storage_dir: &Path, page_indices: &[us
         if !blocks_path.exists() {
             continue;
         }
-        match load_text_detection_page(storage_dir, *page_idx) {
+        match read_text_detection_page(storage_dir, *page_idx) {
             Ok(Some(result)) => load.pages.push((*page_idx, result)),
             Ok(None) => {}
             Err(error) => {
@@ -389,75 +379,6 @@ pub(super) fn load_text_detection_storage(storage_dir: &Path, page_indices: &[us
         }
     }
     load
-}
-
-fn load_text_detection_page(
-    storage_dir: &Path,
-    page_idx: usize,
-) -> Result<Option<TextDetectorPageResult>, String> {
-    let blocks_path = text_detection_blocks_file_path(storage_dir, page_idx);
-    let raw = fs::read_to_string(&blocks_path)
-        .map_err(|err| format!("{}: {err}", blocks_path.display()))?;
-    let data = serde_json::from_str::<Value>(&raw)
-        .map_err(|err| format!("{}: {err}", blocks_path.display()))?;
-    let Some(obj) = data.as_object() else {
-        return Ok(None);
-    };
-
-    let source_size = parse_u32_pair(obj.get("source_size"))
-        .ok_or_else(|| tf!("translation.tab.invalid_source_size_error", path = blocks_path.display()))?;
-    let mut blocks = Vec::<TextDetectorRect>::new();
-    if let Some(items) = obj.get("blocks").and_then(Value::as_array) {
-        for item in items {
-            let x1 = item.get("x1").and_then(Value::as_f64);
-            let y1 = item.get("y1").and_then(Value::as_f64);
-            let x2 = item.get("x2").and_then(Value::as_f64);
-            let y2 = item.get("y2").and_then(Value::as_f64);
-            let (Some(x1), Some(y1), Some(x2), Some(y2)) = (x1, y1, x2, y2) else {
-                continue;
-            };
-            if let Some(rect) =
-                TextDetectorRect::from_xyxy(x1 as f32, y1 as f32, x2 as f32, y2 as f32)
-            {
-                blocks.push(rect);
-            }
-        }
-    }
-    ms_text_detect::blocks::sort_reading_order(&mut blocks);
-
-    let mask_size = parse_u32_pair(obj.get("mask_size")).unwrap_or(source_size);
-    let mask_file = obj
-        .get("mask_file")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| storage_dir.join(s))
-        .unwrap_or_else(|| text_detection_mask_file_path(storage_dir, page_idx));
-    // A mask file that exists but cannot be decoded, or whose size differs from the recorded
-    // one, fails the page: loading it as mask-less would let Save delete the file.
-    let mask_alpha = if mask_file.exists() {
-        let gray = image::open(&mask_file).map_err(|err| format!("{}: {err}", mask_file.display()))?.to_luma8();
-        if gray.width() != mask_size[0] || gray.height() != mask_size[1] {
-            return Err(format!(
-                "{}: mask is {}x{}, the blocks file records {}x{}",
-                mask_file.display(),
-                gray.width(),
-                gray.height(),
-                mask_size[0],
-                mask_size[1]
-            ));
-        }
-        gray.into_raw()
-    } else {
-        Vec::new()
-    };
-
-    Ok(Some(TextDetectorPageResult {
-        source_size,
-        blocks,
-        mask_size,
-        mask_alpha,
-    }))
 }
 
 /// Replaces the chapter's stored detection with `pages` (worker thread): every stored
@@ -508,7 +429,7 @@ pub(super) fn save_text_detection_storage(
     let mut sorted = pages.to_vec();
     sorted.sort_by_key(|(page_idx, _)| *page_idx);
     for (page_idx, result) in sorted {
-        match save_text_detection_page(storage_dir, page_idx, &result) {
+        match write_text_detection_page(storage_dir, page_idx, &result) {
             Ok(()) => {
                 saved = saved.saturating_add(1);
             }
@@ -520,76 +441,4 @@ pub(super) fn save_text_detection_storage(
     }
 
     Ok((saved, failed))
-}
-
-/// The page index a stored detection file name starts with (`{page_idx:05}_blocks.json` /
-/// `{page_idx:05}_mask.png`, see `text_detection_blocks_file_path`), or `None` for any other name.
-pub(super) fn stored_detection_file_page(name: &str) -> Option<usize> {
-    let (index, _) = name.split_once('_')?;
-    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    index.parse().ok()
-}
-
-fn save_text_detection_page(
-    storage_dir: &Path,
-    page_idx: usize,
-    result: &TextDetectorPageResult,
-) -> Result<(), String> {
-    let mask_file_name = text_detection_mask_file_name(page_idx);
-    let blocks_path = text_detection_blocks_file_path(storage_dir, page_idx);
-    let mask_path = storage_dir.join(&mask_file_name);
-
-    let has_mask = !result.mask_alpha.is_empty()
-        && result.mask_size[0] > 0
-        && result.mask_size[1] > 0
-        && result.mask_alpha.len()
-            == (result.mask_size[0] as usize).saturating_mul(result.mask_size[1] as usize);
-
-    if has_mask {
-        let img = image::GrayImage::from_vec(
-            result.mask_size[0],
-            result.mask_size[1],
-            result.mask_alpha.clone(),
-        )
-        .ok_or_else(|| tf!("translation.tab.invalid_mask_error", page_idx = page_idx))?;
-        img.save_with_format(&mask_path, image::ImageFormat::Png)
-            .map_err(|err| format!("{}: {err}", mask_path.display()))?;
-    } else if mask_path.exists() {
-        fs::remove_file(&mask_path).map_err(|err| format!("{}: {err}", mask_path.display()))?;
-    }
-
-    let blocks = result
-        .blocks
-        .iter()
-        .map(|rect| {
-            serde_json::json!({
-                "x1": rect.x1,
-                "y1": rect.y1,
-                "x2": rect.x2,
-                "y2": rect.y2
-            })
-        })
-        .collect::<Vec<_>>();
-    let payload = serde_json::json!({
-        "page_idx": page_idx,
-        "source_size": result.source_size,
-        "blocks": blocks,
-        "mask_size": result.mask_size,
-        "mask_file": if has_mask { mask_file_name } else { String::new() },
-    });
-    let raw = serde_json::to_string_pretty(&payload).map_err(|err| err.to_string())?;
-    fs::write(&blocks_path, raw).map_err(|err| format!("{}: {err}", blocks_path.display()))?;
-    Ok(())
-}
-
-fn parse_u32_pair(value: Option<&Value>) -> Option<[u32; 2]> {
-    let arr = value?.as_array()?;
-    if arr.len() < 2 {
-        return None;
-    }
-    let w = arr[0].as_u64().and_then(|v| u32::try_from(v).ok())?;
-    let h = arr[1].as_u64().and_then(|v| u32::try_from(v).ok())?;
-    Some([w, h])
 }

@@ -157,6 +157,9 @@ impl TranslationTabState {
         }
     }
 
+    /// Asks the shared backend probe thread for a health check when the snapshot is stale (or
+    /// `force`), at most once per `OCR_HEALTH_CHECK_THROTTLE_SECS`. Non-blocking: only a channel
+    /// send; a dead probe thread is logged once and the tab stops asking.
     pub(super) fn request_ai_backend_health_check(&mut self, ctx: &egui::Context, force: bool) {
         if self.local_ai.backend.is_err() {
             return;
@@ -171,7 +174,15 @@ impl TranslationTabState {
             && now_s - self.ocr_last_health_check_request_s >= OCR_HEALTH_CHECK_THROTTLE_SECS
             && let Some(tx) = self.ai_backend_probe_tx.as_ref()
         {
-            let _ = tx.send(AiBackendProbeCommand::CheckNow);
+            if let Err(err) = tx.send(AiBackendProbeCommand::CheckNow) {
+                // The probe thread is gone (process shutdown or a crashed probe); a disconnected
+                // channel never reconnects, so drop the sender to log this once, not every
+                // throttle period. The shared health snapshot then simply stops refreshing.
+                ms_log::runtime_log::log_warn(format!(
+                    "[translation] backend health check not requested: the probe thread is gone ({err}); further checks from this tab are disabled"
+                ));
+                self.ai_backend_probe_tx = None;
+            }
             self.ocr_last_health_check_request_s = now_s;
         }
     }

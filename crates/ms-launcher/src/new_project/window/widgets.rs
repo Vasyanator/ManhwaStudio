@@ -3,7 +3,7 @@ File: crates/ms-launcher/src/new_project/window/widgets.rs
 
 Purpose:
 Small UI helpers shared by the New Project window files: progress display, section and field
-layout helpers, index combos, sized buttons and the batch child window's close path.
+layout helpers, index combos (on `WheelComboBox`), sized buttons and the batch child window's close path.
 
 Key items:
 - `current_progress`, `show_operation_progress`, `progress_fraction` / `progress_value` / `progress_label`.
@@ -141,42 +141,47 @@ pub(super) fn selected_label<'a>(values: &'a [&str], selected: usize, field_name
     }
 }
 
+/// Index combo over borrowed labels: shows `values[*selected]` ("—" for an out-of-range index),
+/// a click selects a row, and the wheel over the closed combo cycles the index.
 pub(super) fn combo_index(ui: &mut Ui, id: &str, values: &[&str], selected: &mut usize) {
-    ComboBox::from_id_salt(id)
-        .width(fill_width(ui))
-        .selected_text(values.get(*selected).copied().unwrap_or("—"))
-        .show_ui(ui, |ui| {
-            for (index, value) in values.iter().enumerate() {
-                ui.selectable_value(selected, index, *value);
-            }
-        });
+    combo_index_by(ui, id, values.len(), selected, |index| values.get(index).copied());
 }
 
+/// [`combo_index`] over owned labels.
 pub(super) fn combo_index_owned(ui: &mut Ui, id: &str, values: &[String], selected: &mut usize) {
-    ComboBox::from_id_salt(id)
-        .width(fill_width(ui))
-        .selected_text(values.get(*selected).map(String::as_str).unwrap_or("—"))
-        .show_ui(ui, |ui| {
-            for (index, value) in values.iter().enumerate() {
-                ui.selectable_value(selected, index, value);
-            }
-        });
+    combo_index_by(ui, id, values.len(), selected, |index| values.get(index).map(String::as_str));
 }
 
+/// [`combo_index`] over `(label, value)` pairs; only the label is shown.
 pub(super) fn combo_index_pairs(ui: &mut Ui, id: &str, values: &[(String, String)], selected: &mut usize) {
-    ComboBox::from_id_salt(id)
+    combo_index_by(ui, id, values.len(), selected, |index| {
+        values.get(index).map(|(name, _)| name.as_str())
+    });
+}
+
+/// Shared body of the `combo_index*` helpers on the project `WheelComboBox` (stock
+/// `egui::ComboBox` is forbidden in product UI, `PROJECT_RULES.md`): `label(i)` is `Some` for
+/// every `i < len`. Wheel steps over the closed combo cycle `*selected` through `0..len`.
+fn combo_index_by<'a>(
+    ui: &mut Ui,
+    id: &str,
+    len: usize,
+    selected: &mut usize,
+    label: impl Fn(usize) -> Option<&'a str>,
+) {
+    let combo = WheelComboBox::from_id_salt(id)
         .width(fill_width(ui))
-        .selected_text(
-            values
-                .get(*selected)
-                .map(|(name, _)| name.as_str())
-                .unwrap_or("—"),
-        )
-        .show_ui(ui, |ui| {
-            for (index, (name, _)) in values.iter().enumerate() {
-                ui.selectable_value(selected, index, name);
+        .selected_text(label(*selected).unwrap_or("—"))
+        .show_ui_with_wheel(ui, |ui| {
+            for index in 0..len {
+                if let Some(value) = label(index) {
+                    ui.selectable_value(selected, index, value);
+                }
             }
         });
+    if let Some(steps) = combo.wheel_steps {
+        *selected = cycle_wrapped_index(*selected, len, steps);
+    }
 }
 
 pub(super) fn fill_width(ui: &Ui) -> f32 {

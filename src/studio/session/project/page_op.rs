@@ -16,7 +16,8 @@ Key functions:
   worker thread started parked (a refused thread REFUSES the op here, before any writer stops) ->
   `StagingWriters::quiesce_for_page_op` -> worker released (join клин autosave, клин snapshots,
   bubbles pause, layer barrier, staging writes, `execute_page_op`).
-- `ProjectSession::poll_page_op`, `ProjectSession::draw_page_op_overlays`.
+- `ProjectSession::poll_page_op` (driven by the worker's `WakeGuiOnDrop`, no timer poll),
+  `ProjectSession::draw_page_op_overlays`.
 
 Notes:
 Unreachable in an image-set session (the Page Manager tab is hidden there; `SessionMode::start_page_op`
@@ -114,7 +115,14 @@ impl ProjectSession {
         // клин autosave thread: a thread the OS refuses then refuses the operation while the session
         // is still exactly as it was (no writer stopped, nothing on disk moved).
         let (start_tx, start_rx) = std::sync::mpsc::channel::<Option<thread::JoinHandle<()>>>();
+        let wake_gui = self.job_waker("page-op");
         let spawned = thread::Builder::new().name("page-op".to_owned()).spawn(move || {
+            // Declared first so it drops last, on every return path and on a panic: the GUI polls
+            // `rx` only on that wake, never on a timer. `tx` is rebound right after it so the
+            // sender is gone (a lost worker reads as `Disconnected`) before the wake fires —
+            // a moved-in capture would otherwise drop with the closure, after every local.
+            let _wake_gui = wake_gui;
+            let tx = tx;
             // A closed start channel means `start_page_op` dropped the worker without releasing it;
             // nothing was quiesced for it, so it must not touch the staging trees. Dropping `tx`
             // reports that as a lost worker.
@@ -216,6 +224,10 @@ impl ProjectSession {
     }
 
     /// Polls the structural-operation worker and requests a safe bootstrap reload on success.
+    ///
+    /// No timer poll: the worker wakes the GUI when it ends ([`super::WakeGuiOnDrop`]), so an
+    /// `Empty` channel requests no repaint. The operation reports no intermediate progress; the
+    /// veil's spinner animates itself.
     pub(super) fn poll_page_op(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.page_op_rx.as_ref() else { return; };
         match rx.try_recv() {
@@ -233,7 +245,7 @@ impl ProjectSession {
                 self.page_op_rx = None;
                 self.page_op_error = Some(err);
             }
-            Err(TryRecvError::Empty) => ctx.request_repaint(),
+            Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.page_op_rx = None;
                 self.page_op_error = Some(t!("page_manager.op_thread_crashed").to_string());

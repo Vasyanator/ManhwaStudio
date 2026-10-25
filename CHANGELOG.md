@@ -174,6 +174,9 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **Right-to-left text spacing** — Hebrew and other right-to-left text no longer runs backwards or misspaces letters with «Metric» or optical kerning; your own kerning pairs now tighten or loosen right-to-left letter pairs by exactly the value entered (a 0 entry no longer shifts letters); faux bold widens right-to-left text instead of squeezing it.
 - **Custom kerning pairs and line breaks** — line wrapping and the text-forms search now measure your custom kerning pairs exactly as they are drawn, so a line that fits thanks to tightened pairs is no longer broken early, and pairs drawn by a fallback font or merged into a ligature no longer skew the measurement.
 - **Line breaks follow letter spacing** — text with manual letter spacing (in px or %) or «Metric» kerning now wraps where its drawn lines actually end instead of running past the text box, and the text-forms window sizes its options the same way.
+- **Python environment repair** — environments set up by older versions no longer end up with two conflicting OpenCV packages: the duplicate is removed and the right one reinstalled; the readiness message now says packages are «missing or outdated».
+- **Image bubbles** — pasting an image from the clipboard or choosing an image file for a bubble no longer freezes the window while it is saved, and an interrupted save can no longer leave a damaged file.
+- **New Project window** — its dropdowns and the download-threads slider react to the mouse wheel like the rest of the app, without scrolling the panel.
 
 ---
 
@@ -353,3 +356,6 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **Интервалы в тексте справа налево** — иврит и другой текст справа налево больше не идёт задом наперёд и не сбивается по интервалам при кернинге «Метрический» и оптическом; собственные кернинговые пары сдвигают буквы такого текста ровно на заданную величину (значение 0 больше не смещает буквы); искусственное полужирное начертание расширяет такой текст, а не сжимает его.
 - **Пользовательские кернинговые пары и переносы строк** — перенос строк и подбор форм текста теперь учитывают ваши кернинговые пары ровно так, как они рисуются: строка, которая помещается благодаря сжатым парам, больше не переносится раньше времени, а пары, нарисованные запасным шрифтом или слитые в лигатуру, больше не искажают замер.
 - **Переносы строк учитывают межбуквенный интервал** — текст с ручным интервалом между буквами (в px или %) или с кернингом «Метрический» теперь переносится там, где реально кончаются нарисованные строки, а не вылезает за рамку текста; окно форм текста подбирает варианты так же.
+- **Восстановление окружения Python** — в окружениях от старых версий больше не остаются два конфликтующих пакета OpenCV: лишний удаляется, нужный переустанавливается; сообщение проверки теперь говорит «отсутствуют или устарели пакеты».
+- **Бабблы-картинки** — вставка картинки из буфера обмена или выбор файла картинки для баббла больше не подвешивает окно на время сохранения, а прерванное сохранение не оставляет повреждённый файл.
+- **Окно «Новый проект»** — выпадающие списки и ползунок потоков загрузки реагируют на колесо мыши, как во всём приложении, не прокручивая панель.

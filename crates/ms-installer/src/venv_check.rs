@@ -82,7 +82,7 @@ impl NotReadyReason {
             }
             Self::ProbeFailed(err) => tf!("venv_check.reason_probe_failed", err = err),
             Self::MissingPackages(packages) => tf!(
-                "venv_check.reason_missing_packages",
+                "venv_check.reason_missing_or_outdated_packages",
                 packages = packages.join(", ")
             ),
             // `Current` never reaches this variant; it would read as "missing".

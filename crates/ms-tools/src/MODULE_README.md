@@ -39,7 +39,9 @@ images. They perform bounds clipping and return early on invalid binary-mask dim
 ## Files and submodules
 - `lib.rs`: crate root; shared-tool exports and the `ms-i18n` macro mount.
 - `mask_brush.rs` (public module): `MaskBrush`, internal ColorImage painting helpers, binary-mask
-  painting helpers, cursor drawing, and the shared brush input set (`declarations`,
+  painting helpers, the ONE soft stroke-mask painter `paint_soft_line_mask` (`SoftDabTip`,
+  `SoftDabSampling`: Cleaning brushes and Translation advanced recognition; a second copy in a
+  tab is a defect), cursor drawing, and the shared brush input set (`declarations`,
   `BRUSH_ACTIVE`, `apply_input`).
 - `sor.rs`: `red_black_sor_sweeps`, the ONE red-black SOR kernel of the project. Consumers are the
   cleaning tab's gradient fill and `patch/membrane.rs`.

@@ -100,7 +100,7 @@ fn status_line_step(set_at: f64, now: f64) -> StatusLineStep {
     }
 }
 
-/// Wakes the GUI when dropped. A save-merge or DISCARD job thread owns one for its whole run, so
+/// Wakes the GUI when dropped. A save-merge, page-op or DISCARD job thread owns one for its whole run, so
 /// the frame that polls its channel follows whether the job answered, returned early or
 /// panicked; the GUI never polls these jobs on a timer. `None` (no frame ticked yet, see
 /// [`ProjectSession::job_waker`]) wakes nothing.
@@ -277,9 +277,9 @@ impl ProjectSession {
                 StatusLineStep::Sticky => {}
             }
         }
-        // The save merge and the DISCARD cleanup need no timer poll: their threads wake the GUI
-        // when they end (`WakeGuiOnDrop`), and their sticky «Saving…» / «Cleaning…» line needs no
-        // repaint while they run.
+        // The save merge, the page op and the DISCARD cleanup need no timer poll: their threads wake
+        // the GUI when they end (`WakeGuiOnDrop`), and their sticky «Saving…» / «Cleaning…» line needs
+        // no repaint while they run (the page-op veil's spinner animates itself).
 
         // A save-then-close armed by an exit dialog's Save ends with its save: close on a clean
         // success, otherwise drop the arm (it never outlives its save) and keep running.

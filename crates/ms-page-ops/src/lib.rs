@@ -163,9 +163,9 @@ pub struct ProjectPaths {
 /// top-left of the placed image inside the new canvas, and the whole placed
 /// rectangle must lie inside it. A STITCH placement never rotates: merging N
 /// pages onto one canvas has no rotation to express, so the request type
-/// carries none and the engine builds it with [`PageRotation::IDENTITY`]. The
+/// carries none and the engine builds it with [`PageRotation::IDENTITY`](crate::crop_geometry::PageRotation::IDENTITY). The
 /// affine itself is rotation-capable — a rotating placement first maps the page
-/// through a [`RotatedPage`], and its `crop` is then read in that rotated
+/// through a [`RotatedPage`](crate::crop_geometry::RotatedPage), and its `crop` is then read in that rotated
 /// canvas' pixels rather than the page's own.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StitchPlacement {

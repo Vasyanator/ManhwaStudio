@@ -152,8 +152,9 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `flush_debounced_stores_blocking` writes what the tools' settings writers still owe
   (`CleaningTool::flush_settings_blocking` of every tool; the region-edit engines' `SettingsSaver`s).
 - `text_mask_storage.rs`: reads a page's stored text-detector mask (`{idx:05}_mask.png`) with
-  the `source_size` / `mask_size` its `{idx:05}_blocks.json` records (format owned by
-  `ms-tab-translation`; a mask may be stored smaller than the page). Used by the display-cache
+  the `source_size` / `mask_size` its `{idx:05}_blocks.json` records — an adapter over the
+  format's one reader `ms_tab_translation::text_detector::read_text_detection_page` (never a
+  second parser; a mask may be stored smaller than the page). Used by the display-cache
   load and the quick text clean's disk fallback, so a scaled stored mask reaches `TextMaskModel`
   with the page's real source size, never as a source-sized mask of another image.
 - `lib.rs`: module wiring and public re-export of `CleaningTabState`.

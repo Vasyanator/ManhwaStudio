@@ -35,6 +35,8 @@ ms-config = { path = "../ms-config" }
 # The title `settings.json` sections this tab owns are written through the serialized
 # `ms_docstore::update`; `characters.json` is change-probed with `ms_docstore::signature`.
 ms-docstore = { path = "../ms-docstore" }
+# The atomic file replace (temp + rename) behind a pasted image bubble's PNG write.
+ms-atomic-file = { path = "../ms-atomic-file" }
 # Diagnostics (`runtime_log`) for the OCR/MT/detector worker pipelines.
 ms-log = { path = "../ms-log" }
 # Image-cache budgets consulted before a page raster is uploaded.

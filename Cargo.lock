@@ -4118,6 +4118,7 @@ dependencies = [
  "image 0.25.10",
  "minijinja",
  "ms-ai-api",
+ "ms-atomic-file",
  "ms-backend-ipc",
  "ms-browser-bridge",
  "ms-browser-ext",

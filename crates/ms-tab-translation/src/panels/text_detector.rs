@@ -851,17 +851,6 @@ mod tests {
         }
     }
 
-    /// Installs the embedded English catalog for tests that assert formatted text, serialized
-    /// on the process-global locale lock (the active catalog is one `ArcSwap`).
-    fn english_locale() -> std::sync::MutexGuard<'static, ()> {
-        let guard = ms_config::locale_store::GLOBAL_LOCALE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tag = ms_i18n::LocaleTag::parse("en").expect("the `en` tag parses");
-        ms_i18n::set_locale(&tag).expect("the embedded English catalog installs");
-        guard
-    }
-
     fn notice(mode: PlanMode, scale_percent: [u32; 2], grid: [u32; 2], ctd: Option<u32>) -> PlanNotice {
         PlanNotice {
             mode,
@@ -877,7 +866,7 @@ mod tests {
 
     #[test]
     fn plan_notice_text_per_mode() {
-        let _guard = english_locale();
+        let _guard = crate::english_locale_for_test();
         assert_eq!(
             plan_notice_text(&notice(PlanMode::FullResolution, [100, 100], [1, 1], None)),
             "Current page: full resolution (800×12000), one pass."
@@ -903,7 +892,7 @@ mod tests {
 
     #[test]
     fn ctd_size_line_only_for_ctd() {
-        let _guard = english_locale();
+        let _guard = crate::english_locale_for_test();
         assert_eq!(plan_ctd_size_text(&notice(PlanMode::Tiled, [100, 100], [1, 3], None)), None);
         assert_eq!(
             plan_ctd_size_text(&notice(PlanMode::Tiled, [100, 100], [1, 3], Some(960))).as_deref(),

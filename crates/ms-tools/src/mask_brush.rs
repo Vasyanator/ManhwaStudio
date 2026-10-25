@@ -16,6 +16,9 @@ FILE HEADER (tools/mask_brush.rs)
   - `paint_binary_mask_segment`: рисует/стирает бинарную маску (`0/255`) без
     промежуточных аллокаций `ColorImage`.
   - `draw_circle_cursor_on_image`: рисует кольцо курсора в image viewport.
+  - `paint_soft_line_mask` (`SoftDabTip`, `SoftDabSampling`): the ONE soft stroke-mask painter
+    (`f32` strength mask, hardness falloff, anti-aliased / pixel-centre / snapped sampling) of the
+    Cleaning brushes and the Translation advanced-recognition brush.
 - Ключевые helper-функции:
   - `paint_line_with_brush`: штампует круги вдоль отрезка.
   - `paint_circle`: заполняет круг в целевом `ColorImage`.
@@ -371,6 +374,150 @@ fn paint_circle_on_binary_mask(
     }
 }
 
+/// How a soft dab samples its falloff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoftDabSampling {
+    /// Anti-aliased: each pixel takes the mean falloff of a 4x4 sub-sample grid, so partly
+    /// covered edge pixels get partial strength. Dab centres stay fractional.
+    Coverage,
+    /// The falloff at pixel centres only (no anti-aliasing); dab centres stay fractional, and a
+    /// dab whose rounded centre repeats the previous one is skipped.
+    PixelCentres,
+    /// As `PixelCentres`, but every dab centre is first rounded to a whole pixel (an integer
+    /// stroke grid, e.g. the advanced-recognition brush).
+    SnappedPixelCentres,
+}
+
+/// The tip of one soft mask dab: `radius` in pixels (below 1 counts as 1), `hardness` (`0..=1`:
+/// the fully opaque inner fraction of the radius; the rest falls off by `1 - smoothstep`) and
+/// the `sampling` rule.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SoftDabTip {
+    /// Dab radius in pixels.
+    pub radius: i32,
+    /// Opaque inner fraction of the radius, clamped to `0..=1`.
+    pub hardness: f32,
+    /// How the falloff is sampled.
+    pub sampling: SoftDabSampling,
+}
+
+/// Paints soft dabs of `tip` along the segment `from` -> `to` (pixel coordinates, fractional
+/// allowed) into the stroke strength mask `dst` (`image_size` = `[width, height]`, row-major,
+/// values `0..=1`), keeping the per-pixel maximum strength. Dabs are spaced `0.45 * radius`
+/// (at least one pixel) apart; a zero-length segment paints one dab. Pixels outside the image,
+/// or beyond the end of a too-short `dst`, are clipped.
+///
+/// The ONE soft stroke-mask painter: the Cleaning brushes and the Translation advanced-recognition
+/// brush both paint through it.
+pub fn paint_soft_line_mask(dst: &mut [f32], image_size: [usize; 2], from: Pos2, to: Pos2, tip: SoftDabTip) {
+    let r = tip.radius.max(1);
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    let distance = (dx * dx + dy * dy).sqrt();
+    let snapped = tip.sampling == SoftDabSampling::SnappedPixelCentres;
+    let centre = |x: f32, y: f32| if snapped { egui::pos2(x.round(), y.round()) } else { egui::pos2(x, y) };
+    if distance <= f32::EPSILON {
+        paint_soft_dab(dst, image_size, centre(from.x, from.y), tip);
+        return;
+    }
+    let skip_repeats = tip.sampling != SoftDabSampling::Coverage;
+    let step = (r as f32 * 0.45).max(1.0);
+    let stamps = (distance / step).ceil() as usize;
+    let mut last = (f32::NAN, f32::NAN);
+    for i in 0..=stamps {
+        let t = i as f32 / stamps.max(1) as f32;
+        let sx = from.x + dx * t;
+        let sy = from.y + dy * t;
+        if skip_repeats && (sx.round(), sy.round()) == last {
+            continue;
+        }
+        paint_soft_dab(dst, image_size, centre(sx, sy), tip);
+        last = (sx.round(), sy.round());
+    }
+}
+
+/// The falloff of one dab, precomputed from its tip.
+#[derive(Clone, Copy, Debug)]
+struct SoftFalloff {
+    radius: f32,
+    hard_radius: f32,
+    soft_span: f32,
+    hardness: f32,
+}
+
+/// Paints one dab of `tip` centred at `center` into `dst` (see [`paint_soft_line_mask`]).
+fn paint_soft_dab(dst: &mut [f32], image_size: [usize; 2], center: Pos2, tip: SoftDabTip) {
+    let SoftDabTip { radius, hardness, sampling } = tip;
+    let (cx, cy) = (center.x, center.y);
+    let r = radius.max(1);
+    let w_usize = image_size[0];
+    let w = w_usize as i32;
+    let h = image_size[1] as i32;
+    let coverage = sampling == SoftDabSampling::Coverage;
+    // Coverage samples reach half a pixel past the radius; centre sampling does not.
+    let sample_margin = if coverage { 0.5 } else { 0.0 };
+    let x0 = (cx - r as f32 - sample_margin).floor().max(0.0) as i32;
+    let x1 = (cx + r as f32 + sample_margin).ceil().min((w - 1) as f32) as i32;
+    let y0 = (cy - r as f32 - sample_margin).floor().max(0.0) as i32;
+    let y1 = (cy + r as f32 + sample_margin).ceil().min((h - 1) as f32) as i32;
+    let radius_f = r as f32;
+    let hardness = hardness.clamp(0.0, 1.0);
+    let hard_radius = (radius_f * hardness).clamp(0.0, radius_f);
+    let falloff = SoftFalloff {
+        radius: radius_f,
+        hard_radius,
+        soft_span: (radius_f - hard_radius).max(f32::EPSILON),
+        hardness,
+    };
+
+    for y in y0..=y1 {
+        let row_off = (y as usize).saturating_mul(w_usize);
+        for x in x0..=x1 {
+            let strength = if coverage {
+                soft_pixel_coverage(x, y, cx, cy, falloff)
+            } else {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                soft_sample_strength((dx * dx + dy * dy).sqrt(), falloff)
+            };
+            if strength <= f32::EPSILON {
+                continue;
+            }
+            let idx = row_off.saturating_add(x as usize);
+            if let Some(mask_px) = dst.get_mut(idx) {
+                *mask_px = mask_px.max(strength);
+            }
+        }
+    }
+}
+
+/// Mean falloff over a 4x4 sub-sample grid of pixel `(x, y)`.
+fn soft_pixel_coverage(x: i32, y: i32, cx: f32, cy: f32, falloff: SoftFalloff) -> f32 {
+    const SAMPLE_OFFSETS: [f32; 4] = [-0.375, -0.125, 0.125, 0.375];
+    let mut sum = 0.0;
+    for oy in SAMPLE_OFFSETS {
+        for ox in SAMPLE_OFFSETS {
+            let dx = x as f32 + ox - cx;
+            let dy = y as f32 + oy - cy;
+            sum += soft_sample_strength((dx * dx + dy * dy).sqrt(), falloff);
+        }
+    }
+    sum / 16.0
+}
+
+/// Falloff at distance `dist` from the dab centre: 1 inside the hard radius (or for a fully hard
+/// tip), `1 - smoothstep` across the soft span, 0 beyond the radius.
+fn soft_sample_strength(dist: f32, falloff: SoftFalloff) -> f32 {
+    if dist > falloff.radius {
+        return 0.0;
+    }
+    if dist <= falloff.hard_radius || falloff.hardness >= 1.0 {
+        return 1.0;
+    }
+    let t = ((dist - falloff.hard_radius) / falloff.soft_span).clamp(0.0, 1.0);
+    1.0 - t * t * (3.0 - 2.0 * t)
+}
+
 #[cfg(test)]
 mod tests {
     use ms_input::{Declarations, InputRegistry, view};
@@ -462,5 +609,79 @@ mod tests {
         let brush_conflicts: Vec<_> = registry.conflicts().conflicts.iter().filter(|conflict| conflict.a.0.starts_with("brush.") || conflict.b.is_some_and(|b| b.0.starts_with("brush."))).collect();
         assert!(brush_conflicts.is_empty(), "{brush_conflicts:?}");
         assert_eq!(registry.bindings(BRUSH_LARGER).len(), 3);
+    }
+
+    /// FNV-1a fingerprint of a mask's bits (pins painter output bit-for-bit).
+    fn fingerprint(mask: &[f32]) -> u64 {
+        mask.iter()
+            .flat_map(|m| m.to_bits().to_le_bytes())
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
+    }
+
+    fn tip(radius: i32, hardness: f32, sampling: SoftDabSampling) -> SoftDabTip {
+        SoftDabTip { radius, hardness, sampling }
+    }
+
+    #[test]
+    fn soft_pixel_coverage_reaches_partially_covered_neighbor() {
+        let mut strict = vec![0.0; 9];
+        let dot = egui::pos2(1.0, 1.0);
+        paint_soft_line_mask(&mut strict, [3, 3], dot, dot, tip(1, 1.0, SoftDabSampling::PixelCentres));
+
+        let mut covered = vec![0.0; 9];
+        let off_centre = egui::pos2(1.49, 1.49);
+        paint_soft_line_mask(&mut covered, [3, 3], off_centre, off_centre, tip(1, 1.0, SoftDabSampling::Coverage));
+
+        assert_eq!(strict[8], 0.0);
+        assert!(covered[8] > 0.0);
+        assert!(covered[8] < 1.0);
+    }
+
+    #[test]
+    fn soft_pixel_coverage_preserves_full_center_strength() {
+        let mut mask = vec![0.0; 9];
+        let dot = egui::pos2(1.0, 1.0);
+        paint_soft_line_mask(&mut mask, [3, 3], dot, dot, tip(2, 1.0, SoftDabSampling::Coverage));
+
+        assert!((mask[4] - 1.0).abs() <= f32::EPSILON);
+    }
+
+    /// characterization: a long soft (`Coverage`) and a long strict (`PixelCentres`) segment
+    /// with partial hardness, pinned by the fingerprints OBSERVED on the Cleaning tab's own
+    /// painter before it moved here; they must stay bit-identical.
+    #[test]
+    fn characterization_cleaning_segments() {
+        let mut soft = vec![0.0f32; 40 * 30];
+        let (from, to) = (egui::pos2(2.3, 4.7), egui::pos2(35.1, 26.4));
+        paint_soft_line_mask(&mut soft, [40, 30], from, to, tip(5, 0.4, SoftDabSampling::Coverage));
+        let mut strict = vec![0.0f32; 40 * 30];
+        paint_soft_line_mask(&mut strict, [40, 30], from, to, tip(5, 0.4, SoftDabSampling::PixelCentres));
+        let observed = (fingerprint(&soft), fingerprint(&strict));
+        assert_eq!(observed, (5_333_657_888_049_218_854, 6_152_694_257_659_312_777), "observed={observed:?}");
+    }
+
+    /// characterization: integer segments with `SnappedPixelCentres`, pinned by the fingerprints
+    /// OBSERVED on the Translation advanced-recognition brush's own painter before it moved here
+    /// (a diagonal soft stroke, a hard stroke leaving the image, a zero-length fully soft dot).
+    #[test]
+    fn characterization_advanced_recognition_segments() {
+        let snapped = SoftDabSampling::SnappedPixelCentres;
+        let mut a = vec![0.0f32; 40 * 30];
+        paint_soft_line_mask(&mut a, [40, 30], egui::pos2(2.0, 5.0), egui::pos2(35.0, 26.0), tip(5, 0.4, snapped));
+        let mut b = vec![0.0f32; 40 * 30];
+        paint_soft_line_mask(&mut b, [40, 30], egui::pos2(38.0, 1.0), egui::pos2(-3.0, 29.0), tip(3, 1.0, snapped));
+        let mut c = vec![0.0f32; 9];
+        let dot = egui::pos2(1.0, 1.0);
+        paint_soft_line_mask(&mut c, [3, 3], dot, dot, tip(2, 0.0, snapped));
+        let observed = (fingerprint(&a), fingerprint(&b), fingerprint(&c));
+        assert_eq!(observed, (7_772_045_614_664_301_125, 10_735_651_597_318_684_984, 11_884_532_895_657_143_656), "observed={observed:?}");
+    }
+
+    /// A mask shorter than `width * height` is clipped, never indexed out of bounds.
+    #[test]
+    fn a_short_soft_mask_is_clipped() {
+        let mut mask = vec![0.0f32; 4];
+        paint_soft_line_mask(&mut mask, [3, 3], egui::pos2(0.0, 0.0), egui::pos2(2.0, 2.0), tip(2, 0.5, SoftDabSampling::Coverage));
+        assert!(mask.iter().all(|v| (0.0..=1.0).contains(v)));
     }
 }

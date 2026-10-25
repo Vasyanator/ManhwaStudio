@@ -9,7 +9,8 @@ FILE HEADER (cleaning/tools/base.rs)
     (`set_input_labels`). No raw key / modifier / wheel read anywhere in this subtree.
   - `StrokePoint`: page, screen position and the sampled `StrokeModes` of one stroke point.
   - `BrushToolBase`: переиспользуемая логика кисти (радиус через единственного владельца
-    `ms_tools::MaskBrush` и общие `brush.*`, hardness, subpixel coverage/strict pixel режим,
+    `ms_tools::MaskBrush` и общие `brush.*`, hardness, subpixel coverage/strict pixel режим —
+    the stroke mask is painted by the shared `ms_tools::paint_soft_line_mask`,
     scratch-штрих, tiled preview с обновлением только dirty-тайлов, без full-size scratch texture).
   - `RegionEditToolBase`: каркас выделения региона, фоновой загрузки композита `base+overlay`,
     показа отдельного окна редактора (its own `ms_input` view: the shared `view.*` zoom aims at it,
@@ -105,7 +106,7 @@ use ms_sysprobe::ai_models::{EnsureCtx, ModelDownloadEvent};
 use ms_tab_translation::model_download_status::{ModelDownloadStatus, draw_model_download_status};
 use crate::input::{self, CleaningLabels, StrokeModes};
 use ms_input::{ActionId, ContextId, HitPhase, InputFrame, ViewId, ViewSurface, view};
-use ms_tools::MaskBrush;
+use ms_tools::{MaskBrush, SoftDabSampling, SoftDabTip, paint_soft_line_mask};
 use ms_widgets::WheelSlider;
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, TextureHandle, TextureOptions};
@@ -131,14 +132,6 @@ const REGION_EDITOR_WINDOW_MAX_H: f32 = 1400.0;
 const REGION_EDITOR_WINDOW_VIEWPORT_CAP_FRAC: f32 = 0.90;
 const REGION_EDITOR_LOADING_WINDOW_W: f32 = 340.0;
 const REGION_EDITOR_LOADING_WINDOW_H: f32 = 120.0;
-
-#[derive(Debug, Clone, Copy)]
-struct BrushFalloff {
-    radius: f32,
-    hard_radius: f32,
-    soft_span: f32,
-    hardness: f32,
-}
 
 /// One point of a canvas stroke: the page under it, its screen position and the stroke modes the
 /// claimed gesture sampled (`crate::input::StrokeModes`).
@@ -590,12 +583,12 @@ impl BrushToolBase {
         else {
             return false;
         };
-        paint_line_mask_with_hardness(
+        paint_soft_line_mask(
             &mut stroke.mask,
             stroke.image.size,
             egui::pos2(sx0, sy0),
             egui::pos2(sx1, sy1),
-            MaskDabTip { radius: radius_px as i32, hardness, strict_pixel_painting },
+            SoftDabTip { radius: radius_px as i32, hardness, sampling: soft_dab_sampling(strict_pixel_painting) },
         );
         let dirty_overlay =
             segment_dirty_overlay_rect(x0, y0, x1, y1, paint_margin, stroke.overlay_rect);
@@ -669,15 +662,15 @@ impl BrushToolBase {
             });
         let mut patch = base_patch.clone();
         let mut mask = vec![0.0; patch.pixels.len()];
-        paint_line_mask_with_hardness(
+        paint_soft_line_mask(
             &mut mask,
             patch.size,
             egui::pos2(x0f - dirty_overlay.x as f32, y0f - dirty_overlay.y as f32),
             egui::pos2(x1f - dirty_overlay.x as f32, y1f - dirty_overlay.y as f32),
-            MaskDabTip {
+            SoftDabTip {
                 radius: self.brush.radius_px().max(1) as i32,
                 hardness: self.hardness,
-                strict_pixel_painting: self.strict_pixel_painting,
+                sampling: soft_dab_sampling(self.strict_pixel_painting),
             },
         );
         apply_cleaning_brush_stroke(
@@ -3459,111 +3452,10 @@ fn union_overlay_rect(a: OverlayRectPx, b: OverlayRectPx) -> OverlayRectPx {
     }
 }
 
-/// The tip of one mask-brush dab: `radius` in pixels (below 1 counts as 1), `hardness` (`0..=1`,
-/// the fully opaque inner fraction of the radius) and `strict_pixel_painting` (sample the
-/// falloff at pixel centres only, instead of the anti-aliased coverage of partly covered pixels).
-#[derive(Debug, Clone, Copy)]
-struct MaskDabTip {
-    radius: i32,
-    hardness: f32,
-    strict_pixel_painting: bool,
-}
-
-/// Paints dabs of `tip` along the segment `from` -> `to` (fractional pixel coordinates of the
-/// `image_size` = `[width, height]` row-major mask `dst`), keeping the per-pixel maximum
-/// strength. Dabs are spaced 0.45 radius apart; a strict tip skips a dab whose rounded centre
-/// repeats the previous one. A zero-length segment paints one dab.
-fn paint_line_mask_with_hardness(dst: &mut [f32], image_size: [usize; 2], from: Pos2, to: Pos2, tip: MaskDabTip) {
-    let r = tip.radius.max(1);
-    let dx = to.x - from.x;
-    let dy = to.y - from.y;
-    let distance = (dx * dx + dy * dy).sqrt();
-    if distance <= f32::EPSILON {
-        paint_circle_mask_with_hardness(dst, image_size, from, tip);
-        return;
-    }
-    let step = (r as f32 * 0.45).max(1.0);
-    let stamps = (distance / step).ceil() as usize;
-    let mut last = (f32::NAN, f32::NAN);
-    for i in 0..=stamps {
-        let t = i as f32 / stamps.max(1) as f32;
-        let sx = from.x + dx * t;
-        let sy = from.y + dy * t;
-        if tip.strict_pixel_painting && (sx.round(), sy.round()) == last {
-            continue;
-        }
-        paint_circle_mask_with_hardness(dst, image_size, egui::pos2(sx, sy), tip);
-        last = (sx.round(), sy.round());
-    }
-}
-
-/// Paints one dab of `tip` centred at `center` (fractional pixel coordinates) into the
-/// `image_size` row-major mask `dst`, keeping the per-pixel maximum strength.
-fn paint_circle_mask_with_hardness(dst: &mut [f32], image_size: [usize; 2], center: Pos2, tip: MaskDabTip) {
-    let MaskDabTip { radius, hardness, strict_pixel_painting } = tip;
-    let (cx, cy) = (center.x, center.y);
-    let r = radius.max(1);
-    let w_usize = image_size[0];
-    let w = w_usize as i32;
-    let h = image_size[1] as i32;
-    let sample_margin = if strict_pixel_painting { 0.0 } else { 0.5 };
-    let x0 = (cx - r as f32 - sample_margin).floor().max(0.0) as i32;
-    let x1 = (cx + r as f32 + sample_margin).ceil().min((w - 1) as f32) as i32;
-    let y0 = (cy - r as f32 - sample_margin).floor().max(0.0) as i32;
-    let y1 = (cy + r as f32 + sample_margin).ceil().min((h - 1) as f32) as i32;
-    let radius_f = r as f32;
-    let hardness = hardness.clamp(0.0, 1.0);
-    let hard_radius = (radius_f * hardness).clamp(0.0, radius_f);
-    let falloff = BrushFalloff {
-        radius: radius_f,
-        hard_radius,
-        soft_span: (radius_f - hard_radius).max(f32::EPSILON),
-        hardness,
-    };
-
-    for y in y0..=y1 {
-        let row_off = (y as usize).saturating_mul(w_usize);
-        for x in x0..=x1 {
-            let strength = if strict_pixel_painting {
-                let dx = x as f32 - cx;
-                let dy = y as f32 - cy;
-                brush_sample_strength((dx * dx + dy * dy).sqrt(), falloff)
-            } else {
-                brush_pixel_coverage_strength(x, y, cx, cy, falloff)
-            };
-            if strength <= f32::EPSILON {
-                continue;
-            }
-            let idx = row_off.saturating_add(x as usize);
-            if let Some(mask_px) = dst.get_mut(idx) {
-                *mask_px = mask_px.max(strength);
-            }
-        }
-    }
-}
-
-fn brush_pixel_coverage_strength(x: i32, y: i32, cx: f32, cy: f32, falloff: BrushFalloff) -> f32 {
-    const SAMPLE_OFFSETS: [f32; 4] = [-0.375, -0.125, 0.125, 0.375];
-    let mut sum = 0.0;
-    for oy in SAMPLE_OFFSETS {
-        for ox in SAMPLE_OFFSETS {
-            let dx = x as f32 + ox - cx;
-            let dy = y as f32 + oy - cy;
-            sum += brush_sample_strength((dx * dx + dy * dy).sqrt(), falloff);
-        }
-    }
-    sum / 16.0
-}
-
-fn brush_sample_strength(dist: f32, falloff: BrushFalloff) -> f32 {
-    if dist > falloff.radius {
-        return 0.0;
-    }
-    if dist <= falloff.hard_radius || falloff.hardness >= 1.0 {
-        return 1.0;
-    }
-    let t = ((dist - falloff.hard_radius) / falloff.soft_span).clamp(0.0, 1.0);
-    1.0 - smoothstep(t)
+/// The shared soft-dab sampling of the cleaning brushes: strict pixel painting samples pixel
+/// centres only (fractional dab centres), otherwise edge pixels get anti-aliased coverage.
+fn soft_dab_sampling(strict_pixel_painting: bool) -> SoftDabSampling {
+    if strict_pixel_painting { SoftDabSampling::PixelCentres } else { SoftDabSampling::Coverage }
 }
 
 fn apply_cleaning_brush_stroke(
@@ -3695,11 +3587,6 @@ fn erase_cleaning_brush_pixel(dst: &mut Color32, pressure: f32) {
     );
 }
 
-fn smoothstep(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
 fn overlay_rect_to_local_rect(
     source_overlay_rect: OverlayRectPx,
     desired_overlay_rect: OverlayRectPx,
@@ -3812,49 +3699,6 @@ fn extract_local_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn soft_pixel_coverage_reaches_partially_covered_neighbor() {
-        let mut strict = vec![0.0; 9];
-        let dot = egui::pos2(1.0, 1.0);
-        paint_line_mask_with_hardness(&mut strict, [3, 3], dot, dot, MaskDabTip { radius: 1, hardness: 1.0, strict_pixel_painting: true });
-
-        let mut covered = vec![0.0; 9];
-        let off_centre = egui::pos2(1.49, 1.49);
-        paint_line_mask_with_hardness(&mut covered, [3, 3], off_centre, off_centre, MaskDabTip { radius: 1, hardness: 1.0, strict_pixel_painting: false });
-
-        assert_eq!(strict[8], 0.0);
-        assert!(covered[8] > 0.0);
-        assert!(covered[8] < 1.0);
-    }
-
-    #[test]
-    fn soft_pixel_coverage_preserves_full_center_strength() {
-        let mut mask = vec![0.0; 9];
-        let dot = egui::pos2(1.0, 1.0);
-        paint_line_mask_with_hardness(&mut mask, [3, 3], dot, dot, MaskDabTip { radius: 2, hardness: 1.0, strict_pixel_painting: false });
-
-        assert!((mask[4] - 1.0).abs() <= f32::EPSILON);
-    }
-
-    /// characterization (parameter-struct refactor): a long soft and a long strict segment with
-    /// partial hardness, pinned by an FNV-1a fingerprint of the mask bits. OBSERVED before the
-    /// segment and the brush tip became structs; it must stay bit-identical.
-    #[test]
-    fn characterization_paint_line_mask_segments() {
-        let fingerprint = |mask: &[f32]| {
-            mask.iter()
-                .flat_map(|m| m.to_bits().to_le_bytes())
-                .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
-        };
-        let mut soft = vec![0.0f32; 40 * 30];
-        let (from, to) = (egui::pos2(2.3, 4.7), egui::pos2(35.1, 26.4));
-        paint_line_mask_with_hardness(&mut soft, [40, 30], from, to, MaskDabTip { radius: 5, hardness: 0.4, strict_pixel_painting: false });
-        let mut strict = vec![0.0f32; 40 * 30];
-        paint_line_mask_with_hardness(&mut strict, [40, 30], from, to, MaskDabTip { radius: 5, hardness: 0.4, strict_pixel_painting: true });
-        let observed = (fingerprint(&soft), fingerprint(&strict));
-        assert_eq!(observed, (5_333_657_888_049_218_854, 6_152_694_257_659_312_777), "observed={observed:?}");
-    }
 
     fn rect(x: usize, y: usize, w: usize, h: usize) -> OverlayRectPx {
         OverlayRectPx { x, y, w, h }

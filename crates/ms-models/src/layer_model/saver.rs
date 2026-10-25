@@ -233,7 +233,7 @@ pub enum StructuralEdit {
 /// One page's owned save payload. Either or both halves may be present: a whole-page flush sets both,
 /// a text-only flush sets only `text`. When two jobs for the same page are coalesced, the text half
 /// is replaced (latest wins), the raster half is MERGED losslessly (see
-/// [`merge_raster_parts`]), structural edits are APPENDED, and an absent half never erases the queued
+/// `merge_raster_parts`), structural edits are APPENDED, and an absent half never erases the queued
 /// one — so a Full then TextOnly (or vice-versa) never drops a kind's data.
 #[derive(Debug, Clone)]
 pub struct PageSaveJob {

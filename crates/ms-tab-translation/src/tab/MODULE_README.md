@@ -31,7 +31,7 @@ wrapper that the studio root holds is `host.rs` (`TranslationTab`); the panels i
 - `ocr_flow.rs`: OCR controller events, the image-crop selection, advanced recognition and
   manual / quick OCR on a selection, the OCR request and original-text builders.
 - `detection_storage.rs`: detector controller events and the `text_detection` disk storage
-  (lazy load, Save, worker IO, file layout `<page>_blocks.json` + `<page>_mask.png`).
+  (lazy load, Save, worker IO, directory policy); the file format is `text_detector/storage.rs`.
 - `detection_mask.rs`: detector status and edit modes, the sync with the shared `TextMaskModel`,
   mask painting, mask / line overlays, detector geometry and the tiled mask textures.
 - `detection_ocr.rs`: detected-block queries, detector runs (page / all), the sequential

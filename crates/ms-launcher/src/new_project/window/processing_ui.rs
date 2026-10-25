@@ -736,7 +736,7 @@ impl NewProjectWindowState {
             let refresh_width = 96.0;
             let combo_width =
                 (ui.available_width() - refresh_width - ui.spacing().item_spacing.x).max(150.0);
-            ComboBox::from_id_salt("launcher_new_project_reline_model_name")
+            WheelComboBox::from_id_salt("launcher_new_project_reline_model_name")
                 .width(combo_width)
                 .selected_text(if self.reline_model_name.trim().is_empty() {
                     t!("launcher.new_project.reline_not_selected")

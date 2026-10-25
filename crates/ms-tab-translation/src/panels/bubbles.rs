@@ -11,7 +11,7 @@ Main types:
   translation+original, image controls, character controls, «Перевести» action).
 - `BubblesPanelState`: panel runtime state (filters, editor cache, pending flushes, visible list cache).
 - `BubblesPanelContext`: shared tab state links (footer overrides, pending patches, character refresh flags,
-  the tab's image-bubble file-dialog slot, this frame's input).
+  the tab's image-bubble file-dialog and file-save slots, this frame's input).
 - `ImageBubbleFilePick`: a pending «choose file» dialog for one external image bubble; started here
   or from the canvas footer, resolved by the tab (`tab/characters.rs::poll_image_bubble_pick`).
 
@@ -25,7 +25,10 @@ Main flow:
 Utilities:
 - footer parsing helpers: `footer_state_for_bubble`, `bubble_footer_state_from_record`,
   `bubble_extra_string` (без trim, сохраняет пользовательские пробелы),
-  `bubble_extra_bool`, `bubble_extra_i32`, the clipboard image-bubble save helper and
+  `bubble_extra_bool`, `bubble_extra_i32`, `ImageBubbleSave` + `ImageBubbleSource` (the one
+  image-bubble file job — clipboard paste or picked-file copy, read + atomic write on a worker,
+  shared with the canvas footer), `image_bubbles_dir`,
+  `default_image_crop_rect` (the one default page-crop rect, from known page sizes) and
   `image_bubble_file_request` (the one «choose file» dialog request).
 - patch helper: `queue_footer_patch`.
 */
@@ -81,6 +84,133 @@ impl ImageBubbleFilePick {
     pub fn poll(&mut self) -> Option<DialogResult> {
         self.dialog.poll()
     }
+}
+
+/// Where an external image bubble's file comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageBubbleSource {
+    /// The image on the system clipboard, saved as PNG.
+    Clipboard,
+    /// A file the user picked, copied byte for byte (its extension kept, `png` without one).
+    File(PathBuf),
+}
+
+/// A running «save the image-bubble file» job for one external image bubble (a clipboard
+/// paste or a copy of a picked file): the read, the encode (paste) and the atomic write into
+/// the chapter's staged image-bubble folder run on a worker, never on the GUI thread.
+///
+/// Like [`ImageBubbleFilePick`], the Translation tab keeps ONE slot for it
+/// (`TranslationTabState::image_bubble_save`), shared by the canvas footer and this panel's
+/// cards, and resolves the result once per frame (`tab/characters.rs::poll_image_bubble_save`).
+/// The Paste and «choose file» buttons are disabled while a pick or a save is in flight, so a
+/// finished pick always finds the slot free.
+pub struct ImageBubbleSave {
+    bubble_id: i64,
+    rx: std::sync::mpsc::Receiver<Result<PathBuf, String>>,
+}
+
+impl ImageBubbleSave {
+    /// Starts the job for `bubble_id` from `source`, writing into `project`'s staged
+    /// image-bubble folder; `ctx` is repainted when it ends.
+    ///
+    /// # Errors
+    /// A localized message when the worker thread cannot be started (logged).
+    pub fn start(ctx: &egui::Context, project: &ProjectData, bubble_id: i64, source: ImageBubbleSource) -> Result<Self, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = image_bubbles_dir(project);
+        let repaint_ctx = ctx.clone();
+        ms_thread::Builder::new()
+            .name("ms-image-bubble-save".to_owned())
+            .spawn(move || {
+                let result = match &source {
+                    ImageBubbleSource::Clipboard => save_clipboard_image_bubble(&dir, bubble_id),
+                    ImageBubbleSource::File(file) => copy_image_bubble_file(&dir, bubble_id, file),
+                };
+                if let Err(err) = &result {
+                    ms_log::runtime_log::log_warn(format!("[translation] image bubble {bubble_id}: {source:?} not saved into {}: {err}", dir.display()));
+                }
+                // A closed receiver means the tab dropped the job (closed): nothing waits for it.
+                if tx.send(result).is_err() {
+                    ms_log::runtime_log::log_info(format!("[translation] image bubble {bubble_id}: save result discarded, the tab no longer waits for it"));
+                }
+                repaint_ctx.request_repaint();
+            })
+            .map_err(|err| {
+                ms_log::runtime_log::log_error(format!("[translation] image bubble {bubble_id}: could not start the save worker: {err}"));
+                tf!("translation.image_io.save_worker_start_error", err = err)
+            })?;
+        Ok(Self { bubble_id, rx })
+    }
+
+    /// The bubble the saved file is for.
+    #[must_use]
+    pub fn bubble_id(&self) -> i64 {
+        self.bubble_id
+    }
+
+    /// `None` while the job runs; its result exactly once: the saved file, or a localized
+    /// error (also when the worker ended without answering).
+    pub fn poll(&mut self) -> Option<Result<PathBuf, String>> {
+        match self.rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                ms_log::runtime_log::log_error(format!("[translation] image bubble {}: the save worker ended without a result", self.bubble_id));
+                Some(Err(t!("translation.image_io.save_worker_lost_error").to_string()))
+            }
+        }
+    }
+}
+
+/// Atomic replace of an image-bubble file, creating the folder first.
+fn write_image_bubble_bytes(path: &Path, bytes: &[u8]) -> Result<(), ms_atomic_file::AtomicWriteError> {
+    let options = ms_atomic_file::AtomicWriteOptions { create_parent: true, ..ms_atomic_file::AtomicWriteOptions::new(ms_atomic_file::Durability::Contents) };
+    ms_atomic_file::write_atomic_with(path, bytes, &options)
+}
+
+/// Copies the picked `source` as `dir/image_bubble_{bubble_id}.{ext}` (its extension, `png`
+/// without one; the folder is created, the file replaced atomically). Worker thread only.
+fn copy_image_bubble_file(dir: &Path, bubble_id: i64, source: &Path) -> Result<PathBuf, String> {
+    if !source.is_file() {
+        return Err(tf!("translation.image_io.file_not_found_error", source = source.display()));
+    }
+    let ext = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("png");
+    let path = dir.join(format!("image_bubble_{bubble_id}.{ext}"));
+    let copy_error = |err: &dyn std::fmt::Display| tf!("translation.image_io.copy_error", source = source.display(), path = path.display(), err = err);
+    let bytes = fs::read(source).map_err(|err| copy_error(&err))?;
+    write_image_bubble_bytes(&path, &bytes).map_err(|err| copy_error(&err))?;
+    Ok(path)
+}
+
+/// Reads the clipboard image and writes it as `dir/image_bubble_{bubble_id}.png` (the folder
+/// is created; the file is replaced atomically). Worker thread only: clipboard read, PNG
+/// encode and file I/O. Returns the written path or a localized error naming the cause.
+fn save_clipboard_image_bubble(dir: &Path, bubble_id: i64) -> Result<PathBuf, String> {
+    write_image_bubble_png(dir, bubble_id, paste_image::read_image_from_clipboard()?)
+}
+
+/// Encodes `clipboard_image` as PNG and atomically writes it as `dir/image_bubble_{bubble_id}.png`
+/// (creating `dir`). Worker thread only. Errors are localized and name the cause.
+fn write_image_bubble_png(dir: &Path, bubble_id: i64, clipboard_image: paste_image::ClipboardImage) -> Result<PathBuf, String> {
+    let width = u32::try_from(clipboard_image.width)
+        .map_err(|_| t!("translation.image_io.clipboard_too_wide_error").to_string())?;
+    let height = u32::try_from(clipboard_image.height)
+        .map_err(|_| t!("translation.image_io.clipboard_too_tall_error").to_string())?;
+    let Some(image) = image::RgbaImage::from_raw(width, height, clipboard_image.rgba) else {
+        return Err(t!("translation.image_io.clipboard_size_mismatch_error").to_string());
+    };
+    let path = dir.join(format!("image_bubble_{bubble_id}.png"));
+    let mut png = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|err| tf!("translation.image_io.save_error", path = path.display(), err = err))?;
+    write_image_bubble_bytes(&path, png.get_ref())
+        .map_err(|err| tf!("translation.image_io.save_error", path = path.display(), err = err))?;
+    Ok(path)
 }
 
 /// Display placeholder + sentinel for "no character selected" in the footer
@@ -266,8 +396,14 @@ pub struct BubblesPanelContext<'a> {
     pub last_bubble_order: &'a mut i32,
     /// The tab's one «choose file» slot for external image bubbles (see [`ImageBubbleFilePick`]).
     pub image_bubble_pick: &'a mut Option<ImageBubbleFilePick>,
+    /// The tab's one «save the image-bubble file» slot (paste or picked-file copy, see
+    /// [`ImageBubbleSave`]).
+    pub image_bubble_save: &'a mut Option<ImageBubbleSave>,
     /// This frame's input (`None` outside the tab's draw): the card menu gesture.
     pub input: Option<&'a InputFrame>,
+    /// Known source page sizes `[w, h]` by page index (the tab's `known_page_sizes`): the
+    /// default page-crop rect is sized from them, never from a disk read.
+    pub known_page_sizes: &'a HashMap<usize, [u32; 2]>,
 }
 
 /// Read-only inputs shared by every bubble card of one panel frame: the egui context (clipboard
@@ -1061,7 +1197,10 @@ impl BubblesPanelState {
                         panel_ctx.pending_footer_patch_changed_at,
                         bubble_id,
                         "crop_rect",
-                        Value::Array(default_image_crop_rect(project, bubble)),
+                        Value::Array(default_image_crop_rect(
+                            panel_ctx.known_page_sizes.get(&bubble.img_idx).copied(),
+                            bubble,
+                        )),
                         now_s,
                     );
                     queue_footer_patch(
@@ -1076,25 +1215,21 @@ impl BubblesPanelState {
             }
 
             if source_type == "external" {
-                if ui.small_button(t!("translation.common.paste_image_button")).clicked()
+                // Disabled while a file dialog is open or a save runs: one at a time (it may
+                // belong to another bubble). The tab applies the saved file
+                // (`poll_image_bubble_save`) and resolves the dialog (`poll_image_bubble_pick`).
+                let busy = panel_ctx.image_bubble_pick.is_some() || panel_ctx.image_bubble_save.is_some();
+                if ui
+                    .add_enabled(!busy, egui::Button::new(t!("translation.common.paste_image_button")).small())
+                    .clicked()
                 {
-                    match save_clipboard_image_for_bubble(project, bubble_id) {
-                        Ok(path) => queue_footer_patch(
-                            panel_ctx.pending_footer_patches,
-                            panel_ctx.pending_footer_patch_changed_at,
-                            bubble_id,
-                            "image_path",
-                            Value::String(project_relative_path(project, &path)),
-                            now_s,
-                        ),
+                    match ImageBubbleSave::start(ui.ctx(), project, bubble_id, ImageBubbleSource::Clipboard) {
+                        Ok(save) => *panel_ctx.image_bubble_save = Some(save),
                         Err(err) => *image_error = Some(err),
                     }
                 }
-                // Disabled while any image-bubble dialog is open: one dialog at a time, and
-                // the open one may belong to another bubble.
-                let picking = panel_ctx.image_bubble_pick.is_some();
                 if ui
-                    .add_enabled(!picking, egui::Button::new(t!("translation.common.choose_file_button")).small())
+                    .add_enabled(!busy, egui::Button::new(t!("translation.common.choose_file_button")).small())
                     .clicked()
                 {
                     *panel_ctx.image_bubble_pick = Some(ImageBubbleFilePick::request(ui.ctx(), bubble_id));
@@ -1349,61 +1484,126 @@ pub fn bubble_extra_i32(extra: &Map<String, Value>, key: &str, default: i32) -> 
     }
 }
 
-/// Default page-crop rect centered on the bubble anchor, sized to a 256x256 source-pixel square.
+/// Default page-crop rect `[u0, v0, u1, v1]` (normalized, clamped to `0..=1`) centered on the
+/// bubble anchor, sized to a 256x256 source-pixel square of its page.
 ///
-/// Page dimensions are read from the image header to convert 256 px into normalized half-extents,
-/// falling back to a small UV box when unavailable (mirrors `tab/canvas_hooks.rs::default_image_crop_rect_values`).
-fn default_image_crop_rect(project: &ProjectData, bubble: &Bubble) -> Vec<Value> {
-    const DEFAULT_IMAGE_CROP_SIDE_SRC_PX: f32 = 256.0;
+/// `page_size` is the page's known `[w, h]` in source pixels (the tab's `known_page_sizes`, fed
+/// from the page loader's `PageImageInfo`): this runs on the GUI thread, so it never reads the
+/// image. While the size is unknown (page loading or unreadable) it falls back to a `±0.05` UV
+/// box. The one default for both the canvas footer and the bubble cards.
+pub(crate) fn default_image_crop_rect(page_size: Option<[u32; 2]>, bubble: &Bubble) -> Vec<Value> {
+    const DEFAULT_IMAGE_CROP_SIDE_SRC_PX: f64 = 256.0;
+    const UNKNOWN_SIZE_UV_HALF: f64 = 0.05;
     let half = DEFAULT_IMAGE_CROP_SIDE_SRC_PX * 0.5;
-    let (u_half, v_half) = project
-        .pages
-        .iter()
-        .find(|page| page.idx == bubble.img_idx)
-        .and_then(|page| image::image_dimensions(&page.path).ok())
-        .map(|(w, h)| (half / (w.max(1) as f32), half / (h.max(1) as f32)))
-        .unwrap_or((0.05, 0.05));
-    [
-        bubble.img_u - u_half,
-        bubble.img_v - v_half,
-        bubble.img_u + u_half,
-        bubble.img_v + v_half,
-    ]
-    .into_iter()
-    .map(|value| Value::from(f64::from(value.clamp(0.0, 1.0))))
-    .collect()
+    let (u_half, v_half) = page_size
+        .map(|[w, h]| (half / f64::from(w.max(1)), half / f64::from(h.max(1))))
+        .unwrap_or((UNKNOWN_SIZE_UV_HALF, UNKNOWN_SIZE_UV_HALF));
+    let (u, v) = (f64::from(bubble.img_u), f64::from(bubble.img_v));
+    [u - u_half, v - v_half, u + u_half, v + v_half]
+        .into_iter()
+        .map(|value| Value::from(value.clamp(0.0, 1.0)))
+        .collect()
 }
 
-fn save_clipboard_image_for_bubble(
-    project: &ProjectData,
-    bubble_id: i64,
-) -> Result<PathBuf, String> {
-    let clipboard_image = paste_image::read_image_from_clipboard()?;
-    let width = u32::try_from(clipboard_image.width)
-        .map_err(|_| t!("translation.image_io.clipboard_too_wide_error").to_string())?;
-    let height = u32::try_from(clipboard_image.height)
-        .map_err(|_| t!("translation.image_io.clipboard_too_tall_error").to_string())?;
-    let Some(image) = image::RgbaImage::from_raw(width, height, clipboard_image.rgba) else {
-        return Err(t!("translation.image_io.clipboard_size_mismatch_error").to_string());
-    };
-    let dir = image_bubbles_dir(project);
-    fs::create_dir_all(&dir)
-        .map_err(|err| tf!("translation.image_io.create_dir_error", dir = dir.display(), err = err))?;
-    let path = dir.join(format!("image_bubble_{bubble_id}.png"));
-    image
-        .save(&path)
-        .map_err(|err| tf!("translation.image_io.save_error", path = path.display(), err = err))?;
-    Ok(path)
-}
-
-fn project_relative_path(project: &ProjectData, path: &Path) -> String {
-    path.strip_prefix(&project.paths.unsaved_dir)
-        .or_else(|_| path.strip_prefix(&project.project_dir))
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-fn image_bubbles_dir(project: &ProjectData) -> PathBuf {
+/// The chapter's staged image-bubble folder (`{chapter}_unsaved/...`), where pasted and
+/// copied image-bubble files go.
+pub(crate) fn image_bubbles_dir(project: &ProjectData) -> PathBuf {
     project.paths.unsaved_image_bubbles_dir.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ImageBubbleSave, copy_image_bubble_file, default_image_crop_rect, write_image_bubble_png};
+    use ms_sysprobe::paste_image::ClipboardImage;
+    use ms_project::Bubble;
+    use serde_json::{Map, Value};
+
+    fn bubble_at(img_u: f32, img_v: f32) -> Bubble {
+        Bubble {
+            id: 1,
+            img_idx: 0,
+            img_u,
+            img_v,
+            side: None,
+            bubble_class: Some("image".to_string()),
+            bubble_type: None,
+            text: String::new(),
+            original_text: String::new(),
+            extra: Map::new(),
+        }
+    }
+
+    fn as_f64s(values: &[Value]) -> Vec<f64> {
+        values.iter().filter_map(Value::as_f64).collect()
+    }
+
+    fn assert_close(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len(), "{actual:?} vs {expected:?}");
+        for (a, e) in actual.iter().zip(expected) {
+            assert!((a - e).abs() < 1e-6, "{actual:?} vs {expected:?}");
+        }
+    }
+
+    #[test]
+    fn known_page_size_gives_a_256_px_square_around_the_anchor() {
+        let rect = default_image_crop_rect(Some([1000, 2000]), &bubble_at(0.5, 0.5));
+        assert_close(&as_f64s(&rect), &[0.372, 0.436, 0.628, 0.564]);
+    }
+
+    #[test]
+    fn unknown_page_size_falls_back_to_a_small_uv_box() {
+        let rect = default_image_crop_rect(None, &bubble_at(0.5, 0.5));
+        assert_close(&as_f64s(&rect), &[0.45, 0.45, 0.55, 0.55]);
+    }
+
+    #[test]
+    fn rect_is_clamped_to_the_page_and_a_zero_size_does_not_divide_by_zero() {
+        let rect = default_image_crop_rect(Some([0, 0]), &bubble_at(0.0, 1.0));
+        assert_close(&as_f64s(&rect), &[0.0, 0.0, 1.0, 1.0]);
+    }
+
+    /// The pasted image lands as `image_bubble_{id}.png` in a folder that is created on demand
+    /// and decodes back to the same pixels; a buffer that does not match its size is refused.
+    #[test]
+    fn a_pasted_image_is_written_as_a_png_and_a_bad_buffer_is_refused() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let target = dir.path().join("image_bubbles");
+        let rgba = vec![255, 0, 0, 255, 0, 255, 0, 128];
+        let path = write_image_bubble_png(&target, 7, ClipboardImage { width: 2, height: 1, rgba: rgba.clone() })?;
+        assert_eq!(path, target.join("image_bubble_7.png"));
+        let decoded = image::open(&path).map_err(|err| err.to_string())?.to_rgba8();
+        assert_eq!(decoded.into_raw(), rgba);
+        assert!(write_image_bubble_png(&target, 8, ClipboardImage { width: 3, height: 1, rgba: vec![0; 4] }).is_err());
+        assert!(!target.join("image_bubble_8.png").exists());
+        Ok(())
+    }
+
+    /// A worker that ended without answering reads as an error, never as "still running".
+    #[test]
+    fn a_lost_save_worker_is_an_error() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<std::path::PathBuf, String>>();
+        let mut save = ImageBubbleSave { bubble_id: 3, rx };
+        assert!(save.poll().is_none());
+        drop(tx);
+        assert!(matches!(save.poll(), Some(Err(_))));
+    }
+
+    /// A picked file is copied byte for byte with its extension (`png` without one) into a
+    /// folder created on demand; a missing source is refused and writes nothing.
+    #[test]
+    fn a_picked_file_is_copied_with_its_extension() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let target = dir.path().join("image_bubbles");
+        let jpg = dir.path().join("photo.jpg");
+        std::fs::write(&jpg, b"jpeg bytes").map_err(|err| err.to_string())?;
+        let path = copy_image_bubble_file(&target, 5, &jpg)?;
+        assert_eq!(path, target.join("image_bubble_5.jpg"));
+        assert_eq!(std::fs::read(&path).map_err(|err| err.to_string())?, b"jpeg bytes");
+        let bare = dir.path().join("noext");
+        std::fs::write(&bare, b"x").map_err(|err| err.to_string())?;
+        assert_eq!(copy_image_bubble_file(&target, 6, &bare)?, target.join("image_bubble_6.png"));
+        assert!(copy_image_bubble_file(&target, 7, &dir.path().join("missing.png")).is_err());
+        assert!(!target.join("image_bubble_7.png").exists());
+        Ok(())
+    }
 }

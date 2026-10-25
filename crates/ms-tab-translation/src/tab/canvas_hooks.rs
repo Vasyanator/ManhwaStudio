@@ -12,24 +12,24 @@ Key functions:
   on_bubble_action, draw_canvas_page_context_menu, canvas_scrollbar_marks, mask / page overlays.
 - TranslationTabState::build_image_bubble_footer_controls / build_hint_bubble_footer_controls.
 - TranslationTabState::push_toast / draw_toast / draw_startup_page_load_toast.
-- is_image_bubble_record / is_hint_bubble_record, save_clipboard_image_bubble /
-  copy_external_image_bubble / project_relative_path, build_image_crop_selection /
-  default_image_crop_rect_values / normalize_uv_rect / rect_coords_value.
+- is_image_bubble_record / is_hint_bubble_record (the image-bubble file paste / copy is
+  `panels::bubbles::ImageBubbleSave`), project_relative_path, build_image_crop_selection /
+  normalize_uv_rect / rect_coords_value (the default crop rect is
+  `panels::bubbles::default_image_crop_rect`).
 */
 
 use ms_widgets::bubble_status::{BubbleBorderStyle, BubbleStatusContext, evaluate_bubble_status_rules};
 use ms_canvas::{BubbleAction, BubbleClass, CanvasHooks, CanvasScrollbarContext, CanvasUiStatus, CanvasView};
-use ms_sysprobe::paste_image;
 use ms_project::{Bubble, ProjectData};
-use crate::panels::bubbles::{ImageBubbleFilePick, bubble_extra_bool, bubble_extra_string};
+use crate::panels::bubbles::{ImageBubbleFilePick, ImageBubbleSave, ImageBubbleSource, bubble_extra_bool, bubble_extra_string, default_image_crop_rect};
 use ms_widgets::panel_dock::PanelDockState;
 use ms_widgets::{AutocompleteLine, ScrollMark, WheelComboBox, WheelSlider, WheelSpinBox};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Stroke};
 use ms_theme::Severity;
 use serde_json::Value;
-use std::fs;
-use std::path::{Path, PathBuf};
+
+use std::path::Path;
 use super::{FOOTER_CHARACTER_AUTOCOMPLETE_MAX, HINT_SHOW_OUTSIDE_EXTRA_KEY, OcrToast, TranslationTabState, TranslationTool};
 use super::characters::footer_autocomplete_candidates;
 use super::scrollbar_marks;
@@ -175,7 +175,10 @@ impl TranslationTabState {
                 self.queue_footer_patch(
                     bubble_id,
                     "crop_rect",
-                    Value::Array(default_image_crop_rect_values(project, bubble)),
+                    Value::Array(default_image_crop_rect(
+                        self.known_page_sizes.get(&bubble.img_idx).copied(),
+                        bubble,
+                    )),
                     now_s,
                 );
                 self.queue_footer_patch(
@@ -188,22 +191,20 @@ impl TranslationTabState {
         }
 
         if source_type == "external" {
-            if ui.small_button(t!("translation.common.paste_image_button")).clicked() {
-                match save_clipboard_image_bubble(project, bubble_id) {
-                    Ok(path) => self.queue_footer_patch(
-                        bubble_id,
-                        "image_path",
-                        Value::String(project_relative_path(project, &path)),
-                        now_s,
-                    ),
+            // Disabled while a file dialog is open or a save runs: one at a time (it may belong
+            // to another bubble). Resolved by `poll_image_bubble_pick` / `poll_image_bubble_save`.
+            let busy = self.image_bubble_pick.is_some() || self.image_bubble_save.is_some();
+            if ui
+                .add_enabled(!busy, egui::Button::new(t!("translation.common.paste_image_button")).small())
+                .clicked()
+            {
+                match ImageBubbleSave::start(ui.ctx(), project, bubble_id, ImageBubbleSource::Clipboard) {
+                    Ok(save) => self.image_bubble_save = Some(save),
                     Err(err) => self.push_toast(ui.ctx(), err, Severity::Error, 3.0),
                 }
             }
-            // Disabled while any image-bubble dialog is open: one dialog at a time, and the
-            // open one may belong to another bubble. Resolved by `poll_image_bubble_pick`.
-            let picking = self.image_bubble_pick.is_some();
             if ui
-                .add_enabled(!picking, egui::Button::new(t!("translation.common.choose_file_button")).small())
+                .add_enabled(!busy, egui::Button::new(t!("translation.common.choose_file_button")).small())
                 .clicked()
             {
                 self.image_bubble_pick = Some(ImageBubbleFilePick::request(ui.ctx(), bubble_id));
@@ -324,7 +325,8 @@ impl CanvasHooks for TranslationTabState {
         self.handle_advanced_recognition_window(ctx, canvas, project);
         self.maybe_dispatch_next_textdetector_ocr_request(ctx, project);
         self.handle_pending_mt_actions(ctx, canvas, project);
-        self.poll_image_bubble_pick(ctx, project, now_s);
+        self.poll_image_bubble_pick(ctx, project);
+        self.poll_image_bubble_save(ctx, project, now_s);
         self.flush_footer_patches(canvas, project, now_s);
         self.bubbles_panel.flush_text_updates(canvas, now_s);
         // The MT request preview outlives its tool body: polled and drawn on every frame, so it
@@ -585,33 +587,6 @@ impl CanvasHooks for TranslationTabState {
     }
 }
 
-/// Default page-crop rect centered on the bubble anchor, sized to a 256x256 source-pixel square.
-///
-/// The crop page dimensions are read from the image header (cheap, header-only) to convert 256 px
-/// into normalized half-extents; if they are unavailable it falls back to a small UV box. This
-/// avoids the previous `±0.05` UV default, which on tall ribbon pages produced a near-full-height
-/// image area.
-fn default_image_crop_rect_values(project: &ProjectData, bubble: &Bubble) -> Vec<Value> {
-    const DEFAULT_IMAGE_CROP_SIDE_SRC_PX: f32 = 256.0;
-    let half = DEFAULT_IMAGE_CROP_SIDE_SRC_PX * 0.5;
-    let (u_half, v_half) = project
-        .pages
-        .iter()
-        .find(|page| page.idx == bubble.img_idx)
-        .and_then(|page| image::image_dimensions(&page.path).ok())
-        .map(|(w, h)| (half / (w.max(1) as f32), half / (h.max(1) as f32)))
-        .unwrap_or((0.05, 0.05));
-    [
-        bubble.img_u - u_half,
-        bubble.img_v - v_half,
-        bubble.img_u + u_half,
-        bubble.img_v + v_half,
-    ]
-    .into_iter()
-    .map(|value| Value::from(f64::from(value.clamp(0.0, 1.0))))
-    .collect()
-}
-
 pub(super) fn is_image_bubble_record(bubble: &Bubble) -> bool {
     bubble.bubble_class.as_deref().map(BubbleClass::from_str) == Some(BubbleClass::Image)
 }
@@ -619,52 +594,6 @@ pub(super) fn is_image_bubble_record(bubble: &Bubble) -> bool {
 /// True when the stored bubble record is a hint bubble (`bubble_class == "hint"`).
 pub(super) fn is_hint_bubble_record(bubble: &Bubble) -> bool {
     bubble.bubble_class.as_deref().map(BubbleClass::from_str) == Some(BubbleClass::Hint)
-}
-
-fn image_bubbles_dir(project: &ProjectData) -> PathBuf {
-    project.paths.unsaved_image_bubbles_dir.clone()
-}
-
-fn save_clipboard_image_bubble(project: &ProjectData, bubble_id: i64) -> Result<PathBuf, String> {
-    let clipboard_image = paste_image::read_image_from_clipboard()?;
-    let width = u32::try_from(clipboard_image.width)
-        .map_err(|_| t!("translation.image_io.clipboard_too_wide_error").to_string())?;
-    let height = u32::try_from(clipboard_image.height)
-        .map_err(|_| t!("translation.image_io.clipboard_too_tall_error").to_string())?;
-    let Some(image) = image::RgbaImage::from_raw(width, height, clipboard_image.rgba) else {
-        return Err(t!("translation.image_io.clipboard_size_mismatch_error").to_string());
-    };
-    let dir = image_bubbles_dir(project);
-    fs::create_dir_all(&dir)
-        .map_err(|err| tf!("translation.image_io.create_dir_error", dir = dir.display(), err = err))?;
-    let path = dir.join(format!("image_bubble_{bubble_id}.png"));
-    image
-        .save(&path)
-        .map_err(|err| tf!("translation.image_io.save_error", path = path.display(), err = err))?;
-    Ok(path)
-}
-
-pub(super) fn copy_external_image_bubble(
-    project: &ProjectData,
-    bubble_id: i64,
-    source: &Path,
-) -> Result<PathBuf, String> {
-    if !source.is_file() {
-        return Err(tf!("translation.image_io.file_not_found_error", source = source.display()));
-    }
-    let dir = image_bubbles_dir(project);
-    fs::create_dir_all(&dir)
-        .map_err(|err| tf!("translation.image_io.create_dir_error", dir = dir.display(), err = err))?;
-    let ext = source
-        .extension()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("png");
-    let path = dir.join(format!("image_bubble_{bubble_id}.{ext}"));
-    fs::copy(source, &path).map_err(|err| {
-        tf!("translation.image_io.copy_error", source = source.display(), path = path.display(), err = err)
-    })?;
-    Ok(path)
 }
 
 pub(super) fn project_relative_path(project: &ProjectData, path: &Path) -> String {

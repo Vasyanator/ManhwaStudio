@@ -1581,7 +1581,7 @@ impl LayerDoc {
         self.flush_page_inner(page_idx, layers_dir, fallback_dir, &[])
     }
 
-    /// Like [`flush_page`], but also DROPS `removed_raster_uids` from the manifest (and prunes their
+    /// Like [`flush_page`](Self::flush_page), but also DROPS `removed_raster_uids` from the manifest (and prunes their
     /// PNGs). Without this, `save_page_rasters` PRESERVES a manifest raster not in the flushed set as
     /// "owned by another tab" — so a raster the typing tab deleted would resurrect on disk. The deleter
     /// passes the removed uid here. (The PS editor uses `record_raster_deletion` for the same effect.)
@@ -1940,7 +1940,7 @@ impl LayerDoc {
     }
 
     /// ASYNC whole-page save: when the background saver is enabled, builds the page's owned save job
-    /// and enqueues it (coalescing, off-thread); otherwise falls back to the synchronous [`flush_page`]
+    /// and enqueues it (coalescing, off-thread); otherwise falls back to the synchronous [`flush_page`](Self::flush_page)
     /// so behavior is safe either way. No-op (returns `Ok`) if the page is not resident.
     ///
     /// Mirrors `flush_page`'s contract: callers that need the bytes ON DISK before reading them must
@@ -1948,7 +1948,7 @@ impl LayerDoc {
     ///
     /// # Errors
     /// Only the synchronous fallback path can return an error (the async path enqueues and returns
-    /// `Ok`); it matches [`flush_page`]'s error propagation.
+    /// `Ok`); it matches [`flush_page`](Self::flush_page)'s error propagation.
     pub fn enqueue_page_save(
         &mut self,
         page_idx: usize,
@@ -1971,7 +1971,7 @@ impl LayerDoc {
     }
 
     /// ASYNC text-only save: when the background saver is enabled, builds a TEXT-ONLY owned save job
-    /// and enqueues it; otherwise falls back to the synchronous [`flush_page_text`]. No-op (returns
+    /// and enqueues it; otherwise falls back to the synchronous [`flush_page_text`](Self::flush_page_text). No-op (returns
     /// `Ok`) if the page is not resident.
     ///
     /// # Errors
@@ -2011,8 +2011,8 @@ impl LayerDoc {
     /// ASYNC text-only save of SEVERAL pages as one saver batch (`LayerSaverHandle::enqueue_batch`):
     /// every job is built first and sent as ONE message, so the worker writes them in one drain pass
     /// — one manifest commit — instead of possibly one pass per page. Without a saver, each page falls
-    /// back to the synchronous [`flush_page_text`]. Non-resident pages are skipped (reported `Ok`,
-    /// matching [`enqueue_page_text_save`]).
+    /// back to the synchronous [`flush_page_text`](Self::flush_page_text). Non-resident pages are skipped (reported `Ok`,
+    /// matching [`enqueue_page_text_save`](Self::enqueue_page_text_save)).
     ///
     /// Returns one result per entry of `pages`, in order: with a saver every page is `Ok` (the write
     /// outcome arrives through the acknowledgements and the barrier); on the synchronous fallback, a

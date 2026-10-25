@@ -201,6 +201,11 @@ replaces the PyTorch build the Torch stage chose.
   WebGPU build; `OPENCV_DISTRIBUTIONS` for `cv2`) — only for a spec without a version
   specifier — because a working environment built on `onnxruntime-gpu`/`-webgpu`/`-migraphx`
   must not be offered a repair on every launch. Readiness may only ever be SOFTER than installation.
+- Before repair and the update continuation install into an existing environment, the colliding
+  `cv2` distributions are uninstalled (`utils::conflicting_module_distributions`): when the
+  required `opencv-python-headless` meets another `OPENCV_DISTRIBUTIONS` member, EVERY installed
+  member is removed (shared files were overwritten) and the install pass reinstalls the required
+  one. The onnxruntime family is never cleaned (a GPU build is a user choice).
 - `dependency_marker_matches_current_platform` understands exactly the two
   `platform_system == / != "Windows"` markers used by the embedded lists and treats anything else
   as "applies here" (fail-open: an unnecessary install, never a false readiness). A dependency

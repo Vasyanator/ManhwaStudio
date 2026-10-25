@@ -31,7 +31,8 @@ use ms_theme::Severity;
 use serde_json::{Map, Value};
 use std::collections::{HashSet, VecDeque};
 use super::{CHARACTER_NAMES_WATCH_CHECK_SECS, FOOTER_PATCH_DEBOUNCE_SECS, RECENT_CHARACTER_HISTORY_LIMIT, RecentCharacterEntry, TranslationTabState, footer_additional_character_names};
-use super::canvas_hooks::{copy_external_image_bubble, project_relative_path};
+use super::canvas_hooks::project_relative_path;
+use crate::panels::bubbles::{ImageBubbleSave, ImageBubbleSource};
 
 impl TranslationTabState {
     pub(super) fn ensure_character_names_loaded(&mut self, project: &ProjectData) {
@@ -365,10 +366,10 @@ impl TranslationTabState {
         canvas.create_hint_bubble_at_pointer_shortcut(ctx, pointer_pos)
     }
 
-    /// Resolves the image-bubble «choose file» dialog once it closed: copies the picked file into
-    /// the staging image-bubble folder and queues the `image_path` footer patch. A cancel is a
-    /// no-op; a dialog or copy failure becomes an error toast.
-    pub(super) fn poll_image_bubble_pick(&mut self, ctx: &egui::Context, project: &ProjectData, now_s: f64) {
+    /// Resolves the image-bubble «choose file» dialog once it closed: starts the worker copy of
+    /// the picked file into the staging image-bubble folder (`image_bubble_save`, applied by
+    /// `poll_image_bubble_save`). A cancel is a no-op; a dialog failure becomes an error toast.
+    pub(super) fn poll_image_bubble_pick(&mut self, ctx: &egui::Context, project: &ProjectData) {
         let Some(pick) = self.image_bubble_pick.as_mut() else {
             return;
         };
@@ -394,7 +395,30 @@ impl TranslationTabState {
                 return;
             }
         };
-        match copy_external_image_bubble(project, bubble_id, &source) {
+        // The copy runs on a worker; `poll_image_bubble_save` applies it. The buttons are
+        // disabled while a save runs, so the slot is free here; a replaced job (an invariant
+        // break) only loses its result, which its worker logs.
+        if let Some(previous) = self.image_bubble_save.as_ref() {
+            ms_log::runtime_log::log_error(format!("[translation] image bubble {bubble_id}: a save for bubble {} was still running when a pick finished; its result is dropped", previous.bubble_id()));
+        }
+        match ImageBubbleSave::start(ctx, project, bubble_id, ImageBubbleSource::File(source)) {
+            Ok(save) => self.image_bubble_save = Some(save),
+            Err(err) => self.push_toast(ctx, err, Severity::Error, 3.0),
+        }
+    }
+
+    /// Applies the finished image-bubble file job (paste or picked-file copy): the saved file
+    /// becomes the bubble's `image_path`; a failure is a toast (the worker already logged it).
+    pub(super) fn poll_image_bubble_save(&mut self, ctx: &egui::Context, project: &ProjectData, now_s: f64) {
+        let Some(save) = self.image_bubble_save.as_mut() else {
+            return;
+        };
+        let Some(result) = save.poll() else {
+            return;
+        };
+        let bubble_id = save.bubble_id();
+        self.image_bubble_save = None;
+        match result {
             Ok(saved) => self.queue_footer_patch(bubble_id, "image_path", Value::String(project_relative_path(project, &saved)), now_s),
             Err(err) => self.push_toast(ctx, err, Severity::Error, 3.0),
         }

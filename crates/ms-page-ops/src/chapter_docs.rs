@@ -99,7 +99,7 @@ fn tree_dir_of(path: &Path, kind: DocKind) -> Option<&Path> {
 /// name or the bare stem) must use: an existing document keeps its format (the store ignores
 /// the hint then), a NEW one is created in the chapter's format per rule B.3
 /// (`ms_docstore::chapter_new_format` over [`chapter_doc_siblings`]). When the chapter layout
-/// cannot be derived from `path` (see [`tree_dir_of`]) the plain `DocRef` is returned and a
+/// cannot be derived from `path` (see `tree_dir_of`) the plain `DocRef` is returned and a
 /// new document takes `default_format()`.
 ///
 /// Costs up to eight `stat`s; call it on a worker thread like every other document write.

@@ -12,6 +12,9 @@ FILE HEADER (crates/ms-tools/src/lib.rs)
     (`brush.size` / `brush.smaller` / `brush.larger`, active under `BRUSH_ACTIVE`) and
     `MaskBrush::apply_input`. The studio registers the declarations once; brush hosts publish
     the context and call `apply_input`.
+  - `paint_soft_line_mask` (+ `SoftDabTip`, `SoftDabSampling`): the ONE soft stroke-mask
+    painter (hardness falloff, anti-aliased or pixel-centre sampling) of the Cleaning brushes and
+    the Translation advanced-recognition brush.
   - `fill_polygon_spans`: re-export of `ms_raster::fill_polygon_spans`, the one even-odd
     scanline polygon rasterizer (PS-editor lasso, cleaning tools, the patch core). It lives in
     `ms-raster` (level 0) so lower crates can use it; this path is kept for existing callers.
@@ -43,7 +46,7 @@ pub mod patch;
 pub mod png_wire;
 mod sor;
 
-pub use mask_brush::{BinaryMaskMut, LineSegmentPx, MaskBrush};
+pub use mask_brush::{BinaryMaskMut, LineSegmentPx, MaskBrush, SoftDabSampling, SoftDabTip, paint_soft_line_mask};
 pub use overlay_pixel::overlay_pixel_for_final_color;
 pub use ms_raster::fill_polygon_spans;
 pub use sor::{red_black_sor_sweeps, SorProblem, SorSchedule};

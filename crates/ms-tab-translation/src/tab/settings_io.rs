@@ -514,9 +514,6 @@ pub(super) fn save_translation_settings_to_project_file(
 const STALE_TEXT_DETECTOR_PARAM_KEYS: [&str; 4] =
     ["det_rearrange_max_batches", "font size multiplier", "font size max", "font size min"];
 
-/// Writes the four sections the translation tab owns (`OCR`, `machine_translation`,
-/// `composition`, `text_detector`) into the `settings.json` root; other keys are untouched.
-/// The NeuroLate settings go under `OCR.params.neurolate`.
 /// A title's composition options from its `settings.json` `composition` object: every key the
 /// object lacks (or the whole object when absent) takes its default, never the value of the
 /// title loaded before. The result is normalized.
@@ -529,6 +526,9 @@ pub(super) fn composition_options_from_settings(composition: Option<&Map<String,
     options
 }
 
+/// Writes the four sections the translation tab owns (`OCR`, `machine_translation`,
+/// `composition`, `text_detector`) into the `settings.json` root; other keys are untouched.
+/// The NeuroLate settings go under `OCR.params.neurolate`.
 pub(super) fn apply_translation_settings_sections(
     root_obj: &mut Map<String, Value>,
     ocr_options: &OcrPanelOptions,
@@ -537,7 +537,6 @@ pub(super) fn apply_translation_settings_sections(
     text_detector_options: &TextDetectorPanelOptions,
     neurolate: &NeurolateSettings,
 ) {
-
     let mut ocr_obj = root_obj
         .get("OCR")
         .and_then(Value::as_object)

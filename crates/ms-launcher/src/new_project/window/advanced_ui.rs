@@ -212,7 +212,7 @@ impl NewProjectWindowState {
                 !self.advanced_download.is_loading()
                     && !self.advanced_link_collect_active
                     && !self.advanced_intercept_active,
-                Slider::new(&mut self.advanced_fetch_parallelism, 1..=8).text(t!("launcher.new_project.threads_suffix")),
+                WheelSlider::new(&mut self.advanced_fetch_parallelism, 1..=8).text(t!("launcher.new_project.threads_suffix")),
             );
 
             sub_group(ui, t!("launcher.new_project.collect_and_download_button"), |ui| {

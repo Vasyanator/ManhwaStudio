@@ -98,3 +98,15 @@ pub use tab::TranslationTabState;
 pub(crate) fn hold_locale_for_test() -> std::sync::MutexGuard<'static, ()> {
     ms_config::locale_store::GLOBAL_LOCALE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+/// Test-only: takes the process-wide locale lock (as [`hold_locale_for_test`]) AND installs the
+/// embedded English catalog, for a test whose assertion needs real catalog text (e.g. an
+/// interpolated `{error}`). Before any install the active catalog is empty and `tf!` returns the
+/// bare key, so such a test must not rely on another test having installed one first.
+#[cfg(test)]
+pub(crate) fn english_locale_for_test() -> std::sync::MutexGuard<'static, ()> {
+    let guard = hold_locale_for_test();
+    let tag = ms_i18n::LocaleTag::parse("en").expect("the `en` tag parses");
+    ms_i18n::set_locale(&tag).expect("the embedded English catalog installs");
+    guard
+}
