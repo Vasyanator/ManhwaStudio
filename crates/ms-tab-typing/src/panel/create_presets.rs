@@ -1746,6 +1746,9 @@ mod tests {
     /// A failed background write reaches the status line; a success leaves it alone.
     #[test]
     fn a_failed_formula_preset_write_reaches_the_status_line() {
+        // The status text is a localized `tf!`; the active catalog starts empty, so install English under the shared lock.
+        let _locale_guard = ms_config::locale_store::GLOBAL_LOCALE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        ms_i18n::set_locale(&ms_i18n::LocaleTag::english()).expect("embedded English catalog installs");
         let mut state = TypingCreatePanelState::new(false);
         state.status_line = "idle".to_string();
         state.apply_formula_preset_write_outcome(Ok(()));
