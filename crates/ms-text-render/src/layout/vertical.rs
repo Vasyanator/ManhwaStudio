@@ -77,8 +77,9 @@ use crate::optical::{
     OPTICAL_CONTOUR_SIMPLIFY_TOLERANCE_PX, OpticalAxis, OpticalContourCache, median_of_gaps,
     optical_base_advance, optical_delta, optical_pair_gap,
 };
+use crate::pair_advance::{KerningSettings, TrackingBasis};
 use crate::pipeline::{
-    FauxGlyphStyle, GlyphScaleSettings, KerningSettings, faux_bounds_pads, faux_style_for_glyph,
+    FauxGlyphStyle, GlyphScaleSettings, faux_bounds_pads, faux_style_for_glyph,
     inline_glyph_offset_for_glyph, inline_glyph_scale_for_glyph, inline_kerning_for_glyph,
     inline_text_color_for_glyph, resolve_faux_counter_flag,
 };
@@ -1058,7 +1059,9 @@ fn compute_vertical_cell_baselines(
                         .as_ref()
                         .and_then(|deltas| deltas.get(idx).copied())
                         .unwrap_or(0.0);
-                    current_top += base_gap + delta + kerning.extra_spacing_px(font_size_px);
+                    current_top += base_gap
+                        + delta
+                        + kerning.tracking_px(TrackingBasis::FontSize { font_size_px });
                 }
             }
             VerticalRenderCell::Blank(height_mul) => {

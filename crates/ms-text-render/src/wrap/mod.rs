@@ -80,7 +80,7 @@ pub(crate) fn is_hanging_punctuation(ch: char) -> bool {
 /// kerning pair — the width metrics' stand-in for the pen loop's same-face guard.
 ///
 /// The pen loop applies a user-authored pair only when both glyphs came from the
-/// SAME face and that face carries the table (`pipeline::custom_pair_delta_px`). A
+/// SAME face and that face carries the table (`pair_advance::PairAdvanceModel::override_delta_px`). A
 /// width measurement has no per-glyph font ids to reproduce that with, but it has
 /// the cause: a character the selected font does not cover is exactly the character
 /// that falls through to a FALLBACK font at draw time, where no override applies. So

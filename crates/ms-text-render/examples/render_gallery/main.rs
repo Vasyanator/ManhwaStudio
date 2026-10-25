@@ -15,6 +15,11 @@ simply depends on it (`ms_text_render::render_text_to_image` / `::types::*`) —
 Key items:
 - `Case`: one named render case (params + output name).
 - `all_cases()`: the fixed feature-matrix of cases.
+- `KernCase` / `kern_cases()` / `build_kern_font_set()`: the kerning / tracking cases, each
+  rendered with its own one-font `FontContentSet` on a TRACKED `fonts/ui` font carrying the
+  case's user-authored `CustomKerningTable`.
+- `formula_wave_params()` / `vertical_params()`: geometry shared by a base case and its
+  kerning / tracking variant, so a diff between them isolates the kerning input.
 - `onpath_case()` / `wave_points()` / `sharp_turn_points()`: builders for the
   custom-vector-line cases. The on-path cases come in pairs that differ ONLY by
   `distance_mode`, so the curvature-compensating `MinimumPreviousDistance` can be
@@ -23,11 +28,13 @@ Key items:
   image the `CustomRasterLines` case traces its line out of. Written to
   `<outdir>/inputs/`, never next to the goldens.
 - `rgba_diff` / `DiffStats`: pure buffer comparison helper for regression tests.
-- `main`: parse argv[1]=outdir, render every case, write `<outdir>/<name>.png`.
+- `main`: parse argv[1]=outdir, render every case (then every kerning case), write
+  `<outdir>/<name>.png`.
 
 Notes:
-Fully deterministic: no randomness, no time, fixed inputs. Uses the repo font
-`test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf` (Latin + Cyrillic).
+Fully deterministic: no randomness, no time, fixed inputs. `all_cases()` uses the repo font
+`test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf` (Latin + Cyrillic);
+`kern_cases()` use the tracked Noto Sans / Noto Sans Hebrew of `fonts/ui`.
 */
 
 use std::path::{Path, PathBuf};
@@ -36,7 +43,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use ms_text_render::render_text_to_image;
-use ms_text_render::{FontContent, FontContentSet, font_content_id};
+use ms_text_render::{CustomKerningTable, FontContent, FontContentSet, font_content_id};
 use ms_text_render::types::{
     AntiAliasingMode, HorizontalAlign, KerningMode, RenderedTextImage, TextDrawnLinesLayoutParams,
     TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams, TextShape,
@@ -76,6 +83,68 @@ fn build_font_set() -> Result<FontContentSet, String> {
         face_index: 0,
         content_id,
         custom_kerning: None,
+    }]))
+}
+
+/// Working name the kerning / tracking cases reference their font by. Each such case
+/// renders with its OWN `FontContentSet` (see [`build_kern_font_set`]), because the
+/// user-authored kerning table travels on the `FontContent`.
+const KERN_FONT_NAME: &str = "gallery-kern-font";
+
+/// A TRACKED font of the shipped `fonts/ui` stack used by the kerning / tracking cases
+/// (a fresh clone has them; the Liberation Sans of the older cases is not tracked).
+#[derive(Debug, Clone, Copy)]
+enum TrackedFont {
+    /// `fonts/ui/core/00-NotoSans-Regular.ttf`: Latin + Cyrillic with GPOS pair kerning.
+    NotoSans,
+    /// `fonts/ui/ext/30-NotoSansHebrew-Regular.ttf`: the right-to-left cases.
+    NotoSansHebrew,
+}
+
+impl TrackedFont {
+    /// Absolute path, resolved from the crate manifest dir like [`font_path`].
+    fn path(self) -> PathBuf {
+        let relative = match self {
+            Self::NotoSans => "../../fonts/ui/core/00-NotoSans-Regular.ttf",
+            Self::NotoSansHebrew => "../../fonts/ui/ext/30-NotoSansHebrew-Regular.ttf",
+        };
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+}
+
+/// One kerning / tracking case: like [`Case`], plus the tracked font it is drawn with and
+/// the user-authored pairs `(left, right, offset_per_mille)` bound to that font (empty =
+/// no table at all).
+struct KernCase {
+    name: &'static str,
+    params: TextRenderParams,
+    font: TrackedFont,
+    pairs: &'static [(char, char, f32)],
+}
+
+/// Builds the one-font source of a [`KernCase`]: `font` under [`KERN_FONT_NAME`], carrying
+/// `pairs` as its `CustomKerningTable` (none when `pairs` is empty, exactly as a font without
+/// authored pairs reaches the renderer).
+///
+/// # Errors
+/// Returns a message when the tracked font cannot be read.
+fn build_kern_font_set(
+    font: TrackedFont,
+    pairs: &[(char, char, f32)],
+) -> Result<FontContentSet, String> {
+    let path = font.path();
+    let bytes = std::fs::read(&path)
+        .map_err(|err| format!("failed to read harness font {}: {err}", path.display()))?;
+    let content_id = font_content_id(&bytes);
+    let custom_kerning = (!pairs.is_empty())
+        .then(|| Arc::new(CustomKerningTable::from_pairs(pairs.iter().copied())));
+    Ok(FontContentSet::new(vec![FontContent {
+        name: KERN_FONT_NAME.to_string(),
+        original_name: KERN_FONT_NAME.to_string(),
+        data: Arc::new(bytes),
+        face_index: 0,
+        content_id,
+        custom_kerning,
     }]))
 }
 
@@ -273,6 +342,182 @@ fn onpath_case(
     params
 }
 
+/// The `formula_wave` geometry (`TextLayoutMode::Formula`, one sine period across 820 px)
+/// with `text`; shared by `formula_wave` and the kerning / tracking formula cases so a diff
+/// between them isolates the kerning input.
+fn formula_wave_params(text: &str) -> TextRenderParams {
+    let mut params = base_params();
+    params.text = text.to_string();
+    params.font_size_px = 44.0;
+    params.width_px = 820;
+    params.text_layout_mode = TextLayoutMode::Formula;
+    params.formula_layout = TextFormulaLayoutParams {
+        x_expr: "t * w".to_string(),
+        y_expr: "130 * sin(t * tau)".to_string(),
+        rotation_expr: "0".to_string(),
+        use_tangent_rotation: true,
+        ..TextFormulaLayoutParams::default()
+    };
+    params
+}
+
+/// The `vertical` case params (two right-to-left Cyrillic columns at 64 px); shared by
+/// `vertical`, `vertical_optical` and `tracking_vertical`.
+fn vertical_params() -> TextRenderParams {
+    let mut params = base_params();
+    params.text = "ГРОМ\nБАМ".to_string();
+    params.font_size_px = 64.0;
+    params.width_px = 400;
+    params.text_line_mode = TextLineMode::Vertical;
+    params.vertical_line_direction = VerticalLineDirection::RightToLeft;
+    params
+}
+
+/// Latin text dense in font-kerned and user-overridden pairs (`AV`, `To`, `WA`, `VA`, `AY`).
+const KERN_TEXT: &str = "AVATAR WAY To";
+
+/// The override table of the Latin kerning cases: a strong tightening (`AV`), a moderate
+/// one (`To`), and a `0.0` entry that CANCELS the font's own `WA` pair.
+const KERN_PAIRS: &[(char, char, f32)] = &[('A', 'V', -120.0), ('T', 'o', -80.0), ('W', 'A', 0.0)];
+
+/// Hebrew text for the right-to-left cases: two words both starting with the overridden
+/// alef -> bet pair.
+const KERN_RTL_TEXT: &str = "\u{05D0}\u{05D1}\u{05D2} \u{05D0}\u{05D1}";
+
+/// Text of `kern_override_wrap`: two words of five `AV` pairs each, so the whole line's
+/// width depends strongly on the `AV` override.
+const KERN_WRAP_TEXT: &str = "AVAVAVAVAV AVAVAVAVAV";
+
+/// Box width of `kern_override_wrap`, tuned by rendering (NotoSans, 48 px, `KERN_PAIRS`):
+/// the one-line INK width is 537 px with the table and 575 px without it, and today the
+/// wrap breaks this text into two lines at every width below 573 px WITH OR WITHOUT the
+/// table — the override does not move this break (measured 2026-10-25). 560 px sits inside
+/// that gap: the kerned line would fit, so the golden shows exactly the case a wrap that
+/// measures overrides as drawn (behaviour change B1) is expected to turn into ONE line.
+const KERN_WRAP_WIDTH_PX: u32 = 560;
+
+/// The override table of the right-to-left case.
+const KERN_RTL_PAIRS: &[(char, char, f32)] = &[('\u{05D0}', '\u{05D1}', -150.0)];
+
+/// The kerning / tracking golden cases: user-authored pair overrides under every mode, in a
+/// right-to-left run, on the formula path and deciding a line break, plus manual tracking
+/// on the horizontal, formula and vertical paths. Every case draws with a TRACKED font
+/// (`TrackedFont`), so they reproduce on a fresh clone. Order is stable across runs.
+fn kern_cases() -> Vec<KernCase> {
+    let mut cases = Vec::new();
+
+    // Overrides under each kerning mode: the same text, table and size, so a diff between
+    // the three isolates the mode (an overridden pair lands identically in all three).
+    for (name, mode) in [
+        ("kern_override_auto", KerningMode::Auto),
+        ("kern_override_fixed", KerningMode::Fixed),
+        ("kern_override_optical", KerningMode::Optical),
+    ] {
+        let mut params = base_params();
+        params.font_name = KERN_FONT_NAME.to_string();
+        params.text = KERN_TEXT.to_string();
+        params.width_px = 640;
+        params.kerning_mode = mode;
+        cases.push(KernCase { name, params, font: TrackedFont::NotoSans, pairs: KERN_PAIRS });
+    }
+
+    // Right-to-left: an override is mirrored onto the run axis (`kern_override_rtl`), while
+    // `Fixed` WITHOUT an override is not (`kern_fixed_rtl`, the preserved quirk that
+    // behaviour change B2 flips — that case is EXPECTED to change then).
+    let mut rtl = base_params();
+    rtl.font_name = KERN_FONT_NAME.to_string();
+    rtl.text = KERN_RTL_TEXT.to_string();
+    rtl.width_px = 640;
+    rtl.kerning_mode = KerningMode::Auto;
+    cases.push(KernCase {
+        name: "kern_override_rtl",
+        params: rtl.clone(),
+        font: TrackedFont::NotoSansHebrew,
+        pairs: KERN_RTL_PAIRS,
+    });
+    let mut fixed_rtl = rtl;
+    fixed_rtl.kerning_mode = KerningMode::Fixed;
+    cases.push(KernCase {
+        name: "kern_fixed_rtl",
+        params: fixed_rtl,
+        font: TrackedFont::NotoSansHebrew,
+        pairs: &[],
+    });
+
+    // Overrides on the formula seed advances.
+    let mut formula = formula_wave_params(KERN_TEXT);
+    formula.font_name = KERN_FONT_NAME.to_string();
+    cases.push(KernCase {
+        name: "kern_override_formula",
+        params: formula,
+        font: TrackedFont::NotoSans,
+        pairs: KERN_PAIRS,
+    });
+
+    // An override at a line break: see `KERN_WRAP_WIDTH_PX` for why the width sits between
+    // the kerned and the un-kerned one-line width.
+    let mut wrap = base_params();
+    wrap.font_name = KERN_FONT_NAME.to_string();
+    wrap.text = KERN_WRAP_TEXT.to_string();
+    wrap.width_px = KERN_WRAP_WIDTH_PX;
+    wrap.text_wrap_mode = TextWrapMode::WholeWords;
+    cases.push(KernCase {
+        name: "kern_override_wrap",
+        params: wrap,
+        font: TrackedFont::NotoSans,
+        pairs: KERN_PAIRS,
+    });
+
+    // Manual tracking (no table): px tracking on the pen, percent tracking under `Fixed`,
+    // and px tracking on the formula and vertical paths (each path has its own basis).
+    let mut tracking_px = base_params();
+    tracking_px.font_name = KERN_FONT_NAME.to_string();
+    tracking_px.text = KERN_TEXT.to_string();
+    tracking_px.width_px = 640;
+    tracking_px.kerning_px = 6.0;
+    cases.push(KernCase {
+        name: "tracking_px_auto",
+        params: tracking_px,
+        font: TrackedFont::NotoSans,
+        pairs: &[],
+    });
+
+    let mut tracking_percent = base_params();
+    tracking_percent.font_name = KERN_FONT_NAME.to_string();
+    tracking_percent.text = KERN_TEXT.to_string();
+    tracking_percent.width_px = 640;
+    tracking_percent.kerning_mode = KerningMode::Fixed;
+    tracking_percent.kerning_percent = -8.0;
+    cases.push(KernCase {
+        name: "tracking_percent_fixed",
+        params: tracking_percent,
+        font: TrackedFont::NotoSans,
+        pairs: &[],
+    });
+
+    let mut tracking_formula = formula_wave_params("Формула formula волна");
+    tracking_formula.font_name = KERN_FONT_NAME.to_string();
+    tracking_formula.kerning_px = 4.0;
+    cases.push(KernCase {
+        name: "tracking_formula",
+        params: tracking_formula,
+        font: TrackedFont::NotoSans,
+        pairs: &[],
+    });
+
+    let mut tracking_vertical = vertical_params();
+    tracking_vertical.font_name = KERN_FONT_NAME.to_string();
+    tracking_vertical.kerning_px = 4.0;
+    cases.push(KernCase {
+        name: "tracking_vertical",
+        params: tracking_vertical,
+        font: TrackedFont::NotoSans,
+        pairs: &[],
+    });
+
+    cases
+}
+
 /// The fixed feature-matrix of golden cases. Order is stable across runs.
 ///
 /// `raster_lines_image` is the layout source written by
@@ -328,12 +573,7 @@ fn all_cases(raster_lines_image: &Path) -> Vec<Case> {
     cases.push(Case { name: "shape_rect", params: shape_rect });
 
     // 7. Vertical text mode, short Cyrillic string.
-    let mut vertical = base_params();
-    vertical.text = "ГРОМ\nБАМ".to_string();
-    vertical.font_size_px = 64.0;
-    vertical.width_px = 400;
-    vertical.text_line_mode = TextLineMode::Vertical;
-    vertical.vertical_line_direction = VerticalLineDirection::RightToLeft;
+    let vertical = vertical_params();
     cases.push(Case {
         name: "vertical",
         params: vertical.clone(),
@@ -438,19 +678,10 @@ fn all_cases(raster_lines_image: &Path) -> Vec<Case> {
     // FORMULA arc-length accumulator and `OnPathStepSpacing::for_formula` (whose
     // seed floor is half the em, not 1 px), so a change to the step arithmetic
     // can no longer slip through unnoticed on that path.
-    let mut formula_wave = base_params();
-    formula_wave.text = "Формула formula волна".to_string();
-    formula_wave.font_size_px = 44.0;
-    formula_wave.width_px = 820;
-    formula_wave.text_layout_mode = TextLayoutMode::Formula;
-    formula_wave.formula_layout = TextFormulaLayoutParams {
-        x_expr: "t * w".to_string(),
-        y_expr: "130 * sin(t * tau)".to_string(),
-        rotation_expr: "0".to_string(),
-        use_tangent_rotation: true,
-        ..TextFormulaLayoutParams::default()
-    };
-    cases.push(Case { name: "formula_wave", params: formula_wave });
+    cases.push(Case {
+        name: "formula_wave",
+        params: formula_wave_params("Формула formula волна"),
+    });
 
     // 8h. `TextLayoutMode::CustomRasterLines`, the third consumer of the same
     // on-path step. It traces its line out of the generated layout image, which
@@ -684,6 +915,32 @@ fn main() -> ExitCode {
         }
     }
 
+    let mut kern_cases = kern_cases();
+    for case in &mut kern_cases {
+        case.params.anti_aliasing = aa_mode;
+    }
+    for case in &kern_cases {
+        let path = outdir.join(format!("{}.png", case.name));
+        let rendered = build_kern_font_set(case.font, case.pairs)
+            .and_then(|kern_font_set| render_text_to_image(&case.params, &kern_font_set, None));
+        match rendered {
+            Ok(image) => match write_png(&path, &image) {
+                Ok(()) => {
+                    ok += 1;
+                    println!("{}: {}x{}", case.name, image.width, image.height);
+                }
+                Err(err) => {
+                    failed += 1;
+                    eprintln!("{}: WRITE FAILED: {err}", case.name);
+                }
+            },
+            Err(err) => {
+                failed += 1;
+                eprintln!("{}: RENDER FAILED: {err}", case.name);
+            }
+        }
+    }
+
     println!("done: {ok} ok, {failed} failed, out={}", outdir.display());
     if failed == 0 {
         ExitCode::SUCCESS
@@ -694,7 +951,27 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{rgba_diff, DiffStats};
+    use super::{build_kern_font_set, kern_cases, rgba_diff, DiffStats};
+    use ms_text_render::render_text_to_image;
+
+    /// Every kerning case that names a table must render DIFFERENTLY without it; otherwise
+    /// the table never reached the face the text is drawn with and the golden would pin
+    /// nothing about overrides.
+    #[test]
+    fn the_kerning_cases_really_carry_their_override_table() {
+        for case in kern_cases().iter().filter(|case| !case.pairs.is_empty()) {
+            let kerned_set = build_kern_font_set(case.font, case.pairs).expect("tracked font");
+            let plain_set = build_kern_font_set(case.font, &[]).expect("tracked font");
+            let kerned = render_text_to_image(&case.params, &kerned_set, None).expect("render");
+            let plain = render_text_to_image(&case.params, &plain_set, None).expect("render");
+            assert_ne!(
+                (kerned.width, kerned.height, &kerned.rgba),
+                (plain.width, plain.height, &plain.rgba),
+                "{}: the override table changes nothing",
+                case.name
+            );
+        }
+    }
 
     #[test]
     fn rgba_diff_identical_is_zero() {

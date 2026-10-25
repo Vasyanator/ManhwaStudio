@@ -58,7 +58,7 @@ the line paths.
   synthesized wrap hyphen, both of which can never carry an authored pair). One thing
   does NOT carry over: `FormulaGlyphSeed::advance_px` is a MAGNITUDE along the drawn
   line (floored positive at every consumer), not a signed x step, so the RTL sign
-  mirroring `pipeline::custom_pair_step_px` performs has no counterpart here. Formula
+  mirroring the pen performs has no counterpart here (`StepDirection::Magnitude`). Formula
   and drawn lines walk seeds in logical order regardless of script direction — a
   limitation of that whole path, not of the overrides.
 - THE ARC-LENGTH STEP BETWEEN TWO ADJACENT GLYPHS IS DECIDED IN ONE PLACE AND ONLY
@@ -118,7 +118,7 @@ the line paths.
   - WHICH PAIRS ARE NORMALIZED. Both glyphs must have ink: an inkless glyph (a space)
     ends the pair chain, so an inter-word distance neither enters the median nor gets
     normalized, and words cannot merge. A pair carrying a USER-AUTHORED kerning override
-    (`custom_seed_pair_delta_px`) is EXEMPT — it keeps the distance its author gave it
+    (`PairAdvanceModel::is_overridden`) is EXEMPT — it keeps the distance its author gave it
     and is excluded from the median, mirroring `pipeline.rs`, where an authored pair
     cancels optical kerning outright. A pair whose inks do not face each other even when
     straight has nothing to normalize and keeps its arc-length seed.

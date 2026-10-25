@@ -32,7 +32,10 @@ Notes:
   plus the authored delta, so an authored pair is indistinguishable from a built-in
   one and a `0.0` entry cancels one. Guards, fast-path interaction and the
   measurement paths that must stay in sync are the CUSTOM KERNING contract in
-  `MODULE_README.md`;
+  `MODULE_README.md`. The pair DECISION (override guard and magnitude, `Fixed` step,
+  run-axis orientation, tracking basis) is owned by `pair_advance`; the pen loops
+  here only accumulate its `PairStep`s plus tracking, faux growth and the optical
+  normalization;
 - the normal horizontal path runs a SINGLE placement pass: `horizontal_run_layout`
   and `get_image` execute once per run/glyph, collecting each glyph into a
   `HorizontalGlyphPlacement` (`build_horizontal_placement`) that both the bounds
@@ -94,10 +97,14 @@ use super::inline_styles::{
 };
 use super::glyph_blit::{
     glyph_needs_bitmap_fallback, glyph_outline_has_counter, glyph_outline_transform,
-    glyph_subpixel_offset, hash_font_id, nominal_glyph_advance_px, resolve_outline_for_glyph,
+    glyph_subpixel_offset, hash_font_id, resolve_outline_for_glyph,
 };
 use super::glyph_contour::PlacedContour;
 use super::layout::{VerticalRasterRequest, render_vertical_text};
+use super::pair_advance::{
+    KerningSettings, PairAdvanceModel, PairGlyph, PairStep, StepDirection, TrackingBasis,
+    effective_spacing_percent,
+};
 use super::optical::{
     OPTICAL_CONTOUR_SIMPLIFY_TOLERANCE_PX, OpticalAxis, OpticalContourCache, median_of_gaps,
     optical_base_advance, optical_delta, optical_pair_gap,
@@ -251,75 +258,6 @@ impl GlyphScaleSettings {
             scaled_width,
             scaled_height,
         )
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct KerningSettings {
-    pub(crate) mode: KerningMode,
-    pub(crate) spacing_px: f32,
-    pub(crate) spacing_percent: f32,
-    /// Whether the FONT this glyph was drawn from carries user-authored kerning
-    /// pair overrides (`font_provider::CustomKerningTable`). Set per glyph by
-    /// [`Self::with_custom_pairs`] from the render's `CustomKerningMap`; `false`
-    /// on every path that does not apply pair overrides at all (the vertical
-    /// layout, see the MODULE_README).
-    ///
-    /// It exists only to take the run OFF the byte-identical shaped-position fast
-    /// path — see [`Self::uses_default_metric_layout`]. Whether an individual PAIR
-    /// is actually overridden is decided in the pen loop, not here.
-    pub(crate) custom_pairs: bool,
-}
-
-impl KerningSettings {
-    #[must_use]
-    pub(crate) fn from_params(params: &TextRenderParams) -> Self {
-        Self {
-            mode: params.kerning_mode,
-            spacing_px: params.kerning_px.clamp(-300.0, 300.0),
-            spacing_percent: effective_spacing_percent(
-                params.kerning_percent,
-                params.glyph_width_percent,
-            ),
-            custom_pairs: false,
-        }
-    }
-
-    /// Same settings with the custom-override flag set to `active`.
-    ///
-    /// Applied by the horizontal and formula paths right after
-    /// [`inline_kerning_for_glyph`], from `CustomKerningMap::has_table` for the
-    /// glyph's own face. Kept a separate step rather than a parameter so the
-    /// vertical path — which applies no pair kerning of any kind — keeps calling
-    /// the resolver unchanged.
-    #[must_use]
-    pub(crate) fn with_custom_pairs(mut self, active: bool) -> Self {
-        self.custom_pairs = active;
-        self
-    }
-
-    #[must_use]
-    fn has_zero_adjustment(self) -> bool {
-        self.spacing_px.abs() <= f32::EPSILON && self.spacing_percent.abs() <= f32::EPSILON
-    }
-
-    #[must_use]
-    pub(crate) fn extra_spacing_px(self, basis_px: f32) -> f32 {
-        self.spacing_px + basis_px.max(0.0) * (self.spacing_percent / 100.0)
-    }
-
-    /// Whether this glyph may take the fast byte-identical shaped-position path
-    /// (cosmic-text `Shaping::Advanced` positions with no manual tracking). Only
-    /// `Auto` qualifies: `Fixed` needs own-advance repositioning and `Optical`
-    /// needs ink-gap normalization, so both must go through the custom path.
-    ///
-    /// A font carrying user-authored kerning overrides (`custom_pairs`) is
-    /// disqualified for the same reason: the shaped positions already contain the
-    /// font's OWN pair kerning, and an override REPLACES it — taking the shortcut
-    /// would silently render the overrides as if they did not exist.
-    #[must_use]
-    pub(crate) fn uses_default_metric_layout(self) -> bool {
-        self.mode == KerningMode::Auto && self.has_zero_adjustment() && !self.custom_pairs
     }
 }
 
@@ -2381,114 +2319,6 @@ fn faux_floored_advance(base_advance: f32, faux_extra: f32) -> f32 {
     }
 }
 
-/// The single `char` of a glyph's source cluster, or `None` when the cluster is
-/// not exactly one character.
-///
-/// `glyph.start`/`glyph.end` are byte offsets into the run's own text, so the
-/// slice is the cluster the shaper folded into this glyph. A multi-character
-/// cluster (a ligature, a base + combining mark, a surrogate-free emoji sequence)
-/// deliberately yields `None`: user-authored kerning pairs are entered as exactly
-/// TWO characters in the settings UI, so a cluster pair has no authored meaning and
-/// guessing one would kern text the user never described.
-///
-/// `get` rather than indexing: the offsets come from the shaper, and an
-/// out-of-range or non-boundary pair must degrade to "no override", never panic.
-#[must_use]
-pub(crate) fn single_char_cluster(run_text: &str, glyph: &LayoutGlyph) -> Option<char> {
-    let start = glyph.start.min(glyph.end);
-    let end = glyph.start.max(glyph.end);
-    let mut chars = run_text.get(start..end)?.chars();
-    let first = chars.next()?;
-    chars.next().is_none().then_some(first)
-}
-
-/// The user-authored advance delta in px for the pair (`prev`, `cur`), or `None`
-/// when no override applies.
-///
-/// Conservative by contract — ALL of the following must hold, and each guard has a
-/// reason that is easy to "simplify" away:
-/// - both glyphs come from the SAME face (`font_id`). A pair that straddles a
-///   font-fallback boundary is not a kerning pair in ANY font: the two characters
-///   were never adjacent in one typeface's design, and the override was authored
-///   against one specific font entry.
-/// - that face carries an override table at all.
-/// - each glyph's source cluster is exactly one `char` (see
-///   [`single_char_cluster`]).
-///
-/// The em basis is the LEFT glyph's own `font_size`, not the block font size, so an
-/// inline `<size=…>` span kerns proportionally to the text it is part of.
-#[must_use]
-fn custom_pair_delta_px(
-    custom_kerning: &CustomKerningMap,
-    run_text: &str,
-    prev: &LayoutGlyph,
-    cur: &LayoutGlyph,
-) -> Option<f32> {
-    if prev.font_id != cur.font_id {
-        return None;
-    }
-    let table = custom_kerning.table_for(prev.font_id)?;
-    let left = single_char_cluster(run_text, prev)?;
-    let right = single_char_cluster(run_text, cur)?;
-    table.delta_px(left, right, prev.font_size)
-}
-
-/// The pen step an OVERRIDDEN pair must take, in the run's own direction.
-///
-/// `magnitude_px` is the unsigned distance between the two pens — the left glyph's
-/// raw `hmtx` advance (`nominal_glyph_advance_px`) plus the authored delta — and
-/// `metric_advance` is the SHAPED step (`cur.x - prev.x`) the override replaces.
-///
-/// Why a sign is needed at all: cosmic-text lays a right-to-left run out by
-/// SUBTRACTING each (always positive) shaped advance before pushing the glyph, so
-/// `glyph.x` DECREASES with the glyph index and `metric_advance` is negative there
-/// (`cosmic-text/src/shape.rs`, `ShapeLine::layout_to_buffer`). Every input the
-/// override path starts from is unsigned instead: `hmtx` advances are positive by
-/// construction and [`optical_base_advance`] hands a positive own-advance back
-/// verbatim. Adding the authored delta to that magnitude and using it as the step
-/// would walk an RTL pen RIGHTWARD and invert "tighten" into "widen"; mirroring it
-/// onto the run's axis keeps a negative authored delta tightening the pair in BOTH
-/// directions.
-///
-/// The shaped step is the primary evidence of direction — it IS the direction the
-/// shaper walked the pen. A degenerate step (zero or non-finite, e.g. a zero-width
-/// glyph) carries no sign, so the left glyph's bidi embedding level decides
-/// instead; it is the only other direction fact a `LayoutGlyph` holds.
-///
-/// Scope note: `KerningMode::Fixed` WITHOUT an override still steps by the unsigned
-/// nominal advance, so an un-overridden RTL run keeps its pre-existing (wrong)
-/// direction under that mode. Making the override follow the run is a fix for the
-/// override path only; the `Fixed` behaviour predates it and is deliberately left
-/// untouched here.
-#[must_use]
-fn custom_pair_step_px(magnitude_px: f32, metric_advance: f32, prev: &LayoutGlyph) -> f32 {
-    let rtl = if metric_advance.is_finite() && metric_advance != 0.0 {
-        metric_advance < 0.0
-    } else {
-        prev.level.is_rtl()
-    };
-    if rtl { -magnitude_px } else { magnitude_px }
-}
-
-/// Unsigned distance the pen must cover for an OVERRIDDEN pair: the left glyph's
-/// raw (un-kerned) `hmtx` advance plus the authored delta.
-///
-/// The `hmtx` advance is unsigned by construction, so the shaped step is folded in
-/// only as an unsigned FALLBACK magnitude for a glyph whose own advance cannot be
-/// read (`optical_base_advance`'s degenerate branch) — feeding it in signed would
-/// re-introduce the RTL sign this split exists to keep out.
-#[must_use]
-fn custom_pair_magnitude_px(
-    font_system: &mut FontSystem,
-    prev: &LayoutGlyph,
-    metric_advance: f32,
-    delta_px: f32,
-) -> f32 {
-    let fallback = metric_advance.abs();
-    let own = nominal_glyph_advance_px(font_system, prev).unwrap_or(fallback);
-    optical_base_advance(own, fallback) + delta_px
-}
-
 /// Compute per-glyph pen positions (`glyph_xs`) and hanging metrics for one
 /// horizontal layout run, honoring inline tracking and the selected kerning mode.
 ///
@@ -2550,20 +2380,23 @@ fn horizontal_run_layout(
         };
     }
 
+    let model = PairAdvanceModel::new(custom_kerning);
     let glyph_kernings = run
         .glyphs
         .iter()
         .map(|glyph| {
-            inline_kerning_for_glyph(
-                params,
-                inline_style_spans,
-                layout_line_offsets,
-                run.line_i,
-                glyph,
-            )
             // Takes the run off the byte-identical fast path when this glyph's own
             // face carries overrides; which PAIRS are overridden is decided below.
-            .with_custom_pairs(custom_kerning.has_table(glyph.font_id))
+            model.kerning_for_glyph(
+                inline_kerning_for_glyph(
+                    params,
+                    inline_style_spans,
+                    layout_line_offsets,
+                    run.line_i,
+                    glyph,
+                ),
+                glyph,
+            )
         })
         .collect::<Vec<_>>();
 
@@ -2667,28 +2500,29 @@ fn horizontal_run_layout(
         // glyph's raw `hmtx` advance plus the authored delta, so the font's own
         // pair value is dropped and the user's value takes its place verbatim.
         // That is what makes an authored pair behave exactly like a built-in one.
-        // Both inputs are UNSIGNED, so the run's own direction is re-applied by
-        // `custom_pair_step_px` (an RTL run walks the pen leftwards).
-        let custom_delta_px = custom_pair_delta_px(custom_kerning, run.text, prev, glyph);
-        let base_advance = match (custom_delta_px, params.kerning_mode) {
-            (Some(delta_px), _) => custom_pair_step_px(
-                custom_pair_magnitude_px(font_system, prev, metric_advance, delta_px),
+        // Both inputs are UNSIGNED, so the owner re-applies the run's own direction
+        // (`StepDirection::FollowRun`: an RTL run walks the pen leftwards).
+        let base_advance = model
+            .resolve(
+                font_system,
+                params.kerning_mode,
+                StepDirection::FollowRun,
+                PairGlyph::from_run(run.text, prev),
+                PairGlyph::from_run(run.text, glyph),
                 metric_advance,
-                prev,
-            ),
-            (None, KerningMode::Fixed) => {
-                let own = nominal_glyph_advance_px(font_system, prev).unwrap_or(metric_advance);
-                optical_base_advance(own, metric_advance)
-            }
-            (None, KerningMode::Auto | KerningMode::Optical) => metric_advance,
+            )
+            .step_px();
+        let tracking_basis = TrackingBasis::HorizontalPen {
+            shaped_step_px: metric_advance,
+            prev_w_px: prev.w,
+            default_advance_px: default_advance,
         };
-        let spacing_basis = metric_advance.abs().max(prev.w.max(default_advance));
         // Faux-bold growth of the PREVIOUS glyph's advance (0.0 when off),
         // floored so a thinning delta wider than that glyph's own advance cannot
         // step the pen backwards. Manual tracking stays OUTSIDE the floor: a
         // negative letter-spacing is an explicit request for overlap.
         let effective_advance = faux_floored_advance(base_advance, faux_extras[idx - 1]);
-        current_x += effective_advance + pair_kerning.extra_spacing_px(spacing_basis);
+        current_x += effective_advance + pair_kerning.tracking_px(tracking_basis);
         glyph_xs.push(current_x);
     }
 
@@ -2850,6 +2684,7 @@ fn optical_horizontal_run_layout(
     // Self-calibrating target: the median of finite per-pair MIN gaps. None when
     // the run has no finite gap to normalize.
     let target = median_of_gaps(&gaps)?;
+    let model = PairAdvanceModel::new(custom_kerning);
 
     let default_advance = font_size_px.max(1.0) * 0.5;
     let mut glyph_xs = Vec::with_capacity(glyph_count);
@@ -2860,25 +2695,35 @@ fn optical_horizontal_run_layout(
         let cur = &run.glyphs[idx];
         let metric_advance = cur.x - prev.x;
         // Keep the manual-tracking basis identical to the metric branch.
-        let spacing_basis = metric_advance.abs().max(prev.w.max(default_advance));
+        let tracking_basis = TrackingBasis::HorizontalPen {
+            shaped_step_px: metric_advance,
+            prev_w_px: prev.w,
+            default_advance_px: default_advance,
+        };
         // A user-authored pair wins over the optical normalization too: the point
         // of an override is that the user dictated this one distance, so measuring
         // ink and moving the pair toward the run's median gap would overwrite the
         // very value they entered. Every OTHER pair of the run stays optical.
         // Direction is re-applied exactly as on the metric branch: the override's
         // inputs are unsigned, the run's step may not be.
-        let step = match custom_pair_delta_px(custom_kerning, run.text, prev, cur) {
-            Some(custom_delta_px) => custom_pair_step_px(
-                custom_pair_magnitude_px(font_system, prev, metric_advance, custom_delta_px),
-                metric_advance,
-                prev,
-            ),
-            None => {
+        let step = match model.resolve(
+            font_system,
+            KerningMode::Optical,
+            StepDirection::FollowRun,
+            PairGlyph::from_run(run.text, prev),
+            PairGlyph::from_run(run.text, cur),
+            metric_advance,
+        ) {
+            PairStep::Override { step_px, .. } => step_px,
+            // `OwnAdvance` is unreachable here (the owner returns it only for `Fixed`,
+            // and this branch always asks with `Optical`); it is listed so the match
+            // stays exhaustive and would take the optical step if that ever changed.
+            PairStep::Shaped { .. } | PairStep::OwnAdvance { .. } => {
                 optical_base_advance(prev.w, metric_advance)
                     + optical_delta(gaps[idx], target, font_size_px)
             }
         };
-        current_x += step + glyph_kernings[idx].extra_spacing_px(spacing_basis);
+        current_x += step + glyph_kernings[idx].tracking_px(tracking_basis);
         glyph_xs.push(current_x);
     }
 
@@ -3020,10 +2865,6 @@ fn prepare_source_text(source_text: &str, params: &TextRenderParams) -> String {
     } else {
         source_text
     }
-}
-
-pub(crate) fn effective_spacing_percent(base_percent: f32, glyph_percent: f32) -> f32 {
-    (base_percent + (glyph_percent - 100.0)).clamp(-300.0, 300.0)
 }
 
 /// Expands every `…` (U+2026 HORIZONTAL ELLIPSIS) into three ASCII periods.
@@ -4418,9 +4259,9 @@ fn rotated_placement_extra_samples(
 #[cfg(test)]
 mod tests {
     use super::{
-        FauxGlyphStyle, KerningSettings, SYNTHESIZED_ITALIC_SLANT_DEG, apply_effects_to_image,
+        FauxGlyphStyle, SYNTHESIZED_ITALIC_SLANT_DEG, apply_effects_to_image,
         base_attrs_real_bold_italic, faux_bounds_pads, prepare_source_text,
-        replace_ellipsis_with_dots, single_char_cluster,
+        replace_ellipsis_with_dots,
     };
     use crate::vector::FauxOutlineParams;
     use crate::font_provider::{FontContent, FontContentSet, font_content_id};
@@ -8048,8 +7889,8 @@ mod tests {
 
     /// An override must follow the RUN's direction. cosmic-text lays a right-to-left
     /// run out by subtracting each advance, so its pen steps LEFT while every input
-    /// the override path starts from (`hmtx` advances) is positive. Before
-    /// `custom_pair_step_px` the overridden pair stepped the pen RIGHT — the glyphs
+    /// the override path starts from (`hmtx` advances) is positive. Without the
+    /// owner's `StepDirection::FollowRun` orientation the overridden pair stepped the pen RIGHT — the glyphs
     /// of an RTL word crossed over each other — and a negative authored delta
     /// WIDENED the pair instead of tightening it.
     #[test]
@@ -8142,70 +7983,212 @@ mod tests {
         );
     }
 
-    /// The fast path must be unreachable for a font with overrides, otherwise the
-    /// run would keep the shaped positions and the overrides would silently do
-    /// nothing. `Auto` with zero tracking is the ONLY configuration that qualifies
-    /// without them, so it is the only one that can regress.
+    // ---- Characterization of the advance between two adjacent glyphs (pen side) ----
+    //
+    // Recorded BEFORE the pair decision moved to one owner, so the move can be checked bit for
+    // bit. Fonts come from the tracked `fonts/ui` stack only (`crate::characterization`).
+
+    /// Shapes `text` as ONE line with the tracked `font` and runs the production
+    /// `horizontal_run_layout` over it, with `pairs` bound to that face the way
+    /// `CustomKerningMap::record` binds them in a render. Returns `(glyph_xs, line_width_px)`.
+    fn tracked_font_run_layout(
+        font: &mut crate::characterization::LoadedFont,
+        text: &str,
+        params: &TextRenderParams,
+        pairs: &[(char, char, f32)],
+    ) -> (Vec<f32>, f32) {
+        use crate::font_provider::CustomKerningTable;
+        use crate::font_registry::CustomKerningMap;
+        use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping};
+
+        let mut custom_kerning = CustomKerningMap::default();
+        if !pairs.is_empty() {
+            custom_kerning.insert(
+                font.face_id,
+                Arc::new(CustomKerningTable::from_pairs(pairs.iter().copied())),
+                "characterization",
+            );
+        }
+        let font_system = &mut font.font_system;
+        let em = params.font_size_px;
+        let mut buffer = Buffer::new(font_system, Metrics::new(em, em * 1.2));
+        buffer.set_size(font_system, None, None);
+        let attrs = Attrs::new()
+            .family(Family::Name(font.family.as_str()))
+            .metrics(Metrics::new(em, em));
+        buffer.set_text(font_system, text, &attrs, Shaping::Advanced);
+        buffer.shape_until_scroll(font_system, false);
+
+        let mut swash_cache = cosmic_text::SwashCache::new();
+        let mut outline_cache = crate::vector::OutlineCache::new();
+        let mut contour_cache = crate::optical::OpticalContourCache::new();
+        let run = buffer.layout_runs().next().expect("one layout run");
+        let layout = super::horizontal_run_layout(
+            params,
+            &run,
+            font_system,
+            &mut swash_cache,
+            &mut outline_cache,
+            &mut contour_cache,
+            &[0],
+            None,
+            &custom_kerning,
+            em,
+        );
+        (layout.glyph_xs, layout.line_width_px)
+    }
+
+    /// The pen matrix: every text x mode x tracking x table x em of
+    /// `crate::characterization`, as `glyph_xs` plus `line_width_px` per row.
+    fn pen_characterization_matrix() -> Vec<crate::characterization::MatrixRow> {
+        use crate::characterization::{
+            MATRIX_EMS, MATRIX_MODES, MATRIX_TABLES, MATRIX_TEXTS, MATRIX_TRACKING, MatrixRow,
+            TrackedFont, case_name,
+        };
+
+        let mut latin = TrackedFont::Latin.load();
+        let mut hebrew = TrackedFont::Hebrew.load();
+        let mut rows = Vec::new();
+        for text in &MATRIX_TEXTS {
+            let font = match text.font {
+                TrackedFont::Latin => &mut latin,
+                TrackedFont::Hebrew => &mut hebrew,
+            };
+            for (mode_label, mode) in MATRIX_MODES {
+                for (tracking_label, kerning_px, kerning_percent) in MATRIX_TRACKING {
+                    for (table_label, pairs) in MATRIX_TABLES {
+                        for em in MATRIX_EMS {
+                            let mut params = base_params();
+                            params.text = text.text.to_string();
+                            params.font_size_px = em;
+                            params.kerning_mode = mode;
+                            params.kerning_px = kerning_px;
+                            params.kerning_percent = kerning_percent;
+                            let (xs, width) = tracked_font_run_layout(font, text.text, &params, pairs);
+                            rows.push(MatrixRow {
+                                case: case_name(text, mode_label, tracking_label, table_label, em),
+                                fields: vec![("xs", xs), ("width", vec![width])],
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// The horizontal pen (`horizontal_run_layout`, all three modes, tracking, overrides,
+    /// both directions) must reproduce the recorded matrix BIT FOR BIT. A deliberate
+    /// behaviour change regenerates the fixture with
+    /// `MS_TEXT_RENDER_REGEN_CHARACTERIZATION=1` and names the rows it moved.
     #[test]
-    fn a_custom_table_takes_the_run_off_the_default_metric_fast_path() {
-        let params = base_params();
-        let settings = KerningSettings::from_params(&params);
-        assert_eq!(params.kerning_mode, KerningMode::Auto);
-        assert!(
-            settings.uses_default_metric_layout(),
-            "Auto with zero tracking must still qualify without overrides"
-        );
-        assert!(
-            !settings.with_custom_pairs(true).uses_default_metric_layout(),
-            "a font with overrides must never take the shaped-position shortcut"
-        );
-        assert!(
-            settings.with_custom_pairs(false).uses_default_metric_layout(),
-            "clearing the flag must restore the fast path exactly"
+    fn pen_layout_matches_the_recorded_characterization() {
+        crate::characterization::check_against_fixture(
+            "pair_advance_pen_matrix.json",
+            "ms-text-render pen characterization: pipeline::horizontal_run_layout glyph_xs and \
+             line_width_px as f32 bit patterns (see src/characterization.rs)",
+            &pen_characterization_matrix(),
         );
     }
 
-    /// The cluster guard: a pair is only authored for two single characters, so a
-    /// glyph whose source cluster is not exactly one `char` can never match one.
+    /// PRESERVED QUIRK, pinned on purpose: `KerningMode::Fixed` WITHOUT an override steps
+    /// by the UNSIGNED nominal advance, so an un-overridden right-to-left pair is walked
+    /// RIGHTWARDS (`xs[1] > xs[0]`) while `Auto` walks it leftwards. Behaviour change B2
+    /// (approved) mirrors `Fixed` onto the run axis: when it lands, this test FLIPS to
+    /// `xs[1] < xs[0]` and is renamed accordingly — that flip is the intended diff.
     #[test]
-    fn only_single_char_clusters_can_carry_an_authored_pair() {
-        use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, fontdb};
+    fn quirk_fixed_mode_does_not_mirror_an_unoverridden_rtl_pair() {
+        use crate::characterization::TrackedFont;
 
-        let bytes = std::fs::read(test_font_path()).expect("fixture font bytes");
-        let mut db = fontdb::Database::new();
-        db.load_font_data(bytes);
-        let family = db
-            .faces()
-            .next()
-            .and_then(|face| face.families.first().cloned())
-            .map(|(name, _language)| name)
-            .expect("fixture family name");
-        let mut font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
-        let mut buffer = Buffer::new(&mut font_system, Metrics::new(40.0, 48.0));
-        buffer.set_size(&mut font_system, None, None);
-        let attrs = Attrs::new()
-            .family(Family::Name(family.as_str()))
-            .metrics(Metrics::new(40.0, 40.0));
-        buffer.set_text(&mut font_system, "AV", &attrs, Shaping::Advanced);
-        buffer.shape_until_scroll(&mut font_system, false);
-        let run = buffer.layout_runs().next().expect("one layout run");
-        let first = run.glyphs.first().expect("a shaped glyph");
-        assert_eq!(
-            single_char_cluster(run.text, first),
-            Some('A'),
-            "a one-character cluster must resolve to that character"
+        const RTL_PAIR: &str = "\u{05D0}\u{05D1}";
+        let mut hebrew = TrackedFont::Hebrew.load();
+        let mut params = base_params();
+        params.text = RTL_PAIR.to_string();
+        params.font_size_px = 100.0;
+
+        params.kerning_mode = KerningMode::Auto;
+        let (auto_xs, _) = tracked_font_run_layout(&mut hebrew, RTL_PAIR, &params, &[]);
+        assert_eq!(auto_xs.len(), 2, "the fixture must shape the pair as two glyphs");
+        assert!(
+            auto_xs[1] < auto_xs[0],
+            "precondition: cosmic-text lays this run out right-to-left; got {auto_xs:?}"
         );
-        // Out-of-range byte offsets (which a caller must never produce, but which
-        // must not panic either) degrade to "no override".
-        let mut broken = first.clone();
-        broken.start = 0;
-        broken.end = run.text.len() + 8;
-        assert_eq!(single_char_cluster(run.text, &broken), None);
-        // A two-character span is a multi-char cluster and is skipped.
-        let mut wide = first.clone();
-        wide.start = 0;
-        wide.end = 2;
-        assert_eq!(single_char_cluster(run.text, &wide), None);
+
+        params.kerning_mode = KerningMode::Fixed;
+        let (fixed_xs, _) = tracked_font_run_layout(&mut hebrew, RTL_PAIR, &params, &[]);
+        assert!(
+            fixed_xs[1] > fixed_xs[0],
+            "quirk: un-overridden Fixed steps an RTL pair rightwards (B2 flips this); got \
+             {fixed_xs:?}"
+        );
+
+        // An OVERRIDE under `Fixed` already follows the run (leftwards) — only the
+        // un-overridden step carries the quirk.
+        let (overridden_xs, _) = tracked_font_run_layout(
+            &mut hebrew,
+            RTL_PAIR,
+            &params,
+            &[('\u{05D0}', '\u{05D1}', 0.0)],
+        );
+        assert!(
+            overridden_xs[1] < overridden_xs[0],
+            "an overridden RTL pair walks leftwards under Fixed too; got {overridden_xs:?}"
+        );
+    }
+
+    /// PRESERVED QUIRK, pinned on purpose: un-overridden `KerningMode::Optical` steps an
+    /// RTL pair by `optical_base_advance(prev.w, ..)` + the ink delta, and `prev.w` is
+    /// UNSIGNED, so the optical pen walks a right-to-left run RIGHTWARDS too. Unlike the
+    /// `Fixed` quirk this one is not covered by behaviour change B2 (which mirrors `Fixed`
+    /// only); whoever changes it flips this test and says so.
+    #[test]
+    fn quirk_optical_mode_does_not_mirror_an_unoverridden_rtl_pair() {
+        use crate::characterization::TrackedFont;
+
+        const RTL_PAIR: &str = "\u{05D0}\u{05D1}";
+        let mut hebrew = TrackedFont::Hebrew.load();
+        let mut params = base_params();
+        params.text = RTL_PAIR.to_string();
+        params.font_size_px = 100.0;
+        params.kerning_mode = KerningMode::Optical;
+        let (optical_xs, _) = tracked_font_run_layout(&mut hebrew, RTL_PAIR, &params, &[]);
+        assert_eq!(optical_xs.len(), 2, "the fixture must shape the pair as two glyphs");
+        assert!(
+            optical_xs[1] > optical_xs[0],
+            "quirk: un-overridden Optical steps an RTL pair rightwards; got {optical_xs:?}"
+        );
+    }
+
+    /// The pen's tracking basis is `|shaped step|.max(prev.w.max(em / 2))`: a narrow left
+    /// glyph is FLOORED at half the em. `i` at em 100 is far narrower than 50 px, so a
+    /// 50 % tracking grows the `i -> l` step by exactly `0.5 * 50 = 25` px (not by half
+    /// of `i`'s own advance). Pinned because the formula and vertical paths use different
+    /// bases (`TrackingBasis`, behaviour change B3 declined: they stay different).
+    #[test]
+    fn tracking_basis_is_floored_at_half_the_em_on_the_pen() {
+        use crate::characterization::TrackedFont;
+
+        let mut latin = TrackedFont::Latin.load();
+        let mut params = base_params();
+        params.text = "il".to_string();
+        params.font_size_px = 100.0;
+        params.kerning_mode = KerningMode::Auto;
+
+        let (plain_xs, _) = tracked_font_run_layout(&mut latin, "il", &params, &[]);
+        params.kerning_percent = 50.0;
+        let (tracked_xs, _) = tracked_font_run_layout(&mut latin, "il", &params, &[]);
+        assert_eq!(plain_xs.len(), 2);
+        let plain_step = plain_xs[1] - plain_xs[0];
+        let tracked_step = tracked_xs[1] - tracked_xs[0];
+        assert!(
+            plain_step < 50.0,
+            "precondition: `i` must be narrower than half the em; step {plain_step}"
+        );
+        assert!(
+            (tracked_step - plain_step - 25.0).abs() < 1e-3,
+            "50 % tracking must add 0.5 * max(step, i.w, em/2) = 25 px; got {}",
+            tracked_step - plain_step
+        );
     }
 
 }

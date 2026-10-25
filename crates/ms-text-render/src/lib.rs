@@ -21,6 +21,9 @@ Public surface:
 
 #![warn(clippy::all)]
 
+// Test-only: the recorded pen / seed characterization matrices (fixtures under `tests/fixtures/`).
+#[cfg(test)]
+mod characterization;
 pub mod drawn_lines;
 mod effects;
 mod extra_info;
@@ -36,6 +39,7 @@ mod glyph_contour;
 mod inline_styles;
 mod layout;
 mod optical;
+mod pair_advance;
 mod pair_gap;
 pub mod pipeline;
 mod raster;

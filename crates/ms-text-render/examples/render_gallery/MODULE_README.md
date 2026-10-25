@@ -15,15 +15,27 @@ links it (`ms_text_render::render_text_to_image` + `::types::*`). It needs no
 `#[path]` module mounts and pulls in no egui/app/GUI code.
 
 ## Files and submodules
-- `main.rs`: the fixed `all_cases()` set, the per-family case builders, PNG
+- `main.rs`: the fixed `all_cases()` set, the kerning / tracking `kern_cases()` set
+  (`KernCase`, `build_kern_font_set`), the per-family case builders, PNG
   writing, the generated custom-raster-line layout source
   (`raster_line_pixels` / `write_raster_line_source`), the pure
   `rgba_diff`/`DiffStats` compare helper, and self-check `#[test]`s.
 
 ## Contracts and invariants
 - Fully deterministic: no randomness, no time, fixed text/params/geometry.
-- Uses the repo font `test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf`
+- `all_cases()` uses the repo font `test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf`
   (Latin + Cyrillic), resolved via `CARGO_MANIFEST_DIR` (the crate directory) + `../../`.
+- `kern_cases()` (`kern_override_*`, `kern_fixed_rtl`, `tracking_*`) use only TRACKED
+  fonts of the `fonts/ui` stack (Noto Sans, Noto Sans Hebrew), each case with its OWN
+  `FontContentSet` because a user-authored `CustomKerningTable` travels on the
+  `FontContent`. They pin the advance between two adjacent glyphs: overrides under every
+  mode, right-to-left mirroring (`kern_override_rtl`) and its absence for un-overridden
+  `Fixed` (`kern_fixed_rtl`, EXPECTED to change when `Fixed` is mirrored), overrides on
+  formula seeds, an override at a line break (`kern_override_wrap`, see the comment on
+  `KERN_WRAP_WIDTH_PX` for what the break shows today), and manual tracking on the pen,
+  formula and vertical paths. The self-check
+  `the_kerning_cases_really_carry_their_override_table` proves each table reaches the
+  face the text is drawn with.
 - Run: `cargo run -p ms-text-render --example render_gallery -- <outdir> [aa_mode]`;
   its self-check tests run with `cargo test -p ms-text-render` (`test = true` on the
   `[[example]]` table in the crate manifest).
@@ -51,7 +63,8 @@ links it (`ms_text_render::render_text_to_image` + `::types::*`). It needs no
   thicker anywhere, which folds the path.
 
 ## Editing map
-- To add/adjust a golden case, edit `all_cases()` in `main.rs`.
+- To add/adjust a golden case, edit `all_cases()` in `main.rs` (a case that needs
+  user-authored kerning pairs or a tracked font goes into `kern_cases()`).
 - To change the custom-raster-line geometry, edit `raster_line_pixels`; keep the
   one-pixel-per-column property or the traced path folds.
 - To change how the engine is reached, edit the `use ms_text_render::...` imports at

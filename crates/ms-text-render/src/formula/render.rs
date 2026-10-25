@@ -155,7 +155,7 @@ use crate::extra_info::{ExtraInfoAccumulator, rotated_box_samples};
 use crate::font_registry::{CustomKerningMap, InlineFontRegistry};
 use crate::glyph_blit::{
     glyph_needs_bitmap_fallback, glyph_outline_transform, glyph_subpixel_offset,
-    nominal_glyph_advance_px, resolve_outline_for_glyph,
+    resolve_outline_for_glyph,
 };
 use crate::glyph_contour::{
     GlyphContour, PlacedContour, min_placed_distance, placed_aabb_gap,
@@ -167,13 +167,17 @@ use crate::vector::{
 use crate::inline_styles::{
     FauxFaceBaseline, InlineGlyphOffset, InlineStyleSpan, apply_inline_style_to_attrs,
 };
-use crate::optical::{median_of_gaps, optical_base_advance, optical_delta};
+use crate::optical::{median_of_gaps, optical_delta};
 use crate::pair_gap::{GapAxis, directional_pair_gap};
+use crate::pair_advance::{
+    KerningSettings, PairAdvanceModel, PairGlyph, PairStep, StepDirection, TrackingBasis,
+    effective_spacing_percent, single_char_cluster,
+};
 use crate::pipeline::{
-    FauxGlyphStyle, GlyphScaleSettings, InlineHeightRoom, KerningSettings,
-    compute_horizontal_line_baselines, effective_spacing_percent,
+    FauxGlyphStyle, GlyphScaleSettings, InlineHeightRoom,
+    compute_horizontal_line_baselines,
     hanging_edge_run_bounds, horizontal_run_baseline_y, is_edge_run_hanging,
-    line_baseline_advance_table, single_char_cluster,
+    line_baseline_advance_table,
     faux_bounds_pads, faux_style_at_offset, faux_style_for_glyph, horizontal_line_offset,
     resolve_faux_counter_flag,
 };
@@ -433,7 +437,8 @@ struct FormulaGlyphSeed {
     /// Seeds are detached from the `LayoutRun` they came from, so the run text is no
     /// longer reachable when advances are assigned; the character is captured here
     /// instead. Only the user-authored kerning lookup reads it
-    /// (`pipeline::custom_pair_delta_px` states why a multi-char cluster is skipped).
+    /// (`pair_advance::PairAdvanceModel::override_delta_px` states why a multi-char
+    /// cluster is skipped).
     cluster_char: Option<char>,
     text_color: [u8; 4],
     origin_x: f32,
@@ -466,6 +471,14 @@ struct FormulaGlyphSeed {
     /// (`TextRenderParams::excludes_hanging_from_extra_info`);
     /// it never affects the drawn pixels.
     hanging_excluded: bool,
+}
+
+impl FormulaGlyphSeed {
+    /// This seed as the pair owner sees it: the glyph plus the source char captured at
+    /// seed time (the run text is gone by the time pairs are decided).
+    fn pair_glyph(&self) -> PairGlyph<'_> {
+        PairGlyph::detached(&self.glyph, self.cluster_char)
+    }
 }
 
 impl FormulaGlyphSeed {
@@ -1624,7 +1637,7 @@ struct StraightReferenceGaps {
 /// - both glyphs must have ink — an inkless glyph (a space) ends the pair chain,
 ///   so inter-word distance is never normalized and words cannot merge;
 /// - the pair must not carry a USER-AUTHORED kerning override
-///   ([`custom_seed_pair_delta_px`]): an authored pair keeps the spacing its
+///   ([`FormulaGlyphSeed::pair_glyph`] through `PairAdvanceModel::is_overridden`): an authored pair keeps the spacing its
 ///   author gave it and must not drag the target either;
 /// - non-finite gaps (inks that do not face each other at all) are dropped by
 ///   [`median_of_gaps`] itself.
@@ -1677,7 +1690,8 @@ fn straight_reference_target_gaps(
         if let Some((prev_idx, prev_ink)) = line.previous.as_ref()
             // An authored pair is exempt from the normalization, so it must not
             // influence the target the rest of the line is normalized to either.
-            && custom_seed_pair_delta_px(custom_kerning, &seeds[*prev_idx], seed).is_none()
+            && !PairAdvanceModel::new(custom_kerning)
+                .is_overridden(seeds[*prev_idx].pair_glyph(), seed.pair_glyph())
             && let Some(gap) = on_path_pair_gap(prev_ink, &ink)
         {
             line.gaps.push(gap);
@@ -2050,7 +2064,8 @@ fn drawn_line_seed_transform(
             // override already sits in the arc-length seed, and normalizing on
             // top of it would silently overrule the user.
             && state.previous_seed_idx.is_none_or(|prev_idx| {
-                custom_seed_pair_delta_px(custom_kerning, &all_seeds[prev_idx], seed).is_none()
+                !PairAdvanceModel::new(custom_kerning)
+                    .is_overridden(all_seeds[prev_idx].pair_glyph(), seed.pair_glyph())
             })
             && let Some(straight_gap) = on_path_pair_gap(&prev.straight, cur_straight)
             // A pair that does not face itself even when straight (`.` under an
@@ -3881,17 +3896,19 @@ fn collect_formula_glyph_seeds(
                 ),
                 origin_x: line_offset_x,
                 origin_y: baseline_y,
-                kerning: inline_kerning_for_glyph(
-                    params,
-                    inline_style_spans,
-                    layout_line_offsets,
-                    run.line_i,
-                    glyph,
-                )
                 // Keeps the run off the byte-identical fast path when this glyph's
                 // face carries overrides; the PAIRS are resolved in
                 // `assign_formula_seed_advances`.
-                .with_custom_pairs(custom_kerning.has_table(glyph.font_id)),
+                kerning: PairAdvanceModel::new(custom_kerning).kerning_for_glyph(
+                    inline_kerning_for_glyph(
+                        params,
+                        inline_style_spans,
+                        layout_line_offsets,
+                        run.line_i,
+                        glyph,
+                    ),
+                    glyph,
+                ),
                 glyph_scale: inline_glyph_scale_for_glyph(
                     params,
                     inline_style_spans,
@@ -4075,7 +4092,7 @@ fn seed_metric_advance_px(raw_delta_px: f32, glyph_w_px: f32) -> f32 {
 /// drawn line, never a signed x step — the shaped delta is floored positive by
 /// [`seed_metric_advance_px`], and every consumer floors the result AGAIN through
 /// the single [`OnPathStepSpacing::step_px`] owner before walking the path. So the
-/// RTL sign mirroring `pipeline::custom_pair_step_px` performs has no counterpart
+/// RTL sign mirroring `StepDirection::FollowRun` performs has no counterpart
 /// on this path: seeds are advanced along the curve in logical order regardless of
 /// script direction. Formula/drawn lines are LTR-only by construction, which is a
 /// limitation of that whole path, not of the overrides.
@@ -4125,6 +4142,7 @@ fn assign_formula_seed_advances(
         return;
     }
 
+    let model = PairAdvanceModel::new(custom_kerning);
     let mut cache = SwashCache::new();
     let profiles = seeds
         .iter()
@@ -4148,29 +4166,29 @@ fn assign_formula_seed_advances(
                 );
                 let kerning = seeds[glyph_idx + 1].kerning;
                 // A user-authored pair REPLACES the font's own value for that pair
-                // under every mode, exactly as on the horizontal path.
-                let custom_delta_px =
-                    custom_seed_pair_delta_px(custom_kerning, &seeds[glyph_idx], &seeds[glyph_idx + 1]);
-                let base_advance = match (custom_delta_px, kerning.mode) {
-                    (Some(delta_px), _) => {
-                        let own = nominal_glyph_advance_px(font_system, &seeds[glyph_idx].glyph)
-                            .unwrap_or(metric_advance);
-                        optical_base_advance(own, metric_advance) + delta_px
+                // under every mode, exactly as on the horizontal path; the step is a
+                // MAGNITUDE along the path, never mirrored.
+                let step = model.resolve(
+                    font_system,
+                    kerning.mode,
+                    StepDirection::Magnitude,
+                    seeds[glyph_idx].pair_glyph(),
+                    seeds[glyph_idx + 1].pair_glyph(),
+                    metric_advance,
+                );
+                let base_advance = match (step, kerning.mode) {
+                    // An override, or `Fixed`'s own (un-kerned) advance: already final.
+                    (PairStep::Override { step_px, .. } | PairStep::OwnAdvance { step_px }, _) => {
+                        step_px
                     }
-                    // `Auto` keeps the shaped (font-pair-kerned) advance.
-                    (None, KerningMode::Auto) => metric_advance,
-                    // `Fixed` steps by the glyph's OWN nominal (un-kerned) advance,
-                    // dropping font pair kerning and the optical adjustment. The
-                    // shaped advance bakes in pair kerning, so the raw metrics
-                    // table is consulted; falls back to the shaped advance when the
-                    // metric is unavailable.
-                    (None, KerningMode::Fixed) => {
-                        let own = nominal_glyph_advance_px(font_system, &seeds[glyph_idx].glyph)
-                            .unwrap_or(metric_advance);
-                        optical_base_advance(own, metric_advance)
-                    }
-                    (None, KerningMode::Optical) => {
-                        metric_advance
+                    // `Auto` keeps the shaped (font-pair-kerned) advance. `Fixed` never
+                    // gets here (the owner answers it with `OwnAdvance`); it is listed only
+                    // to keep the match exhaustive.
+                    (PairStep::Shaped { step_px }, KerningMode::Auto | KerningMode::Fixed) => step_px,
+                    // `Optical` adds this path's own ink-profile adjustment (NOT
+                    // `optical.rs`: a known, kept divergence, see MODULE_README).
+                    (PairStep::Shaped { step_px }, KerningMode::Optical) => {
+                        step_px
                             + optical_horizontal_pair_adjustment(
                                 profiles[glyph_idx],
                                 profiles[glyph_idx + 1],
@@ -4181,14 +4199,20 @@ fn assign_formula_seed_advances(
                 };
                 // The tracking basis follows the branch the STEP actually took: an
                 // overridden pair is a metric step, not an optical one.
-                let spacing_basis = match (custom_delta_px, kerning.mode) {
-                    (Some(_), _) | (None, KerningMode::Auto | KerningMode::Fixed) => metric_advance,
-                    (None, KerningMode::Optical) => ((profiles[glyph_idx].width_px()
-                        + profiles[glyph_idx + 1].width_px())
-                        * 0.5)
-                        .max(default_advance),
+                let tracking_basis = match (step.is_override(), kerning.mode) {
+                    (true, _) | (false, KerningMode::Auto | KerningMode::Fixed) => {
+                        TrackingBasis::SeedMetric {
+                            metric_advance_px: metric_advance,
+                        }
+                    }
+                    (false, KerningMode::Optical) => TrackingBasis::SeedOpticalInk {
+                        mean_ink_width_px: (profiles[glyph_idx].width_px()
+                            + profiles[glyph_idx + 1].width_px())
+                            * 0.5,
+                        default_advance_px: default_advance,
+                    },
                 };
-                base_advance + kerning.extra_spacing_px(spacing_basis)
+                base_advance + kerning.tracking_px(tracking_basis)
             } else if glyph_idx > line_start {
                 prev_advance
             } else {
@@ -4198,27 +4222,6 @@ fn assign_formula_seed_advances(
             prev_advance = advance_px;
         }
     }
-}
-
-/// The user-authored advance delta in px between two adjacent SEEDS, or `None`
-/// when no override applies.
-///
-/// The seed-side mirror of `pipeline::custom_pair_delta_px` and it enforces the
-/// same guards: the same face on both sides (a pair across a font-fallback
-/// boundary belongs to no font's design), a face that actually carries a table,
-/// and a single-`char` source cluster on each side (captured as
-/// `FormulaGlyphSeed::cluster_char`, since the run text is gone by now).
-#[must_use]
-fn custom_seed_pair_delta_px(
-    custom_kerning: &CustomKerningMap,
-    prev: &FormulaGlyphSeed,
-    cur: &FormulaGlyphSeed,
-) -> Option<f32> {
-    if prev.glyph.font_id != cur.glyph.font_id {
-        return None;
-    }
-    let table = custom_kerning.table_for(prev.glyph.font_id)?;
-    table.delta_px(prev.cluster_char?, cur.cluster_char?, prev.glyph.font_size)
 }
 
 fn compute_layout_line_offsets(text: &str) -> Vec<usize> {
@@ -5286,7 +5289,7 @@ mod tests {
         // A user-authored kerning pair that overlaps the two inks is an
         // INTENTION, and the mode must not undo it. Two independent guards keep
         // it: the walk EXEMPTS an authored pair from the normalization entirely
-        // (`custom_seed_pair_delta_px`, checked by
+        // (`PairAdvanceModel::is_overridden`, checked by
         // `an_authored_pair_is_excluded_from_the_line_target`), and the safety
         // net's floor collapses to the overlap the straight reference itself has
         // — which is what this test pins, together with the search's own
@@ -6051,9 +6054,30 @@ mod tests {
         buffer.shape_until_scroll(&mut font_system, false);
 
         let run = buffer.layout_runs().next().expect("one layout run");
+        let seeds = seeds_from_run(&run, |_glyph| KerningSettings {
+            mode,
+            spacing_px: 0.0,
+            spacing_percent: 0.0,
+            // Set unconditionally: the production caller sets it from the
+            // render's `CustomKerningMap`, and leaving it false would take the
+            // whole run down the fast path that ignores overrides.
+            custom_pairs: true,
+        });
+        // `run` borrows `buffer`, but every seed OWNS its data (the glyph is
+        // cloned, the cluster char is copied), so NLL ends that borrow right
+        // here. `buffer` is local and dies with the fixture.
+        (font_system, face_id, seeds)
+    }
+
+    /// Turns one shaped layout run into the seeds `assign_formula_seed_advances`
+    /// consumes, one per glyph, all on line 0; `kerning_for` supplies each seed's
+    /// resolved kerning settings (the production caller stamps them per glyph).
+    fn seeds_from_run(
+        run: &cosmic_text::LayoutRun<'_>,
+        kerning_for: impl Fn(&LayoutGlyph) -> KerningSettings,
+    ) -> Vec<FormulaGlyphSeed> {
         let glyph_count = run.glyphs.len();
-        let seeds = run
-            .glyphs
+        run.glyphs
             .iter()
             .enumerate()
             .map(|(idx, glyph)| FormulaGlyphSeed {
@@ -6066,15 +6090,7 @@ mod tests {
                 text_color: [0, 0, 0, 255],
                 origin_x: 0.0,
                 origin_y: 0.0,
-                kerning: KerningSettings {
-                    mode,
-                    spacing_px: 0.0,
-                    spacing_percent: 0.0,
-                    // Set unconditionally: the production caller sets it from the
-                    // render's `CustomKerningMap`, and leaving it false would take the
-                    // whole run down the fast path that ignores overrides.
-                    custom_pairs: true,
-                },
+                kerning: kerning_for(glyph),
                 glyph_scale: GlyphScaleSettings {
                     width_mul: 1.0,
                     height_mul: 1.0,
@@ -6091,11 +6107,7 @@ mod tests {
                 faux: FauxGlyphStyle::NONE,
                 hanging_excluded: false,
             })
-            .collect::<Vec<_>>();
-        // `run` borrows `buffer`, but every seed OWNS its data (the glyph is
-        // cloned, the cluster char is copied), so NLL ends that borrow right
-        // here. `buffer` is local and dies with the fixture.
-        (font_system, face_id, seeds)
+            .collect::<Vec<_>>()
     }
 
     /// A `TextRenderParams` whose single vector line runs in
@@ -6908,6 +6920,99 @@ mod tests {
         assert!(
             (clamped.step_px(10.0) - 80.0).abs() < 1e-3,
             "the multiplier must be clamped to 8.0 by the constructor"
+        );
+    }
+
+    // ---- Characterization of the advance between two adjacent glyphs (seed side) ----
+
+    /// The seed matrix: every text x mode x tracking x table x em of
+    /// `crate::characterization`, as each seed's `advance_px` after
+    /// `assign_formula_seed_advances`. Kerning settings are stamped the way the
+    /// production seed capture stamps them: tracking resolved as `KerningSettings::from_params`
+    /// resolves it, and `custom_pairs` from the map's `has_table` for the glyph's own face, so
+    /// the `none` table rows exercise the default-metric fast path.
+    fn seed_characterization_matrix() -> Vec<crate::characterization::MatrixRow> {
+        use crate::characterization::{
+            MATRIX_EMS, MATRIX_MODES, MATRIX_TABLES, MATRIX_TEXTS, MATRIX_TRACKING, MatrixRow,
+            TrackedFont, case_name,
+        };
+        use crate::font_provider::CustomKerningTable;
+        use crate::font_registry::CustomKerningMap;
+        use crate::pair_advance::effective_spacing_percent;
+        use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping};
+        use std::sync::Arc;
+
+        let mut latin = TrackedFont::Latin.load();
+        let mut hebrew = TrackedFont::Hebrew.load();
+        let mut rows = Vec::new();
+        for text in &MATRIX_TEXTS {
+            let font = match text.font {
+                TrackedFont::Latin => &mut latin,
+                TrackedFont::Hebrew => &mut hebrew,
+            };
+            for (mode_label, mode) in MATRIX_MODES {
+                for (tracking_label, kerning_px, kerning_percent) in MATRIX_TRACKING {
+                    for (table_label, pairs) in MATRIX_TABLES {
+                        for em in MATRIX_EMS {
+                            let mut custom_kerning = CustomKerningMap::default();
+                            if !pairs.is_empty() {
+                                custom_kerning.insert(
+                                    font.face_id,
+                                    Arc::new(CustomKerningTable::from_pairs(pairs.iter().copied())),
+                                    "characterization",
+                                );
+                            }
+                            let font_system = &mut font.font_system;
+                            let mut buffer = Buffer::new(font_system, Metrics::new(em, em * 1.2));
+                            buffer.set_size(font_system, None, None);
+                            let attrs = Attrs::new()
+                                .family(Family::Name(font.family.as_str()))
+                                .metrics(Metrics::new(em, em));
+                            buffer.set_text(font_system, text.text, &attrs, Shaping::Advanced);
+                            buffer.shape_until_scroll(font_system, false);
+                            let run = buffer.layout_runs().next().expect("one layout run");
+                            let mut seeds = seeds_from_run(&run, |glyph| {
+                                KerningSettings {
+                                    mode,
+                                    spacing_px: kerning_px.clamp(-300.0, 300.0),
+                                    spacing_percent: effective_spacing_percent(kerning_percent, 100.0),
+                                    custom_pairs: false,
+                                }
+                                .with_custom_pairs(custom_kerning.has_table(glyph.font_id))
+                            });
+                            super::assign_formula_seed_advances(
+                                seeds.as_mut_slice(),
+                                font_system,
+                                &custom_kerning,
+                                em,
+                                (em * 0.5).max(1.0),
+                            );
+                            rows.push(MatrixRow {
+                                case: case_name(text, mode_label, tracking_label, table_label, em),
+                                fields: vec![(
+                                    "advances",
+                                    seeds.iter().map(|seed| seed.advance_px).collect(),
+                                )],
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// The formula seed advances (`assign_formula_seed_advances`, all three modes, tracking,
+    /// overrides, the fast path) must reproduce the recorded matrix BIT FOR BIT. A deliberate
+    /// behaviour change regenerates the fixture with
+    /// `MS_TEXT_RENDER_REGEN_CHARACTERIZATION=1` and names the rows it moved.
+    #[test]
+    fn seed_advances_match_the_recorded_characterization() {
+        crate::characterization::check_against_fixture(
+            "pair_advance_seed_matrix.json",
+            "ms-text-render seed characterization: formula::render::assign_formula_seed_advances \
+             advance_px per seed as f32 bit patterns (see src/characterization.rs)",
+            &seed_characterization_matrix(),
         );
     }
 }

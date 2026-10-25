@@ -192,6 +192,19 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   Contour PLACEMENT (the exact draw-pass transform) stays in the axis-specific
   callers.
   Unit-tested in place.
+- `pair_advance.rs`: THE single owner of "the advance between two adjacent glyphs" —
+  the override guard (`PairAdvanceModel::override_delta_px`), the overridden magnitude,
+  the `Fixed` own-advance step and the run-axis orientation (`resolve` -> `PairStep`,
+  `StepDirection`), and the four tracking bases (`TrackingBasis`). Also home of
+  `KerningSettings` / `effective_spacing_percent` / `single_char_cluster`. The pair
+  DECISION lives here; accumulation loops stay with their consumers (the pen in
+  `pipeline.rs`, the formula seeds in `formula/render.rs`, the vertical stack's
+  tracking term in `layout/vertical.rs`), and optical normalization and faux growth
+  are additive per-path terms on top of a `PairStep`. Never re-implement any part of
+  the decision at a call site. Unit-tested in place.
+- `characterization.rs` (`cfg(test)`): the recorded pen / seed characterization
+  matrices of the pair advance — shared axes, the tracked fixture fonts and the
+  bit-exact fixture compare (see Testing Guidance).
 - `pair_gap.rs`: THE single owner of "what is the gap between these two placed
   glyph contours" — `directional_pair_gap(prev, cur, GapAxis)`, the minimum
   directional projected ink whitespace along an arbitrary oriented axis. `GapAxis`
@@ -1027,18 +1040,20 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   - DIRECTION. `nominal_glyph_advance_px` is an `hmtx` advance and therefore
     UNSIGNED, while cosmic-text lays a right-to-left run out by subtracting each
     advance, so its shaped step is negative. The override's magnitude is mirrored
-    back onto the run's own axis by `pipeline::custom_pair_step_px` (sign taken from
+    back onto the run's own axis by `pair_advance` (`StepDirection::FollowRun`; sign taken from
     the shaped step, falling back to the left glyph's bidi level when that step is
     degenerate), so a negative authored delta TIGHTENS a pair in both directions.
     The formula path has no counterpart: its `advance_px` is a magnitude along the
     drawn line, floored positive at every consumer. Out of scope and untouched:
     `KerningMode::Fixed` WITHOUT an override still steps by the unsigned nominal
-    advance, so an un-overridden RTL run keeps its pre-existing direction there.
+    advance, and un-overridden `KerningMode::Optical` by the unsigned `prev.w`, so an
+    un-overridden RTL run keeps its pre-existing (rightward) direction under both
+    (pinned by the `quirk_*` tests in `pipeline.rs`).
   - GUARDS (conservative on purpose; do not "simplify" them away). A pair applies
     only when both glyphs come from the SAME face (`font_id`) — a pair across a
     font-fallback boundary belongs to no typeface's design — that face carries a
     table, and EACH glyph's source cluster is exactly one `char`
-    (`pipeline::single_char_cluster`). The settings UI accepts exactly two
+    (`pair_advance::single_char_cluster`). The settings UI accepts exactly two
     characters, so a ligature/multi-char cluster has no authored meaning.
   - FAST PATH. `KerningSettings::custom_pairs` (stamped per glyph by
     `with_custom_pairs` from `CustomKerningMap::has_table`) makes
@@ -1046,6 +1061,9 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
     horizontal (`horizontal_run_layout`) and formula
     (`formula::assign_formula_seed_advances`) byte-identical shaped-position
     shortcuts from swallowing the overrides.
+  - OWNER. `pair_advance.rs` (`PairAdvanceModel::resolve` / `is_overridden`,
+    `TrackingBasis`) is the one owner of the pair decision; every site below calls
+    it. The recorded matrices (`characterization.rs`) pin the result bit for bit.
   - SITES. `pipeline::horizontal_run_layout` (metric branch),
     `pipeline::optical_horizontal_run_layout` (an override wins over the optical
     normalization for that one pair; the rest of the run stays optical), and
@@ -1098,12 +1116,16 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   measurement in `pair_gap.rs`.
 - The optical spacing math (`median_of_gaps`, `optical_delta`,
   `optical_base_advance`, the `OpticalContourCache` type, the simplify tolerance
-  and min-gap floor) is axis-agnostic and lives ONLY in `optical.rs`. All three
-  paths reuse it — horizontal (`pipeline.rs`), vertical (`layout/vertical.rs`)
+  and min-gap floor) is axis-agnostic and lives in `optical.rs`. Three paths
+  reuse it — horizontal (`pipeline.rs`), vertical (`layout/vertical.rs`)
   and on-path `MinimumPreviousDistance` (`formula/render.rs`, whose target is the
   median of a line's STRAIGHT-REFERENCE gaps rather than of its on-curve ones, so
   the spacing does not follow the curve's geometry); do not duplicate the
-  formula. It is unit-tested in `optical.rs`.
+  formula. It is unit-tested in `optical.rs`. KNOWN EXCEPTION, kept on purpose
+  (the user declined unifying it): the formula SEED advances under
+  `KerningMode::Optical` (`formula::render::assign_formula_seed_advances`) use
+  their own ink-profile heuristic, `optical_horizontal_pair_adjustment`, not
+  `optical.rs`.
   MEASUREMENT CONTRACT — read this before writing any code that asks how far apart
   two adjacent glyphs are:
   * There is exactly ONE owner of that question: `pair_gap::directional_pair_gap`.
@@ -1199,6 +1221,19 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   bundled or Git-tracked font has such a rule, so the fixture — not a display font
   from `fonts/` — is the only reproducible source of the negative case. Change the
   fixture only through the script, and commit the regenerated file with it.
+- The advance between two adjacent glyphs is pinned by two RECORDED characterization
+  matrices: `pipeline` test `pen_layout_matches_the_recorded_characterization`
+  (`horizontal_run_layout` `glyph_xs` + `line_width_px`) and `formula::render` test
+  `seed_advances_match_the_recorded_characterization` (seed `advance_px`), each a
+  bit-exact (`f32::to_bits`) snapshot over texts x modes x tracking x override tables x
+  em sizes, stored in `tests/fixtures/pair_advance_{pen,seed}_matrix.json` (shared
+  axes and compare: `characterization.rs`). They use only TRACKED fonts of the
+  `fonts/ui` stack (Noto Sans, Noto Sans Hebrew). A refactor must keep them green;
+  a deliberate behaviour change regenerates them with
+  `MS_TEXT_RENDER_REGEN_CHARACTERIZATION=1 cargo test -p ms-text-render
+  recorded_characterization` and names the rows it moved. Without that opt-in the
+  tests only read the fixtures. The intended quirks they contain are also pinned by
+  name (`quirk_*` tests in `pipeline.rs`), so a regenerated fixture cannot hide them.
 - Add golden or property-style tests for new layout contracts where exact pixels are
   fragile. Use explicit tolerances for floating-point geometry and alpha math.
 - After Rust changes, run `cargo check-all` and

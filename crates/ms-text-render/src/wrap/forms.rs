@@ -2254,7 +2254,7 @@ pub struct FormSearchParams {
     ///
     /// (зеркало `pipeline::render_text_to_image`, где считаются
     /// `line_spacing_percent`/`extra_line_spacing_px`; сама формула связи —
-    /// `pipeline::effective_spacing_percent`). Обратите внимание: с
+    /// `pair_advance::effective_spacing_percent`). Обратите внимание: с
     /// `glyph_height_percent` связан ТОЛЬКО глобальный параметр; строчный тег
     /// `<stretching=W%,H%>` в интерлиньяж не входит (см. контракт GLYPH HEIGHT
     /// SCALE в `ms-text-render/src/MODULE_README.md`), поэтому поиск форм его и

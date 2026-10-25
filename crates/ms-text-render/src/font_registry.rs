@@ -100,7 +100,7 @@ impl CustomKerningMap {
 
     /// Whether `face` carries a non-empty override table. The per-glyph flag that
     /// takes a run off the byte-identical shaped-position fast path
-    /// (`pipeline::KerningSettings::uses_default_metric_layout`).
+    /// (`pair_advance::KerningSettings::uses_default_metric_layout`).
     #[must_use]
     pub(crate) fn has_table(&self, face: fontdb::ID) -> bool {
         !self.is_empty() && self.by_face.contains_key(&face)

@@ -123,6 +123,9 @@ android/app/src/main/assets/
 # against in a clean clone. Regenerate with
 # tools/make_ellipsis_ligature_fixture.py (whitelisted below).
 !crates/ms-text-render/tests/fixtures/*.ttf
+# The recorded pen / seed characterization matrices of the advance between two adjacent
+# glyphs (bit-exact layout snapshots; `crates/ms-text-render/src/characterization.rs`).
+!crates/ms-text-render/tests/fixtures/*.json
 
 # Animated hint assets embedded by ms-gifs via include_bytes!. Without this the
 # crate does not build from a Git clone: the .webp files would be absent while
