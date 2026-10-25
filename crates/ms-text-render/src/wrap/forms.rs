@@ -22,17 +22,16 @@ Used by:
   и под wasm) — только детерминированные бюджеты по числу узлов.
 
 User-authored kerning pairs:
-`GlyphWidths::build` takes the selected font's `CustomKerningTable` and REPLACES the
+`GlyphWidths::build` takes the render's face-keyed `CustomKerningMap` and REPLACES the
 font's own pair delta with the authored one, so the form search sizes lines against
-the widths the renderer actually draws. The units already agree — the metric shapes at
-`WIDTH_METRIC_EM` (1000) px per em and the offsets are per-mille of the em — so the
-substitution is exact, and a `0.0` entry is STORED (it cancels the font's own pair)
-rather than dropped by the `delta != 0` filter that applies to measured deltas.
-The substitution is gated on `wrap::selected_face_covers_pair`: the renderer applies
-an override only when both glyphs came from the SAME face carrying the table, and a
-character the selected font does not cover is exactly the one that falls through to a
-fallback face at draw time. Such a pair is shaped like any other here, so the metric
-and the pen agree instead of drifting by the pair's whole authored magnitude.
+the widths the renderer actually draws. WHICH pairs are overridden is the pen's own
+decision (`pair_advance::PairAdvanceModel::override_per_mille` over the two glyphs the
+pair shapes into: same face carrying a table, one `char` per cluster), so a pair that
+falls through to a fallback face or fuses into a ligature is measured like any other.
+The units already agree — the metric shapes at `WIDTH_METRIC_EM` (1000) px per em and
+the offsets are per-mille of the em — so the substitution is exact, and a `0.0` entry
+is STORED (it cancels the font's own pair) rather than dropped by the `delta != 0`
+filter that applies to measured deltas.
 
 The input text is RAW, and the tags come back:
 Both search entry points and the width metric (`GlyphWidths::build`) take the text WITH
@@ -109,7 +108,8 @@ use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
 
 use super::is_hanging_punctuation;
 use ms_text_util::text_punctuation::clamp_hanging_weight;
-use crate::font_provider::CustomKerningTable;
+use crate::font_registry::CustomKerningMap;
+use crate::pair_advance::{PairAdvanceModel, PairGlyph};
 use crate::inline_styles::{InlineTagClass, classify_inline_tag_body};
 use ms_text_util::segmentation::{
     BindingMode, Block, Conservatism, NON_BREAKING_SPACE, SOFT_HYPHEN, SegmentOptions,
@@ -605,22 +605,21 @@ impl GlyphWidths {
     /// `scope` ОБЯЗАН совпадать с тем, что получит [`search_forms`]/[`enumerate_forms`]
     /// для того же текста: иначе метрика меряет не тот алфавит, который сегментируется.
     ///
-    /// `custom_kerning` — user-authored kerning overrides of the SELECTED font (see
-    /// `font_provider::CustomKerningTable`), or `None`. A listed pair REPLACES the
-    /// font's own kerning for that pair, exactly as the renderer's pen loop does:
-    /// `kerns` holds precisely the font's own pair delta in the same per-mille unit
+    /// `custom_kerning` — the user-authored kerning overrides keyed by registered face,
+    /// bound to `font_system`'s faces exactly as the renderer binds them
+    /// (`CustomKerningMap::record` after `load_font_content`; an empty map for a font
+    /// without overrides). A pair the pen overrides REPLACES the font's own kerning for
+    /// it: `kerns` holds precisely the font's own pair delta in the same per-mille unit
     /// the overrides use (`WIDTH_METRIC_EM` == 1000), so the replacement is an exact
-    /// overwrite rather than an approximation. Without it the form search would size
-    /// lines against widths the renderer does not draw.
+    /// overwrite. Whether the pen overrides a pair is decided by the pen's own guard
+    /// over the two glyphs the pair shapes into
+    /// (`pair_advance::PairAdvanceModel::override_per_mille`), so a pair drawn by a
+    /// fallback face or fused into a ligature is measured like any other.
     ///
-    /// A pair the OVERRIDES list but the text never contains is not inserted: the
-    /// metric only ever measures pairs that occur (plus `(ch, '-')` for the wrap
-    /// hyphen), so an unused entry would only grow the map. A pair the selected
-    /// font does not COVER is not overridden either: it would fall through to a
-    /// fallback face at draw time, where the renderer applies no override, so the
-    /// metric shapes it like any other pair (`wrap::selected_face_covers_pair`).
-    // The override table is one more independent axis of the metric, not a variant
-    // of an existing parameter; folding it into `attrs` is impossible (it is not a
+    /// Only pairs that occur are measured (plus `(ch, '-')` for the wrap hyphen), so an
+    /// unused table entry costs nothing.
+    // The override map is one more independent axis of the metric, not a variant of an
+    // existing parameter; folding it into `attrs` is impossible (it is not a
     // font-matching property).
     #[allow(clippy::too_many_arguments)]
     #[must_use]
@@ -631,7 +630,7 @@ impl GlyphWidths {
         hanging: f32,
         tolerance: u32,
         scope: InlineTagScope,
-        custom_kerning: Option<&CustomKerningTable>,
+        custom_kerning: &CustomKerningMap,
     ) -> Self {
         let text = prepare_inline_no_break_text(form_source_text, scope);
         let visible: Vec<char> = text
@@ -659,33 +658,25 @@ impl GlyphWidths {
             pairs.insert((ch, '-'));
         }
         let mut kerns = HashMap::with_capacity(pairs.len());
+        let model = PairAdvanceModel::new(custom_kerning);
         for &(a, b) in &pairs {
-            // A user-authored override REPLACES the font's own pair kerning, so the
-            // pair is not even shaped when one applies. The unit already matches:
-            // `measure_units` shapes at `WIDTH_METRIC_EM` px per em and the offsets
-            // are per-mille of the em, so the override IS the delta in these units.
-            // `0.0` must survive as an entry that cancels the font's own kerning,
-            // which is why the `delta != 0` filter below is not applied here.
-            //
-            // Coverage gate: the renderer applies an override only when both glyphs
-            // came from the SAME face carrying the table, and a character this font
-            // does not cover is exactly the one that falls through to a fallback
-            // face at draw time. An uncovered pair therefore falls through to the
-            // shaped measurement below, so the metric and the pen agree.
-            if let Some(offset) = custom_kerning.and_then(|table| table.delta_per_mille(a, b))
-                && super::selected_face_covers_pair(font_system, attrs, a, b)
-            {
+            scratch.clear();
+            scratch.push(a);
+            scratch.push(b);
+            let (pair_width, authored_per_mille) = measure_pair_units(font_system, attrs, &scratch, model);
+            // A pair the pen overrides REPLACES the font's own pair kerning. The unit
+            // already matches: `WIDTH_METRIC_EM` px per em and per-mille offsets, so the
+            // override IS the delta in these units. `0.0` must survive as an entry that
+            // cancels the font's own kerning, which is why the `delta != 0` filter below
+            // is not applied here.
+            if let Some(offset) = authored_per_mille {
                 let delta = offset.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i32;
                 kerns.insert((a, b), delta);
                 continue;
             }
-            scratch.clear();
-            scratch.push(a);
-            scratch.push(b);
-            let pair_width = i64::from(measure_units(font_system, attrs, &scratch));
             let sum = i64::from(advances.get(&a).copied().unwrap_or(0))
                 + i64::from(advances.get(&b).copied().unwrap_or(0));
-            let delta = (pair_width - sum).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            let delta = (i64::from(pair_width) - sum).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
             if delta != 0 {
                 kerns.insert((a, b), delta);
             }
@@ -739,6 +730,36 @@ impl LineWidthMetric for GlyphWidths {
     fn tolerance(&self) -> u32 {
         self.tolerance
     }
+}
+
+/// A two-character `pair` shaped at `WIDTH_METRIC_EM`: its width in metric units (as
+/// [`measure_units`]) and, when the pen would override it, the authored offset in
+/// per-mille — decided by `model` over the two shaped glyphs (a pair that shapes into
+/// any other glyph count — a ligature, a split — is never overridden).
+fn measure_pair_units(
+    font_system: &mut FontSystem,
+    attrs: &Attrs<'_>,
+    pair: &str,
+    model: PairAdvanceModel<'_>,
+) -> (u32, Option<f32>) {
+    let mut buffer = Buffer::new(font_system, Metrics::new(WIDTH_METRIC_EM, WIDTH_METRIC_EM));
+    buffer.set_size(font_system, None, None);
+    buffer.set_text(font_system, pair, attrs, Shaping::Advanced);
+    buffer.shape_until_scroll(font_system, false);
+    let mut width = 0.0f32;
+    let mut authored = None;
+    for run in buffer.layout_runs() {
+        width = width.max(run.line_w);
+        if let [first, second] = run.glyphs {
+            authored = authored.or_else(|| {
+                model.override_per_mille(
+                    PairGlyph::from_run(run.text, first),
+                    PairGlyph::from_run(run.text, second),
+                )
+            });
+        }
+    }
+    (width.round().max(0.0) as u32, authored)
 }
 
 /// Ширина текста в единицах `WIDTH_METRIC_EM`, измеренная шейпером.
@@ -5233,25 +5254,38 @@ Pages wired down:                        333333.\n";
     }
 
     /// Fixture font for the width metric: the same Liberation Sans the pipeline
-    /// tests use. A test binary cannot reach the shipped `fonts/ui` bundle, and
-    /// this contract is about the metric's arithmetic, not about the bundle.
-    fn metric_fixture_system() -> (cosmic_text::FontSystem, String) {
+    /// tests use. Returns the system, the family name and the registered face id (what
+    /// an override table binds to).
+    fn metric_fixture_system() -> (cosmic_text::FontSystem, String, cosmic_text::fontdb::ID) {
         use cosmic_text::{FontSystem, fontdb};
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf");
         let bytes = std::fs::read(path).expect("fixture font bytes");
         let mut db = fontdb::Database::new();
         db.load_font_data(bytes);
-        let family = db
-            .faces()
-            .next()
-            .and_then(|face| face.families.first().cloned())
-            .map(|(name, _language)| name)
+        let face = db.faces().next().expect("fixture face");
+        let face_id = face.id;
+        let family = face
+            .families
+            .first()
+            .map(|(name, _language)| name.clone())
             .expect("fixture family name");
         (
             FontSystem::new_with_locale_and_db("en-US".to_string(), db),
             family,
+            face_id,
         )
+    }
+
+    /// `pairs` bound to `face`, as `CustomKerningMap::record` binds a content's table.
+    fn map_on(face: cosmic_text::fontdb::ID, pairs: &[(char, char, f32)]) -> CustomKerningMap {
+        let mut map = CustomKerningMap::default();
+        map.insert(
+            face,
+            std::sync::Arc::new(crate::font_provider::CustomKerningTable::from_pairs(pairs.iter().copied())),
+            "fixture",
+        );
+        map
     }
 
     /// The form-search width metric must REPLACE the font's own pair kerning with
@@ -5262,7 +5296,7 @@ Pages wired down:                        333333.\n";
     fn the_glyph_width_metric_replaces_the_fonts_pair_with_the_authored_one() {
         use cosmic_text::{Attrs, Family, Metrics};
 
-        let (mut font_system, family) = metric_fixture_system();
+        let (mut font_system, family, face) = metric_fixture_system();
         let attrs = Attrs::new()
             .family(Family::Name(family.as_str()))
             .metrics(Metrics::new(WIDTH_METRIC_EM, WIDTH_METRIC_EM));
@@ -5274,9 +5308,8 @@ Pages wired down:                        333333.\n";
             0.0,
             DEFAULT_WIDTH_TOLERANCE,
             InlineTagScope::NoBreakOnly,
-            None,
+            &CustomKerningMap::default(),
         );
-        let table = CustomKerningTable::from_pairs([('A', 'V', -120.0)]);
         let kerned = GlyphWidths::build(
             &mut font_system,
             &attrs,
@@ -5284,7 +5317,7 @@ Pages wired down:                        333333.\n";
             0.0,
             DEFAULT_WIDTH_TOLERANCE,
             InlineTagScope::NoBreakOnly,
-            Some(&table),
+            &map_on(face, &[('A', 'V', -120.0)]),
         );
 
         // The font's own `AV` kern is what gets replaced, so it must be non-zero for
@@ -5309,11 +5342,10 @@ Pages wired down:                        333333.\n";
     fn a_zero_authored_entry_cancels_the_fonts_kern_in_the_metric() {
         use cosmic_text::{Attrs, Family, Metrics};
 
-        let (mut font_system, family) = metric_fixture_system();
+        let (mut font_system, family, face) = metric_fixture_system();
         let attrs = Attrs::new()
             .family(Family::Name(family.as_str()))
             .metrics(Metrics::new(WIDTH_METRIC_EM, WIDTH_METRIC_EM));
-        let table = CustomKerningTable::from_pairs([('A', 'V', 0.0)]);
         let cancelled = GlyphWidths::build(
             &mut font_system,
             &attrs,
@@ -5321,7 +5353,7 @@ Pages wired down:                        333333.\n";
             0.0,
             DEFAULT_WIDTH_TOLERANCE,
             InlineTagScope::NoBreakOnly,
-            Some(&table),
+            &map_on(face, &[('A', 'V', 0.0)]),
         );
         assert_eq!(
             cancelled.kerns.get(&('A', 'V')).copied(),
@@ -5339,75 +5371,59 @@ Pages wired down:                        333333.\n";
         );
     }
 
-    /// A pair the SELECTED font cannot draw must NOT be overridden in the metric:
-    /// at draw time both characters fall through to a fallback face that carries no
-    /// override table, so correcting the estimate here would move line BREAKS by the
-    /// pair's whole authored magnitude with nothing matching it on the page.
+    /// A pair the pen does not override must not be overridden in the metric either:
+    /// here the selected (Latin) font carries a table that lists a Hebrew pair, but
+    /// Hebrew is drawn by ANOTHER face of the database — the pen's same-face guard
+    /// rejects it, so the metric keeps the shaped delta. Both tracked `fonts/ui` faces
+    /// sit in one database, so the shaper really falls back.
     #[test]
-    fn an_uncovered_pair_is_not_overridden_in_the_metric() {
-        use cosmic_text::{Attrs, Family, Metrics};
+    fn a_pair_drawn_by_another_face_is_not_overridden_in_the_metric() {
+        use crate::characterization::TrackedFont;
+        use cosmic_text::{Attrs, Family, FontSystem, Metrics, fontdb};
 
-        // Arabic ain + beh: absent from Liberation Sans, so the fixture cannot draw
-        // the pair and the renderer would never apply an override to it.
-        const UNCOVERED: &str = "\u{0639}\u{0628}";
-        let (mut font_system, family) = metric_fixture_system();
+        const FALLBACK_PAIR: &str = "\u{05D0}\u{05D1}";
+        let mut db = fontdb::Database::new();
+        db.load_font_data(TrackedFont::Latin.bytes());
+        let (latin_face, latin_family) = db
+            .faces()
+            .next()
+            .map(|face| (face.id, face.families[0].0.clone()))
+            .expect("latin face");
+        db.load_font_data(TrackedFont::Hebrew.bytes());
+        let mut font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
         let attrs = Attrs::new()
-            .family(Family::Name(family.as_str()))
+            .family(Family::Name(latin_family.as_str()))
             .metrics(Metrics::new(WIDTH_METRIC_EM, WIDTH_METRIC_EM));
+        let table = map_on(latin_face, &[('\u{05D0}', '\u{05D1}', -400.0), ('A', 'V', -400.0)]);
 
-        let plain = GlyphWidths::build(
-            &mut font_system,
-            &attrs,
-            UNCOVERED,
-            0.0,
-            DEFAULT_WIDTH_TOLERANCE,
-            InlineTagScope::NoBreakOnly,
-            None,
-        );
-        let table = CustomKerningTable::from_pairs([(
-            '\u{0639}',
-            '\u{0628}',
-            -400.0,
-        )]);
-        let overridden = GlyphWidths::build(
-            &mut font_system,
-            &attrs,
-            UNCOVERED,
-            0.0,
-            DEFAULT_WIDTH_TOLERANCE,
-            InlineTagScope::NoBreakOnly,
-            Some(&table),
-        );
+        let build = |font_system: &mut FontSystem, text: &str, map: &CustomKerningMap| {
+            GlyphWidths::build(
+                font_system,
+                &attrs,
+                text,
+                0.0,
+                DEFAULT_WIDTH_TOLERANCE,
+                InlineTagScope::NoBreakOnly,
+                map,
+            )
+        };
+        let plain = build(&mut font_system, FALLBACK_PAIR, &CustomKerningMap::default());
+        let overridden = build(&mut font_system, FALLBACK_PAIR, &table);
         assert_eq!(
-            overridden.kerns.get(&('\u{0639}', '\u{0628}')).copied(),
-            plain.kerns.get(&('\u{0639}', '\u{0628}')).copied(),
-            "an uncovered pair must keep the SHAPED delta, not take the authored one"
+            overridden.kerns.get(&('\u{05D0}', '\u{05D1}')).copied(),
+            plain.kerns.get(&('\u{05D0}', '\u{05D1}')).copied(),
+            "a pair drawn by a face without the table must keep the SHAPED delta"
         );
-        assert_eq!(
-            overridden.line_width(UNCOVERED),
-            plain.line_width(UNCOVERED),
-            "an uncovered pair must not move the measured width at all"
-        );
+        assert_eq!(overridden.line_width(FALLBACK_PAIR), plain.line_width(FALLBACK_PAIR));
 
-        // Control on the SAME table: a covered pair in the same font still applies,
-        // so the assertions above prove coverage gating, not a dead override path.
-        let mixed = CustomKerningTable::from_pairs([
-            ('\u{0639}', '\u{0628}', -400.0),
-            ('A', 'V', -400.0),
-        ]);
-        let covered = GlyphWidths::build(
-            &mut font_system,
-            &attrs,
-            "AV",
-            0.0,
-            DEFAULT_WIDTH_TOLERANCE,
-            InlineTagScope::NoBreakOnly,
-            Some(&mixed),
-        );
+        // Control on the SAME map: a pair the selected face draws still applies, so the
+        // assertions above prove the face guard, not a dead override path.
+        let covered = build(&mut font_system, "AV", &table);
         assert_eq!(
             covered.kerns.get(&('A', 'V')).copied(),
             Some(-400),
-            "a covered pair must still take the authored value verbatim"
+            "a same-face pair must still take the authored value verbatim"
         );
     }
+
 }

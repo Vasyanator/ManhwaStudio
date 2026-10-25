@@ -32,8 +32,8 @@ links it (`ms_text_render::render_text_to_image` + `::types::*`). It needs no
   mode, right-to-left steps anchored on the spanning (visually left) glyph for an
   override (`kern_override_rtl`), un-overridden `Fixed` (`kern_fixed_rtl`), `Optical`
   (`kern_optical_rtl`) and faux-bold growth (`kern_faux_rtl`), overrides on
-  formula seeds, an override at a line break (`kern_override_wrap`, see the comment on
-  `KERN_WRAP_WIDTH_PX` for what the break shows today), and manual tracking on the pen,
+  formula seeds, an override at a line break (`kern_override_wrap`, a box the text fits
+  only through its overrides, see `KERN_WRAP_WIDTH_PX`), and manual tracking on the pen,
   formula and vertical paths. The self-check
   `the_kerning_cases_really_carry_their_override_table` proves each table reaches the
   face the text is drawn with.

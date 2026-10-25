@@ -56,7 +56,8 @@ pub use wrap::forms;
 // pooled `FontSystem`); a caller with a one-shot `FontSystem` of its own passes a
 // one-shot `FontFaceCache::new()`.
 pub use font_registry::{
-    family_has_face_of_requested_weight, family_has_matching_face, load_font_content,
+    CustomKerningMap, family_has_face_of_requested_weight, family_has_matching_face,
+    load_font_content,
 };
 pub use font_system_pool::FontFaceCache;
 

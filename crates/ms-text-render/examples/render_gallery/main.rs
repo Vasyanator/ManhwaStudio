@@ -389,11 +389,10 @@ const KERN_RTL_TEXT: &str = "\u{05D0}\u{05D1}\u{05D2} \u{05D0}\u{05D1}";
 const KERN_WRAP_TEXT: &str = "AVAVAVAVAV AVAVAVAVAV";
 
 /// Box width of `kern_override_wrap`, tuned by rendering (NotoSans, 48 px, `KERN_PAIRS`):
-/// the one-line INK width is 537 px with the table and 575 px without it, and today the
-/// wrap breaks this text into two lines at every width below 573 px WITH OR WITHOUT the
-/// table — the override does not move this break (measured 2026-10-25). 560 px sits inside
-/// that gap: the kerned line would fit, so the golden shows exactly the case a wrap that
-/// measures overrides as drawn (behaviour change B1) is expected to turn into ONE line.
+/// the one-line INK width is 537 px with the table and 575 px without it, so at 560 px the
+/// text fits on ONE line only because of the `AV` overrides — the wrap must measure them
+/// exactly as the pen draws them (it does, through `pair_advance`; before that the break
+/// ignored them and this case drew two lines).
 const KERN_WRAP_WIDTH_PX: u32 = 560;
 
 /// The override table of the right-to-left case.

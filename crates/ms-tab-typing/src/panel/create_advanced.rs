@@ -38,9 +38,10 @@ the same reason.
 
 THE METRIC SEES THE FONT'S USER-AUTHORED KERNING PAIRS, and nothing had to be added to
 `AdvancedFormMetricSpec` for that: they ride on the resolved `FontContent`
-(`FontContent::custom_kerning_table`), which the spec already carries, and
+(`FontContent::custom_kerning_table`), which the spec already carries; the metric binds
+them to the loaded faces with `CustomKerningMap::record` (as the renderer does), and
 `forms::GlyphWidths::build` REPLACES the font's own pair value with the authored one —
-the same replacement the renderer's pen loop performs. Staleness is covered by the
+the same replacement, decided by the same guard, the renderer's pen loop performs. Staleness is covered by the
 existing signature: a font reload clears `advanced_form_font`, so `font_content_id`
 passes through `None` and back, which rebuilds the cache with the new table.
 
@@ -1332,8 +1333,13 @@ fn build_advanced_form_glyph_widths_from_spec(
         available,
     );
     // The font's user-authored kerning overrides travel ON the resolved
-    // `FontContent`, so the metric replaces exactly the pairs the renderer's pen
-    // loop replaces. Nothing extra had to be snapshotted into the spec for this.
+    // `FontContent`; they are bound to the faces this content registered into
+    // `font_cache` exactly as the renderer binds them (`CustomKerningMap::record`
+    // after `load_font_content`), so the metric overrides exactly the pairs the
+    // pen loop overrides — none of a bundled-chain fallback face, which carries no
+    // table. Nothing extra had to be snapshotted into the spec for this.
+    let mut custom_kerning = ms_text_render::CustomKerningMap::default();
+    custom_kerning.record(&font_cache, content);
     Some(forms::GlyphWidths::build(
         &mut font_system,
         &attrs,
@@ -1341,7 +1347,7 @@ fn build_advanced_form_glyph_widths_from_spec(
         spec.hanging_punctuation,
         forms::DEFAULT_WIDTH_TOLERANCE,
         scope,
-        content.custom_kerning_table().map(Arc::as_ref),
+        &custom_kerning,
     ))
 }
 

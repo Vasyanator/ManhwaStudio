@@ -108,7 +108,9 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   backend returns raw FLUX klein output and never post-processes),
   sRGB <-> CIELAB conversion (`ms_region_postprocess::LabTables` + `encode_srgb`; a caller may own
   only its quantization), the ordered preset writer thread and free default-name allocator
-  (`ms_config::preset_store`), atomic replacement of a file's contents and its temp names
+  (`ms_config::preset_store`), the advance between two adjacent glyphs — override guard and
+  magnitude, `Fixed` step, run-axis orientation, tracking basis, wrap / form width measurement of
+  overrides (`ms_text_render::pair_advance`), atomic replacement of a file's contents and its temp names
   (`ms_atomic_file::write_atomic` / `write_atomic_with`; publishing an already-staged file uses its
   `rename_with_retry` + `sync_directory`; no private temp+rename copy), SOR
   kernel (`ms_tools::red_black_sor_sweeps`), pixel-inspection threshold and grid
@@ -334,15 +336,18 @@ parallel tasks that touch it.
 
 ## Canonical "one decision, many owners" case (global §2.5)
 
-The advance between two adjacent glyphs is decided in FIVE places —
+The advance between two adjacent glyphs used to be decided in FIVE places —
 `pipeline::horizontal_run_layout`, `pipeline::optical_horizontal_run_layout`,
 `formula::render::assign_formula_seed_advances`, `wrap::forms::GlyphWidths::build` and
-`wrap::horizontal::WrapScoringContext::custom_kerning_correction_px` — plus `layout::vertical`,
-which applies no pair kerning at all (all in `crates/ms-text-render/src/`). User-authored kerning
-pairs therefore had to be implemented five times, and a right-to-left direction bug had to be
-fixed in two of them and separately reasoned about in a third. The wrap measurement has no
-per-glyph font ids, so it cannot reproduce the draw-side same-face guard directly; it reproduces
-it by its cause instead (`wrap::selected_face_covers_pair`: correct a pair only when the selected
-font covers both characters), leaving a documented residual bounded by one pair's authored
-magnitude per line (see "CUSTOM KERNING" in `crates/ms-text-render/src/MODULE_README.md`). One
-owner would have cost one implementation and no approximation.
+`wrap::horizontal::WrapScoringContext` (all in `crates/ms-text-render/src/`). User-authored kerning
+pairs therefore had to be implemented five times; a right-to-left direction bug was fixed in two of them
+and reasoned about separately in a third, and the right-to-left anchor itself was wrong everywhere. The two
+width measurements could only approximate the pen's same-face guard (by character coverage), and the
+capacity estimate ignored overrides entirely, so an override never moved a line break. The decision now
+has one owner, `ms_text_render::pair_advance` (override guard and magnitude, `Fixed` step, run-axis
+orientation and the right-to-left anchor, tracking basis); the five sites only accumulate its answer, the
+wrap measures over the shaped glyphs with the pen's own guard, and recorded bit-exact matrices
+(`tests/fixtures/pair_advance_*.json`) pin all of it. The vertical path still applies no pair kerning (an
+open design question, not a copy). One owner from the start would have cost one implementation and no
+approximation.
+

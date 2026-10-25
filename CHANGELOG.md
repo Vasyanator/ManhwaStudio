@@ -172,6 +172,7 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **Touch input** — a touch cancelled by the system (for example by palm rejection) no longer leaves the pointer held down.
 - **SDXL error message** — when the SDXL library fails to load, the error now shows the real cause instead of always asking to install it.
 - **Right-to-left text spacing** — Hebrew and other right-to-left text no longer runs backwards or misspaces letters with «Metric» or optical kerning; your own kerning pairs now tighten or loosen right-to-left letter pairs by exactly the value entered (a 0 entry no longer shifts letters); faux bold widens right-to-left text instead of squeezing it.
+- **Custom kerning pairs and line breaks** — line wrapping and the text-forms search now measure your custom kerning pairs exactly as they are drawn, so a line that fits thanks to tightened pairs is no longer broken early, and pairs drawn by a fallback font or merged into a ligature no longer skew the measurement.
 
 ---
 
@@ -349,3 +350,4 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **Сенсорный ввод** — касание, отменённое системой (например, при отбрасывании ладони), больше не оставляет указатель зажатым.
 - **Сообщение об ошибке SDXL** — если библиотека SDXL не загружается, ошибка показывает настоящую причину, а не всегда просит её установить.
 - **Интервалы в тексте справа налево** — иврит и другой текст справа налево больше не идёт задом наперёд и не сбивается по интервалам при кернинге «Метрический» и оптическом; собственные кернинговые пары сдвигают буквы такого текста ровно на заданную величину (значение 0 больше не смещает буквы); искусственное полужирное начертание расширяет такой текст, а не сжимает его.
+- **Пользовательские кернинговые пары и переносы строк** — перенос строк и подбор форм текста теперь учитывают ваши кернинговые пары ровно так, как они рисуются: строка, которая помещается благодаря сжатым парам, больше не переносится раньше времени, а пары, нарисованные запасным шрифтом или слитые в лигатуру, больше не искажают замер.

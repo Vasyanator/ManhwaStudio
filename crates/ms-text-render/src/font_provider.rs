@@ -123,8 +123,8 @@ impl CustomKerningTable {
     }
 
     /// Every overridden pair with its per-mille offset, in unspecified order.
-    /// For callers that must pre-compute something per pair (the wrap metric's
-    /// font-kerning correction cache).
+    /// For callers that must enumerate the table (diagnostics, tests); layout never
+    /// iterates it — it asks `pair_advance` about one shaped pair at a time.
     pub fn pairs(&self) -> impl Iterator<Item = (char, char, f32)> + '_ {
         self.pairs
             .iter()

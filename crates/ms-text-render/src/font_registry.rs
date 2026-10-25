@@ -59,8 +59,12 @@ use std::sync::Arc;
 /// A face with no overrides is simply absent, so [`Self::is_empty`] answering
 /// `true` is the cheap "this render has no custom kerning at all" test that keeps
 /// the byte-identical fast paths reachable.
+///
+/// Public (with [`Self::record`]) so an out-of-crate width metric — the typing tab's
+/// form search, `forms::GlyphWidths::build` — binds a table to faces EXACTLY as the
+/// renderer does, from the same `FontFaceCache` the content was loaded into.
 #[derive(Debug, Default, Clone)]
-pub(crate) struct CustomKerningMap {
+pub struct CustomKerningMap {
     by_face: HashMap<fontdb::ID, FaceOverrides>,
 }
 
@@ -138,7 +142,7 @@ impl CustomKerningMap {
     /// table logs a warning naming both fonts (see [`Self::insert`]). A silent
     /// rebinding would render one font's text with another font's pairs, which is
     /// invisible in the output and undiagnosable from a bug report.
-    pub(crate) fn record(&mut self, font_cache: &FontFaceCache, content: &FontContent) {
+    pub fn record(&mut self, font_cache: &FontFaceCache, content: &FontContent) {
         let Some(table) = content.custom_kerning_table() else {
             return;
         };

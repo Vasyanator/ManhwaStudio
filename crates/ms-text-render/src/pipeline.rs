@@ -79,7 +79,7 @@ use ms_log::trace::cat;
 use super::effects::{apply_effects_pipeline, apply_text_preprocess_effects};
 use super::extra_info::ExtraInfoAccumulator;
 use super::fallback_diag::collect_font_fallback_report;
-use super::font_provider::{CustomKerningTable, FontProvider};
+use super::font_provider::FontProvider;
 use super::font_registry::{
     CustomKerningMap, InlineFontRegistry, build_inline_font_registry,
     family_has_face_of_requested_weight, family_has_matching_face, load_font_content,
@@ -329,7 +329,7 @@ fn build_layout_text_for_shape_params(
     shape_params: LayoutShapeParams,
     font_system: &mut FontSystem,
     attrs: &Attrs<'_>,
-    custom_kerning: Option<&CustomKerningTable>,
+    custom_kerning: &CustomKerningMap,
     font_size_px: f32,
     base_line_height_px: f32,
     extra_line_spacing_px: f32,
@@ -550,9 +550,8 @@ pub fn render_text_to_image(
     // free — for every font without overrides.
     let mut custom_kerning = CustomKerningMap::default();
     custom_kerning.record(font_cache, &content);
-    // The SELECTED font's table alone, for the WIDTH METRICS: wrapping measures with
-    // the selected `attrs` and has no per-glyph font ids to key the face map by.
-    let selected_custom_kerning = content.custom_kerning_table().map(Arc::clone);
+    // The wrap measures through this SAME map (selected font only at that point; the
+    // wrap shapes with the selected `attrs`), so a line breaks where it is drawn.
 
     let mut attrs = Attrs::new().metrics(Metrics::new(font_size_px, font_size_px));
     attrs = selected_face.apply_to_attrs(attrs);
@@ -670,7 +669,7 @@ pub fn render_text_to_image(
         layout_shape_params,
         font_system,
         &attrs,
-        selected_custom_kerning.as_deref(),
+        &custom_kerning,
         font_size_px,
         base_line_height_px,
         extra_line_spacing_px,
@@ -685,7 +684,7 @@ pub fn render_text_to_image(
             LayoutShapeParams::from_compare(compare_params),
             font_system,
             &attrs,
-            selected_custom_kerning.as_deref(),
+            &custom_kerning,
             font_size_px,
             base_line_height_px,
             extra_line_spacing_px,
@@ -8262,6 +8261,66 @@ mod tests {
             (rtl_growth - ltr_growth).abs() < 1e-3,
             "an RTL step must grow by the same faux extra as an LTR one: {rtl_growth} vs {ltr_growth}"
         );
+    }
+
+    /// THE WRAP MEASURES A LINE EXACTLY AS THE PEN DRAWS IT. For lines with overridden
+    /// pairs — including a ligature (`fi`, one cluster: never overridden on either side),
+    /// a right-to-left run and pairs the table does not list — the width the wrap scores
+    /// (`wrap::measured_line_width_px_for_tests`, the same code path the line breaker
+    /// uses) equals the pen's own `line_width_px` (`max(x + w)`), the extent the line is
+    /// laid out and aligned with.
+    #[test]
+    fn the_wrap_width_equals_the_pen_width_for_overridden_lines() {
+        use crate::characterization::TrackedFont;
+        use crate::font_provider::CustomKerningTable;
+        use crate::font_registry::CustomKerningMap;
+        use cosmic_text::{Attrs, Family};
+
+        let cases: [(TrackedFont, &str); 6] = [
+            (TrackedFont::Latin, "AVATAR WAY To"),
+            (TrackedFont::Latin, "AVAVAVAVAV AVAVAVAVAV"),
+            (TrackedFont::Latin, "office fit AV"),
+            (TrackedFont::Latin, "To Wa Yo"),
+            (TrackedFont::Hebrew, "\u{05D0}\u{05D1}\u{05D2} \u{05D0}\u{05D1}"),
+            (TrackedFont::Hebrew, "\u{05D0}\u{05D1}"),
+        ];
+        let tables: [&[(char, char, f32)]; 3] = [
+            &[('A', 'V', -120.0), ('T', 'o', -80.0), ('f', 'i', -300.0), ('\u{05D0}', '\u{05D1}', -150.0)],
+            &[('A', 'V', 0.0), ('W', 'a', 90.0), ('\u{05D0}', '\u{05D1}', 0.0)],
+            &[('Q', 'z', -200.0)],
+        ];
+        for (font, text) in cases {
+            let mut loaded = font.load();
+            for pairs in tables {
+                for em in [36.0f32, 48.0, 100.0] {
+                    let mut params = base_params();
+                    params.text = text.to_string();
+                    params.font_size_px = em;
+                    params.kerning_mode = KerningMode::Auto;
+                    let (xs, line_width_px) = tracked_font_run_layout(&mut loaded, text, &params, pairs);
+
+                    let mut map = CustomKerningMap::default();
+                    map.insert(
+                        loaded.face_id,
+                        Arc::new(CustomKerningTable::from_pairs(pairs.iter().copied())),
+                        "fixture",
+                    );
+                    let attrs = Attrs::new().family(Family::Name(loaded.family.as_str()));
+                    let wrap_px = crate::wrap::measured_line_width_px_for_tests(
+                        &mut loaded.font_system,
+                        &attrs,
+                        em,
+                        &map,
+                        text,
+                    );
+                    assert!(
+                        (wrap_px - line_width_px).abs() < 1e-2,
+                        "{text:?} em {em} table {pairs:?}: wrap {wrap_px} vs pen {line_width_px} \
+                         (xs {xs:?})"
+                    );
+                }
+            }
+        }
     }
 
     /// The pen's tracking basis is `|shaped step|.max(prev.w.max(em / 2))`: a narrow left

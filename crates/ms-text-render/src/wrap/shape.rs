@@ -8,9 +8,9 @@ Main responsibilities:
 - строить width profile для `Rectangle`, `Oval`, `Hexagon`;
 - выполнять iterative reshape текста под форму без участия raster-слоя;
 - возвращать предупреждения о приблизительном fallback отдельно от обычного wrap;
-- проносить пользовательскую таблицу кернинг-пар выбранного шрифта
-  (`ShapeWrapRequest::custom_kerning`) в `WrapScoringContext`, иначе замеры ширин
-  разойдутся с тем, что рисует pen loop.
+- pass the render's face-keyed user-authored kerning map
+  (`ShapeWrapRequest::custom_kerning`) into `WrapScoringContext`, so every width the
+  wrap measures is the width the pen loop draws.
 
 Source:
 - `reshape_text_for_shape`
@@ -25,7 +25,7 @@ use super::horizontal::{
 };
 use super::{HyphenationDictionaries, WordBreakPolicy};
 use ms_text_util::segmentation::count_layout_units;
-use crate::font_provider::CustomKerningTable;
+use crate::font_registry::CustomKerningMap;
 use crate::types::{TextShape, TextWrapMode};
 use cosmic_text::{Attrs, FontSystem};
 
@@ -39,10 +39,10 @@ pub(crate) struct ShapeWrapRequest<'a> {
     pub(crate) text: &'a str,
     pub(crate) font_system: &'a mut FontSystem,
     pub(crate) attrs: &'a Attrs<'a>,
-    /// User-authored kerning overrides of the SELECTED font (`None` when it has
-    /// none). Wrapping must see them or the chosen line breaks drift from the pen
-    /// loop, which applies the very same overrides.
-    pub(crate) custom_kerning: Option<&'a CustomKerningTable>,
+    /// The render's user-authored kerning overrides keyed by registered face (the
+    /// SAME map the pen loop uses). Wrapping must see them or the chosen line breaks
+    /// drift from the pen loop, which applies the very same overrides.
+    pub(crate) custom_kerning: &'a CustomKerningMap,
     pub(crate) font_size_px: f32,
     pub(crate) line_height_px: f32,
     pub(crate) base_width_px: f32,

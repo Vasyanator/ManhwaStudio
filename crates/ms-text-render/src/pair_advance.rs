@@ -38,11 +38,12 @@ Notes:
   shaped step).
 */
 
+use crate::font_provider::CustomKerningTable;
 use crate::font_registry::CustomKerningMap;
 use crate::glyph_blit::nominal_glyph_advance_px;
 use crate::optical::optical_base_advance;
 use crate::types::{KerningMode, TextRenderParams};
-use cosmic_text::{FontSystem, LayoutGlyph};
+use cosmic_text::{FontSystem, LayoutGlyph, LayoutRun};
 
 /// A glyph's resolved kerning mode and manual tracking, as every layout path consumes it.
 #[derive(Debug, Clone, Copy)]
@@ -270,11 +271,36 @@ impl<'a> PairAdvanceModel<'a> {
     /// `Some(0.0)` is NOT `None`: it cancels the font's own pair value.
     #[must_use]
     pub(crate) fn override_delta_px(self, prev: PairGlyph<'_>, cur: PairGlyph<'_>) -> Option<f32> {
+        let (table, left, right) = self.guarded_pair(prev, cur)?;
+        table.delta_px(left, right, prev.glyph.font_size)
+    }
+
+    /// The same override as [`Self::override_delta_px`], in THOUSANDTHS OF AN EM (the
+    /// table's own unit), for a width metric that measures at 1000 units per em
+    /// (`wrap::forms::GlyphWidths`). Same guard, so the metric and the pen agree on WHICH
+    /// pairs are overridden.
+    #[must_use]
+    pub(crate) fn override_per_mille(self, prev: PairGlyph<'_>, cur: PairGlyph<'_>) -> Option<f32> {
+        let (table, left, right) = self.guarded_pair(prev, cur)?;
+        table.delta_per_mille(left, right)
+    }
+
+    /// The override guard: the table and the two characters when both glyphs come from the
+    /// same face, that face has a table and both clusters are single chars; else `None`.
+    fn guarded_pair(self, prev: PairGlyph<'_>, cur: PairGlyph<'_>) -> Option<(&'a CustomKerningTable, char, char)> {
         if prev.glyph.font_id != cur.glyph.font_id {
             return None;
         }
         let table = self.custom_kerning.table_for(prev.glyph.font_id)?;
-        table.delta_px(prev.cluster_char?, cur.cluster_char?, prev.glyph.font_size)
+        Some((table, prev.cluster_char?, cur.cluster_char?))
+    }
+
+    /// Whether any glyph of `glyphs` was drawn from a face that carries an override table —
+    /// the cheap test that keeps a width measurement on its byte-identical shaped value.
+    #[must_use]
+    pub(crate) fn any_table(self, glyphs: &[LayoutGlyph]) -> bool {
+        !self.custom_kerning.is_empty()
+            && glyphs.iter().any(|glyph| self.custom_kerning.has_table(glyph.font_id))
     }
 
     /// Whether a user-authored pair applies to (`prev`, `cur`) — [`Self::override_delta_px`]
@@ -341,6 +367,60 @@ impl<'a> PairAdvanceModel<'a> {
             },
         }
     }
+}
+
+/// The width a shaped run measures once its user-authored pairs are applied exactly as the
+/// pen draws them (`KerningMode::Auto`, no tracking, no faux — the wrap measures the shaped
+/// width).
+///
+/// `run.line_w` is the shaper's width, which contains the FONT's own pair kerning but knows
+/// nothing about overrides. When no pair of the run is overridden it is returned VERBATIM
+/// (bit-identical to the measurement without overrides). Otherwise each overridden pair
+/// shifts every later glyph by `override step - shaped step` (`resolve` under `FollowRun`,
+/// the same guard, anchor and orientation as the pen), and the returned width is
+/// `run.line_w` plus the change of the run's right edge `max(x + w)` folded from `0.0` —
+/// exactly the pen's own `line_width_px` rule (`pipeline::horizontal_run_layout`), so the
+/// wrap breaks a line where the pen's laid-out line ends. A right-to-left run keeps its
+/// first (rightmost) glyph in place and walks leftwards, so its overrides move the LEFT
+/// end, which the pen's line width does not count either.
+#[must_use]
+pub(crate) fn measured_run_width_px(
+    model: PairAdvanceModel<'_>,
+    font_system: &mut FontSystem,
+    run: &LayoutRun<'_>,
+) -> f32 {
+    if !model.any_table(run.glyphs) {
+        return run.line_w;
+    }
+    let mut correction_px = 0.0f32;
+    let mut overridden = false;
+    let mut shaped_right = 0.0f32;
+    let mut corrected_right = 0.0f32;
+    for (idx, glyph) in run.glyphs.iter().enumerate() {
+        if idx > 0 {
+            let prev = &run.glyphs[idx - 1];
+            let shaped_step_px = glyph.x - prev.x;
+            let step = model.resolve(
+                font_system,
+                KerningMode::Auto,
+                StepDirection::FollowRun,
+                PairGlyph::from_run(run.text, prev),
+                PairGlyph::from_run(run.text, glyph),
+                shaped_step_px,
+            );
+            if step.is_override() {
+                overridden = true;
+                correction_px += step.step_px() - shaped_step_px;
+            }
+        }
+        let corrected_x = glyph.x + correction_px;
+        shaped_right = shaped_right.max(glyph.x + glyph.w);
+        corrected_right = corrected_right.max(corrected_x + glyph.w);
+    }
+    if !overridden {
+        return run.line_w;
+    }
+    run.line_w + (corrected_right - shaped_right)
 }
 
 /// Which way a step along a shaped run walks.
