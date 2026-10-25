@@ -3,7 +3,7 @@ File: crates/ms-text-render/src/optical.rs
 
 Purpose:
 Axis-agnostic pure numeric core shared by the optical-kerning paths. The
-horizontal path (`pipeline.rs`) and the vertical path (`layout/vertical.rs`)
+horizontal path (`pipeline/`) and the vertical path (`layout/vertical.rs`)
 both re-space adjacent inked glyphs by measuring the MINIMUM DIRECTIONAL
 projected ink whitespace of each pair — the closest facing points between the two
 glyphs — and normalizing it toward the run/column median so the tightest points
@@ -41,12 +41,12 @@ use std::collections::HashMap;
 
 /// Bezier-flattening simplify tolerance (px) for glyph ink contours used by the
 /// optical accumulation on both axes; kept equal to the on-path value in
-/// `formula/render.rs` so measured ink matches the drawn ink.
+/// `formula/render/` so measured ink matches the drawn ink.
 pub(crate) const OPTICAL_CONTOUR_SIMPLIFY_TOLERANCE_PX: f32 = 1.5;
 
 /// Hard lower bound on the resulting ink-to-ink gap (px) for optical kerning; the
 /// applied delta never lets an adjacent pair collide tighter than this. Kept
-/// equal to the on-path floor in `formula/render.rs`. Shared by both axes.
+/// equal to the on-path floor in `formula/render/`. Shared by both axes.
 pub(crate) const OPTICAL_MIN_INK_GAP_FLOOR_PX: f32 = 0.5;
 
 /// Per-render cache of glyph ink contours keyed by
@@ -55,7 +55,7 @@ pub(crate) const OPTICAL_MIN_INK_GAP_FLOOR_PX: f32 = 0.5;
 /// most once. The last component is `vector::faux_key_bits` (`0` = plain), so a
 /// faux-bold (offset-outline) variant never aliases the plain contour — the
 /// same variant keying `OutlineKey` uses. Shared by the horizontal
-/// (`pipeline.rs`) and vertical (`layout/vertical.rs`) paths.
+/// (`pipeline/`) and vertical (`layout/vertical.rs`) paths.
 pub(crate) type OpticalContourCache = HashMap<(u64, u16, u32, u32), GlyphContour>;
 
 /// Median of the finite entries of `gaps`.

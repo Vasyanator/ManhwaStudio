@@ -40,7 +40,7 @@ The glyph height scale keeps the BOX-CENTRE anchor here
 (`GlyphScaleSettings::scaled_rect`), unlike the baseline-anchored horizontal
 paths: a cell places its glyph by its own ink box and the cell step already
 follows the scaled ink height. The column gaps come from the plain
-`pipeline::compute_line_extra_spacing_table`, which an inline `<stretching>`
+`pipeline::line_metrics::compute_line_extra_spacing_table`, which an inline `<stretching>`
 span no longer feeds — see this module's `MODULE_README.md`.
 
 Mesh warp (`TextRenderParams.raster_transform`):

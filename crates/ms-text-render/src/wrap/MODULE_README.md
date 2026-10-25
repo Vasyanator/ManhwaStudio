@@ -6,13 +6,13 @@ renderer. It prepares layout text for horizontal, shape-aware, and vertical mode
 keeping dictionary hyphenation and emergency split rules out of glyph drawing code.
 
 ## Architecture
-`mod.rs` exposes the small internal wrap boundary used by `pipeline.rs`:
+`mod.rs` exposes the small internal wrap boundary used by `pipeline/`:
 `reshape_text_for_shape`, `build_vertical_layout_text`, hyphenation dictionaries, and
 wrap-mode policy helpers.
 
 The main data flow is:
 
-1. `pipeline.rs` normalizes text, resolves inline styles, font metrics, and wrap mode.
+1. `pipeline/` normalizes text, resolves inline styles, font metrics, and wrap mode.
 2. `mod.rs` maps `TextWrapMode` to a `WordBreakPolicy` and dictionary requirements.
 3. `horizontal.rs` scores candidate line breaks for free/rectangle/shape targets.
 4. `hyphenation.rs` supplies safe dictionary and emergency split points.
@@ -48,7 +48,7 @@ output images, or apply effects.
   the render's `RunWidthMeasure` (the pen) down into `horizontal.rs`'s scoring context.
 - `vertical.rs`: vertical column preparation, paragraph splitting, shape-aware vertical
   targets, and vertical emergency token splitting.
-- `forms.rs`: shared discrete line-break "form" logic (presets `FreeNoTree`/`Lens`/
+- `forms/`: shared discrete line-break "form" logic (presets `FreeNoTree`/`Lens`/
   `Widen`/`Narrow`, pluggable `LineWidthMetric` line widths — `GlyphWidths` measures
   pixel widths via cosmic-text shaping with a precomputed per-glyph advance + adjacent-pair
   kerning table — into which a USER-AUTHORED kerning override REPLACES the font's own pair
@@ -71,12 +71,13 @@ output images, or apply effects.
   dictionary hyphenation 2/3/4 by `classify_hyphen` quality) plus a word-break count for
   the panel's grouping and width/cost sorting. Used by the typing panel's "Продвинутая
   форма текста" window and re-exported as `render_next::forms` so the renderer subsystem
-  shares the same definitions.
+  shares the same definitions. A directory module; its files and their roles are mapped
+  in `forms/MODULE_README.md`.
 
 ## Inline tags: the text arrives RAW and the tags go back
 
 `enumerate_forms`, `search_forms`, `choose_form` and `GlyphWidths::build` all take the
-**raw** source text — every inline tag included — plus an `InlineTagScope`. `forms.rs` is
+**raw** source text — every inline tag included — plus an `InlineTagScope`. `forms/` is
 the ONLY place that removes them (`strip_inline_tags`, private for exactly that reason) and
 the ONLY place that puts them back (`reapply_inline_tags_to_form_text`). It strips once per
 consumer, on the raw string. Handing any of them an already stripped text is the defect
@@ -162,9 +163,9 @@ A protected range is ONE unbreakable block, against all three break kinds:
 
 A junction exactly ON a range boundary is not glued — the protected text stays whole there.
 
-## Form search (`forms.rs::search_forms`)
+## Form search (`forms::search_forms`)
 
-`forms.rs` has two entry points into the break tree and they answer different
+`forms/` has two entry points into the break tree and they answer different
 questions. `enumerate_forms` is the original exhaustive walk: every form that
 matches the preset, in tree order, bounded only by `max_forms`, free memory and a
 node ceiling. Free memory comes from the one OS probe `ms_memory::current_memory_availability`
@@ -260,7 +261,7 @@ Contracts:
 - THE HANGING STRENGTH IS ONE NUMBER, THREADED WHOLE. `hanging_punctuation: f32`
   (`0.0..=1.0`) travels unchanged from `TextRenderParams` through `ShapeWrapRequest` and
   `WrapSettings` into `count_layout_units`/`find_emergency_split_index` and the
-  `forms.rs` metrics. Every consumer must reproduce today's two behaviours EXACTLY at
+  `forms/` metrics. Every consumer must reproduce today's two behaviours EXACTLY at
   `0.0` and `1.0`; only what happens in between is new. Two deliberate details:
   `TextShape::SoftPeak` forces `1.0` regardless of the caller (its target profile is
   built against fully hung widths), and `estimate_line_capacity_units` must weight the
@@ -268,9 +269,9 @@ Contracts:
 - The wrap unit model discounts EVERY hanging character of a line, interior ones
   included, while the renderer's visual hang covers the leading/trailing runs only.
   That asymmetry predates the strength and is intentional — do not "fix" it here.
-- Wrapping uses normalized text from `pipeline.rs`; inline style byte-offset remapping
+- Wrapping uses normalized text from `pipeline/`; inline style byte-offset remapping
   must happen outside or around this module, not by applying original tagged spans here.
-  `forms.rs` is the documented exception and only for text→text work: it strips tags from a
+  `forms/` is the documented exception and only for text→text work: it strips tags from a
   raw form source and re-emits them verbatim onto the chosen form, never mapping style spans.
 - `TextWrapMode::None` must preserve caller text except for upstream normalization.
 - `WholeWords` must avoid dictionary/emergency splitting. Minimal, Moderate, and
@@ -303,6 +304,6 @@ Contracts:
   only for glyph placement after wrapping.
 - To retune the ranked form search (corridor tightness, aspect cap, hyphen
   relaxation, quality weights, budgets), change the defaults in
-  `forms.rs::FormSearchParams::default()` and the associated `DEFAULT` consts — not
+  `forms::FormSearchParams::default()` and the associated `DEFAULT` consts — not
   the algorithm bodies. To change *what is shown first*, edit the panel: the crate
   only groups and sorts within a bucket.

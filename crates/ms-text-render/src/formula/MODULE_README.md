@@ -7,13 +7,13 @@ paths into glyph placement on curves before delegating glyph sampling to the sha
 raster helpers.
 
 ## Architecture
-`mod.rs` re-exports the formula render boundary used by `pipeline.rs`. Formula rendering
+`mod.rs` re-exports the formula render boundary used by `pipeline/`. Formula rendering
 is split into three responsibilities:
 
 1. `parser.rs` tokenizes and parses ASCII math expressions into a small AST.
 2. `eval.rs` compiles `TextFormulaLayoutParams` expressions and evaluates finite
    transforms or arc-length samples for runtime glyph variables.
-3. `render.rs` shapes text, builds glyph seeds, maps glyphs to formula/custom-line
+3. `render/` shapes text, builds glyph seeds, maps glyphs to formula/custom-line
    positions, draws rotated glyphs, and reports when shape mode should fall back to the
    standard text path.
 
@@ -27,7 +27,7 @@ the line paths.
   function-call parsing for formula expressions.
 - `eval.rs`: compiled formula bundle, runtime variable lookup, finite-value checks,
   transform evaluation, tangent rotation, and arc-length table generation.
-- `render.rs`: formula/custom-line render requests, glyph seed collection, advance
+- `render/`: formula/custom-line render requests, glyph seed collection, advance
   assignment, line-path mapping, glyph bounds, and fallback decisions. Its composite
   pass rasterizes each glyph's true font outline (`render_next/vector.rs`) via
   `glyph_outline_transform` + `rasterize_outline_into`; color glyphs (no monochrome
@@ -35,7 +35,8 @@ the line paths.
   `MinimumPreviousDistance`, it derives each glyph's ink contour from that outline
   (`vector::glyph_contour_from_outline` -> `render_next/glyph_contour.rs`, cached by
   cosmic-text `CacheKey`) and moves the glyph along the path until the pair reproduces
-  the gap it would have in a STRAIGHT line — see the mode's contract below.
+  the gap it would have in a STRAIGHT line — see the mode's contract below. A directory
+  module; its files and their roles are mapped in `render/MODULE_README.md`.
 
 ## Contracts and invariants
 - Formula input comes from `TextFormulaLayoutParams`; do not read panel state,
@@ -49,7 +50,7 @@ the line paths.
 - Formula and custom-line rendering must preserve inline style, inline font, kerning,
   glyph scale, glyph offset, and text color overrides supplied by the main pipeline. The
   lookups themselves and the synthesized wrap hyphen are `pipeline`'s (one owner,
-  imported over `pipeline::RunShaping`); `render.rs` keeps no copies.
+  imported over `pipeline::RunShaping`); `render/` keeps no copies.
 - USER-AUTHORED KERNING PAIRS are applied here exactly as on the horizontal path (see
   the CUSTOM KERNING contract in `../MODULE_README.md`): a matching pair REPLACES the
   font's own value under every `KerningMode`, stepping by
@@ -64,7 +65,7 @@ the line paths.
   and drawn lines walk seeds in logical order regardless of script direction — a
   limitation of that whole path, not of the overrides.
 - THE ARC-LENGTH STEP BETWEEN TWO ADJACENT GLYPHS IS DECIDED IN ONE PLACE AND ONLY
-  ONE: `OnPathStepSpacing::step_px` in `render.rs`. All three consumers go through it —
+  ONE: `OnPathStepSpacing::step_px` in `render/mod.rs`. All three consumers go through it —
   the alignment pre-pass (`drawn_line_start_offsets`), the custom-line walk
   (`drawn_line_seed_transform`) and the formula/shape accumulator
   (`render_text_with_formula_layout_once`). Each of them used to hold a verbatim copy
@@ -95,7 +96,7 @@ the line paths.
   along the curve: the run is spaced by what the ink actually does, not by the font's
   side bearings. That is a deliberate, user-requested trade — the font's side bearings
   are partly overruled and the same text set on a curve does NOT match the same text set
-  in a straight line. The whole mode is six decisions, all in `render.rs`:
+  in a straight line. The whole mode is six decisions, all in `render/`:
   - REFERENCE. Every placed glyph is ALSO placed in a virtual straight layout
     (`straight_reference_transform`: the path point `(x, 0)` with the constant tangent
     `(1, 0)`, walked by the NOMINAL along-path step read off the arc-length seed, so
@@ -121,7 +122,7 @@ the line paths.
     ends the pair chain, so an inter-word distance neither enters the median nor gets
     normalized, and words cannot merge. A pair carrying a USER-AUTHORED kerning override
     (`PairAdvanceModel::is_overridden`) is EXEMPT — it keeps the distance its author gave it
-    and is excluded from the median, mirroring `pipeline.rs`, where an authored pair
+    and is excluded from the median, mirroring `pipeline/`, where an authored pair
     cancels optical kerning outright. A pair whose inks do not face each other even when
     straight has nothing to normalize and keeps its arc-length seed.
   - WHAT IS NOT AN INVARIANT ANY MORE: "on a straight line the mode equals
@@ -285,9 +286,9 @@ the line paths.
 - To change curve sampling, tangent rotation, or finite checks, edit `eval.rs` and
   verify formula render callers still receive useful errors.
 - To change glyph placement along formula, raster-line, or vector-line paths, edit
-  `render.rs`.
+  `render/`.
 - To change how far apart two adjacent glyphs sit along a path (letter spacing, the
-  per-path floors), edit `OnPathStepSpacing` in `render.rs` and nothing else — it is the
+  per-path floors), edit `OnPathStepSpacing` in `render/mod.rs` and nothing else — it is the
   sole owner of the NOMINAL step.
 - To change uniform ink spacing (`MinimumPreviousDistance`), edit the pieces named in
   its contract above: the reference (`straight_reference_transform` /

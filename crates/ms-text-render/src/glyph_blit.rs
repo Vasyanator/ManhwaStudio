@@ -3,8 +3,8 @@ File: src/tabs/typing/render_next/glyph_blit.rs
 
 Purpose:
 Shared outline-blit helpers for the vector-glyph render paths. Both the
-horizontal renderer (`pipeline.rs`) and the on-path / formula / custom-line
-composite pass (`formula/render.rs`) resolve a glyph's true font outline and
+horizontal renderer (`pipeline/`) and the on-path / formula / custom-line
+composite pass (`formula/render/`) resolve a glyph's true font outline and
 place it with the same pen-relative pivot, so a glyph rasterized from its
 outline lands on exactly the pixels the old bitmap blit would have drawn.
 
@@ -30,7 +30,7 @@ Key functions:
   between scale and rotation.
 
 Notes:
-These helpers were lifted out of `formula/render.rs` so the horizontal path can
+These helpers were lifted out of `formula/render/` so the horizontal path can
 share them instead of duplicating the pivot math. The extraction em is the
 glyph's shaped `font_size` (the exact ppem the bitmap path feeds to swash);
 per-glyph scale is applied later as a transform, never baked into the outline.

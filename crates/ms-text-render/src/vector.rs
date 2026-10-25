@@ -10,8 +10,8 @@ contract, and derives a `glyph_contour::GlyphContour` from an outline so on-path
 distance measurement no longer needs a rasterize-and-retrace round trip.
 
 This layer is consumed by the on-path / formula / custom-line composite pass
-(`formula/render.rs`), which rasterizes each glyph's outline instead of blitting
-its bitmap. The horizontal (`pipeline.rs`) and vertical (`layout/vertical.rs`)
+(`formula/render/`), which rasterizes each glyph's outline instead of blitting
+its bitmap. The horizontal (`pipeline/`) and vertical (`layout/vertical.rs`)
 paths still use the `raster.rs` bitmap blit and are unaffected.
 
 Key structures:
@@ -1541,7 +1541,7 @@ impl MeshWarpContext {
     /// Warp one layout-space `world` point: peel global rotation, warp over the
     /// box, reapply global rotation. Never panics (indices are clamped).
     ///
-    /// `pub(crate)` so the extra-info sampler (`extra_info.rs` via `pipeline.rs`)
+    /// `pub(crate)` so the extra-info sampler (`extra_info.rs` via `pipeline/`)
     /// can warp its per-glyph sample points through the SAME context the
     /// rasterizer uses, keeping the reported centers aligned with the warped ink.
     #[must_use]
@@ -1676,7 +1676,7 @@ pub(crate) struct OutlinePaint<'a> {
 /// Coordinate flow: each glyph-local subpath point is transformed to world
 /// coords by `transform` (scale, then rotate, then translate by `pos`), then
 /// mapped to a canvas pixel by subtracting `origin` (so a world
-/// point at the origin lands at pixel `(0, 0)`, matching how `formula/render.rs`
+/// point at the origin lands at pixel `(0, 0)`, matching how `formula/render/`
 /// blits with an x/y offset). The transformed polygons are filled to an 8-bit
 /// coverage mask with zeno over the integer bounding box of the path (clamped to
 /// the canvas), preserving sub-pixel AA (path points are not rounded).

@@ -53,7 +53,7 @@ pub type FontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
 /// User-authored per-pair kerning overrides for ONE font, in THOUSANDTHS OF AN EM.
 ///
 /// A matching pair REPLACES the font's own kerning for those two characters (see
-/// `pipeline::horizontal_run_layout`): the pen steps by the left glyph's raw
+/// `pipeline::run_layout::horizontal_run_layout`): the pen steps by the left glyph's raw
 /// `hmtx` advance plus this delta, exactly as `KerningMode::Fixed` steps, under
 /// EVERY kerning mode. An entry of `0.0` is therefore meaningful — it CANCELS a
 /// built-in pair — and must never be filtered out.

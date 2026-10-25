@@ -17,7 +17,7 @@ Notes:
   bold/italic: the span is marked bold/italic but deliberately does NOT get a
   Bold/Italic weight or style in attrs — it keeps the SELECTED face's own
   weight/style (`FauxFaceBaseline`) and the style is synthesized geometrically
-  at the glyph seam (`pipeline.rs`, `FauxGlyphStyle`); bare `<b>`/`<i>` keep
+  at the glyph seam (`pipeline/`, `FauxGlyphStyle`); bare `<b>`/`<i>` keep
   the legacy real-Bold/Italic-face behavior.
 */
 

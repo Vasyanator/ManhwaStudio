@@ -11,8 +11,8 @@ placement, `text_info.json`, project storage, or GUI widgets.
 
 Architecture: glyph drawing is vector-first. Monochrome glyphs are rasterized
 from font outlines (`vector.rs` + shared pivot helpers in `glyph_blit.rs`) on all
-three draw paths — horizontal (`pipeline.rs`), vertical (`layout/vertical.rs`),
-and on-path/formula (`formula/render.rs`). `SwashCache::get_image` is kept only
+three draw paths — horizontal (`pipeline/`), vertical (`layout/vertical.rs`),
+and on-path/formula (`formula/render/`). `SwashCache::get_image` is kept only
 for color/emoji glyphs, the bitmap placement/bounds box that pins the outline
 pivot, and bitmap ink measurement.
 Shaping/layout/font matching stay on cosmic-text. History, the deferred
@@ -32,7 +32,7 @@ The public boundary is intentionally small:
 
 The main render flow is:
 
-1. `pipeline.rs` prepares source text (`replace_ellipsis_with_dots`, `uppercase_text`,
+1. `pipeline/` prepares source text (`replace_ellipsis_with_dots`, `uppercase_text`,
    trimming, sentence newlines — in that order, so the expanded `...` is visible to
    sentence detection and wrapping), applies preprocess effects, parses inline style
    tags, and loads the selected font.
@@ -40,7 +40,7 @@ The main render flow is:
    `cosmic-text`.
 3. `wrap/` builds layout text for horizontal, vertical, and shape-aware modes, including
    hyphenation and emergency split rules.
-4. `pipeline.rs` routes by `TextLayoutMode`:
+4. `pipeline/` routes by `TextLayoutMode`:
    `Normal` uses the horizontal raster path, `Formula`/`Shape` use `formula::render`,
    `CustomRasterLines`/`CustomVectorLines` use drawn/vector line paths, and vertical
    text uses `layout::vertical`.
@@ -59,7 +59,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   anchors that keep staged contracts compiled.
 - `types.rs`: public render parameter/result types and enums shared with `typing/tab.rs`
   and `typing/panel.rs`.
-- `pipeline.rs`: central orchestration, horizontal rendering, line metrics, inline glyph
+- `pipeline/`: central orchestration, horizontal rendering, line metrics, inline glyph
   overrides, shape comparison, cancellation handling, and post-effect application. Also
   the ONE owner of the per-glyph inline lookups (`inline_*_for_glyph` / `_at_offset`,
   `compute_inline_line_aligns`, `compute_layout_line_offsets`) and of the wrap hyphen
@@ -68,7 +68,11 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   run-walk context: `GlyphCaches` (swash / outline / optical-contour caches, created
   together per render), `GlyphStyle` (inline scale + faux style), `RunPen` (params,
   spans, line offsets, user kerning, font size) and `RunShaping` (`RunPen` + what the
-  wrap hyphen re-shapes with).
+  wrap hyphen re-shapes with). A directory module: `mod.rs` keeps the orchestration
+  and the shared types, the children hold the pen (`run_layout.rs`), the glyph passes,
+  text preparation, inline lookups, faux styles, line metrics, the hyphen and hanging
+  punctuation; see `pipeline/MODULE_README.md`. Items other modules import keep their
+  `pipeline::` path through re-exports.
 - `font_provider.rs`: the caller-supplied font source. Fonts reach the render
   path by WORKING NAME through the `FontProvider` trait (`FontContent` payload,
   `FontContentSet` in-memory impl, `font_content_id` cache-key hash). The renderer
@@ -127,7 +131,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   line-level inline alignment markers. It owns the crate's SINGLE inline-tag vocabulary:
   `parse_inline_tag` decides what a `<…>` body means (value- and font-size-dependent), the
   style parser applies its payload, and `classify_inline_tag_body` exposes the same decision
-  to `wrap/forms.rs`, which strips tags for the form search and puts them back on the applied
+  to `wrap/forms/`, which strips tags for the form search and puts them back on the applied
   form. Never grow a second dispatch table — the two would drift and the restored tags would
   land next to the wrong words.
 - `raster.rs`: low-level swash sampling, alpha/source-over blending, glyph drawing,
@@ -139,8 +143,8 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   instead.
 - `glyph_blit.rs`: shared outline-blit helpers (`hash_font_id`,
   `resolve_outline_for_glyph`, `glyph_outline_transform` over a Copy `GlyphBox`) used by the horizontal
-  path (`pipeline.rs`), the vertical path (`layout/vertical.rs`), and the
-  on-path/formula path (`formula/render.rs`) so the outline->world pivot lives in
+  path (`pipeline/`), the vertical path (`layout/vertical.rs`), and the
+  on-path/formula path (`formula/render/`) so the outline->world pivot lives in
   one place.
 - `drawn_lines.rs`: raster layout-line tracing and vector-line path normalization for
   custom line layout modes.
@@ -148,7 +152,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   ink contours, plus the OMNIDIRECTIONAL Euclidean `min_placed_distance` used by the
   on-path advance search as a clearance floor, and `placed_aabb_gap`, the single owner
   of the cheap AABB lower bound in front of it (used both by `min_placed_distance`'s own
-  per-component rejection and by the on-path clearance tests in `formula/render.rs`;
+  per-component rejection and by the on-path clearance tests in `formula/render/`;
   never write a second copy of that formula). The contours themselves are produced by
   `vector::glyph_contour_from_outline`. It does NOT own the pair-gap metric — see
   `pair_gap.rs` and the MEASUREMENT CONTRACT below.
@@ -165,7 +169,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   per glyph WITHOUT freeing capacity and re-zeroes the coverage mask, so buffer
   reuse is byte-identical to a fresh allocation.
   conversion. Wired into the on-path / formula / custom-line composite pass
-  (`formula/render.rs`), the horizontal path (`pipeline.rs`, including the
+  (`formula/render/`), the horizontal path (`pipeline/`, including the
   inline-rotated variant), and the vertical path (`layout/vertical.rs`) via the
   shared `glyph_blit.rs` helpers; only color-glyph fallbacks and bitmap
   measurement/bounds still use `raster.rs` bitmaps.
@@ -185,9 +189,9 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   (`median_of_gaps`, `optical_delta`, `optical_base_advance`), the
   `OpticalContourCache` type, and the simplify-tolerance / min-gap-floor
   constants. Exactly one source of truth for the optical spacing FORMULA, reused
-  by the horizontal path (`pipeline.rs`), the vertical path
+  by the horizontal path (`pipeline/`), the vertical path
   (`layout/vertical.rs`) and the on-path `MinimumPreviousDistance` mode
-  (`formula/render.rs`), which normalizes a line onto `median_of_gaps` of its
+  (`formula/render/`), which normalizes a line onto `median_of_gaps` of its
   straight-reference pairs and clamps each pair through `optical_delta`. The gap
   MEASUREMENT lives in `pair_gap.rs`;
   `OpticalAxis` + `optical_pair_gap` here are only the optical paths' adapter
@@ -208,7 +212,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `StepDirection`), and the four tracking bases (`TrackingBasis`). Also home of
   `KerningSettings` / `effective_spacing_percent` / `single_char_cluster`. The pair
   DECISION lives here; accumulation loops stay with their consumers (the pen in
-  `pipeline.rs`, the formula seeds in `formula/render.rs`, the vertical stack's
+  `pipeline/`, the formula seeds in `formula/render/`, the vertical stack's
   tracking term in `layout/vertical.rs`), and optical normalization and faux growth
   are additive per-path terms on top of a `PairStep`. Never re-implement any part of
   the decision at a call site. Unit-tested in place.
@@ -382,7 +386,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
     - Real ITALIC is the one modification the renderer synthesizes out of thin air, so
       it is the one that has to degrade. When the selected family (or an inline
       `<font=...>` family) ships no italic face, the request is rewritten into FAUX
-      italic at `pipeline::SYNTHESIZED_ITALIC_SLANT_DEG` (12°, the `italicAngle` the
+      italic at `pipeline::faux::SYNTHESIZED_ITALIC_SLANT_DEG` (12°, the `italicAngle` the
       matching real Italic faces declare) — the whole-overlay case by setting
       `faux_italic_slant_deg` on a params copy before anything reads the flags, the
       inline case by rewriting the mapped `InlineStyleSpan`s in place before they feed
@@ -403,8 +407,8 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
       rare glyph in the same text renders as tofu. The request is therefore rewritten
       into FAUX bold at `FauxBoldParams::default()` (the `<b=default>` strength, 3 % of
       the em, uniform `outward_only == false` counters) — the whole-overlay case in
-      `pipeline::synthesized_bold_params`, the
-      inline case in `pipeline::degrade_unavailable_inline_bold` — with one
+      `pipeline::faux::synthesized_bold_params`, the
+      inline case in `pipeline::faux::degrade_unavailable_inline_bold` — with one
       `runtime_log::log_warn` and one user-visible `RenderedTextImage.warnings` entry.
       Loading the family's own Bold FILE, or setting explicit faux bold parameters,
       still wins over the synthesized default. VISIBLE CHANGE this introduced: text
@@ -580,7 +584,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   about the layout centroid and the angle is added to each glyph's own rotation,
   then the canvas grows to the rotated bounds (no clipping). Per mode: horizontal
   routes through `render_horizontal_rotated`; formula/on-path/shape and custom
-  raster/vector lines rotate their `transforms` in `formula/render.rs` (custom
+  raster/vector lines rotate their `transforms` in `formula/render/` (custom
   vector lines drop their fixed canvas and grow while rotated); vertical rotates
   its per-glyph placements in `layout/vertical.rs` (centroid via
   `vertical_layout_centroid`). The rotation matrix (`[cos -sin; sin cos]` on a
@@ -608,9 +612,9 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `PixelBounds::include_point`) so a strong outward warp never clips. Like
   `global_rotation_deg`/`anti_aliasing` it does not affect layout, so it is
   excluded from `TextRenderShapeCompareParams`. It is wired on EVERY layout mode:
-  horizontal (Normal + `render_horizontal_rotated` in `pipeline.rs`), vertical
+  horizontal (Normal + `render_horizontal_rotated` in `pipeline/`), vertical
   (`layout/vertical.rs`), formula/on-path + `Shape` and custom raster/vector lines
-  (`formula/render.rs`). Each path captures its OWN pre-global-rotation content
+  (`formula/render/`). Each path captures its OWN pre-global-rotation content
   box + rotation centroid BEFORE it applies the global rotation, then passes
   `Some(&ctx)` at its `rasterize_outline_into` seam and grows its bounds via
   `for_each_warped_bound_point`; the centroid/angle passed to
@@ -632,7 +636,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   line-based modes `Formula` and `CustomVectorLines`. Because those render
   functions are shared with a HIDE sibling (`Shape` reuses the formula path,
   `CustomRasterLines` reuses the drawn-lines path), the pipeline router
-  (`effective_line_placement_frac` in `pipeline.rs`) is the single gating source:
+  (`effective_line_placement_frac` in `pipeline/`) is the single gating source:
   it feeds the real value only for `Formula`/`CustomVectorLines` and `0.0` for
   every other mode, so a stale panel value cannot leak into a HIDE mode. The
   offset is applied by one shared helper (`formula::render::apply_line_placement`,
@@ -720,7 +724,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `faux_italic_slant_deg: Option<f32>`): synthetic styles applied to the VECTOR
   outline instead of switching faces. They take effect ONLY together with the
   matching `force_bold`/`force_italic` flag; `force_* && faux present` keeps the
-  SELECTED face (no Bold/Italic font matching — `pipeline.rs`
+  SELECTED face (no Bold/Italic font matching — `pipeline/`
   `base_attrs_real_bold_italic`), `force_*` without faux keeps the legacy
   real-face behavior byte-identically. Faux bold offsets the flattened outline
   by the SIGNED `d = thicken_percent/100 * glyph em`, `thicken_percent`
@@ -757,7 +761,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   negative under thinning) — `Fixed`/`Auto`; the trailing glyph's extra is
   folded into the logical `line_width_px` so alignment never overshoots. BOTH
   the pen and that width combine the shaped advance with the faux delta through
-  `pipeline::faux_floored_advance`, which floors the pair at zero IN THE
+  `pipeline::run_layout::faux_floored_advance`, which floors the pair at zero IN THE
   DIRECTION THE RUN ADVANCES (negative for an RTL run, where cosmic-text walks
   the pen leftwards): a thinning delta is up to `-0.20 * em` and would otherwise
   step a zero-advance combining mark — or narrow punctuation — BACKWARDS and
@@ -792,8 +796,8 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   payload); bare `<b>`/`<i>`/valueless machine keys keep the real faces. Faux
   spans EXPLICITLY reset attrs to the SELECTED face's own weight/style
   (`inline_styles.rs`, `FauxFaceBaseline::from_registered_face`, threaded from
-  `pipeline.rs`'s `selected_face` into every `apply_inline_style_to_attrs` call
-  site — rich-text spans, the one `pipeline::wrapped_hyphen_attrs` (wrap hyphen of
+  `pipeline/`'s `selected_face` into every `apply_inline_style_to_attrs` call
+  site — rich-text spans, the one `pipeline::hyphen::wrapped_hyphen_attrs` (wrap hyphen of
   every layout path), and the
   `FormulaRenderRequest`), so a global real bold/italic can never leak under the
   faux geometry. INVARIANT — FAUX NEVER CHANGES FONT MATCHING: a faux span must
@@ -850,9 +854,9 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   shifts the centers by the crop origin, and `effects::apply_effects_pipeline`
   shifts them by the `content_origin_x/y` delta at its single exit (so effect
   order vs trim no longer matters). The contract now covers EVERY layout mode:
-  horizontal Normal + `render_horizontal_rotated` (`pipeline.rs`), vertical
+  horizontal Normal + `render_horizontal_rotated` (`pipeline/`), vertical
   (`layout/vertical.rs`), and formula/on-path + `Shape` + custom raster/vector
-  lines (`formula/render.rs`). The shared accumulator API: build one
+  lines (`formula/render/`). The shared accumulator API: build one
   `ExtraInfoAccumulator::new(params.extra_info)` per render, gate work on
   `is_active()`, call `add_glyph(corners, center, warpable, line_idx)` per drawn glyph AFTER all
   placement transforms (post block/group/global rotation), apply the mesh warp once
@@ -878,12 +882,12 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   their per-glyph box via the shared `extra_info::rotated_box_samples` (scaled box
   half-extents rotated by the glyph's total rotation). Hanging-punctuation exclusion
   applies to every mode whose WRAP actually hangs punctuation: the horizontal paths
-  (`pipeline.rs`, per-glyph inline) and the formula/custom-line paths (`formula/render.rs`,
+  (`pipeline/`, per-glyph inline) and the formula/custom-line paths (`formula/render/`,
   marked once per seed in `collect_formula_glyph_seeds` as `hanging_excluded`). Vertical
   is deliberately EXCLUDED from the exclusion: `VerticalWrapRequest` carries no
   `hanging_punctuation` weight, so nothing hangs there and its centers must not react to
   the setting. The shared predicates (`glyph_is_hanging_punctuation`,
-  `hanging_edge_run_bounds`, `is_edge_run_hanging`) live in `pipeline.rs` next to
+  `hanging_edge_run_bounds`, `is_edge_run_hanging`) live in `pipeline/` next to
   `hanging_metrics_for_layout` so the exclusion and the visual hang always agree on what
   hangs. Both formula render functions accumulate INSIDE their
   `_once` body, so the formula retry loop (`render_margin_pad` growth) naturally
@@ -918,7 +922,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - Custom raster-line layout reads a PNG path from `TextDrawnLinesLayoutParams`; failures
   should be clear errors, not silent fallback to normal text.
 - `TextRenderParams::compare_shape_with` (`TextRenderShapeCompareParams`) is a PRE-RASTER
-  shape comparison: `pipeline.rs` builds the layout text a second time with the compared
+  shape comparison: `pipeline/` builds the layout text a second time with the compared
   width/wrap/shape parameters and, when both line breakings are identical, pushes
   `UNCHANGED_LAYOUT_TEXT_WARNING`; with `cancel_render_if_layout_text_unchanged` it returns an
   empty 0x0 image before shaping. The typing tab's shape-variant preview grid
@@ -962,10 +966,10 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `font_registry::family_has_face_of_requested_weight` (weight). To change how an
   illegal one degrades (today: real italic -> faux italic at
   `SYNTHESIZED_ITALIC_SLANT_DEG`, real bold -> faux bold at
-  `FauxBoldParams::default()` — 3 %, sharp, uniform counters), edit `pipeline::synthesized_italic_slant_deg` /
-  `pipeline::synthesized_bold_params` (whole overlay) and
-  `pipeline::degrade_unavailable_inline_italic` /
-  `pipeline::degrade_unavailable_inline_bold` (inline spans). Any NEW code that
+  `FauxBoldParams::default()` — 3 %, sharp, uniform counters), edit `pipeline::faux::synthesized_italic_slant_deg` /
+  `pipeline::faux::synthesized_bold_params` (whole overlay) and
+  `pipeline::faux::degrade_unavailable_inline_italic` /
+  `pipeline::faux::degrade_unavailable_inline_bold` (inline spans). Any NEW code that
   writes `attrs.style(..)`/`attrs.stretch(..)`/`attrs.weight(..)` with a value it did
   not read off a registered face must go through the matching predicate first.
 - To change WHICH GSUB lookups the ellipsis patch rewrites, how the patched bytes
@@ -980,18 +984,18 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - To change the mean/median extra-info math (hull centroid, median, degenerate
   fallbacks, offset mapping, or the shared `rotated_box_samples` corner geometry),
   edit `extra_info.rs`. To change WHERE it is sampled per layout mode, edit that
-  mode's draw pass (`pipeline.rs` for horizontal Normal/rotated; `layout/vertical.rs`
-  for vertical; `formula/render.rs` for formula/on-path + custom raster/vector
+  mode's draw pass (`pipeline/` for horizontal Normal/rotated; `layout/vertical.rs`
+  for vertical; `formula/render/` for formula/on-path + custom raster/vector
   lines). The trim/effects center-shift seams live in
   `raster::trim_rendered_image_to_alpha_bounds` and
   `effects::apply_effects_pipeline`.
 - To change what a hanging-punctuation STRENGTH does, the sites are: the visual hang
-  (`pipeline.rs`: `hanging_metrics_for_layout` + `HorizontalRunLayout`), the wrap unit
+  (`pipeline/`: `hanging_metrics_for_layout` + `HorizontalRunLayout`), the wrap unit
   model (`ms_text_util::segmentation::count_layout_units` and its `wrap/` callers), the
-  form-search metrics (`wrap/forms.rs`), and the thresholded extra-info exclusion
-  (`pipeline.rs`, `formula/render.rs`). Keep the `0.0`/`1.0` endpoints exact.
+  form-search metrics (`wrap/forms/`), and the thresholded extra-info exclusion
+  (`pipeline/`, `formula/render/`). Keep the `0.0`/`1.0` endpoints exact.
 - To change normal horizontal rendering, glyph scaling, kerning, hanging punctuation,
-  line spacing, shape comparison, or routing, edit `pipeline.rs`. The normal
+  line spacing, shape comparison, or routing, edit `pipeline/`. The normal
   horizontal path is SINGLE-PASS: `horizontal_run_layout` + `get_image` run once per
   glyph, collecting each into a `HorizontalGlyphPlacement`
   (`build_horizontal_placement`) reused for both the bounds box (via
@@ -1068,7 +1072,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
     counterpart (`StepDirection::Magnitude`): its `advance_px` is a magnitude along
     the drawn line, floored positive at every consumer. LINE EXTENT: the pen walks an
     RTL run from its first (rightmost) glyph, so whatever changes the line's length
-    lands on its LEFT end; `pipeline::anchor_rtl_run_at_its_left_edge` shifts the pen
+    lands on its LEFT end; `pipeline::run_layout::anchor_rtl_run_at_its_left_edge` shifts the pen
     back by `min(pen x) - min(shaped x)` (an exact `0.0` when nothing changed), so
     `line_width_px` (`max(x + w)`) is the RTL line's real drawn extent and alignment
     and the wrap follow it. Manual tracking is a distance too: the pen signs it onto
@@ -1087,15 +1091,15 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
     `with_custom_pairs` from `CustomKerningMap::has_table`) makes
     `uses_default_metric_layout` return `false`, which is what keeps both the
     horizontal (`horizontal_run_layout`) and formula
-    (`formula::assign_formula_seed_advances`) byte-identical shaped-position
+    (`formula::render::seeds::assign_formula_seed_advances`) byte-identical shaped-position
     shortcuts from swallowing the overrides.
   - OWNER. `pair_advance.rs` (`PairAdvanceModel::resolve` / `is_overridden`,
     `TrackingBasis`) is the one owner of the pair decision; every site below calls
     it. The recorded matrices (`characterization.rs`) pin the result bit for bit.
-  - SITES. `pipeline::horizontal_run_layout` (metric branch),
-    `pipeline::optical_horizontal_run_layout` (an override wins over the optical
+  - SITES. `pipeline::run_layout::horizontal_run_layout` (metric branch),
+    `pipeline::run_layout::optical_horizontal_run_layout` (an override wins over the optical
     normalization for that one pair; the rest of the run stays optical), and
-    `formula::assign_formula_seed_advances` via `FormulaGlyphSeed::cluster_char`
+    `formula::render::seeds::assign_formula_seed_advances` via `FormulaGlyphSeed::cluster_char`
     (seeds are detached from their `LayoutRun`, so the source character is captured
     at seed time). The on-path `MinimumPreviousDistance` walk consults the table a
     SECOND time, for the same reason the optical branch does: an overridden pair is
@@ -1154,13 +1158,13 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - The optical spacing math (`median_of_gaps`, `optical_delta`,
   `optical_base_advance`, the `OpticalContourCache` type, the simplify tolerance
   and min-gap floor) is axis-agnostic and lives in `optical.rs`. Three paths
-  reuse it — horizontal (`pipeline.rs`), vertical (`layout/vertical.rs`)
-  and on-path `MinimumPreviousDistance` (`formula/render.rs`, whose target is the
+  reuse it — horizontal (`pipeline/`), vertical (`layout/vertical.rs`)
+  and on-path `MinimumPreviousDistance` (`formula/render/`, whose target is the
   median of a line's STRAIGHT-REFERENCE gaps rather than of its on-curve ones, so
   the spacing does not follow the curve's geometry); do not duplicate the
   formula. It is unit-tested in `optical.rs`. KNOWN EXCEPTION, kept on purpose
   (the user declined unifying it): the formula SEED advances under
-  `KerningMode::Optical` (`formula::render::assign_formula_seed_advances`) use
+  `KerningMode::Optical` (`formula::render::seeds::assign_formula_seed_advances`) use
   their own ink-profile heuristic, `optical_horizontal_pair_adjustment`, not
   `optical.rs`.
   MEASUREMENT CONTRACT — read this before writing any code that asks how far apart
@@ -1174,7 +1178,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
     for the two world-aligned axes (horizontal: shared vertical band,
     gap = `cur_left - prev_right`; vertical: shared horizontal band,
     gap = `cur_top - prev_bottom`). No measurement logic lives there.
-  * The THIRD consumer is on-path spacing: `formula/render.rs` measures a
+  * The THIRD consumer is on-path spacing: `formula/render/` measures a
     `MinimumPreviousDistance` pair on the CHORD between the two glyphs' ink
     placement centers (`pair_chord_axis` -> `on_path_pair_gap`). The chord, not
     either glyph's path tangent, because the measure must be symmetric under
@@ -1212,7 +1216,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - To change faux bold/italic, the geometry (signed polyline offset, counter
   compensation, joins, shear) lives in `vector.rs` (`offset_outline`,
   `outline_has_counter`, `GlyphTransform.shear_x`, `FauxOutlineParams`);
-  per-glyph resolution, advances, and bounds pads live in `pipeline.rs`
+  per-glyph resolution, advances, and bounds pads live in `pipeline/`
   (`FauxGlyphStyle`, `faux_style_for_glyph`, `resolve_faux_counter_flag`,
   `faux_advance_extra_px_for_glyph`, `faux_bounds_pads`); the strength range is
   one pair of constants (`types::FAUX_THICKEN_PERCENT_MIN`/`_MAX`) honoured by
@@ -1274,7 +1278,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `MS_TEXT_RENDER_REGEN_CHARACTERIZATION=1 cargo test -p ms-text-render
   recorded_characterization` and names the rows it moved. Without that opt-in the
   tests only read the fixtures. The right-to-left contract they contain is also
-  pinned by name (`*_rtl_*` tests in `pipeline.rs` and `pair_advance.rs`), so a
+  pinned by name (`*_rtl_*` tests in `pipeline/` and `pair_advance.rs`), so a
   regenerated fixture cannot hide a regression there.
 - Add golden or property-style tests for new layout contracts where exact pixels are
   fragile. Use explicit tolerances for floating-point geometry and alpha math.

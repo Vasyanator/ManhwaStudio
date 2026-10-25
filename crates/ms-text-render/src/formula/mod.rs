@@ -12,7 +12,7 @@ Main responsibilities:
 Key modules:
 - `parser.rs` — tokenizer, AST и recursive-descent parser;
 - `eval.rs` — runtime variables, program bundle и curve evaluation helper-ы.
-- `render.rs` — formula glyph seeds, fallback logic и rotated raster path.
+- `render/` — formula glyph seeds, fallback logic и rotated raster path.
 */
 
 mod eval;

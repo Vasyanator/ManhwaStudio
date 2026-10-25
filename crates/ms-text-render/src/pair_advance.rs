@@ -9,7 +9,7 @@ basis each layout path measures manual tracking against.
 
 Contract:
 The pair DECISION lives here; accumulation loops live with their consumers (the horizontal
-pen in `pipeline.rs`, the formula seed advances in `formula/render.rs`, the vertical column
+pen in `pipeline/`, the formula seed advances in `formula/render/`, the vertical column
 stacking in `layout/vertical.rs`). Optical normalization and faux-bold growth are additive
 per-path terms on top of a `PairStep`, never part of it. Every expression is the verbatim
 arithmetic the consumers used before this module existed (bit-exact: pinned by the recorded
@@ -32,7 +32,7 @@ Notes:
 - RIGHT-TO-LEFT: on a run axis every step (override, `Fixed`, and the optical step the pen
   builds through `RunOrientation`) is anchored on the advance of the glyph that physically
   spans it and walks in the run's direction (`RunOrientation`).
-- PRESERVED DIVERGENCE (pinned by a test in `pipeline.rs`): the four tracking bases differ by
+- PRESERVED DIVERGENCE (pinned by a test in `pipeline/`): the four tracking bases differ by
   path (`TrackingBasis`).
 - GUI-free, no I/O, no logging; never panics (a glyph whose font is gone falls back to its
   shaped step).

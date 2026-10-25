@@ -1400,7 +1400,7 @@ mod tests {
     /// A rare Han ideograph must be reachable at the weight the renderer actually
     /// shapes with.
     ///
-    /// This pins the reason `pipeline::synthesized_bold_params` exists. cosmic-text
+    /// This pins the reason `pipeline::faux::synthesized_bold_params` exists. cosmic-text
     /// filters the script and common passes to `font_weight_diff == 0`
     /// (`font/fallback/mod.rs:410-417`) and every rare-plane font in the bundle is a
     /// 400-weight face, so a run shaped at `Weight::BOLD` cannot enter the Han chain
@@ -1435,7 +1435,7 @@ mod tests {
         // unreachable, because the script pass admits only `weight_diff == 0`
         // candidates and the bundle ships no bold rare-plane face. That is exactly
         // why a real bold request on a family without a Bold face is degraded to
-        // faux bold instead of being sent to the shaper (see `pipeline.rs`).
+        // faux bold instead of being sent to the shaper (see `pipeline/`).
         let bold = test_bundle::shaped_glyphs(
             &mut system,
             &text,
@@ -1444,7 +1444,7 @@ mod tests {
         assert!(
             bold.iter().any(|(glyph_id, _)| *glyph_id == 0),
             "the documented residual changed: a real bold weight now reaches the rare-plane \
-             chain ({bold:?}); re-check `pipeline::synthesized_bold_params` and the MODULE_README"
+             chain ({bold:?}); re-check `pipeline::faux::synthesized_bold_params` and the MODULE_README"
         );
     }
 

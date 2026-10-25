@@ -7,7 +7,7 @@ has prepared vertical layout text.
 
 ## Architecture
 `layout::vertical` receives shaped `cosmic-text` runs, inline style spans, line offset
-tables, and render parameters from `pipeline.rs`. It converts vertical layout text into
+tables, and render parameters from `pipeline/`. It converts vertical layout text into
 columns and cells, computes visual column positions and optical vertical spacing, then
 draws each glyph by rasterizing its true font outline (shared `glyph_blit` helpers +
 `vector::rasterize_outline_into`), mirroring the horizontal and on-path render paths.
@@ -67,9 +67,9 @@ trimming, and the color-glyph bitmap blit remain in `raster.rs`.
 - Inputs must come through `VerticalRasterRequest`; do not access typing panel, project,
   canvas, overlay, or storage state from layout code.
 - The request's `layout_text`, `layout_line_offsets`, inline spans, and line spacing
-  table must describe the same normalized text prepared by `pipeline.rs`.
+  table must describe the same normalized text prepared by `pipeline/`.
 - `line_extra_spacing_table` entries are COLUMN GAPS here, not baseline advances. This
-  path therefore takes the plain `pipeline::compute_line_extra_spacing_table` and never
+  path therefore takes the plain `pipeline::line_metrics::compute_line_extra_spacing_table` and never
   `line_baseline_advance_table`, whose grow-only ink-rise room is meaningless for
   a horizontal gap. Since an inline `<stretching>` height span no longer feeds that
   table at all, scaling one character can no longer widen the whole column gap. A
@@ -111,4 +111,4 @@ trimming, and the color-glyph bitmap blit remain in `raster.rs`.
 - To change glyph alpha sampling, blending, scaled glyph drawing, or trimming, edit
   `../raster.rs` and audit horizontal/formula callers too.
 - To add another layout-to-raster mode, add a focused module here and route it from
-  `pipeline.rs` through a typed request struct.
+  `pipeline/` through a typed request struct.

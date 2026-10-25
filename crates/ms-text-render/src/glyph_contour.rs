@@ -186,7 +186,7 @@ impl GlyphContour {
 /// `MODULE_README.md`. What this function is good for is the opposite question:
 /// an omnidirectional clearance floor, i.e. "do these two shapes come closer
 /// than X anywhere", which is what the on-path advance search in
-/// `formula/render.rs` asks.
+/// `formula/render/` asks.
 #[must_use]
 pub fn min_placed_distance(a: &PlacedContour, b: &PlacedContour) -> f32 {
     if a.components.is_empty() || b.components.is_empty() {
@@ -220,7 +220,7 @@ pub fn min_placed_distance(a: &PlacedContour, b: &PlacedContour) -> f32 {
 /// The true minimum distance is never smaller than this, so a pair already
 /// farther apart than some floor by their boxes needs no `O(edges^2)` test:
 /// this is the cheap rejection in front of [`min_placed_distance`] and in front
-/// of the on-path clearance predicates in `formula/render.rs`. Same formula as
+/// of the on-path clearance predicates in `formula/render/`. Same formula as
 /// the per-component rejection [`min_placed_distance`] uses internally, over the
 /// whole-contour boxes instead of per-component ones.
 #[must_use]

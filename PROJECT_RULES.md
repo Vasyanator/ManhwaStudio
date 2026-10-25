@@ -323,22 +323,22 @@ Reformatting is acceptable only once proven inert this way.
 ## File-size calibration (global §2.5)
 
 **Overrides global §2.5 "File size" calibration** (thresholds unchanged, counts are this
-repository's). Measured over `src/` and `crates/` (excluding `target/` and the external
+repository's). Measured 2026-10-25 over `src/` and `crates/` (excluding `target/` and the external
 `egui-large-image`, `egui-shader-layers`, `ag-psd` checkouts and the gitignored `egui` / `winit`
-forks): 35 Rust files exceed 3000 lines and 14 exceed 5000; without the exempt test modules, 33
-and 12 — all of them in `crates/`. Among them `crates/ms-tab-ps-editor/src/lib.rs` (10584),
-`crates/ms-tab-translation/src/tab.rs` (7554) and `crates/ms-text-render/src/pipeline.rs` (8211) —
-why the hard gate needs >5000 lines AND a new responsibility. Scale example: custom kerning took
+forks), after every file over 5000 lines was split into a directory module: 27 Rust files exceed 3000
+lines and 2 exceed 5000; without the exempt test modules, 23 and 0. The largest non-test files are
+`crates/ms-models/src/layer_model/persist.rs` (~4960), `crates/ms-tab-cleaning/src/tools/watermark_entry.rs`
+(~4660) and `crates/ms-installer/src/utils.rs` (~4510) — the next feature that adds a responsibility to
+one of them should split it first. Scale example: custom kerning took
 `src/tabs/settings/typesetting/font_properties_window.rs` from 1230 to 2467 lines in one change —
 nothing should have stopped that one, but the NEXT feature to land there must pause.
-`src/studio.rs` (the editor root, ~2080 lines, under both thresholds) is a hotspot: sequence
+`src/studio.rs` (the editor root, ~1500 lines, under both thresholds) is a hotspot: sequence
 parallel tasks that touch it.
-
 ## Canonical "one decision, many owners" case (global §2.5)
 
 The advance between two adjacent glyphs used to be decided in FIVE places —
-`pipeline::horizontal_run_layout`, `pipeline::optical_horizontal_run_layout`,
-`formula::render::assign_formula_seed_advances`, `wrap::forms::GlyphWidths::build` and
+`pipeline::run_layout::horizontal_run_layout`, `pipeline::run_layout::optical_horizontal_run_layout`,
+`formula::render::seeds::assign_formula_seed_advances`, `wrap::forms::GlyphWidths::build` and
 `wrap::horizontal::WrapScoringContext` (all in `crates/ms-text-render/src/`). User-authored kerning
 pairs therefore had to be implemented five times; a right-to-left direction bug was fixed in two of them
 and reasoned about separately in a third, and the right-to-left anchor itself was wrong everywhere. The two

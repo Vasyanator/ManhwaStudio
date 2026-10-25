@@ -600,7 +600,7 @@ pub fn family_has_matching_face(font_system: &FontSystem, attrs: &Attrs<'_>) -> 
 ///
 /// Both are silent. The renderer therefore asks this before putting `Weight::BOLD`
 /// into the attrs and synthesizes faux bold instead when the answer is `false`
-/// (`pipeline::synthesized_bold_params`).
+/// (`pipeline::faux::synthesized_bold_params`).
 ///
 /// The family condition is required for the same reason as in
 /// [`family_has_matching_face`]: `Attrs::matches` short-circuits to `true` for any
@@ -1062,7 +1062,7 @@ mod tests {
         assert!(
             real_bold.iter().any(|(glyph_id, _)| *glyph_id == 0),
             "the avoided outcome changed: a real bold request now reaches the script chain \
-             ({real_bold:?}); re-check `pipeline::synthesized_bold_params`"
+             ({real_bold:?}); re-check `pipeline::faux::synthesized_bold_params`"
         );
     }
 
