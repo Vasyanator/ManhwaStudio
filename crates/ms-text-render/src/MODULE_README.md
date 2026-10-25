@@ -1057,10 +1057,12 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
     lands on its LEFT end; `pipeline::anchor_rtl_run_at_its_left_edge` shifts the pen
     back by `min(pen x) - min(shaped x)` (an exact `0.0` when nothing changed), so
     `line_width_px` (`max(x + w)`) is the RTL line's real drawn extent and alignment
-    and the wrap follow it. NOT direction-aware (known, open): the pen's tracking
-    basis (`TrackingBasis::HorizontalPen` floors `|step|` at `prev.w`), and manual
-    tracking itself, which is added as a positive x step even on a leftward RTL run
-    (positive tracking narrows RTL text).
+    and the wrap follow it. Manual tracking is a distance too: the pen signs it onto
+    the run axis (`RunOrientation::sign`), so positive tracking spreads an RTL run and
+    negative tracking tightens it, as left-to-right; the form metric adds it to the
+    step's magnitude, which is the same thing. NOT direction-aware (kept, see
+    `TrackingBasis`): the pen's percent-tracking basis floors `|step|` at `prev.w`
+    in both directions.
   - GUARDS (conservative on purpose; do not "simplify" them away). A pair applies
     only when both glyphs come from the SAME face (`font_id`) — a pair across a
     font-fallback boundary belongs to no typeface's design — that face carries a

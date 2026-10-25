@@ -2581,12 +2581,16 @@ fn horizontal_run_layout(
         // glyph's own advance cannot step the pen backwards. Manual tracking stays
         // OUTSIDE the floor: a negative letter-spacing is an explicit request for
         // overlap.
-        let faux_extra = match RunOrientation::of_step(metric_advance, prev) {
+        let orientation = RunOrientation::of_step(metric_advance, prev);
+        let faux_extra = match orientation {
             RunOrientation::LeftToRight => faux_extras[idx - 1],
             RunOrientation::RightToLeft => -faux_extras[idx],
         };
         let effective_advance = faux_floored_advance(base_advance, faux_extra);
-        current_x += effective_advance + pair_kerning.tracking_px(tracking_basis);
+        // Manual tracking is a DISTANCE between the two glyphs, signed onto the run axis
+        // like every other part of the step: positive tracking spreads a right-to-left
+        // run too (an unsigned `+` would walk its leftward pen back and tighten it).
+        current_x += effective_advance + orientation.sign(pair_kerning.tracking_px(tracking_basis));
         glyph_xs.push(current_x);
     }
 
@@ -2839,7 +2843,10 @@ fn optical_horizontal_run_layout(
                 )
             }
         };
-        current_x += step + glyph_kernings[idx].tracking_px(tracking_basis);
+        // Tracking signed onto the run axis exactly as on the metric branch.
+        let tracking = RunOrientation::of_step(metric_advance, prev)
+            .sign(glyph_kernings[idx].tracking_px(tracking_basis));
+        current_x += step + tracking;
         glyph_xs.push(current_x);
     }
 
@@ -8431,6 +8438,37 @@ mod tests {
         }
     }
 
+    /// Manual tracking is a distance between letters in BOTH directions: positive tracking
+    /// spreads a right-to-left run (every leftward step grows by exactly the tracking px)
+    /// and negative tracking tightens it, as left-to-right.
+    #[test]
+    fn tracking_spreads_and_tightens_an_rtl_run_like_an_ltr_run() {
+        use crate::characterization::TrackedFont;
+
+        const RTL_TEXT: &str = "\u{05D0}\u{05D1}\u{05D2}";
+        let mut hebrew = TrackedFont::Hebrew.load();
+        let mut params = base_params();
+        params.text = RTL_TEXT.to_string();
+        params.font_size_px = 100.0;
+        let (plain_xs, plain_width) = tracked_font_run_layout(&mut hebrew, RTL_TEXT, &params, &[]);
+        for tracking in [5.0f32, -4.0] {
+            params.kerning_px = tracking;
+            let (xs, width) = tracked_font_run_layout(&mut hebrew, RTL_TEXT, &params, &[]);
+            for idx in 1..xs.len() {
+                let plain_step = plain_xs[idx - 1] - plain_xs[idx];
+                let step = xs[idx - 1] - xs[idx];
+                assert!(
+                    (step - plain_step - tracking).abs() < 1e-3,
+                    "tracking {tracking}: leftward step {idx} must grow by it: {xs:?} vs {plain_xs:?}"
+                );
+            }
+            assert!(
+                (width - plain_width - 2.0 * tracking).abs() < 1e-3,
+                "tracking {tracking}: the line's extent grows by it per step: {width} vs {plain_width}"
+            );
+        }
+    }
+
     /// A RIGHT-TO-LEFT LINE IS ALIGNED BY ITS REAL DRAWN EXTENT. When the pen changes an
     /// RTL line's length (a tightening or widening override, `Fixed`, `Optical`, faux
     /// bold, tracking), the change lands on the line's LEFT end; the left end must stay
@@ -8669,9 +8707,8 @@ mod tests {
 
     /// The form metric sums to the pen's width on a RIGHT-TO-LEFT line too, now that an
     /// RTL line's width is its drawn extent: `Auto` and `Fixed`, with tightening and
-    /// widening overrides. Manual tracking is left out: the pen currently adds tracking
-    /// as a POSITIVE x step even on a leftward RTL run (it narrows the line), a separate
-    /// defect the metric does not reproduce.
+    /// widening overrides, and with manual tracking in px and percent (signed onto the run
+    /// axis by the pen, added to the step's magnitude by the metric).
     #[test]
     fn the_form_metric_sums_to_the_pen_width_on_an_rtl_line() {
         use crate::characterization::TrackedFont;
@@ -8691,11 +8728,14 @@ mod tests {
         ];
         let mut hebrew = TrackedFont::Hebrew.load();
         for mode in [KerningMode::Auto, KerningMode::Fixed] {
+            for (kerning_px, kerning_percent) in [(0.0, 0.0), (35.0, 0.0), (0.0, -20.0), (60.0, 15.0)] {
             for pairs in tables {
                 let mut params = base_params();
                 params.text = TEXT.to_string();
                 params.font_size_px = EM;
                 params.kerning_mode = mode;
+                params.kerning_px = kerning_px;
+                params.kerning_percent = kerning_percent;
                 let (xs, pen_width) = tracked_font_run_layout(&mut hebrew, TEXT, &params, pairs);
                 let mut map = CustomKerningMap::default();
                 if !pairs.is_empty() {
@@ -8715,13 +8755,15 @@ mod tests {
                     0.0,
                     DEFAULT_WIDTH_TOLERANCE,
                     InlineTagScope::NoBreakOnly,
-                    MetricKerning::new(&map, mode, 0.0, 0.0, EM, 100.0),
+                    MetricKerning::new(&map, mode, kerning_px, kerning_percent, EM, 100.0),
                 );
                 let metric_width = metric.line_width(TEXT) as f32;
                 assert!(
                     (metric_width - pen_width).abs() <= xs.len() as f32,
-                    "{mode:?} table {pairs:?}: metric {metric_width} vs pen {pen_width} (xs {xs:?})"
+                    "{mode:?} tracking ({kerning_px}, {kerning_percent}%) table {pairs:?}: metric \
+                     {metric_width} vs pen {pen_width} (xs {xs:?})"
                 );
+            }
             }
         }
     }

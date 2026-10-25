@@ -455,6 +455,16 @@ fn kern_cases() -> Vec<KernCase> {
     });
     // Faux bold on the same right-to-left text: each step grows by the spanning glyph's
     // faux extra, signed onto the run axis (the pair widens, as left-to-right).
+    // Manual tracking on the same right-to-left text: +6 px spreads every pair, as it does
+    // left-to-right (the pen signs tracking onto the run axis).
+    let mut tracking_rtl = rtl.clone();
+    tracking_rtl.kerning_px = 6.0;
+    cases.push(KernCase {
+        name: "tracking_px_rtl",
+        params: tracking_rtl,
+        font: TrackedFont::NotoSansHebrew,
+        pairs: &[],
+    });
     let mut faux_rtl = rtl;
     faux_rtl.force_bold = true;
     faux_rtl.faux_bold = Some(FauxBoldParams {

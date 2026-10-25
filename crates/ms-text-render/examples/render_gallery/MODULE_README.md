@@ -31,7 +31,8 @@ links it (`ms_text_render::render_text_to_image` + `::types::*`). It needs no
   `FontContent`. They pin the advance between two adjacent glyphs: overrides under every
   mode, right-to-left steps anchored on the spanning (visually left) glyph for an
   override (`kern_override_rtl`), un-overridden `Fixed` (`kern_fixed_rtl`), `Optical`
-  (`kern_optical_rtl`) and faux-bold growth (`kern_faux_rtl`), overrides on
+  (`kern_optical_rtl`), faux-bold growth (`kern_faux_rtl`) and manual tracking
+  (`tracking_px_rtl`), overrides on
   formula seeds, an override at a line break (`kern_override_wrap`, a box the text fits
   only through its overrides, see `KERN_WRAP_WIDTH_PX`), and manual tracking on the pen,
   formula and vertical paths, including tracking that decides line breaks
