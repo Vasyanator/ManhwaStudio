@@ -318,11 +318,18 @@ class DeferredTransport(FakeTransport):
         return event
 
     def _flush(self, upto: int) -> None:
+        """Run every queued SIDE copy with sequence <= `upto`; on return they are all done.
+
+        The copies run under the lock: the reader thread's `synchronize` and
+        the main thread's `wait(MAIN, copied)` flush concurrently, and a flush
+        that dequeued the copies but had not run them yet would let the other
+        caller return over stale slot bytes (the S-093 flake).
+        """
         with self.lock:
             ready = [item for item in self._queue if item[0] <= upto]
             self._queue = [item for item in self._queue if item[0] > upto]
-        for _, dst, src in ready:
-            dst.copy_(src)
+            for _, dst, src in ready:
+                dst.copy_(src)
 
     def wait(self, stream: Stream, event: Any) -> None:
         super().wait(stream, event)
