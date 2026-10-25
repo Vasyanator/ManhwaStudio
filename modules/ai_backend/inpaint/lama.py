@@ -453,7 +453,9 @@ class LamaInpaintService:
                     if decoded.ndim == 3 and decoded.shape[2] == 4:
                         return np.ascontiguousarray(cv2.cvtColor(decoded, cv2.COLOR_BGRA2RGB))
             except Exception:
-                pass
+                # PIL reads formats and layouts cv2 rejects, so the decode
+                # falls through to it; the cv2 failure is still recorded.
+                log.warning("LaMa: cv2 could not decode the input image (%d bytes); falling back to PIL", len(image_bytes), exc_info=True)
 
         from PIL import Image
 
@@ -520,7 +522,9 @@ def _decode_image_any(image_bytes: bytes) -> np.ndarray:
             if decoded is not None:
                 return decoded
         except Exception:
-            pass
+            # As in `_decode_image_rgb`: PIL gets the bytes next, the cv2
+            # failure is logged rather than dropped.
+            log.warning("LaMa: cv2 could not decode the mask/image (%d bytes); falling back to PIL", len(image_bytes), exc_info=True)
 
     from PIL import Image
 

@@ -536,9 +536,14 @@ class RuntimeFactory:
 
 
 class PaddleOnnxRuntime:
+    """Stateless PP-OCR pipeline over the shared `RuntimeFactory` session cache.
+
+    Holds no lock of its own: sessions are leased per call (`det_session` /
+    `recognition_sessions`) and the calling service serializes inference.
+    """
+
     def __init__(self, factory: RuntimeFactory) -> None:
         self._factory = factory
-        self._lock = threading.Lock()
 
     @staticmethod
     def _det_provider_settings(settings: ProviderSettings) -> ProviderSettings:

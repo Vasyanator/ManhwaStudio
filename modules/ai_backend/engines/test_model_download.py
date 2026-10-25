@@ -17,14 +17,15 @@ Main responsibilities:
 - verify `download_to_path`'s resume is OPT-IN: its default failure path still
   unlinks and parks nothing, while a resumable transfer parks the partial under
   the stable `.part` name, claims it back by an atomic rename that only one owner
-  can win, and never inherits a stale pid-scoped leftover;
+  can win, adopts the longest partial a crashed (dead-pid) transfer left and
+  deletes the shorter ones, and never touches a running process's staging;
 - verify `download_http_to_path` sends caller headers on every hop, follows an
   interstitial INSIDE each attempt (a retry repeats the confirm step and resumes
   with `Range`), refuses a follow loop, propagates a follow refusal, deletes
   bytes its `verify` rejected, and with an unknown size trusts `Content-Length`;
 - verify `fetch_small_body` retries transient failures (including a short body),
   gives up after the budget, never retries a permanent status, refuses a body
-  over its ceiling and stops on cancel during a backoff wait;
+  over its ceiling and stops on cancel during a backoff wait or a stalled read;
 - verify `download_bearer_to_path` builds the `Authorization: Bearer` header from
   the token it is GIVEN (none for an empty token) with split `(15, 60)` timeouts;
   treats a destination as present only at the expected size; retries connect
@@ -900,6 +901,27 @@ class FetchSmallBodyTests(unittest.TestCase):
         kwargs.update(overrides)
         return md.fetch_small_body("https://example/catalog", **kwargs)
 
+    def test_a_cancel_interrupts_a_read_stalled_mid_body(self) -> None:
+        response = _StallingResponse(self.BODY, total=4096)
+        cancel = threading.Event()
+
+        def cancel_once_stalled() -> None:
+            if response.stalled.wait(10):
+                cancel.set()
+
+        trigger = threading.Thread(target=cancel_once_stalled)
+        trigger.start()
+        started = time.monotonic()
+        try:
+            with self.assertRaises(md.DownloadCancelled):
+                self._fetch(lambda _url, **_kwargs: response, should_cancel=cancel.is_set)
+        finally:
+            trigger.join()
+
+        self.assertTrue(response.sock.shut_down)
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertEqual(self.retries, [])
+
     def test_a_transient_failure_is_retried_and_the_body_returned(self) -> None:
         import requests
 
@@ -960,16 +982,61 @@ class StagingHelperTests(unittest.TestCase):
         self.dest.parent.mkdir(parents=True, exist_ok=True)
         parked.write_bytes(b"partial")
 
-        md._claim_staged_bytes(staging, parked)
+        md._claim_staged_bytes(self.dest, staging, parked)
         self.assertEqual(staging.read_bytes(), b"partial")
         self.assertFalse(parked.exists())
 
-        # A second claimant finds nothing and is left with no staging file at
-        # all, rather than inheriting bytes it has no claim to.
+        # A second process (pid 999999) cannot take our staging — its owner is
+        # running — and keeps only the leftover under its OWN name, which a
+        # crashed process sharing that pid wrote: it resumes that one.
         other = self.dest.with_name(self.dest.name + ".999999.part")
-        other.write_bytes(b"stale leftover")
-        md._claim_staged_bytes(other, parked)
-        self.assertFalse(other.exists())
+        other.write_bytes(b"crash leftover")
+        with patch.object(md.os, "getpid", lambda: 999999), patch.object(md, "_pid_alive", lambda _pid: True):
+            md._claim_staged_bytes(self.dest, other, parked)
+        self.assertEqual(other.read_bytes(), b"crash leftover")
+        self.assertEqual(staging.read_bytes(), b"partial")
+
+    def test_the_longest_crashed_partial_is_adopted_and_the_rest_deleted(self) -> None:
+        self.dest.parent.mkdir(parents=True, exist_ok=True)
+        staging = md.staging_path(self.dest)
+        parked = md.resumable_staging_path(self.dest)
+        parked.write_bytes(b"ab")
+        dead_long = self.dest.with_name(f"{self.dest.name}.111111.part")
+        dead_long.write_bytes(b"abcdef")
+        dead_short = self.dest.with_name(f"{self.dest.name}.111112.part")
+        dead_short.write_bytes(b"abc")
+        live = self.dest.with_name(f"{self.dest.name}.222222.part")
+        live.write_bytes(b"abcdefgh")
+        unknown = self.dest.with_name(f"{self.dest.name}.333333.part")
+        unknown.write_bytes(b"abcdefghij")
+        liveness = {111111: False, 111112: False, 222222: True, 333333: None}
+
+        with patch.object(md, "_pid_alive", liveness.__getitem__):
+            md._claim_staged_bytes(self.dest, staging, parked)
+
+        self.assertEqual(staging.read_bytes(), b"abcdef")
+        for gone in (parked, dead_long, dead_short):
+            self.assertFalse(gone.exists(), gone.name)
+        # A running (or unknown) process may still be writing its file.
+        self.assertEqual(live.read_bytes(), b"abcdefgh")
+        self.assertEqual(unknown.read_bytes(), b"abcdefghij")
+
+    def test_a_transfer_resumes_a_crashed_process_partial_with_range(self) -> None:
+        payload = bytes(range(256)) * 4
+        self.dest.parent.mkdir(parents=True, exist_ok=True)
+        orphan = self.dest.with_name(f"{self.dest.name}.111111.part")
+        orphan.write_bytes(payload[:300])
+        get = _ScriptedGet([_partial(payload[300:], start=300, total=len(payload))])
+
+        with patch.object(md, "_pid_alive", lambda pid: False if pid == 111111 else None):
+            md.download_http_to_path(
+                "https://example/x", self.dest, expected_size=len(payload),
+                on_progress=lambda _done, _total: None, get=get, sleep=lambda _s: None,
+            )
+
+        self.assertEqual(get.ranges, ["bytes=300-"])
+        self.assertEqual(self.dest.read_bytes(), payload)
+        self.assertFalse(orphan.exists())
 
     def test_stale_restart_files_are_swept_only_when_no_live_process_owns_them(self) -> None:
         self.dest.parent.mkdir(parents=True, exist_ok=True)

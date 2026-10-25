@@ -339,6 +339,29 @@ class SuryaPredictorLoadTests(unittest.TestCase):
             ],
         )
 
+    def test_a_failed_load_on_another_device_leaves_nothing_resident(self) -> None:
+        # Pins the invariant "a detector is loaded only while `_device` is set":
+        # a failed recognition load must not strand a detector that no eviction
+        # callback can reach any more (`_unload_detector_key` needs `_device`).
+        self._load_recognition("cuda:0")
+        self._load_detection("cuda:0")
+        unloaded = self._record_unloaded()
+        self.fail_construction = True
+
+        with self.assertRaises(RuntimeError):
+            self._load_recognition("cpu")
+
+        self.assertIsNone(self.service._detection_predictor)
+        self.assertIsNone(self.service._recognition_predictor)
+        self.assertIsNone(self.service._device)
+        self.assertEqual(
+            unloaded,
+            [
+                service_module.SuryaOcrService._foundation_model_key("cuda:0"),
+                service_module.SuryaOcrService._detector_model_key("cuda:0"),
+            ],
+        )
+
     def test_a_directory_change_reports_the_detector_and_keeps_the_reloaded_key(self) -> None:
         self._load_recognition()
         self._load_detection()

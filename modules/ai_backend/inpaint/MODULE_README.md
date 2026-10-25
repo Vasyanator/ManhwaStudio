@@ -102,6 +102,7 @@ Every service follows the same shape and is safe to copy from when adding anothe
   `begin_model_use` (reuses `test_lease_protocol.py`'s case builders, temp checkpoint files).
 - `test_health_during_load.py`: `health()` answers while AOT's lock section loads and infers, and
   reflects loading -> ready and a load error (stubbed load and inference, no torch).
+- `test_lama_decode.py`: LaMa's cv2 decode failure is logged and falls back to PIL (stub cv2).
 - `test_sdxl.py`, `test_flux_fill.py`, `test_flux2_download.py` (also covers `hf_gated_download.py`), `test_lease_protocol.py`
   (`flux2_klein/`'s and `flux3_klein/`'s tests run real torch on the CPU, see their readmes):
   pure-Python

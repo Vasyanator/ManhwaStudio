@@ -100,9 +100,13 @@ for cv2/onnxruntime at startup.
   bytes of a FAILED transfer.** By default they are unlinked. With `resumable=True` a failure renames them to a stable `<name>.part` and the next run
   renames that back into its own pid-scoped staging file. The RENAME is the claim, and it is what
   preserves the pid scoping: a parked partial has exactly one owner at a time, and of two processes
-  racing for it one wins and the other simply starts from zero. A missing parked file makes the
-  claim REMOVE any pid-scoped leftover rather than resume it: such a file can only come from a
-  crashed process that shared our pid. Its `present` predicate (default: non-empty) decides
+  racing for it one wins and the other simply starts from zero. A crash cannot park, so the claim
+  also considers pid-scoped staging files of `dest` whose process is gone (our own pid — we hold
+  the lock and have written nothing yet — or a pid psutil proves dead; a running or unknown pid is
+  left alone): the LONGEST candidate is renamed into our staging and the shorter ones are deleted.
+  The adopted bytes pass the same size / `Range` / sha256 gates as a parked partial. Residual: a
+  sibling destination named `<name>.<digits>` would have its parked file mistaken for an orphan;
+  every caller's names end in an extension. Its `present` predicate (default: non-empty) decides
   whether a destination counts as already downloaded.
 - **`download_http_to_path` (and `download_bearer_to_path` over it) always resumes and is the
   network contract.** Transient = `requests`

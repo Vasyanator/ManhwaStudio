@@ -203,7 +203,9 @@ def download_to_path(
       `fetch`'s job to look, because only it knows whether the transport can
       resume at all. The rename is what keeps the pid-scoped name meaningful: a
       partial file has exactly one owner at a time, and a second process whose
-      rename loses the race simply starts from zero.
+      rename loses the race simply starts from zero. The staging file of a
+      process that crashed (its pid is gone) is a candidate too; the longest
+      candidate is claimed and the others deleted (`_claim_staged_bytes`).
 
     # Errors
     Propagates whatever `fetch` or `verify` raised, and `OSError` when the
@@ -223,7 +225,7 @@ def download_to_path(
         staging = staging_path(dest)
         stable = resumable_staging_path(dest)
         if resumable:
-            _claim_staged_bytes(staging, stable)
+            _claim_staged_bytes(dest, staging, stable)
         published = False
         try:
             fetch(staging)
@@ -240,27 +242,83 @@ def download_to_path(
     return True
 
 
-def _claim_staged_bytes(staging: Path, stable: Path) -> None:
-    """Take ownership of a parked partial file, if there is one.
+def _claim_staged_bytes(dest: Path, staging: Path, stable: Path) -> None:
+    """Take ownership of the longest partial left for `dest`, if there is one.
 
-    The rename is the claim: it is atomic, so of two processes racing for the
-    same parked file exactly one gets it and the other sees `FileNotFoundError`
-    and starts from zero. Nothing is shared and nothing is locked across
-    processes.
-
-    When there is nothing parked, any leftover pid-scoped staging file is
-    REMOVED rather than resumed: it can only come from a process that crashed and
-    happened to share our pid, so its bytes have no established relationship to
-    this destination.
+    Candidates: the parked `stable` file, and pid-scoped staging files of `dest`
+    whose process is gone (`_orphaned_staging_files`: a crash cannot park, so
+    without this an interrupted run would never resume). The longest one is
+    renamed into this process's `staging`; the rename is the claim, so of two
+    processes racing for one file exactly one gets it and the other falls back
+    to the next candidate or starts from zero. The remaining candidates are
+    shorter partials of the same file and are deleted. Correctness never rests
+    on the adopted bytes: the transfer's size / `Range` / sha256 gates check
+    them like any parked partial. Runs under `dest`'s download lock.
     """
+    candidates: list[tuple[int, Path]] = []
+    for path in [stable, *_orphaned_staging_files(dest)]:
+        try:
+            candidates.append((int(path.stat().st_size), path))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            log.warning("model download: could not inspect the staged file %s: %s", path, exc)
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    adopted: Path | None = None
+    for size, path in candidates:
+        if path == staging:
+            adopted = path
+            break
+        try:
+            os.replace(path, staging)
+        except FileNotFoundError:
+            # Another process claimed it first: try the next candidate.
+            continue
+        except OSError as exc:
+            log.warning("model download: could not claim the staged file %s: %s", path, exc)
+            continue
+        if path != stable:
+            log.info("model download: resuming %s from %d bytes left by a crashed transfer (%s)", dest.name, size, path.name)
+        adopted = path
+        break
+    for _size, path in candidates:
+        if path != adopted and path != staging:
+            _unlink_quietly(path)
+    if adopted is None:
+        # Nothing claimable: a stale file under our own name (an unreadable
+        # one) must not be appended to.
+        _unlink_quietly(staging)
+
+
+def _orphaned_staging_files(dest: Path) -> list[Path]:
+    """`staging_path`-named files of `dest` whose writer is gone.
+
+    Our own pid's file is one (we hold `dest`'s download lock and have not
+    started writing, so it is a leftover of a crashed process that shared our
+    pid); another pid's file is one only when `_pid_alive` proves that process
+    gone — a running one (or an unknown) may be mid-transfer and is left alone.
+    Residual: a sibling destination named `<dest name>.<digits>` would make its
+    parked `.part` look like an orphan here; every caller's file names end in
+    an extension, and pinned files are also sha256-checked.
+    """
+    pattern = re.compile(re.escape(dest.name) + r"\.(\d+)\.part")
     try:
-        os.replace(stable, staging)
-        return
+        entries = list(os.scandir(dest.parent))
     except FileNotFoundError:
-        pass
+        return []
     except OSError as exc:
-        log.warning("model download: could not claim the staged file %s: %s", stable, exc)
-    _unlink_quietly(staging)
+        log.warning("model download: could not list %s for crashed partial downloads: %s", dest.parent, exc)
+        return []
+    own_pid = os.getpid()
+    orphans: list[Path] = []
+    for entry in entries:
+        match = pattern.fullmatch(entry.name)
+        if match is None:
+            continue
+        pid = int(match.group(1))
+        if pid == own_pid or _pid_alive(pid) is False:
+            orphans.append(Path(entry.path))
+    return orphans
 
 
 def _park_staged_bytes(staging: Path, stable: Path) -> None:
@@ -710,7 +768,8 @@ def fetch_small_body(
     `requests.HTTPError` for a permanent non-2xx status; `RetriesExhaustedError` after
     `retry.max_retries` consecutive transient failures; `DownloadError` for a body over
     `max_bytes`; `DownloadCancelled` when `should_cancel()` answers true (polled per chunk and
-    during backoff waits).
+    during backoff waits; while the body streams `_CancelWatch` also shuts a stalled socket
+    down, so `should_cancel` must be thread-safe, as for `download_http_to_path`).
     """
     fetch_get = get if get is not None else _default_get
     fetch_sleep = sleep if sleep is not None else _default_sleep
@@ -721,9 +780,11 @@ def fetch_small_body(
         try:
             return _small_body_attempt(
                 url, label, headers=dict(headers or {}), max_bytes=max_bytes,
-                should_cancel=should_cancel, get=fetch_get,
+                should_cancel=should_cancel, get=fetch_get, cancel_poll_s=retry.cancel_poll_s,
             )
         except transient as exc:
+            # A body broken by the cancel watcher is the cancel, not a retry.
+            _raise_if_cancelled(should_cancel, label, cause=exc)
             failures += 1
             reason = _describe_transient(exc)
             if failures > retry.max_retries:
@@ -753,8 +814,11 @@ def _small_body_attempt(
     max_bytes: int,
     should_cancel: Callable[[], bool] | None,
     get: GetFn,
+    cancel_poll_s: float,
 ) -> bytes:
     """One GET of `fetch_small_body`; returns the complete body.
+
+    The body streams under `_CancelWatch` (`cancel_poll_s` between its polls).
 
     # Errors
     `_TransientStatus` / `_ShortBody` (retried by the caller), `requests.HTTPError`,
@@ -773,14 +837,15 @@ def _small_body_attempt(
         response.raise_for_status()
         announced = _content_length(response)
         body = bytearray()
-        for chunk in response.iter_content(chunk_size=1 << 16):
-            if not chunk:
-                continue
-            body.extend(chunk)
-            if len(body) > max_bytes:
-                log.error("model download: %s exceeds %d bytes; refusing it", label, max_bytes)
-                raise DownloadError(f"Ответ слишком большой: {label} (больше {max_bytes} Б).")
-            _raise_if_cancelled(should_cancel, label)
+        with _CancelWatch(response, should_cancel, cancel_poll_s, label):
+            for chunk in _chunks_or_cancel(response, 1 << 16, should_cancel, label):
+                if not chunk:
+                    continue
+                body.extend(chunk)
+                if len(body) > max_bytes:
+                    log.error("model download: %s exceeds %d bytes; refusing it", label, max_bytes)
+                    raise DownloadError(f"Ответ слишком большой: {label} (больше {max_bytes} Б).")
+                _raise_if_cancelled(should_cancel, label)
     if announced and len(body) < announced:
         raise _ShortBody(len(body), announced)
     return bytes(body)
