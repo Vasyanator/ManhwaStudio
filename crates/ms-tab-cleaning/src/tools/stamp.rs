@@ -41,14 +41,19 @@ FILE HEADER (cleaning/tools/stamp.rs)
     с Photoshop-like смещением и опциональным поворотом.
   - На панели инструмента показывается статус, когда кэш источника текущей страницы ещё грузится.
   - Во время штриха используется локальный scratch-буфер и коммит в модель только в конце штриха.
+  - Stroke preview (English): `draw_stroke_preview` paints the live scratch and the RETIRING
+    preview of the last committed stroke every frame, independent of the pointer, over the
+    page's current rect; `overlay_suppressed_pages` / `release_settled_preview` follow
+    `base::RetiringPreview`. `draw_cursor` paints the markers and the cursor only.
   - Если сторона scratch-превью больше safe-порога (`16k`), инструмент не создаёт giant texture в `egui`,
     а показывает превью инкрементально через `replace_overlay_region_local`, обходя лимит texture size.
 - Потоки:
   - Отдельный worker декодирует alt-страницу в `RgbaImage` и отправляет результат через channel.
 */
 use super::base::{
-    BrushToolBase, CleaningCursorOccluder, CleaningTool, StrokePoint, extract_overlay_chunk,
-    overlay_pixel_for_final_color, overlay_pos_to_scene_pos, overlay_rect_to_scene_rect,
+    BrushToolBase, CleaningCursorOccluder, CleaningTool, RetiringPageFacts, RetiringPreview,
+    StrokePoint, drop_retiring_preview_of_page, extract_overlay_chunk, overlay_pixel_for_final_color, overlay_pos_to_scene_pos,
+    overlay_rect_to_scene_rect, preview_pages, preview_scene_rect, release_retiring_preview,
     scene_pos_to_overlay_pos,
 };
 use crate::input::{self, CleaningLabels};
@@ -159,9 +164,14 @@ struct StampAnchor {
     overlay_xy: [f32; 2],
 }
 
+/// The live stamp stroke: the visible part of its page's overlay (`base_image`) and the same
+/// pixels with the stroke painted in (`image`), previewed as one texture unless
+/// `preview_into_canvas` writes the preview straight into the canvas overlay instead.
 struct StampScratch {
     page_idx: usize,
     overlay_rect: OverlayRectPx,
+    /// Where `overlay_rect` was on screen when the stroke began; the commit writes through it.
+    /// The preview is drawn over the CURRENT rect (`base::preview_scene_rect`) instead.
     scene_rect: Rect,
     base_image: egui::ColorImage,
     image: egui::ColorImage,
@@ -188,6 +198,9 @@ pub struct StampTool {
     rect_current: Option<StrokePoint>,
     rect_erase: bool,
     scratch: Option<StampScratch>,
+    /// The last committed (texture-previewed) stroke, still standing in for its page's overlay
+    /// (`base::RetiringPreview`).
+    retiring: Option<RetiringPreview<StampScratch>>,
     active_source: Option<Arc<RgbaImage>>,
     active_erase: bool,
     last_stroke_point: Option<StrokePoint>,
@@ -267,6 +280,7 @@ impl Default for StampTool {
             rect_current: None,
             rect_erase: false,
             scratch: None,
+            retiring: None,
             active_source: None,
             active_erase: false,
             last_stroke_point: None,
@@ -676,6 +690,7 @@ impl StampTool {
         let preview_into_canvas = image.size[0] > STAMP_SCRATCH_TEXTURE_SIDE_LIMIT
             || image.size[1] > STAMP_SCRATCH_TEXTURE_SIDE_LIMIT;
 
+        drop_retiring_preview_of_page(&mut self.retiring, point.page_idx);
         self.scratch = Some(StampScratch {
             page_idx: point.page_idx,
             overlay_rect: expanded_rect,
@@ -815,43 +830,13 @@ impl StampTool {
         let _ = canvas.replace_overlay_region_local(scratch.page_idx, scene_rect, &patch);
     }
 
+    /// Paints the retiring preview and the live scratch (unless it previews into the canvas),
+    /// each over its page's current rect.
     fn draw_scratch_preview(&mut self, ui: &mut egui::Ui, canvas: &CanvasView) {
-        let Some(scratch) = self.scratch.as_mut() else {
-            return;
-        };
-        if scratch.preview_into_canvas {
-            return;
+        let retiring = self.retiring.as_mut().map(RetiringPreview::preview_mut);
+        for scratch in retiring.into_iter().chain(self.scratch.as_mut()) {
+            draw_stamp_scratch(scratch, ui, canvas);
         }
-        let texture_options = if canvas.pixel_sampling_nearest() {
-            TextureOptions::NEAREST
-        } else {
-            STAMP_PREVIEW_TEXTURE_OPTIONS
-        };
-        if scratch.texture.is_none() {
-            let texture = ui.ctx().load_texture(
-                "cleaning-stamp-scratch-preview",
-                scratch.image.clone(),
-                texture_options,
-            );
-            scratch.texture = Some(texture);
-            scratch.texture_options = texture_options;
-            scratch.texture_dirty = false;
-        } else if scratch.texture_dirty || scratch.texture_options != texture_options {
-            if let Some(texture) = scratch.texture.as_mut() {
-                texture.set(scratch.image.clone(), texture_options);
-            }
-            scratch.texture_options = texture_options;
-            scratch.texture_dirty = false;
-        }
-        let Some(texture) = scratch.texture.as_ref() else {
-            return;
-        };
-        ui.painter().image(
-            texture.id(),
-            scratch.scene_rect,
-            Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
     }
 
     fn finish_active_stroke(&mut self, canvas: &mut CanvasView) {
@@ -860,14 +845,16 @@ impl StampTool {
             return;
         };
         if scratch.painted {
-            if !scratch.preview_into_canvas {
-                let _ = canvas.replace_overlay_region_local(
-                    scratch.page_idx,
-                    scratch.scene_rect,
-                    &scratch.image,
-                );
+            let page_idx = scratch.page_idx;
+            self.touched_pages.insert(page_idx);
+            // A texture-previewed stroke keeps standing in for its page until the canvas shows
+            // the written pixels (`base::RetiringPreview`); a preview-into-canvas stroke already
+            // is the canvas overlay, so nothing retires for it.
+            if !scratch.preview_into_canvas
+                && canvas.replace_overlay_region_local(page_idx, scratch.scene_rect, &scratch.image)
+            {
+                self.retiring = Some(RetiringPreview::after_commit(canvas, page_idx, scratch));
             }
-            self.touched_pages.insert(scratch.page_idx);
         }
         self.clear_runtime_stroke_state();
     }
@@ -1196,6 +1183,7 @@ impl CleaningTool for StampTool {
         self.rect_current = None;
         self.rect_erase = false;
         self.clear_runtime_stroke_state();
+        self.retiring = None;
     }
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
@@ -1446,10 +1434,21 @@ impl CleaningTool for StampTool {
         }
     }
 
-    fn suppress_base_overlay_render(&self) -> bool {
-        self.scratch
+    fn overlay_suppressed_pages(&self) -> Vec<usize> {
+        let live = self
+            .scratch
             .as_ref()
-            .is_some_and(|scratch| !scratch.preview_into_canvas)
+            .filter(|scratch| !scratch.preview_into_canvas)
+            .map(|scratch| scratch.page_idx);
+        preview_pages(live, self.retiring.as_ref().map(RetiringPreview::page_idx))
+    }
+
+    fn release_settled_preview(&mut self, canvas: &CanvasView) -> bool {
+        release_retiring_preview(&mut self.retiring, |page_idx| RetiringPageFacts::of(canvas, page_idx))
+    }
+
+    fn draw_stroke_preview(&mut self, ui: &mut egui::Ui, canvas: &CanvasView) {
+        self.draw_scratch_preview(ui, canvas);
     }
 
     fn draw_overlay_ui(
@@ -1473,7 +1472,6 @@ impl CleaningTool for StampTool {
         canvas: &CanvasView,
         pointer_scene_pos: Option<egui::Pos2>,
     ) {
-        self.draw_scratch_preview(ui, canvas);
         draw_source_anchor_marker(ui, canvas, self.mode, self.source_anchor);
         if let (Some(start), Some(current)) = (self.rect_start, self.rect_current)
             && start.page_idx == current.page_idx
@@ -1524,6 +1522,47 @@ impl CleaningTool for StampTool {
         }
         self.brush_base.bubble_occluder(canvas, pointer_scene_pos)
     }
+}
+
+/// Uploads (when changed) and paints one stamp scratch's preview texture over the CURRENT rect of
+/// its overlay region. A scratch that previews into the canvas has no texture and paints nothing.
+fn draw_stamp_scratch(scratch: &mut StampScratch, ui: &mut egui::Ui, canvas: &CanvasView) {
+    if scratch.preview_into_canvas {
+        return;
+    }
+    let Some(scene_rect) = preview_scene_rect(canvas, scratch.page_idx, scratch.overlay_rect) else {
+        return;
+    };
+    let texture_options = if canvas.pixel_sampling_nearest() {
+        TextureOptions::NEAREST
+    } else {
+        STAMP_PREVIEW_TEXTURE_OPTIONS
+    };
+    if scratch.texture.is_none() {
+        let texture = ui.ctx().load_texture(
+            "cleaning-stamp-scratch-preview",
+            scratch.image.clone(),
+            texture_options,
+        );
+        scratch.texture = Some(texture);
+        scratch.texture_options = texture_options;
+        scratch.texture_dirty = false;
+    } else if scratch.texture_dirty || scratch.texture_options != texture_options {
+        if let Some(texture) = scratch.texture.as_mut() {
+            texture.set(scratch.image.clone(), texture_options);
+        }
+        scratch.texture_options = texture_options;
+        scratch.texture_dirty = false;
+    }
+    let Some(texture) = scratch.texture.as_ref() else {
+        return;
+    };
+    ui.painter().image(
+        texture.id(),
+        scene_rect,
+        Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
 }
 
 fn list_alt_version_dirs(base_dir: &Path) -> Vec<String> {

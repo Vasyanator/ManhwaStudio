@@ -25,7 +25,15 @@ Key functions:
 - OverlayRuntimeState::sync_from_model() + plan_overlay_sync(): non-destructive per-canvas delta apply
 - write_own_change() / synced_revision_after_own_write(): own model writes never skip foreign changes
 - begin_draw_tracking() / has_pending_work(): the pending-work repaint rule
+- upload_page_work(): the GPU half of draw_overlay_on_page (also run for render-suppressed pages)
+- page_settled() / page_generation(): what a tool preview standing in for a page waits on
 Notes:
+- Render suppression is per page (`overlay_render_suppressed_pages`): a suppressed page in view is
+  still uploaded and counted in `drawn_pages`, only its painting is skipped. A tool preview that
+  replaces it retires once `page_settled` (textures current) or `page_generation` moved.
+- A tile edited while a full prepare is pending is "superseded": the late prepare uploads it from
+  the current pixels, and dirty tiles missing from a half-built texture request a full prepare, so
+  no pending work is stranded and settled pages really show `overlay_images`.
 - Pending work (prepare in flight, prepared tiles, dirty tiles) can only be uploaded while its page
   is drawn, so only pages drawn this frame (`drawn_pages`) count as pending for the repaint request.
   Pending work of an off-screen page is kept (a finished prepare is not thrown away) and resumes
@@ -78,8 +86,22 @@ pub(super) struct OverlayRuntimeState {
     pub(super) overlay_prepare_thread: Option<JoinHandle<()>>,
     pub(super) overlay_prepare_inflight: HashMap<usize, u64>,
     pub(super) overlay_prepared_pages: HashMap<usize, OverlayPreparedPage>,
+    /// Per page, the tiles whose CPU pixels changed AFTER its pending prepare (in flight or not yet
+    /// fully uploaded) took its snapshot. The prepare's copy of such a tile is older than what the
+    /// dirty-tile path may already have uploaded, so `upload_prepared_tiles` builds it from the
+    /// current `overlay_images` instead: newer pixels always win over a late full prepare.
+    pub(super) overlay_prepare_superseded: HashMap<usize, HashSet<usize>>,
     pub(super) overlay_prepare_next_job_id: u64,
-    pub(super) overlay_render_suppressed: bool,
+    /// Pages whose overlay is NOT painted this frame because a tool preview stands in for it
+    /// (`CanvasView::set_overlay_render_suppressed_pages`). Their GPU work still progresses:
+    /// `draw_overlay_on_page` uploads and records them in `drawn_pages`, it only skips painting.
+    pub(super) overlay_render_suppressed_pages: HashSet<usize>,
+    /// Per page, the value of `overlay_generation_clock` at the last change of its
+    /// `overlay_images` entry (own edit, model sync, lazy load, drop); see `page_generation`.
+    pub(super) overlay_page_generations: HashMap<usize, u64>,
+    /// Monotonic source of `overlay_page_generations` values, so a page that is dropped and
+    /// re-created never repeats an old generation.
+    pub(super) overlay_generation_clock: u64,
     /// Pages whose overlay was drawn (in view, overlays enabled) in the current frame; cleared by
     /// `begin_draw_tracking`, filled by `draw_overlay_on_page`. Only these pages' pending work
     /// keeps the canvas repainting.
@@ -107,8 +129,11 @@ impl Default for OverlayRuntimeState {
             overlay_prepare_thread: Some(overlay_prepare_thread),
             overlay_prepare_inflight: HashMap::new(),
             overlay_prepared_pages: HashMap::new(),
+            overlay_prepare_superseded: HashMap::new(),
             overlay_prepare_next_job_id: 1,
-            overlay_render_suppressed: false,
+            overlay_render_suppressed_pages: HashSet::new(),
+            overlay_page_generations: HashMap::new(),
+            overlay_generation_clock: 0,
             drawn_pages: HashSet::new(),
         }
     }
@@ -234,14 +259,39 @@ impl OverlayRuntimeState {
         self.own_write_stamps.clear();
         self.overlay_prepare_inflight.clear();
         self.overlay_prepared_pages.clear();
+        self.overlay_prepare_superseded.clear();
     }
 
     pub(super) fn model_handle(&self) -> Option<Arc<Mutex<CleanOverlaysModel>>> {
         self.overlays_model.clone()
     }
 
-    pub(super) fn set_render_suppressed(&mut self, suppressed: bool) {
-        self.overlay_render_suppressed = suppressed;
+    /// Replaces the set of pages whose overlay is not painted (uploads continue, see the field).
+    pub(super) fn set_render_suppressed_pages(&mut self, pages: &[usize]) {
+        self.overlay_render_suppressed_pages.clear();
+        self.overlay_render_suppressed_pages.extend(pages.iter().copied());
+    }
+
+    /// Records that `page_idx`'s `overlay_images` entry changed (or was dropped): every mutation
+    /// of that map calls it, so `page_generation` differs from any earlier reading.
+    fn note_page_changed(&mut self, page_idx: usize) {
+        self.overlay_generation_clock = self.overlay_generation_clock.saturating_add(1);
+        self.overlay_page_generations.insert(page_idx, self.overlay_generation_clock);
+    }
+
+    /// The change generation of `page_idx`'s CPU overlay: equal readings mean the page's pixels
+    /// were not changed in between by anyone (this canvas, a model sync, a lazy load). `0` for a
+    /// page that never had an overlay on this canvas.
+    pub(super) fn page_generation(&self, page_idx: usize) -> u64 {
+        self.overlay_page_generations.get(&page_idx).copied().unwrap_or(0)
+    }
+
+    /// Whether waiting for `page_idx`'s GPU overlay is over, as of the LAST `draw`: the page was
+    /// not processed by it (out of view, overlays hidden, no model — its pending work cannot
+    /// progress, so there is nothing to wait for), or it has no pending work left, i.e. its
+    /// textures show exactly `overlay_images`.
+    pub(super) fn page_settled(&self, page_idx: usize) -> bool {
+        !self.drawn_pages.contains(&page_idx) || !self.page_has_pending_work(page_idx)
     }
 
     pub(super) fn set_upload_min_interval_s(&mut self, seconds: f64) {
@@ -314,6 +364,7 @@ impl OverlayRuntimeState {
             self.overlay_textures.remove(&page_idx);
             self.overlay_texture_last_used_frame.remove(&page_idx);
             self.overlay_images.insert(page_idx, Arc::new(image));
+            self.note_page_changed(page_idx);
             self.own_write_stamps.remove(&page_idx);
             self.mark_dirty_full(page_idx);
             return true;
@@ -342,6 +393,7 @@ impl OverlayRuntimeState {
             page_idx,
             Arc::new(egui::ColorImage::filled([w, h], Color32::TRANSPARENT)),
         );
+        self.note_page_changed(page_idx);
         self.mark_dirty_full(page_idx);
         if let Some(model) = self.overlays_model.as_ref()
             && let Ok(mut locked) = model.lock()
@@ -392,6 +444,7 @@ impl OverlayRuntimeState {
             }
             self.reset_prepare_state(idx);
             self.own_write_stamps.remove(&idx);
+            self.note_page_changed(idx);
             // An absent or zero-sized model overlay means "no clean": the cached page is dropped.
             match fetched.remove(&idx).filter(|img| img.size[0] > 0 && img.size[1] > 0) {
                 Some(img) => {
@@ -413,12 +466,25 @@ impl OverlayRuntimeState {
     pub(super) fn reset_prepare_state(&mut self, page_idx: usize) {
         self.overlay_prepare_inflight.remove(&page_idx);
         self.overlay_prepared_pages.remove(&page_idx);
+        self.overlay_prepare_superseded.remove(&page_idx);
+    }
+
+    /// Whether `page_idx` has a full prepare in flight or prepared tiles not yet uploaded.
+    fn prepare_pending(&self, page_idx: usize) -> bool {
+        self.overlay_prepare_inflight.contains_key(&page_idx) || self.overlay_prepared_pages.contains_key(&page_idx)
+    }
+
+    /// Marks `tiles` of `page_idx` dirty, and superseded in its pending prepare (if any): their
+    /// CPU pixels just changed, so the prepare's snapshot of them is stale.
+    fn mark_tiles_dirty(&mut self, page_idx: usize, tiles: impl IntoIterator<Item = usize> + Clone) {
+        if self.prepare_pending(page_idx) {
+            self.overlay_prepare_superseded.entry(page_idx).or_default().extend(tiles.clone());
+        }
+        self.overlay_dirty_tiles.entry(page_idx).or_default().extend(tiles);
     }
 
     pub(super) fn request_prepare(&mut self, page_idx: usize, image: Arc<egui::ColorImage>) {
-        if self.overlay_prepare_inflight.contains_key(&page_idx)
-            || self.overlay_prepared_pages.contains_key(&page_idx)
-        {
+        if self.prepare_pending(page_idx) {
             return;
         }
         let job_id = self.overlay_prepare_next_job_id;
@@ -430,6 +496,8 @@ impl OverlayRuntimeState {
         };
         if self.overlay_prepare_tx.send(Some(request)).is_ok() {
             self.overlay_prepare_inflight.insert(page_idx, job_id);
+            // The snapshot just taken holds every change so far: nothing is superseded yet.
+            self.overlay_prepare_superseded.remove(&page_idx);
         }
     }
 
@@ -481,15 +549,22 @@ impl OverlayRuntimeState {
                 done = true;
             } else {
                 let mut uploaded_any = false;
+                let superseded = self.overlay_prepare_superseded.get(&page_idx);
+                // The current CPU overlay, when it still has the prepared size (a resize resets the
+                // whole texture on the next upload anyway).
+                let current = self.overlay_images.get(&page_idx).filter(|ov| ov.size == prepared.size);
                 while prepared.next_upload_tile < prepared.tiles.len() && *tile_budget > 0 {
                     let tile = &prepared.tiles[prepared.next_upload_tile];
                     if uploaded_any && tile.rgba.len() > *bytes_budget {
                         break;
                     }
-                    let tile_img = egui::ColorImage::from_rgba_premultiplied(
-                        [tile.size_px[0], tile.size_px[1]],
-                        &tile.rgba,
-                    );
+                    // A tile changed after the snapshot is built from the current pixels: the
+                    // dirty-tile path may already have uploaded them, and the late prepared copy
+                    // must not overwrite them with older ones.
+                    let tile_img = match current.filter(|_| superseded.is_some_and(|tiles| tiles.contains(&tile.tile_idx))) {
+                        Some(ov) => build_overlay_tile_image(ov, tile.origin_px[0], tile.origin_px[1], tile.size_px[0], tile.size_px[1]),
+                        None => egui::ColorImage::from_rgba_premultiplied([tile.size_px[0], tile.size_px[1]], &tile.rgba),
+                    };
                     if tile.tile_idx < page_tex.tiles.len() {
                         page_tex.tiles[tile.tile_idx]
                             .texture
@@ -519,6 +594,7 @@ impl OverlayRuntimeState {
         }
         if done {
             self.overlay_prepared_pages.remove(&page_idx);
+            self.overlay_prepare_superseded.remove(&page_idx);
         }
     }
 
@@ -543,7 +619,7 @@ impl OverlayRuntimeState {
     /// must request another frame to finish it.
     ///
     /// Pages not drawn this frame never count: their work can only progress while they are drawn
-    /// (off screen, overlays hidden or render-suppressed), so repainting for them would spin the
+    /// (off screen, overlays hidden), so repainting for them would spin the
     /// GUI at full frame rate without progress. Their dirty tiles are uploaded when they are next
     /// drawn, which happens on whatever event brings them into view.
     pub(super) fn has_pending_work(&self) -> bool {
@@ -647,6 +723,7 @@ impl OverlayRuntimeState {
             should_sync_model = true;
         }
         if should_sync_model {
+            self.note_page_changed(page_idx);
             self.mark_dirty_full(page_idx);
             if let Some(model) = self.overlays_model.as_ref()
                 && let Some(overlay) = self.overlay_images.get(&page_idx)
@@ -735,6 +812,7 @@ impl OverlayRuntimeState {
             return false;
         };
         blit_scaled_chunk(Arc::make_mut(dst), target, chunk);
+        self.note_page_changed(page_idx);
         if sync_model
             && let Some(model) = self.overlays_model.as_ref()
             && let Ok(mut locked) = model.lock()
@@ -769,6 +847,7 @@ impl OverlayRuntimeState {
             return false;
         }
         blit_scaled_chunk(Arc::make_mut(dst), clipped, chunk);
+        self.note_page_changed(page_idx);
         if sync_model
             && let Some(model) = self.overlays_model.as_ref()
             && let Ok(mut locked) = model.lock()
@@ -808,13 +887,8 @@ impl OverlayRuntimeState {
         }
         let tiles_x = w.div_ceil(OVERLAY_TILE_SIDE);
         let tiles_y = h.div_ceil(OVERLAY_TILE_SIDE);
-        let full = self.overlay_dirty_tiles.entry(page_idx).or_default();
-        full.clear();
-        for ty in 0..tiles_y {
-            for tx in 0..tiles_x {
-                full.insert(ty * tiles_x + tx);
-            }
-        }
+        self.overlay_dirty_tiles.remove(&page_idx);
+        self.mark_tiles_dirty(page_idx, 0..tiles_x.saturating_mul(tiles_y));
     }
 
     pub(super) fn mark_dirty_rect(
@@ -848,29 +922,30 @@ impl OverlayRuntimeState {
         let tile_x1 = (x1.saturating_sub(1)) / OVERLAY_TILE_SIDE;
         let tile_y1 = (y1.saturating_sub(1)) / OVERLAY_TILE_SIDE;
         let tiles_x = ov_w.div_ceil(OVERLAY_TILE_SIDE);
-        let dirty = self.overlay_dirty_tiles.entry(page_idx).or_default();
-        for ty in tile_y0..=tile_y1 {
-            for tx in tile_x0..=tile_x1 {
-                dirty.insert(ty * tiles_x + tx);
-            }
-        }
+        let tiles: Vec<usize> = (tile_y0..=tile_y1)
+            .flat_map(|ty| (tile_x0..=tile_x1).map(move |tx| ty * tiles_x + tx))
+            .collect();
+        self.mark_tiles_dirty(page_idx, tiles);
     }
 
-    pub(super) fn draw_overlay_on_page(
+    /// Advances `page_idx`'s pending GPU work by up to the frame's remaining budgets: creates or
+    /// resets its texture page, starts a full background prepare when needed, uploads prepared
+    /// tiles and then dirty tiles (or turns many dirty tiles into one full re-prepare). Leftover
+    /// work stays queued for the next call. Returns whether the page has a non-empty overlay
+    /// (otherwise there is nothing to upload or paint).
+    pub(super) fn upload_page_work(
         &mut self,
-        ui: &mut egui::Ui,
+        ctx: &egui::Context,
         page_idx: usize,
-        image_rect: Rect,
         tile_budget: &mut usize,
         bytes_budget: &mut usize,
         pixel_sampling_nearest: bool,
-    ) {
-        self.drawn_pages.insert(page_idx);
+    ) -> bool {
         let Some(ov_size) = self.overlay_images.get(&page_idx).map(|ov| ov.size) else {
-            return;
+            return false;
         };
         if ov_size[0] == 0 || ov_size[1] == 0 {
-            return;
+            return false;
         }
         let texture_options = if pixel_sampling_nearest {
             egui::TextureOptions::NEAREST
@@ -879,7 +954,7 @@ impl OverlayRuntimeState {
         };
 
         let dirty_tiles = self.overlay_dirty_tiles.remove(&page_idx);
-        let now_s = ui.ctx().input(|i| i.time);
+        let now_s = ctx.input(|i| i.time);
         let needs_reset = self
             .overlay_textures
             .get(&page_idx)
@@ -905,7 +980,7 @@ impl OverlayRuntimeState {
             self.request_prepare(page_idx, ov);
         }
         self.upload_prepared_tiles(
-            ui.ctx(),
+            ctx,
             page_idx,
             tile_budget,
             bytes_budget,
@@ -962,6 +1037,16 @@ impl OverlayRuntimeState {
                         remaining_dirty.insert(tile_idx);
                     }
                 }
+                // A dirty tile the texture does not have yet (a half-built texture whose prepare
+                // was reset, e.g. by a model refetch) can only appear through a full prepare;
+                // without one pending it would stay dirty forever, repainting for nothing and
+                // never letting the page settle.
+                if !remaining_dirty.is_empty()
+                    && !self.prepare_pending(page_idx)
+                    && let Some(ov) = self.overlay_images.get(&page_idx).cloned()
+                {
+                    self.request_prepare(page_idx, ov);
+                }
                 for (tile_idx, origin_px, size_px) in tile_meta {
                     if *tile_budget == 0 {
                         remaining_dirty.insert(tile_idx);
@@ -1003,11 +1088,36 @@ impl OverlayRuntimeState {
             }
         }
 
+        true
+    }
+
+    /// Draws `page_idx`'s clean overlay into `image_rect` after advancing its GPU work.
+    ///
+    /// Records the page in `drawn_pages`, then uploads under the frame's shared budgets
+    /// ([`Self::upload_page_work`]). A page in `overlay_render_suppressed_pages` stops there: its
+    /// uploads progress (so a tool preview standing in for it can retire as soon as the textures
+    /// are current), but nothing is painted.
+    pub(super) fn draw_overlay_on_page(
+        &mut self,
+        ui: &mut egui::Ui,
+        page_idx: usize,
+        image_rect: Rect,
+        tile_budget: &mut usize,
+        bytes_budget: &mut usize,
+        pixel_sampling_nearest: bool,
+    ) {
+        self.drawn_pages.insert(page_idx);
+        if !self.upload_page_work(ui.ctx(), page_idx, tile_budget, bytes_budget, pixel_sampling_nearest) {
+            return;
+        }
         let Some(page_tex) = self.overlay_textures.get(&page_idx) else {
             return;
         };
         self.overlay_texture_last_used_frame
             .insert(page_idx, ui.ctx().cumulative_frame_nr());
+        if self.overlay_render_suppressed_pages.contains(&page_idx) {
+            return;
+        }
         let src_w = page_tex.size[0] as f32;
         let src_h = page_tex.size[1] as f32;
         if src_w <= 0.0 || src_h <= 0.0 {
@@ -1324,9 +1434,220 @@ mod tests {
             assert!(runtime.has_pending_work(), "drawn page {page_idx} with pending work must drive repaints");
         }
 
-        // A frame that drew nothing (overlays hidden or render-suppressed) never repaints for work.
+        // A frame that drew nothing (overlays hidden, pages off screen) never repaints for work.
         runtime.begin_draw_tracking();
         assert!(!runtime.has_pending_work());
+        runtime.shutdown();
+    }
+
+    /// THE BUG this guards (S-096): a page whose overlay a tool preview stands in for must keep
+    /// uploading, or the preview could never learn that the committed stroke reached the GPU.
+    /// Suppression is per page and never stops the work; settling is what the preview waits on.
+    #[test]
+    fn a_render_suppressed_page_still_uploads_and_then_settles() {
+        let ctx = egui::Context::default();
+        let mut runtime = OverlayRuntimeState::default();
+        runtime.overlay_images.insert(0, Arc::new(opaque_pixel()));
+        runtime.overlay_textures.insert(0, texture_page(&ctx, [1, 1], 1));
+        runtime.overlay_dirty_tiles.insert(0, HashSet::from([0]));
+        runtime.set_render_suppressed_pages(&[0]);
+        assert!(runtime.overlay_render_suppressed_pages.contains(&0));
+        assert!(!runtime.overlay_render_suppressed_pages.contains(&1), "suppression is per page");
+
+        runtime.begin_draw_tracking();
+        runtime.drawn_pages.insert(0);
+        assert!(!runtime.page_settled(0), "a drawn page with dirty tiles is not settled");
+        assert!(runtime.has_pending_work(), "a suppressed page with pending work keeps the canvas repainting");
+
+        let (mut tiles, mut bytes) = (2, usize::MAX);
+        assert!(runtime.upload_page_work(&ctx, 0, &mut tiles, &mut bytes, false));
+        assert_eq!(tiles, 1, "the dirty tile was uploaded under the frame budget");
+        assert!(runtime.page_settled(0));
+        assert!(!runtime.has_pending_work());
+
+        runtime.set_render_suppressed_pages(&[]);
+        assert!(runtime.overlay_render_suppressed_pages.is_empty());
+        runtime.shutdown();
+    }
+
+    /// The scene-level half of S-096: `draw_overlay_on_page` of a suppressed page must still
+    /// upload (and count the page as drawn) and paint nothing; an unsuppressed page paints.
+    #[test]
+    fn draw_overlay_on_page_uploads_but_does_not_paint_a_suppressed_page() {
+        let ctx = egui::Context::default();
+        let mut runtime = OverlayRuntimeState::default();
+        runtime.overlay_images.insert(0, Arc::new(opaque_pixel()));
+        runtime.overlay_textures.insert(0, texture_page(&ctx, [1, 1], 1));
+        runtime.overlay_dirty_tiles.insert(0, HashSet::from([0]));
+        let image_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(10.0, 10.0));
+        let draw_frame = |runtime: &mut OverlayRuntimeState| {
+            runtime.begin_draw_tracking();
+            let (mut tiles, mut bytes) = (2, usize::MAX);
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                runtime.draw_overlay_on_page(ui, 0, image_rect, &mut tiles, &mut bytes, false);
+            });
+            // No painter applies the texture changes here; epaint asserts they are handled.
+            output.textures_delta.clear();
+            output.shapes.len()
+        };
+
+        runtime.set_render_suppressed_pages(&[0]);
+        assert_eq!(draw_frame(&mut runtime), 0, "a suppressed page paints nothing");
+        assert!(runtime.drawn_pages.contains(&0), "but it counts as drawn");
+        assert!(runtime.page_settled(0), "and its dirty tile was uploaded");
+
+        runtime.set_render_suppressed_pages(&[]);
+        assert!(draw_frame(&mut runtime) > 0, "an unsuppressed page paints its tiles");
+        runtime.shutdown();
+    }
+
+    /// Polls the prepare worker until `page_idx` has no prepare in flight (bounded wait).
+    fn wait_for_prepare(runtime: &mut OverlayRuntimeState, page_idx: usize) {
+        for _ in 0..1000 {
+            runtime.poll_prepare_results();
+            if !runtime.overlay_prepare_inflight.contains_key(&page_idx) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("the overlay prepare worker did not answer");
+    }
+
+    /// The last image set on `texture` in the context's pending texture delta.
+    fn last_set_image(ctx: &egui::Context, texture: egui::TextureId) -> Option<Arc<egui::ColorImage>> {
+        let mut delta = ctx.tex_manager().write().take_delta();
+        let image = delta.set.get(&texture).and_then(|deltas| deltas.last()).map(|delta| match &delta.image {
+            egui::ImageData::Color(image) => Arc::clone(image),
+        });
+        // No painter applies the texture changes here; epaint asserts they are handled.
+        delta.clear();
+        image
+    }
+
+    /// M1: an edit that lands while a full prepare is in flight is uploaded by the dirty-tile path
+    /// first; the late prepare result must not overwrite that tile with its older snapshot.
+    #[test]
+    fn a_late_full_prepare_never_overwrites_a_newer_tile() {
+        let ctx = egui::Context::default();
+        let mut runtime = OverlayRuntimeState::default();
+        let size = [OVERLAY_TILE_SIDE + 1, 1];
+        let old = Color32::from_rgba_unmultiplied(10, 20, 30, 255);
+        runtime.overlay_images.insert(0, Arc::new(egui::ColorImage::filled(size, old)));
+        let tile = |origin_px: [usize; 2], size_px: [usize; 2], name: &str| OverlayTextureTile {
+            texture: ctx.load_texture(name, egui::ColorImage::filled(size_px, old), egui::TextureOptions::LINEAR),
+            origin_px,
+            size_px,
+        };
+        runtime.overlay_textures.insert(0, OverlayTexturePage {
+            size,
+            texture_options: egui::TextureOptions::LINEAR,
+            tiles: vec![tile([0, 0], [OVERLAY_TILE_SIDE, 1], "m1-0"), tile([OVERLAY_TILE_SIDE, 0], [1, 1], "m1-1")],
+        });
+        let tile1 = runtime.overlay_textures[&0].tiles[1].texture.id();
+        // Stroke 1 started a full re-prepare from the current pixels...
+        let snapshot = Arc::clone(&runtime.overlay_images[&0]);
+        runtime.request_prepare(0, snapshot);
+        // ...and stroke 2 commits into tile 1 before it answers.
+        let target = OverlayRectPx { x: OVERLAY_TILE_SIDE, y: 0, w: 1, h: 1 };
+        assert!(runtime.replace_overlay_region_px(0, size, target, &red_pixel(), false));
+        let (mut tiles, mut bytes) = (8, usize::MAX);
+        assert!(runtime.upload_page_work(&ctx, 0, &mut tiles, &mut bytes, false));
+        wait_for_prepare(&mut runtime, 0);
+        ctx.tex_manager().write().take_delta().clear();
+
+        runtime.begin_draw_tracking();
+        runtime.drawn_pages.insert(0);
+        let (mut tiles, mut bytes) = (8, usize::MAX);
+        assert!(runtime.upload_page_work(&ctx, 0, &mut tiles, &mut bytes, false));
+        assert!(runtime.page_settled(0));
+        let uploaded = last_set_image(&ctx, tile1).expect("the prepared tile 1 was uploaded");
+        assert_eq!(uploaded.pixels, red_pixel().pixels, "tile 1 shows stroke 2, not the prepare's older snapshot");
+        runtime.shutdown();
+    }
+
+    /// M2: a half-built texture (a prepare reset mid-upload, e.g. by a model refetch) on a
+    /// one-tile-wide page must still get its missing tiles and settle, instead of re-queueing
+    /// them as dirty forever.
+    #[test]
+    fn missing_tiles_of_a_half_built_texture_are_prepared_and_the_page_settles() {
+        let ctx = egui::Context::default();
+        let mut runtime = OverlayRuntimeState::default();
+        let size = [1, 2 * OVERLAY_TILE_SIDE + 1];
+        runtime.overlay_images.insert(0, Arc::new(egui::ColorImage::filled(size, Color32::WHITE)));
+        runtime.overlay_textures.insert(0, OverlayTexturePage {
+            size,
+            texture_options: egui::TextureOptions::LINEAR,
+            tiles: vec![OverlayTextureTile {
+                texture: ctx.load_texture("m2-0", egui::ColorImage::filled([1, OVERLAY_TILE_SIDE], Color32::WHITE), egui::TextureOptions::LINEAR),
+                origin_px: [0, 0],
+                size_px: [1, OVERLAY_TILE_SIDE],
+            }],
+        });
+        runtime.mark_dirty_full(0);
+        runtime.begin_draw_tracking();
+        runtime.drawn_pages.insert(0);
+        for _ in 0..1000 {
+            let (mut tiles, mut bytes) = (2, usize::MAX);
+            assert!(runtime.upload_page_work(&ctx, 0, &mut tiles, &mut bytes, false));
+            if runtime.page_settled(0) {
+                break;
+            }
+            runtime.poll_prepare_results();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(runtime.page_settled(0), "the page must settle");
+        assert_eq!(runtime.overlay_textures[&0].tiles.len(), 3, "every tile exists");
+        runtime.shutdown();
+    }
+
+    /// Waiting is pointless for a page the last draw did not process: its work cannot progress.
+    #[test]
+    fn a_page_not_drawn_last_frame_counts_as_settled_despite_pending_work() {
+        let mut runtime = OverlayRuntimeState::default();
+        runtime.overlay_dirty_tiles.insert(3, HashSet::from([0]));
+        runtime.overlay_prepare_inflight.insert(4, 1);
+        runtime.begin_draw_tracking();
+        assert!(runtime.page_settled(3) && runtime.page_settled(4));
+        runtime.drawn_pages.insert(4);
+        assert!(!runtime.page_settled(4), "a prepare in flight for a drawn page is pending");
+        runtime.shutdown();
+    }
+
+    /// Every change of a page's CPU overlay moves its generation: own edits, a model sync of a
+    /// foreign change (an undo looks the same), a drop. A page nobody touched keeps it.
+    #[test]
+    fn the_page_generation_moves_on_every_overlay_change_and_only_then() {
+        let model = two_page_model();
+        foreign_write(&model, 0);
+        let mut runtime = OverlayRuntimeState::default();
+        runtime.set_model(Arc::clone(&model));
+        assert_eq!(runtime.page_generation(0), 0, "never cached");
+        assert!(runtime.ensure_overlay_for_page_size(0, [1, 1]));
+        runtime.sync_from_model();
+        let loaded = runtime.page_generation(0);
+        assert_ne!(loaded, 0);
+        runtime.sync_from_model();
+        assert_eq!(runtime.page_generation(0), loaded, "a sync with nothing new changes nothing");
+
+        let target = OverlayRectPx { x: 0, y: 0, w: 1, h: 1 };
+        assert!(runtime.replace_overlay_region_px(0, [1, 1], target, &red_pixel(), true));
+        let own = runtime.page_generation(0);
+        assert!(own > loaded);
+        runtime.sync_from_model();
+        assert_eq!(runtime.page_generation(0), own, "the canvas's own write is not re-applied by the sync");
+
+        foreign_write(&model, 0);
+        runtime.sync_from_model();
+        let foreign = runtime.page_generation(0);
+        assert!(foreign > own, "a foreign change (or an undo) moves the generation");
+
+        match model.lock() {
+            Ok(mut locked) => assert!(locked.detach_page_overlay(0)),
+            Err(err) => panic!("test failed to lock CleanOverlaysModel: {err}"),
+        }
+        runtime.sync_from_model();
+        assert!(runtime.page_generation(0) > foreign, "dropping the page moves it too");
+        assert_eq!(runtime.page_generation(1), 0);
         runtime.shutdown();
     }
 

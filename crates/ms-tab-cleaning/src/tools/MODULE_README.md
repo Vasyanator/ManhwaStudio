@@ -16,7 +16,15 @@ the current bindings in its hints (`set_input_labels`). No tool reads a key, a m
 wheel. The tab also dispatches floating-window drawing, cursor painting and backend availability.
 
 Brush tools use `BrushToolBase` to draw into a local scratch overlay. Scratch previews are tiled
-for large images and are committed to `CanvasView` only at stroke boundaries. Region tools use
+for large images and are committed to `CanvasView` only at stroke boundaries. A scratch preview
+holds base pixels + stroke for the visible part of its page, so it REPLACES that page's overlay:
+the tool names the page in `overlay_suppressed_pages` and the canvas uploads but does not paint
+it. The commit runs after `CanvasView::draw` and the canvas needs further frames to upload the
+written pixels, so the committed stroke stays on screen as a `RetiringPreview` (Zamazka through
+`BrushToolBase`, Stamp with its own `StampScratch`) until `release_settled_preview`, called by the
+tab at the TOP of a frame, sees `CanvasView::overlay_page_settled` (or a changed
+`overlay_page_generation`: undo / redo / another writer). Previews are painted by
+`draw_stroke_preview` every frame, independent of the pointer, over the page's CURRENT rect. Region tools use
 `RegionEditToolBase` to select an overlay rectangle, load the composited source page plus current
 clean overlay on a worker thread, show a detached region editor, and insert the accepted result
 back into the page overlay. Mask-inpaint tools use `RegionMaskInpaintToolBase` to add editable
@@ -569,6 +577,15 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
 - A surface of its own (`region_edit_v2`'s frame `Area`) is not the canvas view for the router, so
   the tab's strokes and cursor stop over it by themselves; its gestures are targeted ones resolved
   from its own `Response`s (`InputFrame::gesture_for`).
+- Stroke-preview retirement (S-096): a preview that replaces a page's overlay is released only at
+  the top of a frame, BEFORE the tab takes the suppression set, never at the commit — otherwise a
+  frame paints neither the overlay nor the preview, then stale tiles. It is released when the
+  page settled or its overlay generation moved; a new stroke on the same page replaces it
+  (`drop_retiring_preview_of_page`: two previews of one page would composite the stroke twice);
+  `deactivate` drops it. Committed overlay bytes do not depend on it: retirement is display only.
+  Known limit: when a Zamazka segment leaves its scratch's rect, the stroke commits and paints
+  straight into the overlay (pixels as always), which releases the preview over tiles not uploaded
+  yet, so the stroke-end blink can remain on that rare path.
 - A surface that must stay visible while the pointer is elsewhere is painted from
   `draw_overlay_ui` through `ctx.layer_painter(LayerId::new(Order::Middle, …))`, never from
   `draw_cursor`, which is pointer-gated. A bare layer painter registers no interactable `Area`, so
@@ -589,7 +606,8 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
 - To add a new cleaning tool, implement `CleaningTool`, export it from `mod.rs`, and register it in
   `CleaningTabState::default`.
 - To change common brush radius, scratch preview, stroke commit, or dirty-tile behavior, edit
-  `BrushToolBase` in `base.rs`.
+  `BrushToolBase` in `base.rs`; the retirement rule of a committed preview is `RetiringPreview`
+  / `release_retiring_preview` there (shared with `stamp.rs`).
 - To change region selection, composited-region loading, editor zoom/scroll, or apply behavior,
   edit `RegionEditToolBase` in `base.rs`. A tool that wants a finished selection WITHOUT the
   region editor arms `set_selection_diverted` and collects the rect with

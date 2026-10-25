@@ -8,6 +8,12 @@ FILE HEADER (cleaning/tools/zamazka.rs)
   - Кисть/ластик рисуют через локальный scratch-буфер; preview показывается tiled scratch-overlay,
     а commit в shared-модель делается только на `stroke_end`; по умолчанию кисть использует
     subpixel coverage, а строгий пиксельный режим оставлен как опция инструмента.
+  - Stroke preview (English): `draw_stroke_preview` paints the live scratch and the RETIRING
+    preview of the last committed stroke every frame, independent of the pointer; the pages they
+    stand in for are `overlay_suppressed_pages`, and `release_settled_preview` ends the retirement
+    (`base::RetiringPreview`). `draw_cursor` paints only the cursor. Known limit: a segment
+    outside the scratch rect commits it and paints straight into the overlay, which releases the
+    preview over tiles not yet uploaded, so on that rare path the stroke-end blink can remain.
   - Пипетка сначала берёт цвет из overlay, затем fallback на базовую страницу (подгрузка в фоне).
   - Для пипетки base-страница под курсором предварительно подгружается в фоне на каждом кадре,
     чтобы цвет можно было взять до первого рисования на странице.
@@ -320,6 +326,7 @@ impl CleaningTool for ZamazkaTool {
 
     fn deactivate(&mut self, _canvas: &mut CanvasView) {
         self.brush_base.cancel_scratch_stroke();
+        self.brush_base.drop_retiring_preview();
         self.rect_stroke_erase = false;
         self.rect_start = None;
         self.rect_current = None;
@@ -461,7 +468,6 @@ impl CleaningTool for ZamazkaTool {
                 .output_mut(|out| out.cursor_icon = egui::CursorIcon::Default);
             return;
         }
-        self.brush_base.draw_scratch_preview(ui, canvas);
         if self.brush_base.should_ignore_drawing() {
             return;
         }
@@ -578,7 +584,15 @@ impl CleaningTool for ZamazkaTool {
         }
     }
 
-    fn suppress_base_overlay_render(&self) -> bool {
-        self.brush_base.scratch_active()
+    fn overlay_suppressed_pages(&self) -> Vec<usize> {
+        self.brush_base.preview_pages()
+    }
+
+    fn release_settled_preview(&mut self, canvas: &CanvasView) -> bool {
+        self.brush_base.release_settled_preview(canvas)
+    }
+
+    fn draw_stroke_preview(&mut self, ui: &mut egui::Ui, canvas: &CanvasView) {
+        self.brush_base.draw_scratch_preview(ui, canvas);
     }
 }

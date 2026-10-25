@@ -734,8 +734,19 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   uploaded, or shared model state.
 - Pending clean-overlay GPU work (prepare in flight, prepared tiles, dirty tiles) progresses only
   while its page is drawn (`draw_overlay_on_page`, in view with overlays enabled), so the canvas
-  requests a repaint only for pages drawn THIS frame (`OverlayRuntimeState::drawn_pages`); off-screen,
-  hidden or render-suppressed work never keeps the GUI repainting. That work is kept, not dropped
+  requests a repaint only for pages drawn THIS frame (`OverlayRuntimeState::drawn_pages`); off-screen
+  or hidden work never keeps the GUI repainting.
+- Render suppression is PER PAGE (`set_overlay_render_suppressed_pages`, set by a tool whose preview
+  fully replaces a page's overlay) and suppresses only PAINTING: a suppressed page in view still
+  goes through `draw_overlay_on_page` (uploads, `drawn_pages`, repaint while pending), and every
+  other page keeps its overlay. A tool retires such a preview at the top of a frame by asking
+  `overlay_page_settled(page)` (no pending GPU work, or the page was not processed by the last draw
+  so waiting is pointless) and `overlay_page_generation(page)` (moves on every change of the page's
+  CPU overlay — own edit, model sync, lazy load, drop; equal readings mean untouched pixels).
+- "Settled" must mean "textures show `overlay_images`": a tile changed while a full prepare is
+  pending is recorded in `overlay_prepare_superseded` and uploaded from the current pixels when the
+  late prepare arrives (never its older snapshot), and a dirty tile the texture lacks requests a
+  full prepare when none is pending (a half-built texture would otherwise stay dirty forever). That work is kept, not dropped
   (a finished prepare is reused when the page returns) and resumes on the page's next draw, from
   the current `overlay_images`, so an edit from another canvas or writer still shows. Its memory is
   bounded by eviction: a non-pinned page is reconstructable even with prepare work, its snapshot

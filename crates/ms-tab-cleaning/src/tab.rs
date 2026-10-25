@@ -1022,12 +1022,22 @@ impl CleaningTabState {
         let history_changed = self.apply_history_commands(input);
         let tool_changed = self.tools.get_mut(self.active_tool_idx).is_some_and(|tool| tool.apply_input(input));
         let stroking = self.strokes.stroking();
-        let suppress_overlay_render = self
+        // A committed stroke's preview stands in for its page until the canvas shows the written
+        // pixels; it is released HERE, at the top of the frame and before the suppression set is
+        // taken, so the frame that stops suppressing the page also paints its (settled) overlay —
+        // never a frame with neither. The stroke itself commits later in this frame
+        // (`drive_strokes`, after `canvas.draw`), which is why the preview must outlive it.
+        let preview_retiring = self
+            .tools
+            .get_mut(self.active_tool_idx)
+            .is_some_and(|tool| tool.release_settled_preview(&self.canvas));
+        let suppressed_pages = self
             .tools
             .get(self.active_tool_idx)
-            .is_some_and(|tool| tool.suppress_base_overlay_render());
+            .map(|tool| tool.overlay_suppressed_pages())
+            .unwrap_or_default();
         self.canvas
-            .set_overlay_render_suppressed(suppress_overlay_render);
+            .set_overlay_render_suppressed_pages(&suppressed_pages);
 
         if let Some(active_tool) = self.tools.get_mut(self.active_tool_idx) {
             // Before `canvas.draw`: the tool's dock bodies run inside it, hide what the session
@@ -1114,6 +1124,8 @@ impl CleaningTabState {
             // viewport before `draw_overlay_ui` places anything against it.
             active_tool.set_panel_rects(&self.panel_rects);
             active_tool.draw_overlay_ui(ctx, &mut self.canvas, project, input);
+            // Wherever the pointer is: a render-suppressed page shows nothing but this preview.
+            active_tool.draw_stroke_preview(ui, &self.canvas);
         }
         self.draw_active_tool_cursor(ctx, ui, canvas_rect, input);
         self.canvas.draw_pixel_grid_overlay(ui);
@@ -1121,8 +1133,11 @@ impl CleaningTabState {
         // must not force 60 fps: egui already repaints on panel interaction (drag,
         // resize, hover), and its spinners/progress are gated on the in-progress
         // flags below, so an idle open panel has nothing to animate.
+        // A retiring preview waits for the canvas' uploads, which raise no input event: keep
+        // frames coming until the top-of-frame release lets it go.
         if tool_changed
             || history_changed
+            || preview_retiring
             || self.text_mask_load_in_progress
             || self.quick_clean_job_in_progress
         {

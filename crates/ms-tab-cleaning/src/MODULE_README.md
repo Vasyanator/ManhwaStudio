@@ -21,7 +21,11 @@ files) go through the level-0 owner `ms-atomic-file`, never a private temp + ren
 and optional shared models injected by `StudioApp`. The tab routes this frame's declared input
 (`ms-input`, see "Input" below) into the active tool and lends it the frame for its own surfaces. Tools edit canvas overlay scratch state and
 commit through `CanvasView`, which synchronizes committed pages into `CleanOverlaysModel`
-and its diff-based undo/redo history.
+and its diff-based undo/redo history. Frame order for stroke previews (S-096): at the top of
+`draw` the active tool releases a settled `RetiringPreview` (`release_settled_preview`), then the
+tab hands its `overlay_suppressed_pages` to `CanvasView::set_overlay_render_suppressed_pages`;
+strokes commit after `canvas.draw` (`drive_strokes`); `draw_stroke_preview` paints the previews
+after `draw_overlay_ui`, regardless of the pointer; the tab repaints while a preview retires.
 
 Text mask data flows from `TextMaskModel` when available, or from `text_detection/` files through
 a background load job. The tab uploads mask tiles to egui textures and exposes them to canvas via

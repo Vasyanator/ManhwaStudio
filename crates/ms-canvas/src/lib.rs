@@ -124,7 +124,7 @@ CanvasView method map:
   `has_pending_overlay_work`, `draw_overlay_on_page`,
   `commit_overlay_page_to_model`.
 - External wiring/state toggles:
-  `set_bubbles_model`, `set_overlays_model`, `set_overlay_render_suppressed`,
+  `set_bubbles_model`, `set_overlays_model`, `set_overlay_render_suppressed_pages`,
   `set_overlay_upload_min_interval_s`, `set_clean_overlays_visible`,
   `set_clean_overlays_visible_for_canvas_only`, `set_scroll_area_id_salt`,
   `viewport_snapshot`, `apply_viewport_snapshot`, `clean_overlays_visible`.
@@ -223,7 +223,8 @@ Key CanvasView state groups (important fields):
   `overlay_upload_min_interval_s`, `overlay_last_upload_s`, `drawn_pages` (repaint gate).
 - Shared-model bindings: `bubbles_model`, `overlays_model`, `synced_*_revision`.
 - Interaction gates: `view_locked_by_claim`, `zoom_drag_active`, `zoom_drag_last_x`,
-  `pan_mode_active`, `overlay_render_suppressed`.
+  `pan_mode_active`, `overlay_render_suppressed_pages` (per-page paint gate, uploads continue).
+- Tool preview retirement: `overlay_page_settled`, `overlay_page_generation`.
 - Input: `input_frame` (this frame's `InputFrame`, `Some` only during `draw`), `labels`
   (`input::CanvasLabels`).
 - Async settings persistence: `last_published_canvas_snapshot`,
@@ -1147,8 +1148,31 @@ impl CanvasView {
             .wrapping_add(next_id_bits)
     }
 
-    pub fn set_overlay_render_suppressed(&mut self, suppressed: bool) {
-        self.overlay_runtime.set_render_suppressed(suppressed);
+    /// Sets the pages whose clean overlay is NOT painted from the next `draw` on, replacing the
+    /// previous set (`&[]` paints every page). Meant for a tool preview that fully replaces a
+    /// page's overlay (base + stroke); every other page keeps its overlay. A suppressed page in
+    /// view still uploads its pending GPU work, so [`Self::overlay_page_settled`] keeps moving.
+    pub fn set_overlay_render_suppressed_pages(&mut self, pages: &[usize]) {
+        self.overlay_runtime.set_render_suppressed_pages(pages);
+    }
+
+    /// Whether a preview standing in for `page_idx`'s overlay may stop doing so, as of the last
+    /// `draw`: the page's GPU textures show exactly its CPU overlay (no prepare in flight, no
+    /// prepared or dirty tiles left), or the page was not processed by that draw (out of view,
+    /// clean overlays hidden, no model) so its pending work cannot progress and waiting is
+    /// pointless. Cheap; meant to be asked at the top of a frame, before the suppression set.
+    #[must_use]
+    pub fn overlay_page_settled(&self, page_idx: usize) -> bool {
+        self.overlay_runtime.page_settled(page_idx)
+    }
+
+    /// The change generation of `page_idx`'s CPU clean overlay on this canvas: two equal readings
+    /// mean nobody changed the page's pixels in between (an own edit, a model sync such as an
+    /// undo or another writer, a lazy load, a drop all move it). `0` for a page that never had
+    /// an overlay here.
+    #[must_use]
+    pub fn overlay_page_generation(&self, page_idx: usize) -> u64 {
+        self.overlay_runtime.page_generation(page_idx)
     }
 
     pub fn set_overlay_upload_min_interval_s(&mut self, seconds: f64) {
@@ -1587,6 +1611,9 @@ impl CanvasView {
             .retain(|idx, _| self.overlay_runtime.overlay_images.contains_key(idx));
         self.overlay_runtime
             .overlay_prepared_pages
+            .retain(|idx, _| self.overlay_runtime.overlay_images.contains_key(idx));
+        self.overlay_runtime
+            .overlay_prepare_superseded
             .retain(|idx, _| self.overlay_runtime.overlay_images.contains_key(idx));
         if !self.editable {
             self.bubble_runtime.canvas_context_menu_target = None;

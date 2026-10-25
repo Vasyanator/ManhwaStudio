@@ -12,6 +12,11 @@ FILE HEADER (cleaning/tools/base.rs)
     `ms_tools::MaskBrush` и общие `brush.*`, hardness, subpixel coverage/strict pixel режим —
     the stroke mask is painted by the shared `ms_tools::paint_soft_line_mask`,
     scratch-штрих, tiled preview с обновлением только dirty-тайлов, без full-size scratch texture).
+  - `RetiringPreview` / `release_retiring_preview` / `drop_retiring_preview_of_page` (English):
+    a committed stroke's preview keeps standing in for its render-suppressed page until the canvas
+    shows the committed pixels (`CanvasView::overlay_page_settled`) or the page changed
+    (`overlay_page_generation`); shared by `BrushToolBase` and the stamp. The trait side is
+    `overlay_suppressed_pages` / `release_settled_preview` (top of frame) / `draw_stroke_preview`.
   - `RegionEditToolBase`: каркас выделения региона, фоновой загрузки композита `base+overlay`,
     показа отдельного окна редактора (its own `ms_input` view: the shared `view.*` zoom aims at it,
     `apply_editor_window_zoom`) и вставки результата обратно в overlay.
@@ -214,9 +219,27 @@ pub trait CleaningTool: Send {
         self.stroke_end(canvas);
     }
 
-    fn suppress_base_overlay_render(&self) -> bool {
+    /// The pages whose clean overlay this tool's stroke preview fully replaces this frame (the
+    /// preview holds base pixels + stroke, `draw_stroke_preview` paints it): the canvas uploads
+    /// them but does not paint them (`CanvasView::set_overlay_render_suppressed_pages`). Asked by
+    /// the tab at the top of every frame, after `release_settled_preview`. Default: none.
+    fn overlay_suppressed_pages(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    /// Top of every frame, before `overlay_suppressed_pages`: releases the preview of a committed
+    /// stroke that is still standing in for its page's overlay once the canvas shows the
+    /// committed pixels (see [`RetiringPreview`]). Returns whether a preview is still retiring;
+    /// the tab then keeps repainting, so the release is never stuck waiting for an input event.
+    /// Default: no previews, `false`.
+    fn release_settled_preview(&mut self, _canvas: &CanvasView) -> bool {
         false
     }
+
+    /// Paints the stroke previews (the live scratch and a retiring one) for every page they
+    /// belong to. Called every frame after `draw_overlay_ui` and before the cursor, wherever the
+    /// pointer is: a suppressed page shows nothing but this preview. Default: nothing.
+    fn draw_stroke_preview(&mut self, _ui: &mut egui::Ui, _canvas: &CanvasView) {}
 
     /// The tool's veto on a stroke whose gesture already matched (a state the binding cannot
     /// express: no stamp source yet, an eyedropper owning the click). Asked once, at the stroke's
@@ -336,10 +359,107 @@ struct ScratchTextureTile {
     size_px: [usize; 2],
 }
 
+/// What the canvas reports, at the top of a frame, about the page of a [`RetiringPreview`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RetiringPageFacts {
+    /// `CanvasView::overlay_page_generation` now.
+    pub(super) overlay_generation: u64,
+    /// `CanvasView::overlay_page_settled` now.
+    pub(super) settled: bool,
+}
+
+impl RetiringPageFacts {
+    /// Reads the facts of `page_idx` from `canvas`.
+    pub(super) fn of(canvas: &CanvasView, page_idx: usize) -> Self {
+        Self { overlay_generation: canvas.overlay_page_generation(page_idx), settled: canvas.overlay_page_settled(page_idx) }
+    }
+}
+
+/// The preview of a COMMITTED stroke, still standing in for its page's clean overlay.
+///
+/// A brush stroke commits after `CanvasView::draw` of its last frame, and the canvas then needs
+/// more frames to get the committed pixels onto the GPU (a per-frame tile budget, or a background
+/// re-prepare). Dropping the preview at the commit showed a frame with no clean at all and then
+/// stale tiles (S-096). So the commit keeps the preview, the page stays render-suppressed, and the
+/// preview is released at the top of a later frame once the page is settled. It is also released
+/// at once when the page's overlay changed after the commit (an undo / redo, another writer): the
+/// preview would then show pixels that are no longer the overlay. A new stroke on the same page
+/// replaces it (the new scratch already holds the committed pixels); a tool switch drops it.
+pub(super) struct RetiringPreview<T> {
+    preview: T,
+    page_idx: usize,
+    /// The page's overlay generation right after the commit wrote it.
+    overlay_generation: u64,
+}
+
+impl<T> RetiringPreview<T> {
+    /// Retires `preview` of `page_idx`; call right after the commit's canvas write.
+    pub(super) fn after_commit(canvas: &CanvasView, page_idx: usize, preview: T) -> Self {
+        Self { preview, page_idx, overlay_generation: canvas.overlay_page_generation(page_idx) }
+    }
+
+    /// The page whose overlay this preview stands in for.
+    pub(super) fn page_idx(&self) -> usize {
+        self.page_idx
+    }
+
+    /// The retired preview itself, for drawing.
+    pub(super) fn preview_mut(&mut self) -> &mut T {
+        &mut self.preview
+    }
+
+    /// Whether `facts` about this preview's page end the retirement: the page settled, or its
+    /// overlay changed since the commit.
+    fn released_by(&self, facts: RetiringPageFacts) -> bool {
+        facts.settled || facts.overlay_generation != self.overlay_generation
+    }
+}
+
+/// Releases `slot`'s retiring preview when the facts `facts_of` reports for its page end the
+/// retirement ([`RetiringPreview`]). Returns whether a preview is still retiring.
+pub(super) fn release_retiring_preview<T>(slot: &mut Option<RetiringPreview<T>>, facts_of: impl FnOnce(usize) -> RetiringPageFacts) -> bool {
+    let Some(retiring) = slot.as_ref() else {
+        return false;
+    };
+    if retiring.released_by(facts_of(retiring.page_idx)) {
+        *slot = None;
+        return false;
+    }
+    true
+}
+
+/// Drops `slot`'s retiring preview when it belongs to `page_idx`, where a new stroke starts: the
+/// new stroke's base was cut from the overlay that already holds the retired stroke's pixels, and
+/// both previews drawn would composite that stroke twice. A preview of another page keeps
+/// retiring.
+pub(super) fn drop_retiring_preview_of_page<T>(slot: &mut Option<RetiringPreview<T>>, page_idx: usize) {
+    if slot.as_ref().is_some_and(|retiring| retiring.page_idx == page_idx) {
+        *slot = None;
+    }
+}
+
+/// The pages a live preview (`live`) and a retiring one (`retiring`) stand in for, without
+/// duplicates: the `overlay_suppressed_pages` answer of a brush tool.
+pub(super) fn preview_pages(live: Option<usize>, retiring: Option<usize>) -> Vec<usize> {
+    let mut pages: Vec<usize> = live.into_iter().collect();
+    if let Some(page_idx) = retiring.filter(|page_idx| !pages.contains(page_idx)) {
+        pages.push(page_idx);
+    }
+    pages
+}
+
+/// Where `overlay_rect` (overlay pixels of `page_idx`) is on screen NOW, from the canvas's current
+/// page geometry: a preview may outlive the frame it was started in (a retiring preview, a scroll
+/// mid-stroke). `None` while the page has no laid-out rect or no overlay.
+pub(super) fn preview_scene_rect(canvas: &CanvasView, page_idx: usize, overlay_rect: OverlayRectPx) -> Option<Rect> {
+    let page_scene_rect = canvas.page_scene_rect(page_idx)?;
+    let [overlay_w, overlay_h] = canvas.overlay_size(page_idx)?;
+    overlay_rect_to_scene_rect(page_scene_rect, overlay_w, overlay_h, overlay_rect)
+}
+
 struct ScratchStroke {
     page_idx: usize,
     overlay_rect: OverlayRectPx,
-    scene_rect: Rect,
     base_image: egui::ColorImage,
     image: egui::ColorImage,
     mask: Vec<f32>,
@@ -350,7 +470,8 @@ struct ScratchStroke {
 
 /// The shared base of the canvas brush tools (Замазка, Штамп): radius (through the one brush-size
 /// owner, `ms_tools::MaskBrush`), hardness, colour blending, the strict-pixel mode, the scratch
-/// stroke and its tiled preview.
+/// stroke and its tiled preview, and the retiring preview of the last committed scratch stroke
+/// ([`RetiringPreview`]).
 pub struct BrushToolBase {
     /// The radius and its laws (`-` / `=` steps, wheel notches, bounds): the shared brush owner,
     /// so the Cleaning brushes resize exactly like every other brush of the studio.
@@ -362,6 +483,8 @@ pub struct BrushToolBase {
     /// nothing, the drag pans the canvas.
     pan_active: bool,
     scratch: Option<ScratchStroke>,
+    /// The last committed scratch stroke, still standing in for its page's overlay.
+    retiring: Option<RetiringPreview<ScratchStroke>>,
 }
 
 impl Default for BrushToolBase {
@@ -373,6 +496,7 @@ impl Default for BrushToolBase {
             strict_pixel_painting: false,
             pan_active: false,
             scratch: None,
+            retiring: None,
         }
     }
 }
@@ -497,6 +621,31 @@ impl BrushToolBase {
         self.scratch.is_some()
     }
 
+    /// The pages whose overlay the live scratch and the retiring preview replace (see
+    /// `CleaningTool::overlay_suppressed_pages`).
+    pub fn preview_pages(&self) -> Vec<usize> {
+        preview_pages(self.scratch.as_ref().map(|stroke| stroke.page_idx), self.retiring.as_ref().map(RetiringPreview::page_idx))
+    }
+
+    /// Releases the retiring preview once its page settled or changed
+    /// (`CleaningTool::release_settled_preview`). Returns whether one is still retiring.
+    pub fn release_settled_preview(&mut self, canvas: &CanvasView) -> bool {
+        release_retiring_preview(&mut self.retiring, |page_idx| RetiringPageFacts::of(canvas, page_idx))
+    }
+
+    /// Drops the retiring preview at once (the tool is being deactivated: an inactive tool is
+    /// never asked again, so its preview must not outlive it).
+    pub fn drop_retiring_preview(&mut self) {
+        self.retiring = None;
+    }
+
+    /// Makes `stroke` the live scratch, replacing a retiring preview of the same page
+    /// ([`drop_retiring_preview_of_page`]).
+    fn install_scratch(&mut self, stroke: ScratchStroke) {
+        drop_retiring_preview_of_page(&mut self.retiring, stroke.page_idx);
+        self.scratch = Some(stroke);
+    }
+
     pub fn ensure_overlay_under_point(canvas: &mut CanvasView, point: StrokePoint) -> bool {
         if canvas.overlay_image(point.page_idx).is_some() {
             return true;
@@ -533,17 +682,14 @@ impl BrushToolBase {
         };
         let expanded_rect =
             expand_overlay_rect(base_rect, overlay_w, overlay_h, self.brush.radius_px().max(1) + 2);
-        let Some(scene_rect) =
-            overlay_rect_to_scene_rect(page_scene_rect, overlay_w, overlay_h, expanded_rect)
-        else {
+        if overlay_rect_to_scene_rect(page_scene_rect, overlay_w, overlay_h, expanded_rect).is_none() {
             return false;
-        };
+        }
         let base_image = extract_overlay_chunk(overlay, expanded_rect);
         let pixel_count = base_image.pixels.len();
-        self.scratch = Some(ScratchStroke {
+        self.install_scratch(ScratchStroke {
             page_idx: point.page_idx,
             overlay_rect: expanded_rect,
-            scene_rect,
             image: base_image.clone(),
             base_image,
             mask: vec![0.0; pixel_count],
@@ -685,6 +831,11 @@ impl BrushToolBase {
         canvas.replace_overlay_region(page_idx, scene_rect, &patch)
     }
 
+    /// Writes the live scratch's painted rect into the canvas overlay (and the shared model) and
+    /// returns its page. On success the stroke becomes the retiring preview, which keeps standing
+    /// in for the page until the canvas shows the committed pixels (`release_settled_preview`).
+    /// `None` when there was no scratch, nothing was painted or the write failed (no preview
+    /// retires then: the overlay did not change).
     pub fn commit_scratch_stroke(&mut self, canvas: &mut CanvasView) -> Option<usize> {
         let stroke = self.scratch.take()?;
         let dirty_rect = stroke.dirty_rect?;
@@ -694,7 +845,9 @@ impl BrushToolBase {
             overlay_rect_to_scene_rect(page_scene_rect, overlay_w, overlay_h, dirty_rect)?;
         let patch = extract_local_chunk(&stroke.image, stroke.overlay_rect, dirty_rect);
         if canvas.replace_overlay_region(stroke.page_idx, scene_rect, &patch) {
-            return Some(stroke.page_idx);
+            let page_idx = stroke.page_idx;
+            self.retiring = Some(RetiringPreview::after_commit(canvas, page_idx, stroke));
+            return Some(page_idx);
         }
         None
     }
@@ -703,14 +856,19 @@ impl BrushToolBase {
         self.scratch = None;
     }
 
+    /// Paints the retiring preview and the live scratch, each over its page's current rect.
+    /// They never share a page (`install_scratch`), so nothing is composited twice.
     pub fn draw_scratch_preview(&mut self, ui: &mut egui::Ui, canvas: &CanvasView) {
-        let Some(stroke) = self.scratch.as_mut() else {
-            return;
-        };
         let texture_options = scratch_preview_texture_options(canvas);
-        ensure_scratch_tiles(stroke, ui.ctx(), texture_options);
-        upload_dirty_scratch_tiles(stroke, texture_options);
-        paint_scratch_tiles(stroke, ui);
+        let retiring = self.retiring.as_mut().map(RetiringPreview::preview_mut);
+        for stroke in retiring.into_iter().chain(self.scratch.as_mut()) {
+            let Some(scene_rect) = preview_scene_rect(canvas, stroke.page_idx, stroke.overlay_rect) else {
+                continue;
+            };
+            ensure_scratch_tiles(stroke, ui.ctx(), texture_options);
+            upload_dirty_scratch_tiles(stroke, texture_options);
+            paint_scratch_tiles(stroke, scene_rect, ui);
+        }
     }
 
     fn paint_dirty_margin(&self) -> usize {
@@ -3350,7 +3508,8 @@ fn upload_dirty_scratch_tiles(stroke: &mut ScratchStroke, texture_options: Textu
     }
 }
 
-fn paint_scratch_tiles(stroke: &ScratchStroke, ui: &mut egui::Ui) {
+/// Paints `stroke`'s tiles stretched over `scene_rect` (where its overlay rect is on screen now).
+fn paint_scratch_tiles(stroke: &ScratchStroke, scene_rect: Rect, ui: &mut egui::Ui) {
     let src_w = stroke.image.size[0] as f32;
     let src_h = stroke.image.size[1] as f32;
     if src_w <= 0.0 || src_h <= 0.0 {
@@ -3363,12 +3522,12 @@ fn paint_scratch_tiles(stroke: &ScratchStroke, ui: &mut egui::Ui) {
         let th = tile.size_px[1] as f32;
         let dst = Rect::from_min_size(
             egui::pos2(
-                stroke.scene_rect.left() + stroke.scene_rect.width() * (ox / src_w),
-                stroke.scene_rect.top() + stroke.scene_rect.height() * (oy / src_h),
+                scene_rect.left() + scene_rect.width() * (ox / src_w),
+                scene_rect.top() + scene_rect.height() * (oy / src_h),
             ),
             egui::vec2(
-                stroke.scene_rect.width() * (tw / src_w),
-                stroke.scene_rect.height() * (th / src_h),
+                scene_rect.width() * (tw / src_w),
+                scene_rect.height() * (th / src_h),
             ),
         );
         ui.painter().image(
@@ -3868,6 +4027,115 @@ mod tests {
             .take_selection_refusal()
             .expect("a refused size must be drainable by the owning tool");
         assert_eq!(base.load_error.as_deref(), Some(refusal.as_str()));
+    }
+
+    /// A one-pixel scratch stroke of `page_idx`, as `begin_scratch_stroke` would cut it.
+    fn test_stroke(page_idx: usize) -> ScratchStroke {
+        let image = egui::ColorImage::filled([1, 1], Color32::TRANSPARENT);
+        ScratchStroke {
+            page_idx,
+            overlay_rect: rect(0, 0, 1, 1),
+            base_image: image.clone(),
+            image,
+            mask: vec![0.0],
+            tiles: Vec::new(),
+            dirty_tiles: HashSet::new(),
+            dirty_rect: None,
+        }
+    }
+
+    fn retiring(page_idx: usize, overlay_generation: u64) -> RetiringPreview<ScratchStroke> {
+        RetiringPreview { preview: test_stroke(page_idx), page_idx, overlay_generation }
+    }
+
+    fn facts(overlay_generation: u64, settled: bool) -> RetiringPageFacts {
+        RetiringPageFacts { overlay_generation, settled }
+    }
+
+    /// THE BUG this guards (S-096): a committed stroke's preview must keep standing in for its
+    /// page while the canvas is still uploading the committed pixels, and go exactly when the
+    /// page settled — earlier is a blank or stale frame, never is a stale preview.
+    #[test]
+    fn a_retiring_preview_is_held_until_its_page_settles() {
+        let mut slot = Some(retiring(3, 7));
+        assert!(release_retiring_preview(&mut slot, |page_idx| {
+            assert_eq!(page_idx, 3, "the facts are read for the preview's own page");
+            facts(7, false)
+        }));
+        assert!(slot.is_some(), "unsettled and unchanged: the preview still stands in");
+        assert!(!release_retiring_preview(&mut slot, |_| facts(7, true)));
+        assert!(slot.is_none(), "settled: the canvas shows the committed pixels itself");
+        assert!(!release_retiring_preview(&mut slot, |_| facts(7, false)), "nothing retiring, nothing to wait for");
+    }
+
+    /// An undo / redo or another writer changed the page after the commit: the preview shows
+    /// pixels that are no longer the overlay, so it goes at once, settled or not.
+    #[test]
+    fn a_retiring_preview_goes_at_once_when_its_page_changed_after_the_commit() {
+        let mut slot = Some(retiring(0, 7));
+        assert!(!release_retiring_preview(&mut slot, |_| facts(8, false)));
+        assert!(slot.is_none());
+    }
+
+    /// A new stroke on the retiring page replaces the preview (its base already holds the
+    /// committed pixels; both drawn would composite the stroke twice); on another page both stay,
+    /// and both pages are suppressed.
+    #[test]
+    fn a_new_stroke_replaces_a_retiring_preview_of_its_own_page_only() {
+        let mut brush = BrushToolBase { retiring: Some(retiring(1, 4)), ..BrushToolBase::default() };
+        brush.install_scratch(test_stroke(2));
+        assert!(brush.retiring.is_some(), "a preview of another page keeps retiring");
+        assert_eq!(brush.preview_pages(), vec![2, 1]);
+
+        brush.cancel_scratch_stroke();
+        brush.install_scratch(test_stroke(1));
+        assert!(brush.retiring.is_none(), "the same page's preview is replaced by the new scratch");
+        assert_eq!(brush.preview_pages(), vec![1]);
+    }
+
+    /// Cancelling a scratch leaves a retiring preview alone; deactivating the tool drops it, since
+    /// an inactive tool is never asked to release it.
+    #[test]
+    fn deactivation_drops_the_retiring_preview_and_a_cancel_does_not() {
+        let mut brush = BrushToolBase { retiring: Some(retiring(0, 1)), ..BrushToolBase::default() };
+        brush.install_scratch(test_stroke(5));
+        brush.cancel_scratch_stroke();
+        assert_eq!(brush.preview_pages(), vec![0]);
+        brush.drop_retiring_preview();
+        assert!(brush.preview_pages().is_empty());
+    }
+
+    /// A commit that writes nothing (no scratch, nothing painted, no laid-out page) leaves the
+    /// overlay unchanged, so nothing may retire and nothing stays suppressed.
+    #[test]
+    fn a_commit_that_wrote_nothing_leaves_no_retiring_preview() {
+        let mut canvas = CanvasView::default();
+        let mut brush = BrushToolBase::default();
+        assert_eq!(brush.commit_scratch_stroke(&mut canvas), None);
+        brush.install_scratch(test_stroke(0));
+        assert_eq!(brush.commit_scratch_stroke(&mut canvas), None, "nothing was painted");
+        assert!(brush.retiring.is_none() && brush.scratch.is_none());
+        assert!(brush.preview_pages().is_empty());
+    }
+
+    /// On a page the canvas never drew, waiting is pointless: the facts read from a real canvas
+    /// release a preview right away instead of stranding it.
+    #[test]
+    fn a_preview_of_a_page_the_canvas_never_drew_is_released() {
+        let canvas = CanvasView::default();
+        assert_eq!(RetiringPageFacts::of(&canvas, 4), facts(0, true));
+        let mut slot = Some(RetiringPreview::after_commit(&canvas, 4, test_stroke(4)));
+        assert!(!release_retiring_preview(&mut slot, |page_idx| RetiringPageFacts::of(&canvas, page_idx)));
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn preview_pages_lists_each_page_once() {
+        assert!(preview_pages(None, None).is_empty());
+        assert_eq!(preview_pages(Some(1), None), vec![1]);
+        assert_eq!(preview_pages(None, Some(2)), vec![2]);
+        assert_eq!(preview_pages(Some(3), Some(3)), vec![3]);
+        assert_eq!(preview_pages(Some(3), Some(4)), vec![3, 4]);
     }
 
     /// Installs the embedded English catalog for the tests that compare localized text.

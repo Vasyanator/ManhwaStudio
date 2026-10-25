@@ -904,9 +904,10 @@ impl CanvasView {
             canvas_rect,
             suppress_wheel_scroll,
             zoom_drag_active,
+            // Render-suppressed pages stay enabled here: `draw_overlay_on_page` still uploads them
+            // and skips only their painting.
             overlays_enabled: self.overlay_runtime.overlays_model.is_some()
-                && self.overlay_runtime.overlays_visible
-                && !self.overlay_runtime.overlay_render_suppressed,
+                && self.overlay_runtime.overlays_visible,
             space_pan_drag_enabled: pan_mode_active,
         }
     }
