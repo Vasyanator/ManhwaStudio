@@ -19,6 +19,8 @@ Key submodules:
 - `engine`: the `AiEngine` contract between the host and the engines it runs, and the one
   size-violation wording
 - `engine_settings`: engine-agnostic settings helpers shared by every hosted engine (the save gate)
+- `engine_settings_file`: an engine's own settings file — quarantining read, atomic write, the
+  debounced `SettingsSaver` and its teardown flush — shared by every hosted engine
 - `host`: `HostSpec` and `RegionEditHost` — the generic hosted tool
 - `host_panels`: the host's two panel bodies
 - `postprocess`: what a run of a raw-answer engine keeps, and the latest-wins worker that
@@ -35,6 +37,7 @@ Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md`.
 
 pub mod engine;
 pub mod engine_settings;
+pub mod engine_settings_file;
 pub mod frame;
 pub mod geometry;
 pub mod host;

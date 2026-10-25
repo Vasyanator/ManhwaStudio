@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use super::grid::{self, Field, index_f64, reflect101, to_f32};
 use super::jitter::{jittered_sample_indices, splitmix64};
-use super::lab::LabTables;
+use crate::lab::LabTables;
 use super::{LocalMatchError, MAX_SCALE_PX, match_color_local};
 
 type TestResult = Result<(), Box<dyn Error>>;

@@ -18,6 +18,9 @@ Main items:
   (paint / erase drags) through `InputFrame::gesture_for`.
 - `TranslationTabState::delete_selected_text_detector_line` /
   `create_text_detector_line_at_page_center`: the lines edit commands the host executes.
+- `TranslationTabState::flush_line_edits_to_text_mask_model`: hands the edited lines to the shared
+  `TextMaskModel` (Cleaning's quick clean reads its boxes) once no drag runs on the page;
+  `drop_line_edit_state_on_page` drops a selection / drag whose block index went stale.
 
 Notes:
 - A claimed selection starts at the PRESS point (the claim's origin) and commits on the button
@@ -352,10 +355,14 @@ impl TranslationTabState {
         let Some(line) = self.text_detector_results.get_mut(&page_idx).and_then(|result| result.blocks.get_mut(drag.selection.line_idx)) else {
             return;
         };
-        *line = match drag.kind {
+        let moved = match drag.kind {
             TextDetectorLineDragKind::Move => move_text_detector_rect(drag.start_rect, drag.start_pointer_src, pointer_src, source_w, source_h),
             TextDetectorLineDragKind::Resize { handle_idx } => resize_text_detector_rect(drag.start_rect, pointer_src, handle_idx, source_w, source_h),
         };
+        if *line != moved {
+            *line = moved;
+            self.line_edited_pages.insert(page_idx);
+        }
     }
 
     /// Deletes the selected detected line (lines edit command); nothing without a selection.
@@ -367,16 +374,85 @@ impl TranslationTabState {
             && selection.line_idx < result.blocks.len()
         {
             result.blocks.remove(selection.line_idx);
+            self.line_edited_pages.insert(selection.page_idx);
         }
         self.text_detector_line_drag_state = None;
     }
 
+    /// Drops the line selection and drag of page `page_idx` (its blocks were replaced or
+    /// re-sorted, so their index is stale); another page's selection is kept.
+    pub(super) fn drop_line_edit_state_on_page(&mut self, page_idx: usize) {
+        if self.text_detector_line_selection.is_some_and(|selection| selection.page_idx == page_idx) {
+            self.text_detector_line_selection = None;
+        }
+        if self.text_detector_line_drag_state.is_some_and(|drag| drag.selection.page_idx == page_idx) {
+            self.text_detector_line_drag_state = None;
+        }
+    }
+
+    /// Hands every line-edited page (`line_edited_pages`) whose drag has ended to the shared
+    /// `TextMaskModel`, so Cleaning's quick clean sees the edited boxes. Per page:
+    /// - no model page, or one whose boxes are unknown (a hand-edited mask) or of another size:
+    ///   left alone (a hand-edited mask's boxes stay unknown);
+    /// - a mask-less (legacy) result: the model page is the display raster of the OLD resolved
+    ///   lines, so it is rebuilt from the edited ones (`materialize_text_mask_page_from_blocks_if_missing`);
+    /// - otherwise the model keeps its mask and takes the result's raw lines as its boxes.
+    ///
+    /// Called every frame; a no-op while nothing was edited.
+    pub(super) fn flush_line_edits_to_text_mask_model(&mut self) {
+        if self.line_edited_pages.is_empty() {
+            return;
+        }
+        let dragging = self.text_detector_line_drag_state.map(|drag| drag.selection.page_idx);
+        let ready: Vec<usize> = self.line_edited_pages.iter().copied().filter(|page_idx| Some(*page_idx) != dragging).collect();
+        for page_idx in ready {
+            self.line_edited_pages.remove(&page_idx);
+            self.sync_text_mask_blocks_after_line_edit(page_idx);
+        }
+    }
+
+    /// One page of [`Self::flush_line_edits_to_text_mask_model`].
+    fn sync_text_mask_blocks_after_line_edit(&mut self, page_idx: usize) {
+        let Some(model) = self.text_mask_model.clone() else {
+            return;
+        };
+        let Some(result) = self.text_detector_results.get(&page_idx) else {
+            return;
+        };
+        let rebuild_raster = {
+            let mut model = match model.lock() {
+                Ok(model) => model,
+                Err(error) => {
+                    ms_log::runtime_log::log_error(format!("[text-detector] text mask model lock poisoned, edited lines of page {page_idx} not mirrored: {error}"));
+                    return;
+                }
+            };
+            let Some(page) = model.page(page_idx).filter(|page| page.blocks.is_some() && page.source_size == result.source_size) else {
+                return;
+            };
+            if result.mask_alpha.is_empty() {
+                model.remove_page(page_idx);
+                true
+            } else {
+                let page = page.clone();
+                model.set_page_with_blocks(page_idx, page.source_size, page.mask_size, page.mask_alpha, super::detector_rects_to_blocks_px(&result.blocks));
+                false
+            }
+        };
+        if rebuild_raster {
+            self.materialize_text_mask_page_from_blocks_if_missing(page_idx);
+        }
+        self.text_detector_mask_textures.remove(&page_idx);
+    }
+
     /// Adds a line in the middle of `canvas`'s current page (lines edit command). A page whose
-    /// detector entry cannot be created is logged and left alone.
-    pub(crate) fn create_text_detector_line_at_page_center(&mut self, canvas: &CanvasView, project: &ProjectData) {
+    /// detector entry cannot be created (its size is not known yet) is logged and the detector
+    /// status line says why.
+    pub(crate) fn create_text_detector_line_at_page_center(&mut self, canvas: &CanvasView) {
         let page_idx = canvas.current_page_idx();
-        if let Err(error) = self.create_text_detector_line_at_uv(project, page_idx, egui::pos2(0.5, 0.5)) {
+        if let Err(error) = self.create_text_detector_line_at_uv(page_idx, egui::pos2(0.5, 0.5)) {
             ms_log::runtime_log::log_warn(format!("[translation] lines edit: could not add a line on page {page_idx}: {error}"));
+            self.set_text_detector_status(error, Severity::Error);
         }
     }
 

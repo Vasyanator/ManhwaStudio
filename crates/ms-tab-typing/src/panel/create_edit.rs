@@ -317,11 +317,7 @@ impl TypingCreatePanelState {
                                                     &face_combo.inner.response,
                                                 );
                                                 if let Some(steps) = face_combo.wheel_steps {
-                                                    cycle_wrapped_index(
-                                                        &mut face_idx,
-                                                        face_count,
-                                                        steps,
-                                                    );
+                                                    face_idx = cycle_wrapped_index(face_idx, face_count, steps);
                                                 }
                                                 self.selected_face_idx = face_idx;
                                                 if self.selected_face_idx != prev_face_idx {

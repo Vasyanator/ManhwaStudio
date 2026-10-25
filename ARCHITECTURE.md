@@ -184,7 +184,7 @@ shared wiki view). The studio never references
   protocol, a paid POST that carries a fresh `Idempotency-Key`, is never retried and is abandoned — not aborted — on cancel, with
   a process-wide cap on unfinished paid requests; the free key/limit fetch; the key + limit
   panel). Crate-private `http/` is the one native transport, multipart builder and
-  key-origin check shared by `image_edit` and `neurolate`.
+  key-origin check shared by `image_edit`, `neurolate` and the OpenRouter account status.
 
 **UI engines and tabs (levels 8-12)**
 - `ms-canvas` — the shared page + bubble canvas; declares `CanvasHooks`.

@@ -151,6 +151,8 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
 - `gradient.rs`: local mask fill using Lab scanline estimation and smoothing. Its screened-Poisson
   L-channel consolidation calls the project's SHARED red-black SOR kernel
   `crate::tools::red_black_sor_sweeps`; the other consumer is `crate::tools::patch::membrane`.
+  Its sRGB <-> CIELAB conversion is `ms_region_postprocess::LabTables`; only the dithered
+  quantization back to 8 bits is local.
 - `texture_synthesis.rs`: local inpaint through the `texture-synthesis` crate, with optional
   sample mask limiting the texture source area.
 - `flux_fill.rs`: FLUX.1-Fill-dev tool (IPC methods `inpaint.flux_fill` streaming, `.unload`,

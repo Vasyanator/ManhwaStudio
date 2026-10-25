@@ -323,6 +323,13 @@ pub trait CleaningTool: Send {
     ) -> Option<CleaningCursorOccluder> {
         None
     }
+
+    /// Teardown only: synchronously writes every settings value the tool still owes to its
+    /// own settings files, so a process exit right after cannot lose it. The one method here
+    /// allowed to block; called from the studio's teardown worker
+    /// (`StudioTab::flush_debounced_stores_blocking`), never from the GUI thread. A tool with
+    /// no debounced settings writer keeps the no-op default.
+    fn flush_settings_blocking(&mut self) {}
 }
 
 struct ScratchTextureTile {

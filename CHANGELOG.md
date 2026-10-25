@@ -161,6 +161,16 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **Canvas panel toggles survive Settings changes** — «Show bubbles» and the bubble opacity changed on a canvas panel are no longer reverted when you then change a setting in Settings › Ribbon and bubbles.
 - **FLUX.1-Fill works offline** — once FLUX.1-Fill is downloaded, inpainting with it no longer contacts Hugging Face on every run, so it works without internet and a network hiccup no longer makes it fail.
 - **Cancelling a model download is immediate** — cancelling a download that the AI backend performs now stops it within about a second even when the connection has stalled; before, it could take up to a minute.
+- **AI environment repair** — the installer and the environment check now bring an existing AI environment up to the tested package versions: they install the missing packages FLUX.2/FLUX.3 klein and FLUX Fill need, keep the language-model library on its tested version and fix packages installed at the wrong version.
+- **Text detector** — Save no longer deletes or overwrites saved page detections that could not be read, and says how many it kept; edited detected lines now reach Cleaning's quick clean.
+- **OCR status** — a recognition that was replaced or lost no longer leaves the status stuck on «detecting».
+- **Region editing settings** — SDXL, Lama and cloud image-edit settings are saved once a dial settles instead of on every step, written safely, and the last change is no longer lost when the app closes right after it. When status checks of a cloud edit fail for good, the job is also cancelled at fal, Replicate or Runway. Cancelling with no result says «Processing cancelled.» instead of «result discarded».
+- **Quick text clean** — text masks the detector saved at a reduced size are now recognized as belonging to their page.
+- **Formula presets** — a failed save is now shown in the panel status line instead of being lost silently, two quick saves can no longer land in the wrong order, and preset names keep spaces exactly as typed.
+- **Save and discard status** — the status line updates the moment saving to the project or discarding finishes, without needing to move the mouse.
+- **Quick OCR availability** — quick recognition on the Translation canvas follows the AI backend's current state even when all tools are hidden.
+- **Touch input** — a touch cancelled by the system (for example by palm rejection) no longer leaves the pointer held down.
+- **SDXL error message** — when the SDXL library fails to load, the error now shows the real cause instead of always asking to install it.
 
 ---
 
@@ -327,3 +337,13 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **Переключатели панели холста не сбрасываются настройками** — «Показывать пузыри» и прозрачность пузырей, изменённые на панели холста, больше не возвращаются назад, когда после этого меняется параметр в Настройках › «Лента и пузыри».
 - **FLUX.1-Fill работает без интернета** — после загрузки FLUX.1-Fill инпейнт им больше не обращается к Hugging Face при каждом запуске, поэтому работает офлайн, и сбой сети больше не приводит к ошибке.
 - **Отмена загрузки модели срабатывает сразу** — отмена загрузки, которую выполняет AI-бэкенд, теперь останавливает её примерно за секунду даже при зависшем соединении; раньше это могло занимать до минуты.
+- **Восстановление ИИ-окружения** — установщик и проверка окружения теперь приводят существующее ИИ-окружение к проверенным версиям пакетов: доустанавливают пакеты, нужные FLUX.2/FLUX.3 klein и FLUX Fill, держат библиотеку языковых моделей на проверенной версии и исправляют пакеты, установленные не той версии.
+- **Детектор текста** — сохранение больше не удаляет и не перезаписывает нечитаемые сохранённые детекции страниц и сообщает, сколько их оставлено; правка строк детектора теперь доходит до быстрой очистки во вкладке клина.
+- **Статус OCR** — заменённое или потерянное распознавание больше не оставляет статус «детекция» висеть.
+- **Настройки редактирования области** — параметры SDXL, Lama и облачного редактирования сохраняются один раз после остановки регулятора, а не на каждом шаге, записываются безопасно, и последнее изменение больше не теряется при закрытии программы сразу после него. Если проверки статуса облачного задания окончательно не удались, задание отменяется и у fal, Replicate или Runway. Отмена без готового результата пишет «Обработка отменена.», а не «результат отброшен».
+- **Быстрая очистка текста** — маски текста, сохранённые детектором в уменьшенном размере, теперь правильно относятся к своей странице.
+- **Пресеты формул** — ошибка сохранения теперь показывается в строке состояния панели, а не теряется молча, два быстрых сохранения больше не могут записаться в обратном порядке, а имена пресетов сохраняются ровно так, как введены.
+- **Статус сохранения и сброса** — строка статуса обновляется сразу по завершении сохранения в проект или сброса, без движения мыши.
+- **Доступность быстрого OCR** — быстрое распознавание на холсте перевода учитывает текущее состояние ИИ-бэкенда, даже когда все инструменты скрыты.
+- **Сенсорный ввод** — касание, отменённое системой (например, при отбрасывании ладони), больше не оставляет указатель зажатым.
+- **Сообщение об ошибке SDXL** — если библиотека SDXL не загружается, ошибка показывает настоящую причину, а не всегда просит её установить.

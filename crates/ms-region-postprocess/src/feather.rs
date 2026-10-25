@@ -16,6 +16,11 @@ Deliberate deviation from the Python reference: the distance is the EXACT Euclid
 underestimates diagonal distances by up to ~2 %. The ramp is a few levels different at most.
 The transform itself is sequential (`ms-raster` is a std-only foundation crate); the pipeline
 runs it concurrently with the colour match instead. The per-pixel passes here are rayon-parallel.
+
+Not shared with the patch tool's coverage ramp (`ms-tools` `patch::membrane::build_coverage`),
+which also ramps a smoothstep inwards but over city-block depth, with the ROI border NOT a
+contour and the outermost ring at 0; nor with the cloud editor's OUTWARD dilate + box-blur
+feather (`ms-ai-api` `image_edit::composite`). Each output is pinned on its own rule.
 */
 
 use ms_raster::squared_distance_to_mask;

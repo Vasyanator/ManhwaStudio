@@ -5,7 +5,7 @@ Process-global lazy manager for the in-process native ONNX Runtime path.
 Purpose:
 Owns the single, lazily-loaded `ms_onnx::OrtRuntime` plus a small, LRU-bounded cache
 of native OCR engines. Exactly ONE `PaddleDetector` is kept resident and shared by
-the native Paddle detection forward (`paddle_det_forward` / `detect_paddle`) AND every
+the native Paddle detection forward (`paddle_det_forward`) AND every
 PaddleOCR-language recognition (through
 `ms_onnx::paddle_recognize`), so no per-language detector session is duplicated.
 `MangaOcrEngine`s (Base / 2025), per-language `PaddleRecognizer`s and `BaberuOcrEngine`s
@@ -72,8 +72,6 @@ Key items:
 - BaberuModelPaths / recognize_baberu : native Baberu OCR entry point over CALLER-resolved
   model files (missing file -> ModelNotDownloaded before any dylib work; vision on the
   selected EP, decoders on CPU; the effective vision EP is logged once per engine build).
-- detect_paddle         : native PaddleOCR text-detector entry point (shared detector,
-  single 960-px pass + postprocess; kept for callers of the whole-page result).
 - paddle_det_forward    : forward-only PaddleOCR detector pass on prepared tiles -> u8
   probability maps (shared detector), for the tiled `ms_text_detect` pipeline.
 - paddle_det_max_batch  : tiles per paddle_det_forward call for the effective provider
@@ -143,7 +141,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use ms_onnx::{
     BaberuOcrEngine, BaberuVisionPlacement, ExecutionProvider, MangaOcrEngine,
-    NativeDeviceSelection, OrtError, OrtRuntime, PaddleDetection, PaddleDetector,
+    NativeDeviceSelection, OrtError, OrtRuntime, PaddleDetector,
     PaddleRecognizer,
 };
 
@@ -1178,8 +1176,7 @@ static SUCCEEDED_MARKED: AtomicBool = AtomicBool::new(false);
 /// marker never fires while another op could still SIGILL. See [`InFlightGuard`].
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
-/// Serializes PaddleOCR detector operations (`detect_paddle`, `paddle_det_forward`,
-/// `recognize_paddle`),
+/// Serializes PaddleOCR detector operations (`paddle_det_forward`, `recognize_paddle`),
 /// which all share the single resident `PaddleDetector`.
 static PADDLE_OP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -1393,39 +1390,13 @@ pub fn recognize_baberu(
     })
 }
 
-/// Detects text regions in `image` using the native PaddleOCR detector.
-///
-/// Ensures the shared detector model via `ai_models`, builds/caches the ONE shared
-/// [`PaddleDetector`], and runs detection. Shares the SIGILL guard/first-success
-/// machinery with the OCR paths via [`run_guarded`].
-///
-/// # Threading
-/// Worker-thread only: performs blocking download, dlopen, and inference.
-///
-/// # Errors
-/// Same guard/dylib/ORT-load surface as [`recognize_manga`], plus
-/// [`NativeRuntimeError::PaddleDetectorLoad`] / [`NativeRuntimeError::PaddleDetect`].
-pub fn detect_paddle(
-    image: &image::RgbaImage,
-    cancel: &AtomicBool,
-    progress: &mut dyn FnMut(NativeProgress<'_>),
-) -> Result<PaddleDetection, NativeRuntimeError> {
-    run_guarded(cancel, progress, |ort, progress| {
-        // Serialize with `recognize_paddle` on the shared detector (see there); a
-        // concurrent caller blocks rather than finding the detector taken.
-        let _paddle_op = lock_paddle_op();
-        ensure_paddle_detector(ort, cancel, progress)?;
-        run_paddle_detect(image)
-    })
-}
-
 /// Runs the native PaddleOCR detection model on prepared tiles and returns one
 /// quantized probability map per tile — the forward pass of the tiled text-detector
 /// pipeline (`ms_text_detect` plans the tiles, stitches the maps and runs the DB
 /// postprocess). See `ms_onnx::PaddleDetector::forward_prob_maps` for the tile
 /// contract (equal sizes, both sides a multiple of 32, no resize) and the quantization.
 ///
-/// Uses the SAME sequence as [`detect_paddle`]: [`run_guarded`] (load guard, attempt
+/// Uses the SAME sequence as [`recognize_paddle`]: [`run_guarded`] (load guard, attempt
 /// marker, first-success marker), `lock_paddle_op` (serialized with every other op on
 /// the ONE shared detector), then the shared detector.
 ///
@@ -1442,7 +1413,7 @@ pub fn paddle_det_forward(
     progress: &mut dyn FnMut(NativeProgress<'_>),
 ) -> Result<Vec<ProbMap>, NativeRuntimeError> {
     run_guarded(cancel, progress, |ort, progress| {
-        // Serialize with `recognize_paddle` / `detect_paddle` on the shared detector.
+        // Serialize with `recognize_paddle` on the shared detector.
         let _paddle_op = lock_paddle_op();
         ensure_paddle_detector(ort, cancel, progress)?;
         run_paddle_forward(tiles)
@@ -1925,11 +1896,6 @@ fn ensure_paddle_detector(
     let mut state = lock_state();
     state.paddle_detector.get_or_insert(detector);
     Ok(())
-}
-
-/// Runs PaddleOCR text detection with the global lock RELEASED during the call.
-fn run_paddle_detect(image: &image::RgbaImage) -> Result<PaddleDetection, NativeRuntimeError> {
-    with_shared_detector(|detector| detector.detect(image))
 }
 
 /// Runs the forward-only PaddleOCR detector pass on `tiles` with the global lock

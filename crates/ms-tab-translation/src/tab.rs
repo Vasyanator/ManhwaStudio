@@ -31,7 +31,9 @@ Main types:
   ручного редактирования маски детектора.
 - `TextDetectorMaskTextureTile` / `TextDetectorMaskTexturePage`: tiled GPU mask textures
   for visualizing text-detector alpha masks, including LRU metadata for cache eviction.
-- `TextDetectionStorageEvent`: async load/save result for `text_detection` disk storage.
+- `TextDetectionStorageEvent` / `DetectionLoad`: async load/save result for `text_detection`
+  disk storage; a load lists the pages whose files could not be read, which Save then keeps
+  untouched (`load_failed_detection_pages`).
 - `TranslationSettingsSaveRequest`: snapshot request for async settings persistence.
 - `TranslationTabState`: primary tab state (controllers, panel options, caches, pending actions).
 
@@ -195,9 +197,10 @@ Module-level utility functions:
 - Detector storage paths/IO:
   `text_detection_blocks_file_path`, `text_detection_mask_file_name`,
   `text_detection_mask_file_path`, `load_text_detection_storage`,
-  `load_text_detection_page`, `save_text_detection_storage`, `save_text_detection_page`.
+  `load_text_detection_page`, `save_text_detection_storage`, `save_text_detection_page`,
+  `stored_detection_file_page`.
 - Misc helpers:
-  `parse_u32_pair`.
+  `parse_u32_pair`, `composition_options_from_settings` (a title's composition options over the defaults).
 - Async settings persistence:
   `spawn_translation_settings_saver_thread`, `save_translation_settings_to_project_file`.
 - Settings parsing/conversion:
@@ -262,6 +265,7 @@ use ms_memory::{
 };
 use ms_models::SessionCapabilities;
 use ms_models::text_mask_model::{TextMaskModel, TextMaskPage};
+use ms_models::page_view::PageImageInfo;
 use ms_sysprobe::paste_image;
 use ms_project::{Bubble, ComicType, Page, ProjectData};
 use ms_tabs_simple::characters::load_character_names;
@@ -305,7 +309,7 @@ use crate::panels::ocr::{
 };
 use crate::panels::text_detector::{
     DetectorUnavailable, TextDetectorAlgorithm, TextDetectorPanelOptions,
-    TextDetectorPlanNoticeCache,
+    TextDetectorPlanNoticeCache, detector_page_size,
 };
 use crate::neurolate::NeurolateSettings;
 use ms_ai_api::neurolate::NeurolateKeyPanel;
@@ -360,8 +364,15 @@ use canvas_input::CanvasSelection;
 pub use dock::translation_default_dock_layout;
 use tool_panels::{ToolToggles, TranslationTool};
 
-/// (detected results per page, total loaded, total failed)
-type DetectionLoadResult = Result<(Vec<(usize, TextDetectorPageResult)>, usize, usize), String>;
+/// What the stored-detection load read from a chapter's `text_detection` directory.
+#[derive(Debug, Default)]
+struct DetectionLoad {
+    /// The pages read, each with its result.
+    pages: Vec<(usize, TextDetectorPageResult)>,
+    /// Pages whose stored files exist but could not be read (each logged with its cause). Save
+    /// never deletes nor rewrites them (`load_failed_detection_pages`).
+    failed_pages: Vec<usize>,
+}
 
 const FOOTER_PATCH_DEBOUNCE_SECS: f64 = 0.25;
 /// Bubble `extra` key holding a hint bubble's "show outside the translation tab" flag.
@@ -509,14 +520,14 @@ struct TextDetectorMaskTexturePage {
 enum TextDetectionStorageEvent {
     Loaded {
         project_dir: PathBuf,
-        pages: Vec<(usize, TextDetectorPageResult)>,
-        loaded: usize,
-        failed: usize,
+        load: DetectionLoad,
     },
     Saved {
         project_dir: PathBuf,
         saved: usize,
         failed: usize,
+        /// Pages left alone because their stored files could not be read at load.
+        kept_unreadable: usize,
     },
     Failed {
         project_dir: PathBuf,
@@ -559,6 +570,10 @@ pub struct TranslationTabState {
     /// Size of the current page, cached by the host before the canvas draw for the detector
     /// tool body (the overlay hook receives no `page_infos`); `None` while unknown.
     current_page_size: Option<[u32; 2]>,
+    /// Source size of every page whose `PageImageInfo` is known (decoded, non-zero), refreshed by
+    /// the host each frame (`note_page_sizes`): the GUI thread's page size source, so no hook
+    /// reads an image header from disk.
+    known_page_sizes: HashMap<usize, [u32; 2]>,
     /// Which local AI runtimes (Python backend, native ONNX) this process may use (`--no-ai`
     /// and platform). Only routes needing an off runtime are refused (`ocr_route_availability`,
     /// `TextDetectorAlgorithm::availability`); cloud AI API and machine translation never are.
@@ -630,12 +645,19 @@ pub struct TranslationTabState {
     ribbon_panel_rect: Option<Rect>,
     text_detector_line_selection: Option<TextDetectorLineSelection>,
     text_detector_line_drag_state: Option<TextDetectorLineDragState>,
+    /// Pages whose detected lines were edited (moved, resized, added, deleted) and not yet handed
+    /// to the shared `TextMaskModel` (`canvas_input::flush_line_edits_to_text_mask_model`).
+    line_edited_pages: BTreeSet<usize>,
     /// Where (page-normalized) the lines edit page menu was opened: its "create line" item adds
     /// the line there.
     text_detector_line_menu_uv: Option<Pos2>,
     text_detector_mask_stroke_state: Option<TextDetectorMaskStrokeState>,
     text_detector_mask_brush: MaskBrush,
     text_detection_storage_loaded_for: Option<PathBuf>,
+    /// Pages of the loaded chapter whose stored detection files exist but could not be read
+    /// (set by each load). Save neither deletes nor rewrites their files and says so; a full
+    /// page detection of such a page (`PageDetected`) replaces the whole page and lifts it.
+    load_failed_detection_pages: HashSet<usize>,
     text_detection_storage_busy: bool,
     text_detection_storage_rx: Option<Receiver<TextDetectionStorageEvent>>,
     /// Region detections that arrived while the chapter's stored detection was loading (or
@@ -771,6 +793,7 @@ impl TranslationTabState {
             pending_tool_focus: Vec::new(),
             tools_persist_pending: false,
             current_page_size: None,
+            known_page_sizes: HashMap::new(),
             local_ai,
             ai_backend_health: Arc::clone(&ai_backend_health),
             ai_backend_health_cached: match ai_backend_health.lock() {
@@ -815,10 +838,12 @@ impl TranslationTabState {
             ribbon_panel_rect: None,
             text_detector_line_selection: None,
             text_detector_line_drag_state: None,
+            line_edited_pages: BTreeSet::new(),
             text_detector_line_menu_uv: None,
             text_detector_mask_stroke_state: None,
             text_detector_mask_brush: MaskBrush::default(),
             text_detection_storage_loaded_for: None,
+            load_failed_detection_pages: HashSet::new(),
             text_detection_storage_busy: false,
             pending_region_detections: Vec::new(),
             pending_ocr_regions: HashSet::new(),
@@ -1190,11 +1215,10 @@ impl TranslationTabState {
         self.input_mode_active(crate::input::OCR_ADVANCED_MODE)
     }
 
+    /// Refreshes the per-frame health copy; clones only when the shared snapshot's revision
+    /// changed, so calling it every frame is cheap.
     fn refresh_ai_backend_health_snapshot_cache(&mut self) {
-        self.ai_backend_health_cached = match self.ai_backend_health.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
+        ms_local_ai::backend_health::refresh_cached_snapshot(&self.ai_backend_health, &mut self.ai_backend_health_cached);
     }
 
     fn ai_backend_health_snapshot(&self) -> &AiBackendHealthSnapshot {
@@ -2033,6 +2057,10 @@ impl TranslationTabState {
                         self.create_bubbles_from_page_texts(canvas, project, page_idx, &result, &texts);
                     }
                     self.text_detector_results.insert(page_idx, result);
+                    // The page's blocks were replaced: a line selection or drag indexes the old ones.
+                    self.drop_line_edit_state_on_page(page_idx);
+                    // A full detection is the whole page: Save may now replace its unreadable files.
+                    self.load_failed_detection_pages.remove(&page_idx);
                     self.text_detector_mask_textures.remove(&page_idx);
                     self.sync_text_mask_page_from_result(page_idx);
                 }
@@ -2131,16 +2159,8 @@ impl TranslationTabState {
         self.set_text_detector_status(t!("translation.tab.loading_saved_mask_status"), Severity::Info);
 
         thread::spawn(move || {
-            let event = match load_text_detection_storage(&storage_dir, &page_indices) {
-                Ok((pages, loaded, failed)) => TextDetectionStorageEvent::Loaded {
-                    project_dir,
-                    pages,
-                    loaded,
-                    failed,
-                },
-                Err(error) => TextDetectionStorageEvent::Failed { project_dir, error },
-            };
-            let _ = tx.send(event);
+            let load = load_text_detection_storage(&storage_dir, &page_indices);
+            let _ = tx.send(TextDetectionStorageEvent::Loaded { project_dir, load });
         });
     }
 
@@ -2168,6 +2188,26 @@ impl TranslationTabState {
             );
             return;
         }
+        // A page whose stored files could not be read is neither deleted nor rewritten: what the
+        // session holds for it (a region merged onto an empty page) is not the whole page.
+        let protected = self.load_failed_detection_pages.clone();
+        let pages: Vec<(usize, TextDetectorPageResult)> = pages.into_iter().filter(|(page_idx, _)| !protected.contains(page_idx)).collect();
+        if !protected.is_empty() {
+            let mut sorted: Vec<usize> = protected.iter().copied().collect();
+            sorted.sort_unstable();
+            ms_log::runtime_log::log_warn(format!(
+                "[text-detector] save keeps the unreadable stored detection of page(s) {sorted:?} as it is (not deleted, not rewritten)"
+            ));
+        }
+        if pages.is_empty() {
+            let status = if protected.is_empty() {
+                t!("translation.tab.no_results_to_save_status").to_string()
+            } else {
+                tf!("translation.tab.unreadable_pages_kept_status", count = protected.len())
+            };
+            self.set_text_detector_status(status, Severity::Error);
+            return;
+        }
         let project_dir = project.paths.project_dir.clone();
         let storage_dir = project.paths.text_detection_dir.clone();
         let (tx, rx) = mpsc::channel::<TextDetectionStorageEvent>();
@@ -2176,11 +2216,12 @@ impl TranslationTabState {
         self.set_text_detector_status(t!("translation.tab.saving_mask_status"), Severity::Info);
 
         thread::spawn(move || {
-            let event = match save_text_detection_storage(&storage_dir, &pages) {
+            let event = match save_text_detection_storage(&storage_dir, &pages, &protected) {
                 Ok((saved, failed)) => TextDetectionStorageEvent::Saved {
                     project_dir,
                     saved,
                     failed,
+                    kept_unreadable: protected.len(),
                 },
                 Err(error) => TextDetectionStorageEvent::Failed { project_dir, error },
             };
@@ -2218,16 +2259,14 @@ impl TranslationTabState {
 
         let current_project_dir = project.paths.project_dir.clone();
         match event {
-            TextDetectionStorageEvent::Loaded {
-                project_dir,
-                pages,
-                loaded,
-                failed,
-            } => {
+            TextDetectionStorageEvent::Loaded { project_dir, load } => {
                 if project_dir != current_project_dir {
                     return;
                 }
-                self.apply_loaded_detection_pages(pages);
+                let loaded = load.pages.len();
+                let failed = load.failed_pages.len();
+                self.load_failed_detection_pages = load.failed_pages.into_iter().collect();
+                self.apply_loaded_detection_pages(load.pages);
                 self.text_detection_storage_loaded_for = Some(project_dir);
                 let status = if failed == 0 {
                     tf!("translation.tab.loaded_saved_pages_status", loaded = loaded)
@@ -2245,17 +2284,21 @@ impl TranslationTabState {
                 project_dir,
                 saved,
                 failed,
+                kept_unreadable,
             } => {
                 if project_dir != current_project_dir {
                     return;
                 }
                 self.text_detection_storage_loaded_for = Some(project_dir);
-                let status = if failed == 0 {
+                let mut status = if failed == 0 {
                     tf!("translation.tab.saved_pages_status", saved = saved)
                 } else {
                     tf!("translation.tab.save_progress_status", saved = saved, failed = failed)
                 };
-                let severity = if failed == 0 {
+                if kept_unreadable > 0 {
+                    status = format!("{status} {}", tf!("translation.tab.unreadable_pages_kept_status", count = kept_unreadable));
+                }
+                let severity = if failed == 0 && kept_unreadable == 0 {
                     Severity::Success
                 } else {
                     Severity::Warning
@@ -3064,13 +3107,8 @@ impl TranslationTabState {
 
     /// Adds a line centred at `uv` (page-normalized) on page `page_idx`, creating the page's
     /// detector entry first when it has none, and selects it.
-    fn create_text_detector_line_at_uv(
-        &mut self,
-        project: &ProjectData,
-        page_idx: usize,
-        uv: Pos2,
-    ) -> Result<(), String> {
-        self.ensure_text_detector_page_entry(project, page_idx)?;
+    fn create_text_detector_line_at_uv(&mut self, page_idx: usize, uv: Pos2) -> Result<(), String> {
+        self.ensure_text_detector_page_entry(page_idx)?;
         self.add_text_detector_line_at_uv(page_idx, uv)
     }
 
@@ -3098,6 +3136,7 @@ impl TranslationTabState {
             result.blocks.push(rect);
             result.blocks.len().saturating_sub(1)
         };
+        self.line_edited_pages.insert(page_idx);
         self.text_detector_line_selection = Some(TextDetectorLineSelection {
             page_idx,
             line_idx: next_idx,
@@ -3106,26 +3145,38 @@ impl TranslationTabState {
         Ok(())
     }
 
-    fn ensure_text_detector_page_entry(
-        &mut self,
-        project: &ProjectData,
-        page_idx: usize,
-    ) -> Result<&mut TextDetectorPageResult, String> {
+    /// Refreshes `known_page_sizes` from this frame's page map (host, before the canvas draw):
+    /// a page whose size is not known (loading, failed, absent) has no entry. O(pages), no I/O.
+    pub(crate) fn note_page_sizes(&mut self, page_infos: &HashMap<usize, PageImageInfo>) {
+        self.known_page_sizes.retain(|page_idx, _| page_infos.contains_key(page_idx));
+        for (&page_idx, info) in page_infos {
+            match detector_page_size(Some(info)) {
+                Some(size) => {
+                    self.known_page_sizes.insert(page_idx, size);
+                }
+                None => {
+                    self.known_page_sizes.remove(&page_idx);
+                }
+            }
+        }
+    }
+
+    /// The detector entry of page `page_idx`, created empty when it has none. The page size comes
+    /// from the page loader's `PageImageInfo` (`known_page_sizes`), never from disk: this runs on
+    /// the GUI thread. Errors while that size is unknown (the page is loading or unreadable).
+    fn ensure_text_detector_page_entry(&mut self, page_idx: usize) -> Result<&mut TextDetectorPageResult, String> {
         if let std::collections::hash_map::Entry::Vacant(e) =
             self.text_detector_results.entry(page_idx)
         {
-            let page = project
-                .pages
-                .iter()
-                .find(|page| page.idx == page_idx)
-                .ok_or_else(|| tf!("translation.tab.page_not_found_error", page_idx = page_idx))?;
-            let (w, h) = image::image_dimensions(&page.path).map_err(|err| {
-                tf!("translation.tab.page_image_size_error", page_idx = page_idx, page = page.path.display(), err = err)
-            })?;
+            let [w, h] = self
+                .known_page_sizes
+                .get(&page_idx)
+                .copied()
+                .ok_or_else(|| tf!("translation.tab.page_size_unknown_error", page_idx = page_idx))?;
             e.insert(TextDetectorPageResult {
-                source_size: [w.max(1), h.max(1)],
+                source_size: [w, h],
                 blocks: Vec::new(),
-                mask_size: [w.max(1), h.max(1)],
+                mask_size: [w, h],
                 mask_alpha: Vec::new(),
             });
         }
@@ -4425,6 +4476,7 @@ impl CanvasHooks for TranslationTabState {
         // The canvas-wide rect selections (mouse and finger alike) come from the router's
         // claim; the canvas raises its own capture area while one is armed.
         self.drive_canvas_selection(ctx, canvas, project);
+        self.flush_line_edits_to_text_mask_model();
         self.handle_advanced_recognition_window(ctx, canvas, project);
         self.maybe_dispatch_next_textdetector_ocr_request(ctx, project);
         self.handle_pending_mt_actions(ctx, canvas, project);
@@ -4522,15 +4574,14 @@ impl CanvasHooks for TranslationTabState {
             ctx.request_repaint();
         }
         // The dock runs LAST in this hook, but NOT because that would win it the pointer: within
-        // one `Order`, egui's layer list is persistent and re-sorted stably every pass
-        // (`egui-0.35.0/src/memory/mod.rs:1215-1221`, `:1350`), so where in the frame an `Area` is
-        // created is irrelevant. What raises a layer is `Area::begin`'s `move_to_top` for an area
-        // that was not visible last frame (`egui-0.35.0/src/containers/area.rs:548-552`): the OCR
-        // and image-crop capture surfaces above are full-canvas `Order::Foreground` areas, so each
-        // time the user ENTERS one of those selection modes the surface rises above the dock's
-        // panels and swallows clicks on them until the mode ends. Known and unchanged by the dock
-        // migration — the old controls panel was on the lower `Order::Middle` and lost the same
-        // clicks (`egui-docs/06-overlays.md` §1.1).
+        // one `Order`, egui's layer list is persistent (`egui-0.36.2/src/memory/mod.rs:1236-1242`)
+        // and re-sorted stably every pass (`:1371`), so where in the frame an `Area` is created is
+        // irrelevant. What raises a layer inside its `Order` is `Area::begin`'s `move_to_top` for
+        // an area that was not visible last frame (`egui-0.36.2/src/containers/area.rs:549-553`).
+        // The canvas-wide selections (OCR, image crop) are therefore not a problem for the dock:
+        // the canvas' own capture area lives on the LOWER `Order::Background`
+        // (`ms_canvas` `CanvasView::draw_capture_area`), so it never rises above the dock's panels
+        // and an armed selection takes no panel's clicks (`egui-docs/06-overlays.md` §1.1).
         //
         // It must run on EVERY frame this tab is active — the dock's detached sub-windows are
         // immediate viewports that only exist while `PanelDock::end` shows them
@@ -4665,7 +4716,7 @@ impl CanvasHooks for TranslationTabState {
     fn draw_canvas_page_context_menu(
         &mut self,
         ui: &mut egui::Ui,
-        project: &ProjectData,
+        _project: &ProjectData,
         page_idx: usize,
         page_uv: Pos2,
     ) -> bool {
@@ -4676,7 +4727,10 @@ impl CanvasHooks for TranslationTabState {
             return false;
         }
         if ui.button(t!("translation.tab.create_line_button")).clicked() {
-            let _ = self.create_text_detector_line_at_uv(project, page_idx, page_uv);
+            if let Err(error) = self.create_text_detector_line_at_uv(page_idx, page_uv) {
+                ms_log::runtime_log::log_warn(format!("[translation] lines edit: could not add a line on page {page_idx}: {error}"));
+                self.set_text_detector_status(error, Severity::Error);
+            }
             ui.close();
         }
         true
@@ -4998,14 +5052,10 @@ impl TranslationTabState {
             return;
         }
 
-        // Absent keys keep their current values (the codec overlays); the selected preset is
-        // re-selected without re-applying it, the title's own options win.
+        // The selected preset is re-selected without re-applying it: the title's own options win.
         let composition = project.settings_data.get("composition").and_then(Value::as_object);
-        if let Some(comp_obj) = composition {
-            read_composition_options_json(comp_obj, &mut self.composition_panel_options);
-        }
+        self.composition_panel_options = composition_options_from_settings(composition);
         self.composition_presets.restore_selection(composition.and_then(read_selected_preset));
-        self.composition_panel_options.normalize();
         self.composition_settings_loaded_for = Some(settings_path);
         self.composition_settings_dirty = false;
         self.composition_rebuild_requested = true;
@@ -5665,31 +5715,31 @@ fn text_detection_mask_file_path(dir: &Path, page_idx: usize) -> PathBuf {
     dir.join(text_detection_mask_file_name(page_idx))
 }
 
-fn load_text_detection_storage(storage_dir: &Path, page_indices: &[usize]) -> DetectionLoadResult {
+/// Reads the stored detection of `page_indices` from `storage_dir` (worker thread). A page with
+/// no blocks file has none; a page whose files exist but cannot be read is logged and listed in
+/// [`DetectionLoad::failed_pages`] (never treated as empty).
+fn load_text_detection_storage(storage_dir: &Path, page_indices: &[usize]) -> DetectionLoad {
+    let mut load = DetectionLoad::default();
     if !storage_dir.exists() {
-        return Ok((Vec::new(), 0, 0));
+        return load;
     }
-    let mut out = Vec::<(usize, TextDetectorPageResult)>::new();
-    let mut loaded = 0usize;
-    let mut failed = 0usize;
-
     for page_idx in page_indices {
         let blocks_path = text_detection_blocks_file_path(storage_dir, *page_idx);
         if !blocks_path.exists() {
             continue;
         }
         match load_text_detection_page(storage_dir, *page_idx) {
-            Ok(Some(result)) => {
-                out.push((*page_idx, result));
-                loaded = loaded.saturating_add(1);
-            }
+            Ok(Some(result)) => load.pages.push((*page_idx, result)),
             Ok(None) => {}
-            Err(_) => {
-                failed = failed.saturating_add(1);
+            Err(error) => {
+                ms_log::runtime_log::log_error(format!(
+                    "[text-detector] stored detection of page {page_idx} could not be read; Save will keep its files untouched: {error}"
+                ));
+                load.failed_pages.push(*page_idx);
             }
         }
     }
-    Ok((out, loaded, failed))
+    load
 }
 
 fn load_text_detection_page(
@@ -5734,20 +5784,21 @@ fn load_text_detection_page(
         .filter(|s| !s.is_empty())
         .map(|s| storage_dir.join(s))
         .unwrap_or_else(|| text_detection_mask_file_path(storage_dir, page_idx));
+    // A mask file that exists but cannot be decoded, or whose size differs from the recorded
+    // one, fails the page: loading it as mask-less would let Save delete the file.
     let mask_alpha = if mask_file.exists() {
-        match image::open(&mask_file) {
-            Ok(img) => {
-                let gray = img.to_luma8();
-                let w = gray.width();
-                let h = gray.height();
-                if w == mask_size[0] && h == mask_size[1] {
-                    gray.into_raw()
-                } else {
-                    Vec::new()
-                }
-            }
-            Err(_) => Vec::new(),
+        let gray = image::open(&mask_file).map_err(|err| format!("{}: {err}", mask_file.display()))?.to_luma8();
+        if gray.width() != mask_size[0] || gray.height() != mask_size[1] {
+            return Err(format!(
+                "{}: mask is {}x{}, the blocks file records {}x{}",
+                mask_file.display(),
+                gray.width(),
+                gray.height(),
+                mask_size[0],
+                mask_size[1]
+            ));
         }
+        gray.into_raw()
     } else {
         Vec::new()
     };
@@ -5760,29 +5811,50 @@ fn load_text_detection_page(
     }))
 }
 
+/// Replaces the chapter's stored detection with `pages` (worker thread): every stored
+/// `*_blocks.json` / `*_mask.png` is removed first, except the files of the `protected` pages
+/// (their stored detection could not be read at load), then each page is written.
+///
+/// Returns `(saved, failed)`: `failed` counts the pages that could not be written plus the old
+/// files that could not be removed (each logged). `Err` when the directory cannot be created or
+/// listed — nothing was removed or written then.
 fn save_text_detection_storage(
     storage_dir: &Path,
     pages: &[(usize, TextDetectorPageResult)],
+    protected: &HashSet<usize>,
 ) -> Result<(usize, usize), String> {
     fs::create_dir_all(storage_dir).map_err(|err| format!("{}: {err}", storage_dir.display()))?;
-
-    if let Ok(entries) = fs::read_dir(storage_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if name.ends_with("_blocks.json") || name.ends_with("_mask.png") {
-                let _ = fs::remove_file(&path);
-            }
-        }
-    }
+    let entries = fs::read_dir(storage_dir).map_err(|err| format!("{}: {err}", storage_dir.display()))?;
 
     let mut saved = 0usize;
     let mut failed = 0usize;
+
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(err) => {
+                ms_log::runtime_log::log_warn(format!("[text-detector] save: unreadable entry in {}: {err}", storage_dir.display()));
+                continue;
+            }
+        };
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !(name.ends_with("_blocks.json") || name.ends_with("_mask.png")) {
+            continue;
+        }
+        if stored_detection_file_page(name).is_some_and(|page_idx| protected.contains(&page_idx)) {
+            continue;
+        }
+        if let Err(err) = fs::remove_file(&path) {
+            // A stale file left behind would be loaded again next time: report it as a failure.
+            ms_log::runtime_log::log_error(format!("[text-detector] save: could not remove the old {}: {err}", path.display()));
+            failed = failed.saturating_add(1);
+        }
+    }
 
     let mut sorted = pages.to_vec();
     sorted.sort_by_key(|(page_idx, _)| *page_idx);
@@ -5791,13 +5863,24 @@ fn save_text_detection_storage(
             Ok(()) => {
                 saved = saved.saturating_add(1);
             }
-            Err(_) => {
+            Err(error) => {
+                ms_log::runtime_log::log_error(format!("[text-detector] save: page {page_idx} not written: {error}"));
                 failed = failed.saturating_add(1);
             }
         }
     }
 
     Ok((saved, failed))
+}
+
+/// The page index a stored detection file name starts with (`{page_idx:05}_blocks.json` /
+/// `{page_idx:05}_mask.png`, see `text_detection_blocks_file_path`), or `None` for any other name.
+fn stored_detection_file_page(name: &str) -> Option<usize> {
+    let (index, _) = name.split_once('_')?;
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    index.parse().ok()
 }
 
 fn save_text_detection_page(
@@ -5825,7 +5908,7 @@ fn save_text_detection_page(
         img.save_with_format(&mask_path, image::ImageFormat::Png)
             .map_err(|err| format!("{}: {err}", mask_path.display()))?;
     } else if mask_path.exists() {
-        let _ = fs::remove_file(&mask_path);
+        fs::remove_file(&mask_path).map_err(|err| format!("{}: {err}", mask_path.display()))?;
     }
 
     let blocks = result
@@ -6228,6 +6311,18 @@ const STALE_TEXT_DETECTOR_PARAM_KEYS: [&str; 4] =
 /// Writes the four sections the translation tab owns (`OCR`, `machine_translation`,
 /// `composition`, `text_detector`) into the `settings.json` root; other keys are untouched.
 /// The NeuroLate settings go under `OCR.params.neurolate`.
+/// A title's composition options from its `settings.json` `composition` object: every key the
+/// object lacks (or the whole object when absent) takes its default, never the value of the
+/// title loaded before. The result is normalized.
+fn composition_options_from_settings(composition: Option<&Map<String, Value>>) -> CompositionPanelOptions {
+    let mut options = CompositionPanelOptions::default();
+    if let Some(comp_obj) = composition {
+        read_composition_options_json(comp_obj, &mut options);
+    }
+    options.normalize();
+    options
+}
+
 fn apply_translation_settings_sections(
     root_obj: &mut Map<String, Value>,
     ocr_options: &OcrPanelOptions,
@@ -7103,11 +7198,87 @@ mod tests {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
+mod detection_storage_tests {
+    use std::collections::HashSet;
+    use std::fs;
+
+    use super::{
+        TextDetectorPageResult, TextDetectorRect, load_text_detection_storage, save_text_detection_storage, stored_detection_file_page,
+        text_detection_blocks_file_path, text_detection_mask_file_path,
+    };
+
+    fn page(blocks: usize) -> TextDetectorPageResult {
+        let rect = TextDetectorRect::from_xyxy(0.0, 0.0, 1.0, 1.0).expect("valid rect");
+        TextDetectorPageResult { source_size: [2, 2], blocks: vec![rect; blocks], mask_size: [2, 2], mask_alpha: vec![0, 255, 255, 0] }
+    }
+
+    /// Pages whose stored files exist but cannot be read (bad JSON, an undecodable mask) are
+    /// reported as failed, never loaded as empty; a readable page loads.
+    #[test]
+    fn unreadable_stored_pages_are_reported_not_emptied() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let storage = dir.path();
+        save_text_detection_storage(storage, &[(0, page(1)), (1, page(1)), (2, page(1))], &HashSet::new())?;
+        fs::write(text_detection_blocks_file_path(storage, 1), "{ not json").map_err(|err| err.to_string())?;
+        fs::write(text_detection_mask_file_path(storage, 2), b"not a png").map_err(|err| err.to_string())?;
+        let load = load_text_detection_storage(storage, &[0, 1, 2, 3]);
+        assert_eq!(load.pages.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(load.failed_pages, vec![1, 2]);
+        Ok(())
+    }
+
+    /// Save removes every other stored page but leaves the files of a protected (unreadable)
+    /// page exactly as they are.
+    #[test]
+    fn save_keeps_the_files_of_protected_pages() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let storage = dir.path();
+        save_text_detection_storage(storage, &[(0, page(1)), (1, page(1))], &HashSet::new())?;
+        fs::write(text_detection_blocks_file_path(storage, 1), "{ not json").map_err(|err| err.to_string())?;
+        let protected = HashSet::from([1]);
+        let (saved, failed) = save_text_detection_storage(storage, &[(5, page(2))], &protected)?;
+        assert_eq!((saved, failed), (1, 0));
+        assert!(!text_detection_blocks_file_path(storage, 0).exists(), "a stale page is removed");
+        assert_eq!(fs::read_to_string(text_detection_blocks_file_path(storage, 1)).map_err(|err| err.to_string())?, "{ not json");
+        assert!(text_detection_mask_file_path(storage, 1).exists(), "the protected mask stays");
+        assert!(text_detection_blocks_file_path(storage, 5).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn stored_file_names_map_to_their_page() {
+        assert_eq!(stored_detection_file_page("00012_blocks.json"), Some(12));
+        assert_eq!(stored_detection_file_page("00003_mask.png"), Some(3));
+        assert_eq!(stored_detection_file_page("custom_mask.png"), None);
+        assert_eq!(stored_detection_file_page("_mask.png"), None);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod settings_persistence_tests {
     use super::{
         CompositionPanelOptions, MtPanelOptions, OcrPanelOptions, TextDetectorPanelOptions, Value,
-        save_translation_settings_to_project_file,
+        composition_options_from_settings, save_translation_settings_to_project_file,
     };
+
+    /// A title's composition object that lacks keys yields their defaults: the loader never
+    /// carries a value over from the title loaded before (it starts from the defaults).
+    #[test]
+    fn composition_keys_missing_from_a_title_take_their_defaults() {
+        let mut first = serde_json::Map::new();
+        first.insert("ignore_translated_lines".to_string(), Value::Bool(false));
+        first.insert("replica_prefix".to_string(), Value::String("- ".to_string()));
+        let loaded = composition_options_from_settings(Some(&first));
+        assert!(!loaded.ignore_translated_lines);
+        assert_eq!(loaded.replica_prefix, "- ");
+
+        let mut second = serde_json::Map::new();
+        second.insert("replica_prefix".to_string(), Value::String("* ".to_string()));
+        let loaded = composition_options_from_settings(Some(&second));
+        assert_eq!(loaded.ignore_translated_lines, CompositionPanelOptions::default().ignore_translated_lines);
+        assert_eq!(loaded.replica_prefix, "* ");
+        assert_eq!(composition_options_from_settings(None), CompositionPanelOptions::default());
+    }
 
     fn save_defaults(path: &std::path::Path) -> Result<(), String> {
         save_translation_settings_to_project_file(

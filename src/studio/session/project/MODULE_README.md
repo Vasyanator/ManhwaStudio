@@ -50,6 +50,9 @@ flushes or notifies. Workers get Arc clones of the models from `StagingWriters`.
 - No I/O on the GUI thread: the per-second staging-dir check runs on the `StagingDirProbe`
   worker and the post-merge check inside the save worker (`MergeDone::staging_exists`); merges,
   deletes and page ops run on `ms_thread` workers.
+- The save-merge and DISCARD job threads wake the GUI when they end (`WakeGuiOnDrop`, holding
+  the context `tick` captured on the first frame; dropped last, so also on an early return or a
+  panic): the GUI polls their channels on that frame and never on a timer.
 - The cached unsaved flag is sticky: only a successful save or discard clears it
   (`reset_unsaved_after_persist`, which also drops every probe answer asked before); it is forced
   to false while the DISCARD latch is set. Besides the probe it latches on the in-memory facts:

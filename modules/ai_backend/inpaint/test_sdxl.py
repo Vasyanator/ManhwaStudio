@@ -14,6 +14,8 @@ Main responsibilities:
   download, any other repo id is refused, a missing path is explicit;
 - verify every load passes `local_files_only=True` (plus `config=` / the fp16
   `variant`) and that no Hugging Face download function is ever called;
+- verify a failed `diffusers` import keeps its real cause in the user-facing
+  text and says "install" only when diffusers itself is absent;
 - verify the pipeline's host->device move happens inside the ROCm mmap->GPU
   staging patch, and that unloading drops the pipeline and reports it to the
   shared model manager.
@@ -404,6 +406,23 @@ class SdxlUnloadTests(unittest.TestCase):
 
         self.assertFalse(service._unload_key("sdxl:b"))
         self.assertIsNotNone(service._pipe)
+
+
+class DiffusersImportErrorTextTests(unittest.TestCase):
+    def test_absent_diffusers_asks_to_install_it(self) -> None:
+        text = svc._diffusers_import_error_text(ModuleNotFoundError("No module named 'diffusers'", name="diffusers"))
+        self.assertIn("требуется пакет diffusers", text)
+
+    def test_broken_import_keeps_the_real_error(self) -> None:
+        cause = ImportError("cannot import name 'MT5Tokenizer' from 'transformers'")
+        text = svc._diffusers_import_error_text(cause)
+        self.assertIn("ImportError: cannot import name 'MT5Tokenizer' from 'transformers'", text)
+        self.assertNotIn("требуется пакет diffusers", text)
+
+    def test_missing_transitive_module_is_not_reported_as_missing_diffusers(self) -> None:
+        text = svc._diffusers_import_error_text(ModuleNotFoundError("No module named 'gguf'", name="gguf"))
+        self.assertIn("No module named 'gguf'", text)
+        self.assertNotIn("требуется пакет diffusers", text)
 
 
 if __name__ == "__main__":

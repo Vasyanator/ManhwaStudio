@@ -16,7 +16,7 @@ FILE HEADER (widgets/wheel_input_guard.rs)
 
 Shared wheel-step helpers (English, added later):
 - `wheel_steps_if_hovered`: the one logical wheel step a CLOSED combo-box button reacts to.
-- `cycle_wrapped_index`: moves a selected index by that step, wrapping at both ends.
+- `cycle_wrapped_index` (public): moves a selected index by that step, wrapping at both ends.
 - `raw_wheel_events_delta` / `axis_wheel_delta`: the per-notch delta those two read.
 They live here rather than in one combo box because `WheelComboBox` and `SearchableComboBox`
 must react to the wheel identically; a copy per widget is exactly how that contract drifts.
@@ -106,7 +106,11 @@ pub(super) fn combo_popup_blocks_pointer(ctx: &egui::Context) -> bool {
 /// its caller has not cleaned up yet (`SearchableComboBox::show` documents that this never
 /// panics), and the naive `index + shift` overflows in debug builds for an index within `len`
 /// of `usize::MAX`.
-pub(super) fn cycle_wrapped_index(index: usize, len: usize, steps: i32) -> usize {
+///
+/// Public (`ms_widgets::cycle_wrapped_index`): this is THE wheel-cycling rule of the workspace,
+/// so hand-made wheel selectors in the tabs use it instead of a copy.
+#[must_use]
+pub fn cycle_wrapped_index(index: usize, len: usize, steps: i32) -> usize {
     if len == 0 || steps == 0 {
         return index;
     }

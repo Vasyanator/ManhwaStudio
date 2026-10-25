@@ -69,8 +69,8 @@ Every message in either direction is a single frame:
 
 ## Message kinds and event topics
 
-Seven kinds (`hello`, `request`, `progress`, `response`, `cancel`, `event`, `error`) and four event
-topics (`health`, `device`, `model_load`, `log`). Their exact directions, payload fields and
+Seven kinds (`hello`, `request`, `progress`, `response`, `cancel`, `event`, `error`) and three event
+topics (`health`, `device`, `log`). Their exact directions, payload fields and
 lifecycles are specified in `PROTOCOL.md` §3 and §7 — deliberately NOT restated here, because two
 copies of a wire contract in one directory drift.
 

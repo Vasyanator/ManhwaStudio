@@ -46,8 +46,9 @@ status lines. Nothing here is behind a fold except the parameters, which open by
 - `scan.rs`: the presence scan of BOTH model directories (a worker) and the one status line it
   feeds. Informational only — the picker always offers the full catalog.
 - `settings.rs`: `LamaSettings` (the selected model and every parameter of both methods), its
-  clamping and its file IO. The save gate `settings_save_due` is shared, in
-  `../../../region_edit_v2/engine_settings.rs`.
+  clamping and its file IO (`save_lama_settings`: normalized, atomic through the shared
+  `write_settings_json`, nothing in a test build). When it is written is the shared
+  `SettingsSaver`'s decision (`../../../region_edit_v2/engine_settings_file.rs`).
 - `wire.rs`: `effective_refine`, `lama_run_header`, `run_lama`, `unload_lama`, the
   request-blob packing and the `CallError` mapping (the PNGs come from `tools/region_png.rs`). Edit here to change what travels on the wire.
 - `engine.rs`: `LamaEngine`, its `AiEngine` impl, its channel polling and its parameter panel.

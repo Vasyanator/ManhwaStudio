@@ -147,8 +147,9 @@ functions with unit tests, not conditionals inside the drawing code.
   rate window, frame parser and `stream_call`; the Hugging Face download (per-repository
   verdicts and links, the nullable plan, `hf_download_readiness`, the two calls,
   `HfTokenControl`) and its drawing (`draw_hf_token_row`, `draw_hf_download_controls`,
-  `gated_button`); the settings-file rules (`read_settings_file` quarantines a damaged file,
-  `SettingsSaver` keeps a failed write pending with backoff); `mask_for_run`. Nothing there names
+  `gated_button`); the settings-file rules re-exported from `region_edit_v2::engine_settings_file`
+  (`read_settings_file` quarantines a damaged file, `SettingsSaver` debounces, retries with
+  backoff and flushes at teardown); `mask_for_run`. Nothing there names
   a model. Own `MODULE_README.md`.
 - `lama/`: the «Lama» engine — a DIRECTORY for the same reason `flux2_klein/` is one, and the source
   of exactly ONE picker entry offering FOUR checkpoints. Its own `MODULE_README.md` is the map. The
@@ -190,10 +191,12 @@ functions with unit tests, not conditionals inside the drawing code.
   Every engine's saver runs inside `poll`; a host that stops polling keeps the tool working and
   quietly discards every model path, memory step, prompt and parameter on exit. The arming rule
   is the pure `settings_save_due(dirty, settings_loaded, save_in_flight)`, ONE copy for every
-  engine in `../../region_edit_v2/engine_settings.rs` — a plain gate with no
-  time debounce, so a save starts on the first poll it is due on: a write before the initial load
-  lands would overwrite the user's file with the in-memory defaults, so `dirty` is kept pending
-  instead of dropped, and at most one writer touches the path at a time.
+  engine in `../../region_edit_v2/engine_settings.rs`, applied by the ONE saver every engine
+  uses (`SettingsSaver`, `../../region_edit_v2/engine_settings_file.rs`: a 700 ms quiet-time
+  debounce, atomic writes, retry with backoff, the teardown flush through
+  `AiEngine::flush_settings_blocking`): a write before the initial load lands would overwrite
+  the user's file with the in-memory defaults, so `dirty` is kept pending instead of dropped,
+  and at most one writer touches the path at a time.
 - **A user edit outranks a settings load that lands after it** (`lama/`, `sdxl/`). The host draws an
   engine's panel body earlier in a frame than it polls that engine, so a value changed before the
   load landed would be replaced silently; `poll_settings_load` therefore applies the file only while

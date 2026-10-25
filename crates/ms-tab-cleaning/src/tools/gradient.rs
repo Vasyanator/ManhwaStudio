@@ -19,6 +19,8 @@ FILE HEADER (cleaning/tools/gradient.rs)
     A second SOR implementation anywhere in the project is a defect.
   - `dilate` is only a `bool` adapter over the one square dilation `ms_raster::dilate_square`
     (iterated 3×3 growth = one square window of radius `iters`); no morphology lives here.
+  - sRGB <-> CIELAB goes through the project's one conversion `ms_region_postprocess::LabTables`
+    (+ `encode_srgb`); only the dithered, half-up quantization of `lab_to_rgb` is this tool's.
 */
 use super::base::{CleaningTool, RegionMaskInpaintToolBase, StrokePoint};
 use std::sync::Arc;
@@ -27,6 +29,7 @@ use ms_input::{ContextId, InputFrame};
 use ms_canvas::CanvasView;
 use ms_project::ProjectData;
 use ms_tools::red_black_sor_sweeps;
+use ms_region_postprocess::{LabTables, encode_srgb};
 use eframe::egui;
 use egui::Color32;
 
@@ -845,50 +848,30 @@ fn dilate(mask: &[bool], w: usize, h: usize, iters: usize) -> Vec<bool> {
     }
 }
 
+/// Planar CIELAB (`l`, `a`, `b`) of row-major sRGB pixels, through the project's one
+/// conversion (`ms_region_postprocess::LabTables`).
 fn rgb_to_lab(rgb: &[[u8; 3]]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let mut l = vec![0.0f32; rgb.len()];
-    let mut a = vec![0.0f32; rgb.len()];
-    let mut b = vec![0.0f32; rgb.len()];
-
-    const EPS: f32 = 216.0 / 24389.0;
-    const KAPPA: f32 = 24389.0 / 27.0;
-    const XN: f32 = 0.95047;
-    const YN: f32 = 1.0;
-    const ZN: f32 = 1.08883;
-
-    for (i, px) in rgb.iter().enumerate() {
-        let r = srgb_to_linear(px[0]);
-        let g = srgb_to_linear(px[1]);
-        let bl = srgb_to_linear(px[2]);
-
-        let x = (0.4124564 * r + 0.3575761 * g + 0.1804375 * bl) / XN;
-        let y = (0.2126729 * r + 0.7151522 * g + 0.0721750 * bl) / YN;
-        let z = (0.0193339 * r + 0.119_192 * g + 0.9503041 * bl) / ZN;
-
-        let fx = if x > EPS {
-            x.cbrt()
-        } else {
-            (KAPPA * x + 16.0) / 116.0
-        };
-        let fy = if y > EPS {
-            y.cbrt()
-        } else {
-            (KAPPA * y + 16.0) / 116.0
-        };
-        let fz = if z > EPS {
-            z.cbrt()
-        } else {
-            (KAPPA * z + 16.0) / 116.0
-        };
-
-        l[i] = 116.0 * fy - 16.0;
-        a[i] = 500.0 * (fx - fy);
-        b[i] = 200.0 * (fy - fz);
+    let tables = LabTables::new();
+    let mut l = Vec::with_capacity(rgb.len());
+    let mut a = Vec::with_capacity(rgb.len());
+    let mut b = Vec::with_capacity(rgb.len());
+    for px in rgb {
+        let [pl, pa, pb] = tables.to_lab(*px);
+        l.push(pl);
+        a.push(pa);
+        b.push(pb);
     }
-
     (l, a, b)
 }
 
+/// Planar CIELAB -> row-major sRGB pixels (`w` = row width, for the dither position).
+///
+/// The Lab -> linear step is the shared `LabTables::to_linear_rgb`; the quantization stays this
+/// tool's own: the linear value is clipped only BELOW 0 before `encode_srgb`, the optional
+/// dither (`dither_eps` levels of `pseudo_noise`, only where `dither_mask` is set) is added to
+/// the still-unclipped encoded value, and the result is clamped to `0..=1` and rounded half up.
+/// That differs from `LabTables::to_srgb` (clip to `0..=1` first, round half to even) on
+/// purpose: it keeps the gradient fill's pinned output.
 fn lab_to_rgb(
     l: &[f32],
     a: &[f32],
@@ -898,12 +881,7 @@ fn lab_to_rgb(
     dither_eps: f32,
     dither_mask: Option<&[bool]>,
 ) -> Vec<[u8; 3]> {
-    const EPS: f32 = 216.0 / 24389.0;
-    const KAPPA: f32 = 24389.0 / 27.0;
-    const XN: f32 = 0.95047;
-    const YN: f32 = 1.0;
-    const ZN: f32 = 1.08883;
-
+    let tables = LabTables::new();
     let mut out = vec![[0u8; 3]; l.len()];
     let dither_amp = if dither_eps > 0.0 {
         dither_eps / 255.0
@@ -912,37 +890,9 @@ fn lab_to_rgb(
     };
 
     for idx in 0..l.len() {
-        let fy = (l[idx] + 16.0) / 116.0;
-        let fx = fy + a[idx] / 500.0;
-        let fz = fy - b[idx] / 200.0;
-
-        let xr = if fx * fx * fx > EPS {
-            fx * fx * fx
-        } else {
-            (116.0 * fx - 16.0) / KAPPA
-        };
-        let yr = if fy * fy * fy > EPS {
-            fy * fy * fy
-        } else {
-            (116.0 * fy - 16.0) / KAPPA
-        };
-        let zr = if fz * fz * fz > EPS {
-            fz * fz * fz
-        } else {
-            (116.0 * fz - 16.0) / KAPPA
-        };
-
-        let x = xr * XN;
-        let y = yr * YN;
-        let z = zr * ZN;
-
-        let r_lin = 3.2404542 * x - 1.5371385 * y - 0.4985314 * z;
-        let g_lin = -0.969_266 * x + 1.8760108 * y + 0.0415560 * z;
-        let b_lin = 0.0556434 * x - 0.2040259 * y + 1.0572252 * z;
-
-        let mut r = linear_to_srgb(r_lin);
-        let mut g = linear_to_srgb(g_lin);
-        let mut bl = linear_to_srgb(b_lin);
+        let [mut r, mut g, mut bl] = tables
+            .to_linear_rgb([l[idx], a[idx], b[idx]])
+            .map(|linear| encode_srgb(linear.max(0.0)));
 
         if dither_amp > 0.0 && dither_mask.is_none_or(|m| m[idx]) {
             let (x, y) = (idx % w, idx / w);
@@ -992,23 +942,6 @@ fn gradient_2d(arr: &[f32], w: usize, h: usize) -> (Vec<f32>, Vec<f32>) {
     }
 
     (gy, gx)
-}
-
-fn srgb_to_linear(v: u8) -> f32 {
-    let c = v as f32 / 255.0;
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn linear_to_srgb(c: f32) -> f32 {
-    if c <= 0.0031308 {
-        12.92 * c.max(0.0)
-    } else {
-        1.055 * c.max(0.0).powf(1.0 / 2.4) - 0.055
-    }
 }
 
 fn smoothstep(x: f32) -> f32 {
@@ -1227,5 +1160,73 @@ mod tests {
             ],
             "observed={observed:?}"
         );
+    }
+
+    /// Deterministic `w x h` RGBA fixture: a diagonal two-colour ramp with LCG noise, plus a
+    /// mask that covers an off-centre ellipse (alpha 255) and one stray pixel (alpha 9).
+    fn characterization_fill_fixture(w: usize, h: usize, seed: u64) -> (egui::ColorImage, egui::ColorImage) {
+        let mut state = seed;
+        let mut image = egui::ColorImage::filled([w, h], Color32::BLACK);
+        let mut mask = egui::ColorImage::filled([w, h], Color32::TRANSPARENT);
+        let (cx, cy) = (w * 3 / 5, h / 2);
+        for y in 0..h {
+            for x in 0..w {
+                let t = (x + 2 * y) * 255 / (w + 2 * h);
+                let noise = usize::try_from(lcg_next(&mut state) % 9).unwrap_or(0);
+                let r = u8::try_from((40 + t * 3 / 4 + noise).min(255)).unwrap_or(255);
+                let g = u8::try_from((200usize.saturating_sub(t / 2) + noise).min(255)).unwrap_or(255);
+                let b = u8::try_from((90 + t / 3).min(255)).unwrap_or(255);
+                image.pixels[y * w + x] = Color32::from_rgb(r, g, b);
+                let dx = x.abs_diff(cx);
+                let dy = y.abs_diff(cy);
+                if dx * dx * 4 + dy * dy * 9 <= (w * w) / 4 {
+                    mask.pixels[y * w + x] = Color32::from_rgba_unmultiplied(255, 255, 255, 255);
+                }
+            }
+        }
+        mask.pixels[w + 1] = Color32::from_rgba_unmultiplied(0, 0, 0, 9);
+        (image, mask)
+    }
+
+    /// characterization (S-066 Lab move): the whole gradient fill on two noisy ramps, pinned
+    /// by an FNV-1a fingerprint of the output RGBA bytes. The values were OBSERVED from the
+    /// tool's private Lab conversion before it switched to the shared
+    /// `ms_region_postprocess::LabTables`; they must stay byte-identical.
+    #[test]
+    fn characterization_gradient_fill_output() {
+        let observed = [(29usize, 21usize, 0x5eed_0001_u64), (40, 17, 0x5eed_0002)]
+            .into_iter()
+            .map(|(w, h, seed)| {
+                let (image, mask) = characterization_fill_fixture(w, h, seed);
+                let out = GradientFillTool::run(&image, &mask).unwrap_or_else(|err| panic!("fixture {w}x{h}: {err}"));
+                let bytes = out.pixels.iter().flat_map(|px| px.to_array()).collect::<Vec<_>>();
+                let changed = out.pixels.iter().zip(&image.pixels).filter(|(a, b)| a != b).count();
+                (w, h, changed, fnv1a64(&bytes))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed, vec![(29, 21, 111, 4_103_040_897_038_428_570), (40, 17, 209, 9_970_743_423_388_696_185)], "observed={observed:?}");
+    }
+
+    /// characterization (S-066 Lab move): `rgb_to_lab` -> `lab_to_rgb` with and without the
+    /// dither over a 9-level RGB cube (729 colours), pinned by FNV-1a fingerprints observed
+    /// before the switch to the shared Lab conversion.
+    #[test]
+    fn characterization_lab_round_trip() {
+        let levels = [0u8, 1, 17, 64, 127, 128, 200, 254, 255];
+        let mut cube = Vec::with_capacity(levels.len().pow(3));
+        for r in levels {
+            for g in levels {
+                for b in levels {
+                    cube.push([r, g, b]);
+                }
+            }
+        }
+        let (l, a, b) = rgb_to_lab(&cube);
+        let w = levels.len();
+        let plain = lab_to_rgb(&l, &a, &b, w, cube.len() / w, 0.0, None);
+        let dithered = lab_to_rgb(&l, &a, &b, w, cube.len() / w, 0.6, None);
+        let identity = plain.iter().zip(&cube).filter(|(x, y)| x == y).count();
+        let observed = (identity, fnv1a64(&plain.concat()), fnv1a64(&dithered.concat()));
+        assert_eq!(observed, (729, 7_310_844_075_801_908_823, 11_622_179_329_196_392_038), "observed={observed:?}");
     }
 }

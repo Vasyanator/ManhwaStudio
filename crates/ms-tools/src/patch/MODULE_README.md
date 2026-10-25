@@ -103,6 +103,9 @@ layer — instead of solving in a plane that does not contain it.
 - Pixels whose `coverage` is `0.0` are NOT part of the patch: a host must leave whatever is already
   stored there untouched, because the commit replaces the whole ROI and anything else would erase
   the surrounding work. Their `rgb` entry is the destination colour and carries no information.
+- The coverage ramp (`build_coverage`) is this tool's own rule — city-block depth, outer ring at
+  0 — and deliberately not the Euclidean inward feather of `ms-region-postprocess`; its doc
+  comment says why. Do not route one through the other.
 - **A `stroke_end` is NOT proof of a pointer release.** A host issues one when a drag crosses onto
   another page and one when the pointer leaves the canvas with the button still held. For an
   ordinary brush that is harmless ("end this page's stroke"); for this tool it would mean "commit".

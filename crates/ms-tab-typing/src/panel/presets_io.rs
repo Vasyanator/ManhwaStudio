@@ -719,7 +719,38 @@ pub(super) fn load_imported_system_fonts_from(user_settings_file: &Path) -> Vec<
 // `fonts_data.json` exists (which is what stops a removed imported font from coming back);
 // this reader therefore only ever sees a config that has not been migrated yet.
 
+/// One formula-presets write for the panel's ordered writer: the WHOLE map (`TextTab.formula_presets`
+/// is rewritten from it) and the target file — `None` is the app's `user_config`, resolved on the
+/// writer thread (path resolution may touch the disk).
+pub(super) struct FormulaPresetsWrite {
+    pub(super) presets: HashMap<String, TypingFormulaPreset>,
+    pub(super) file: Option<PathBuf>,
+}
+
+/// The formula-preset writer's step (runs on its thread): writes `job` and logs a failure with
+/// its context. Returns the technical reason on failure, for the panel's status line.
+pub(super) fn run_formula_presets_write(job: FormulaPresetsWrite) -> Result<(), String> {
+    let FormulaPresetsWrite { presets, file } = job;
+    let file = file.unwrap_or_else(config::user_config_path);
+    let result = save_text_tab_formula_presets(&file, &presets);
+    if let Err(err) = &result {
+        ms_log::runtime_log::log_error(format!(
+            "typing: failed to save the formula presets; path={} presets={} error={err} possible_cause=malformed or unwritable user_config (a malformed one is left untouched)",
+            file.display(),
+            presets.len()
+        ));
+    }
+    result
+}
+
+/// Rewrites `TextTab.formula_presets` of the `user_config` document at `user_settings_file`
+/// from `presets` (name-sorted).
+///
+/// # Errors
+/// The technical message when the document cannot be read, does not parse (it is then left
+/// untouched) or cannot be written.
 pub(super) fn save_text_tab_formula_presets(
+    user_settings_file: &Path,
     presets: &HashMap<String, TypingFormulaPreset>,
 ) -> Result<(), String> {
     let mut presets_obj = Map::new();
@@ -731,11 +762,7 @@ pub(super) fn save_text_tab_formula_presets(
         };
         presets_obj.insert(name.clone(), text_formula_layout_to_value(&preset.layout));
     }
-    update_text_tab_value(
-        &config::user_config_path(),
-        TEXT_TAB_FORMULA_PRESETS_KEY,
-        Value::Object(presets_obj),
-    )
+    update_text_tab_value(user_settings_file, TEXT_TAB_FORMULA_PRESETS_KEY, Value::Object(presets_obj))
 }
 
 #[cfg(test)]
@@ -751,6 +778,33 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("ms_test_{tag}_{nanos}.json"))
+    }
+
+    /// The formula-preset writer step writes the whole map under verbatim names and keeps the
+    /// rest of the document; a malformed document fails, is reported, and stays untouched.
+    #[test]
+    fn formula_presets_write_round_trips_and_reports_a_malformed_file() -> Result<(), String> {
+        let path = unique_temp_config_path("formula_presets_write");
+        fs::write(&path, r#"{"General":{"ui_language":"ru"}}"#).map_err(|err| err.to_string())?;
+        let mut presets = HashMap::new();
+        presets.insert(" Волна ".to_string(), formula_preset("t", "sin(t)", "0", false, 1.0, [0.0; TEXT_FORMULA_USER_VAR_COUNT]));
+        let written = run_formula_presets_write(FormulaPresetsWrite { presets, file: Some(path.clone()) });
+        let text = fs::read_to_string(&path).map_err(|err| err.to_string());
+        let removed = fs::remove_file(&path).map_err(|err| err.to_string());
+        written?;
+        removed?;
+        let root: Value = serde_json::from_str(&text?).map_err(|err| err.to_string())?;
+        assert_eq!(root["General"]["ui_language"], "ru", "other sections survive");
+        assert!(root["TextTab"]["formula_presets"].get(" Волна ").is_some(), "the name is stored verbatim: {root}");
+
+        let broken = unique_temp_config_path("formula_presets_write_broken");
+        fs::write(&broken, "{ not json").map_err(|err| err.to_string())?;
+        let failed = run_formula_presets_write(FormulaPresetsWrite { presets: HashMap::new(), file: Some(broken.clone()) });
+        let after = fs::read_to_string(&broken).map_err(|err| err.to_string());
+        fs::remove_file(&broken).map_err(|err| err.to_string())?;
+        assert!(failed.is_err(), "a malformed document is a reported failure");
+        assert_eq!(after?, "{ not json", "the malformed document is left untouched");
+        Ok(())
     }
 
     #[test]

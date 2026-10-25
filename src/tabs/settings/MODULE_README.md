@@ -120,7 +120,7 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   publishes its whole snapshot, so a stale copy would revert them.
 - `canvas_layout_presets.rs`: the layout preset block (`LayoutPresetsPane`, an
   `ms_widgets::PresetPicker` over «Pages», «Webtoon» and the user presets) and its ordered
-  writer thread. The store and its rules (override / revert, version guard, JSON codec) belong to
+  writer thread (`ms_config::preset_store::OrderedWriter`, shared with the other preset stores). The store and its rules (override / revert, version guard, JSON codec) belong to
   `ms_project::canvas_layout` (`CanvasLayoutPresets`, `LayoutPresetOp`); this file decides what
   each action means: Select applies the effective values; «None» keeps the values; Create stores
   the current values under a free default name; Save commits values (built-ins: an override,

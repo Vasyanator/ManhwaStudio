@@ -15,6 +15,13 @@ primitives); out = src * (255 - alpha) + edited * alpha, rounded, per RGB channe
 255. A pixel with alpha 0 reproduces the source exactly and alpha 255 the edit exactly, so
 pixels farther than `dilate + feather` from paint are bit-identical to the source. An empty
 mask (`None` or all zero) means the whole region: the result is the edit.
+
+This is deliberately NOT the region post-processing feather that `ms-region-postprocess` owns.
+That one ramps INWARD (weight 0 on the contour, the mask is a hard permission to change) because
+FLUX klein paints exactly the masked pixels; here the ramp grows OUTWARD from the paint by
+`dilate + feather`, because a cloud provider re-renders the whole frame and the painted stroke
+must be covered completely, its soft edge falling on source pixels. The two rules answer
+different contracts; do not merge them.
 */
 
 use super::error::ImageEditError;
@@ -22,6 +29,9 @@ use super::request::{MaskBlend, RgbaRegion, pixel_count};
 
 /// Blends `edited` (RGBA8, the size of `source`) into `source` inside `mask` (one byte per
 /// pixel, nonzero = editable) and returns RGBA8 bytes of the source size with alpha 255.
+///
+/// The blend alpha grows OUTWARD from the mask (square dilation, then box blur), unlike the
+/// inward feather of `ms-region-postprocess`; see the file notes for why the two stay separate.
 ///
 /// # Errors
 /// `ImageEditError::ShapeMismatch` when `edited` or `mask` does not match the source size, or

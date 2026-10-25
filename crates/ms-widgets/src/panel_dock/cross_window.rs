@@ -4,7 +4,7 @@ File: crates/ms-widgets/src/panel_dock/cross_window.rs
 Purpose:
 Addressing a reorganisation gesture that crossed a window border (plan §4.8,
 §4.9). A drag gesture does not travel between egui viewports — `Memory::{interactions,
-focus,areas}` are `ViewportIdMap`s (`egui-0.35.0/src/memory/mod.rs:103-118`) and a
+focus,areas}` are `ViewportIdMap`s (`egui-0.36.2/src/memory/mod.rs:103-118`) and a
 held mouse button keeps an implicit pointer grab on the window the press started
 in — so the window under the cursor cannot answer "is the drop mine?" by
 hit-testing. This module answers it from GEOMETRY instead: every window reports
@@ -32,13 +32,13 @@ Key functions:
 Notes:
 THE SHARED FRAME IS PHYSICAL PIXELS. `ViewportInfo::inner_rect` is the window's
 content rect in monitor space divided by THAT window's `pixels_per_point`
-(`egui-winit-0.35.0/src/lib.rs:1329-1333`, `:51-55`), so two windows on monitors
+(fork `crates/egui/crates/egui-winit/src/lib.rs:1395-1399`, `:54-58`), so two windows on monitors
 with different scale factors express monitor space in two different units.
 Multiplying each window's rect by its own scale puts them back into the one frame
 the window manager actually uses.
 
 WAYLAND HAS NO SUCH FRAME. `ViewportInfo::inner_rect` and `outer_rect` are always
-`None` there (`egui-0.35.0/src/data/input/viewport_info.rs:52-66`), and winit's
+`None` there (`egui-0.36.2/src/data/input/viewport_info.rs:52-66`), and winit's
 `outer_position()` returns `Err`, so no global coordinate exists at all — not in
 egui, not below it. A caller that gets no geometry must degrade honestly: this
 module simply produces no `WindowGeometry` and every decision falls back to the

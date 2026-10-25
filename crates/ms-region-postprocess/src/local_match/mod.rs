@@ -49,12 +49,11 @@ caller logs and times the run.
 
 mod grid;
 mod jitter;
-mod lab;
 #[cfg(test)]
 mod tests;
 
 use grid::{AxisWeights, Field, box_moments_into, for_each_row, index_f64, integral_to_usize, reflect_fill, smooth, to_f32, blend_col, blend_rows, upsample_linear};
-use lab::LabTables;
+use crate::lab::LabTables;
 
 /// Margin, in pixels, between the sample mask and the pixels the target statistics come from:
 /// a text outline the mask does not quite cover sits at its edge (reference

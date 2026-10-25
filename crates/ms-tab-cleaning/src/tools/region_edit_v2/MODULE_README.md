@@ -24,13 +24,14 @@ render.rs          paint only      strokes, handles, chrome plates, status text,
 frame.rs           the pass        RegionFrame: state, the per-frame pass, the reported intent
 engine.rs          the contract    AiEngine + run request/poll; the one size-violation wording
 engine_settings.rs engine helper   the settings save gate shared by every hosted engine
+engine_settings_file.rs  engine helper   an engine's settings file: read/quarantine, atomic write, SettingsSaver
 host.rs            the tool        HostSpec, RegionEditHost: run, mask generation, apply, tests
 host_panels.rs     the panels      the host's compact panel and its half of the main panel
 postprocess.rs     host helper     a raw answer's capture and its latest-wins post-process worker
 ```
 
 Dependency direction: the framework files know nothing of the host; `host*.rs`, `engine.rs` and
-`engine_settings.rs` know nothing of any consumer tool or engine — a consumer depends on them,
+`engine_settings*.rs` know nothing of any consumer tool or engine — a consumer depends on them,
 never the reverse.
 
 The authoritative frame state is `(page_idx, rect_px: OverlayRectPx)` in SOURCE PAGE PIXELS.
@@ -84,6 +85,22 @@ that owns the context, the canvas and the project at once:
   `settings_save_due(dirty, settings_loaded, save_in_flight)`, the ONE save gate every engine's
   `poll` saver consults. Each engine still owns its document, path and IO; add a rule here only
   when it is the same for every engine, never a copy in an engine.
+- `engine_settings_file.rs`: the shared file half of every engine's settings (both consumer
+  tools: `ai_editor/engines/*` through `shared`'s re-export, and `ai_api_editor/`):
+  `read_settings_file` (missing -> first run; damaged -> moved aside to the first free
+  `<stem>.malformed-<unix_secs>[-<n>].json`, reserved with `create_new`; unreadable or
+  unquarantinable -> saving BLOCKED), `write_settings_json` (atomic: a unique sibling temp
+  `.<name>.<pid>.<n>.tmp`, synced, renamed over the file; typed `SettingsWriteError`),
+  `SettingsSaver` + `SaveGate` (one writer, never before the load, never while blocked; a change
+  is written only after `SETTINGS_SAVE_DEBOUNCE` = 700 ms of quiet, detected BY VALUE so the
+  settings type is `PartialEq`; `wake_after(now)` says when the engine must be polled again; a
+  failed write restores `dirty` and retries after `save_retry_delay`: 2 s doubling to 60 s).
+  Teardown: `flush_blocking` writes the owed value synchronously on the studio teardown worker
+  (reached through `AiEngine::flush_settings_blocking`, `CleaningTool::flush_settings_blocking`
+  and the tab's `StudioTab::flush_debounced_stores_blocking`), waiting at most 5 s for a write
+  in flight; a saver dropped while still owing a value (no teardown flush ran, or it gave up on
+  that write) flushes it on a detached worker as a last resort. An engine's product writer
+  writes nothing in a test build.
 - `host.rs`: `HostSpec`, `RegionEditHost` (the `CleaningTool` impl, built by
   `RegionEditHost::new(&'static HostSpec)`), the run and mask-generation pipelines, the D7 size
   check `check_result_fits`, `ApplyError` / `CaptureError`, and the host's tests (over a test

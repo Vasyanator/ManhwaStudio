@@ -354,7 +354,7 @@ Three properties are contractual:
   the body budget, so a changed header composition would land in the tab's stored measurement.
 * **An invisible panel still intercepts pointer input over its rect.** The `Area` keeps
   `Order::Foreground` and `interactable(true)`, which canvas input gating
-  (`crate::input_util::pointer_over_floating_area`) and `Ui::rect_contains_pointer` both depend on.
+  (`ms_input::Condition::PointerOnView`, through `Context::layer_id_at`) and `Ui::rect_contains_pointer` both depend on.
   Making the layer non-interactive would blind the panel to its own hover. This is an accepted
   consequence of the mode, not a defect.
 
@@ -1050,8 +1050,10 @@ content.
   a program tab of this dock draws; `PanelDockState::show_idle_sub_windows` shows them on every
   other frame. Exactly one of the two per frame.
 - **Panels stay on `Order::Foreground`.** Canvas input gating is z-order based
-  (`crate::input_util::pointer_over_floating_area`, `crates/ms-widgets/src/input_util.rs`), so a panel drawn on a
-  lower order would stop shielding the canvas beneath it.
+  (`ms_input::Condition::PointerOnView`: a view surface counts as under the pointer only where
+  `Context::layer_id_at` reports `Order::Background` or the view's own capture layer;
+  `crates/ms-input/src/router.rs` `surface_at`), so a panel drawn on `Order::Background` would stop
+  shielding the canvas beneath it.
 - **Total, panic-free solving.** Non-finite or negative sizes and positions are sanitized to `0.0`
   on the way in, a degenerate or inverted `area` collapses onto its `min` corner, and a chain that
   cannot fit even at its floors is returned aligned to the area's top-left with `shrunk: true`.

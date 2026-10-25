@@ -3,9 +3,10 @@ File: crates/ms-tab-translation/src/page_crop.rs
 
 Purpose:
 The one rule that turns a page-normalized selection rect (`uv_rect`, 0..1 of the page) into the
-pixel rect cropped out of the decoded page. The OCR worker crops its input with it and the text
-detector's region detection crops the same pixels with it, so an OCR selection and the detector
-run on that selection see exactly the same image.
+pixel rect cropped out of the decoded page. The OCR worker crops its input with it, the text
+detector's region detection crops the same pixels with it and the advanced-recognition window
+(`adv_rec`) builds its preview with it, so an OCR selection, its preview and the detector run on
+that selection see exactly the same image.
 
 Key items:
 - `PixelRect`: a non-empty pixel rect inside the page (`x`, `y`, `width`, `height`).

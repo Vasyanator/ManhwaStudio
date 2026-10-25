@@ -6,36 +6,62 @@ OpenRouter account status (usage, credit limit, remaining credit, rate limit) fo
 connection UI. Native only (`ureq`, `serde_json`).
 
 Key functions:
-- fetch_account_status()  : blocking GET `https://openrouter.ai/api/v1/key`.
+- fetch_account_status()  : blocking GET `https://openrouter.ai/api/v1/key` over the crate's
+                            one transport (`crate::http::UreqTransport`: connect + whole-request
+                            timeouts, body cap, no redirects with a key).
+- fetch_account_status_with() : the same over any `HttpTransport` (test seam).
 - format_account_status() : pure formatter of that response, tested without network.
 
 Notes:
 The key travels only in the `Authorization` header; it never enters a URL, an error or a log.
+Not retried: a status query the user re-runs on demand, not a download.
 The `"OpenRouter: "` prefix and the `"{requests} req/{interval}"` part are not localized.
 */
+
+use std::time::Duration;
 
 use ms_log::runtime_log;
 use serde_json::Value;
 
 use crate::error::AiApiError;
+use crate::http::{AuthScheme, HttpBody, HttpMethod, HttpRequestSpec, HttpTransport, SendOptions, UreqTransport, log_body};
 
 /// `OpenRouter`'s "current key" endpoint.
 const OPENROUTER_KEY_URL: &str = "https://openrouter.ai/api/v1/key";
+/// TCP / TLS connect timeout of the status request.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Whole-request timeout (connect, send and body read) of the status request.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Body cap of the status answer: a small JSON object; anything larger is not that answer.
+const RESPONSE_CAP_BYTES: u64 = 256 * 1024;
 
 /// Fetches and formats the account status of the `OpenRouter` `api_key`. Blocking network
 /// I/O: worker threads only.
 ///
 /// # Errors
-/// `OpenRouterRequest` when the request fails, `OpenRouterNonJson` when the body is not JSON.
+/// As [`fetch_account_status_with`].
 pub fn fetch_account_status(api_key: &str) -> Result<String, AiApiError> {
-    let response = ureq::get(OPENROUTER_KEY_URL)
-        .set("Authorization", &format!("Bearer {api_key}"))
-        .call()
-        .map_err(|err| {
-            runtime_log::log_warn(format!("[AI API] OpenRouter account status request failed: {err}"));
-            AiApiError::OpenRouterRequest { detail: err.to_string() }
-        })?;
-    let value: Value = response.into_json().map_err(|err| {
+    fetch_account_status_with(&UreqTransport::new(CONNECT_TIMEOUT), api_key)
+}
+
+/// [`fetch_account_status`] over `transport` (the test seam): one GET with the key as a
+/// Bearer header, bounded by [`REQUEST_TIMEOUT`] and [`RESPONSE_CAP_BYTES`].
+///
+/// # Errors
+/// `OpenRouterRequest` when the exchange fails (network, timeout, oversized body) or the
+/// answer is not a 2xx status; `OpenRouterNonJson` when a 2xx body is not JSON.
+pub(crate) fn fetch_account_status_with(transport: &dyn HttpTransport, api_key: &str) -> Result<String, AiApiError> {
+    let spec = HttpRequestSpec { method: HttpMethod::Get, url: OPENROUTER_KEY_URL.to_string(), headers: Vec::new(), body: HttpBody::Empty, auth: Some(AuthScheme::Bearer) };
+    let options = SendOptions { timeout: REQUEST_TIMEOUT, cap: RESPONSE_CAP_BYTES, stage: "openrouter_key" };
+    let response = transport.send(&spec, Some((AuthScheme::Bearer, api_key)), options).map_err(|err| {
+        runtime_log::log_warn(format!("[AI API] OpenRouter account status request failed: {err}"));
+        AiApiError::OpenRouterRequest { detail: err.to_string() }
+    })?;
+    if !(200..300).contains(&response.status) {
+        runtime_log::log_warn(format!("[AI API] OpenRouter account status answered HTTP {}: {}", response.status, log_body(&response.body)));
+        return Err(AiApiError::OpenRouterRequest { detail: format!("HTTP {}", response.status) });
+    }
+    let value: Value = serde_json::from_slice(&response.body).map_err(|err| {
         runtime_log::log_warn(format!("[AI API] OpenRouter account status response is not JSON: {err}"));
         AiApiError::OpenRouterNonJson { detail: err.to_string() }
     })?;
@@ -96,8 +122,80 @@ pub fn format_account_status(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_account_status;
+    use super::{OPENROUTER_KEY_URL, REQUEST_TIMEOUT, RESPONSE_CAP_BYTES, fetch_account_status_with, format_account_status};
+    use crate::error::AiApiError;
+    use crate::http::{AuthScheme, HttpError, HttpMethod, HttpRequestSpec, HttpResponse, HttpTransport, SendOptions};
     use serde_json::json;
+    use std::sync::Mutex;
+
+    /// One request as the fake transport saw it.
+    struct SeenRequest {
+        method: HttpMethod,
+        url: String,
+        auth: Option<AuthScheme>,
+        /// The test key was handed to the transport.
+        key_attached: bool,
+        options: SendOptions,
+    }
+
+    /// Answers every request with `answer` and records what was asked of it.
+    struct FakeTransport {
+        answer: Result<HttpResponse, HttpError>,
+        seen: Mutex<Vec<SeenRequest>>,
+    }
+
+    impl FakeTransport {
+        fn new(answer: Result<HttpResponse, HttpError>) -> Self {
+            Self { answer, seen: Mutex::new(Vec::new()) }
+        }
+    }
+
+    impl HttpTransport for FakeTransport {
+        fn send(&self, request: &HttpRequestSpec, auth: Option<(AuthScheme, &str)>, options: SendOptions) -> Result<HttpResponse, HttpError> {
+            let key_attached = auth.is_some_and(|(_, key)| key == "sk-test");
+            self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(SeenRequest { method: request.method, url: request.url.clone(), auth: request.auth, key_attached, options });
+            self.answer.clone()
+        }
+    }
+
+    fn response(status: u16, body: &str) -> HttpResponse {
+        HttpResponse { status, content_type: Some("application/json".to_string()), body: body.as_bytes().to_vec() }
+    }
+
+    /// The status request goes through the transport with the key as Bearer auth and the
+    /// explicit timeout and body cap (never ureq's unbounded default agent).
+    #[test]
+    fn status_request_carries_key_timeout_and_cap() {
+        let transport = FakeTransport::new(Ok(response(200, r#"{"data":{"usage":1.5}}"#)));
+        let status = fetch_account_status_with(&transport, "sk-test").expect("a 2xx JSON answer formats");
+        assert!(status.starts_with("OpenRouter: "));
+        let seen = transport.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let request = &seen[0];
+        assert_eq!(request.method, HttpMethod::Get);
+        assert_eq!(request.url, OPENROUTER_KEY_URL);
+        assert_eq!(request.auth, Some(AuthScheme::Bearer));
+        assert!(request.key_attached);
+        assert_eq!(request.options.timeout, REQUEST_TIMEOUT);
+        assert_eq!(request.options.cap, RESPONSE_CAP_BYTES);
+    }
+
+    #[test]
+    fn non_2xx_status_is_a_request_error() {
+        let transport = FakeTransport::new(Ok(response(401, r#"{"error":"bad key"}"#)));
+        assert!(matches!(fetch_account_status_with(&transport, "sk-test"), Err(AiApiError::OpenRouterRequest { detail }) if detail == "HTTP 401"));
+    }
+
+    #[test]
+    fn transport_timeout_is_a_request_error() {
+        let transport = FakeTransport::new(Err(HttpError::Timeout { stage: "openrouter_key".to_string() }));
+        assert!(matches!(fetch_account_status_with(&transport, "sk-test"), Err(AiApiError::OpenRouterRequest { .. })));
+    }
+
+    #[test]
+    fn non_json_body_is_reported() {
+        let transport = FakeTransport::new(Ok(response(200, "<html>")));
+        assert!(matches!(fetch_account_status_with(&transport, "sk-test"), Err(AiApiError::OpenRouterNonJson { .. })));
+    }
 
     // No UI locale is installed in this test binary, so these assert the structure (prefix,
     // part count, the unlocalized rate-limit part), never localized text.

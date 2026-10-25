@@ -39,27 +39,6 @@ pub fn raw_wheel_delta(input: &egui::InputState) -> egui::Vec2 {
         .fold(egui::Vec2::ZERO, |acc, delta| acc + delta)
 }
 
-/// True when the pointer is over a floating egui layer (a `Window`, menu, popup or
-/// tooltip) rather than the background/central content.
-///
-/// Replaces egui 0.33's `Context::is_pointer_over_area` for "did the click land on
-/// bare canvas versus on floating UI drawn over it" tests. egui 0.35's
-/// `is_pointer_over_egui` is unreliable for this: an app that fills the window with a
-/// space-consuming [`egui::CentralPanel`] leaves the root ui's available rect empty
-/// (the panel advances the cursor past it), so egui records an empty
-/// `root_ui_available_rect` and `is_pointer_over_egui` then reports `true` for every
-/// point over the central content — which permanently suppressed the typing tab's
-/// deselect-on-empty-click. Callers already restrict the click to the canvas rect, so
-/// only the presence of a floating layer above that point matters here.
-#[must_use]
-pub fn pointer_over_floating_area(ctx: &egui::Context) -> bool {
-    let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) else {
-        return false;
-    };
-    ctx.layer_id_at(pos)
-        .is_some_and(|layer| layer.order != egui::Order::Background)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -80,8 +80,19 @@ Long work is delegated to focused controllers:
   included — with the tab's blocks, plus pages that only have a hand-painted mask
   (`detector_region::detection_pages_for_save`; the button is enabled for either). A legacy page
   (stored blocks, no stored mask) the user never edited is written exactly as before, without a
-  mask; a region merge onto it first freezes its shown block raster into the result. The mask is
-  never autosaved. The detector's mask and blocks are drawn on the canvas while the Detector
+  mask; a region merge onto it first freezes its shown block raster into the result, and the
+  shared model then gets the resolved (expanded) boxes that raster was built from outside the
+  selection (`text_detector::merge_region_blocks`, the one block rule), while the tab keeps the
+  raw lines. A page whose stored files exist but could not be read at load
+  (`TranslationTabState::load_failed_detection_pages`, logged per page) is never deleted nor
+  rewritten by Save — what the session holds for it may be only a merged region — and the status
+  line says how many were kept; a full page detection of it (`PageDetected`) lifts that. Line edits
+  (move, resize, add, delete) reach the shared model's boxes once their drag ends
+  (`canvas_input::flush_line_edits_to_text_mask_model`: a raw-mask page keeps its mask and takes
+  the raw lines, a legacy page's display raster is rebuilt, a hand-edited mask keeps unknown
+  boxes); a batch result for a page drops a line selection or drag on it. A new detector entry
+  (a line on an undetected page) takes its size from the page loader's `PageImageInfo`
+  (`known_page_sizes`, refreshed by the host), never from disk. The mask is never autosaved. The detector's mask and blocks are drawn on the canvas while the Detector
   panel is open OR while the selected OCR engine's "create mask" parameter is on
   (`detector_region::detector_overlay_visible_for`, the one owner; the same draw path either way,
   and the stored detection's lazy load is started for it). Display only: the mask brush and the
@@ -184,8 +195,9 @@ read-before-declare pattern) and written host-side before `begin` on change
 toolbar's `initial_size` width is measured from its captions every frame (`tools_tab_sizes`): a dock
 panel never re-measures its own width, so a bar started narrower would stay wrapped. Per-frame tool
 work that used to assume one visible tool runs outside the bodies: the host's `prepare_tool_frame`
-caches the current page size for the detector body (the hook gets no `page_infos`) and, while any
-tool is on, refreshes the backend health snapshot and the OCR route inputs; the hook polls and draws
+caches the current page size for the detector body (the hook gets no `page_infos`), refreshes the
+backend health snapshot every frame (the canvas quick-OCR gesture gates on it with every tool off;
+cloned only on a revision change) and, while any tool is on, the OCR route inputs; the hook polls and draws
 the MT request preview every frame, rebuilds Composition while it is on and a rebuild is pending,
 and loads the stored detection while the detector is on. The OCR body asks for a frame every
 350 ms only while it is actually drawn (its status lines change without an egui event), so an OCR
@@ -285,7 +297,12 @@ gives each Load / Recognize its own cancel token (a newer command sets the previ
 sets the newest; `TranslationOcrController::command_cancel`) and forwards the thinned events as
 `OcrControllerEvent::ModelDownloadProgress` (state `DownloadingModel`); a cancelled download
 ends as `RecognizeCancelled` (a load: `StateChanged(NotLoaded)` + `RecognizeCancelled` for the
-waiting request), never as an error. The detector batch has one flag per batch (set on drop,
+waiting request), never as an error. Every request ends in exactly one terminal event: a request
+waiting for a load that a newer one replaces, and a backend recognize superseded by a newer
+selection, end as `RecognizeCancelled`; a request the worker can no longer take (send to a dead
+worker, a worker that disconnects with requests in flight) ends as `RecognizeFailed`; so the tab's
+pending targets (`pending_ocr_regions` via `drop_ocr_region`, bubble inserts, the detector batch)
+are always released. The detector batch has one flag per batch (set on drop,
 checked before every page) and emits `TextDetectorControllerEvent::{ModelDownloadStarted,
 ModelDownloadProgress, DetectCancelled}`; the region helpers used by Cleaning take the caller's
 `EnsureCtx` and return `DetectFailure::{Cancelled, Failed}`. The tab keeps the latest event per
@@ -524,7 +541,8 @@ is an author note addressed to the translator, not a replica.
   frame (see "Input").
 - `tab/canvas_input.rs` (child module of `tab`): the canvas pointer drivers — the claimed rect
   selections (`advance_selection`, `drive_canvas_selection`), the lines editor and the mask brush
-  on the page, the lines edit commands; `tab/canvas_input/tests.rs` covers the pure helpers.
+  on the page, the lines edit commands and the hand-off of edited lines to the shared model;
+  `tab/canvas_input/tests.rs` covers the pure helpers and that hand-off.
 - `tab/detector_region.rs` (child module of `tab`): the selection region-detection trigger, the
   merge of its answer into `text_detector_results` and the shared `TextMaskModel`, and the
   detector Save snapshot of the shown masks (`detection_pages_for_save`); unit tests inline.

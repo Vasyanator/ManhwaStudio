@@ -35,8 +35,8 @@ crate's `[dev-dependencies]`, so no production build carries them.
 - `lib.rs`: public export surface for reusable widgets.
 - `../examples/`: focused widget demos as Cargo examples of this package; see
   `../examples/MODULE_README.md`.
-- `input_util.rs`: shared egui input helpers — raw (unsmoothed) wheel delta and the
-  "is the pointer over a floating egui layer" test. Both restore semantics egui removed after 0.31 (still absent in 0.36).
+- `input_util.rs`: shared egui input helpers — the raw (unsmoothed) wheel delta, which restores
+  semantics egui removed after 0.31 (still absent in 0.36).
 - `ui_scale.rs`: the single owner of the process-global interface scale
   (`General.ui_scale_percent`, in percent): the startup seed, the live read, the live change
   (`apply_ui_scale`, used by the settings slider) and `apply_ui_scale_to_context`, which every
@@ -88,7 +88,9 @@ crate's `[dev-dependencies]`, so no production build carries them.
   another. The download goes through `ms_download::fetch_small` (retry with capped backoff,
   `Range` resume, timeouts, 32 MiB cap); both bodies are fetched first, then each file is written
   temp + fsync + rename with `.dic` last, so discovery never pairs an incomplete download. It has no
-  cancel: the spellcheck worker lives for the whole process. Per-word matching is language-first, script-second: a word in the active language's own
+  cancel: the spellcheck worker lives for the whole process. If that worker dies anyway (a panic),
+  its exit guard (`SpellWorkerExit`) closes the request channel, marks the service dead and resolves
+  every still-pending word as unchecked (unmarked); it is not restarted. Per-word matching is language-first, script-second: a word in the active language's own
   script is judged ONLY by that language's dictionary (a stale same-script dictionary left on disk,
   e.g. `uk_UA` after switching to Russian, must not vote), while a word of the other script is judged
   by any dictionary of that script so mixed-script text keeps working. If the active language's
@@ -348,20 +350,29 @@ crate's `[dev-dependencies]`, so no production build carries them.
   a pending rename holds. Draw only: `show` reports at most one `PresetPickerAction`
   (`Deselect`, `Create`, `Select(idx)`, `Save`, `Delete(idx)`) and the caller applies it,
   validates the name (`PresetPickerState::name`, verbatim) and writes any status text. The
-  pure decisions are local and unit-tested: `wheel_target` (the wheel cycles «None» +
-  presets, never the create row), `action_changes_nothing` (re-selecting the selection or
-  «None» with none selected is dropped), `delete_step` (arm on a plain click, confirm on the
-  next plain click, a double click never counts, disarm when the pointer leaves) and
-  `popup_id_bucket` (the row-count bucket folded into the combo id, see the growing-popup
-  contract below). The name row keeps a fixed 190 pt reserve for its buttons. Builder options
+  pure decisions are unit-tested: `preset_wheel_target` (public: the wheel cycles «None» +
+  presets, never the create row; the typing tab's image-row local-preset combo, which cannot be
+  a picker, cycles through it too), `action_changes_nothing` (re-selecting the selection or
+  «None» with none selected is dropped) and `popup_id_bucket` (the row-count bucket folded into
+  the combo id, see the growing-popup contract below). «Delete» is an `ArmedDeleteButton` with
+  the `DESTRUCTIVE_IDLE_FILL` at rest. The name row keeps a fixed 190 pt reserve for its buttons. Builder options
   `create_row`, `delete` and `rename` (all default `true`); `rename(false)` shows the
-  selection's name in a disabled field and leaves «Save» as a values-only commit. Consumer: the
-  typing tab's global presets.
+  selection's name in a disabled field and leaves «Save» as a values-only commit. Consumers: the
+  typing tab's global presets, the translation tab's composition presets and Settings › «Лента
+  и пузыри» layout presets.
+- `armed_delete_button.rs`: `ArmedDeleteButton`, the ONE two-click delete button — the first
+  plain click arms it (confirm caption, `DESTRUCTIVE_ARMED_FILL`), the next plain click
+  confirms, a double click never counts, an armed button the pointer leaves disarms; disabled
+  means never armed. Stateless: `show(ui, armed)` returns the response and an `ArmedDeleteStep`
+  the caller applies to the arm it owns (one flag, or which row of a list is armed); the pure
+  rule is `armed_delete_step`. Consumers: `PresetPicker`, Settings › Тайп font groups and
+  custom fonts.
 - `wheel_combo_box.rs`, `wheel_slider.rs`, `wheel_spin_box.rs`: input widgets that consume
   mouse-wheel changes without scrolling parent views.
 - `wheel_input_guard.rs`: shared popup/wheel guard used by wheel-aware widgets, and the
   shared WHEEL-STEP helpers the combo boxes react through (`wheel_steps_if_hovered`,
-  `cycle_wrapped_index`, and the raw per-notch delta behind them). `WheelComboBox` and
+  `cycle_wrapped_index` — public, THE wrapping index rule for every wheel-cycled selector of the
+  workspace — and the raw per-notch delta behind them). `WheelComboBox` and
   `SearchableComboBox` both call them, which is the point: one wheel notch must move one row
   in both, and a copy per widget is how that contract drifts. One step per FRAME is reported
   however many notches arrived in it — only the sign of the raw delta is read — and
@@ -506,8 +517,8 @@ crate's `[dev-dependencies]`, so no production build carries them.
 - To change text styling/highlight layout, edit `text_edit_plus.rs` and verify wrapped lines and
   explicit newlines.
 - To change viewport eyedropper behavior, edit `viewport_color_selector.rs`.
-- To change the named-preset block (rows, wheel rule, armed delete, warning line), edit
-  `preset_picker.rs`; what an action MEANS stays in the caller.
+- To change the named-preset block (rows, wheel rule, warning line), edit `preset_picker.rs`;
+  what an action MEANS stays in the caller. The two-click delete is `armed_delete_button.rs`.
 - To change the preset grid, its palette defaults, or the update/cancel semantics, edit
   `color_preset_picker.rs`; to change WHERE a preset set comes from or goes, edit the caller,
   not the widget.

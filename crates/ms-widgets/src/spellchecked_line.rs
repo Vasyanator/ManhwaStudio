@@ -63,7 +63,7 @@ use ms_thread as thread;
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use web_time::Duration;
@@ -200,14 +200,15 @@ struct SpellRequest(SpellCacheKey);
 
 /// The process-wide spellcheck worker handle and its verdict cache.
 ///
-/// `available` is `false` when the worker thread could not be spawned: every word then
-/// reads `Unsupported` (left unmarked, exactly like a language without a dictionary)
-/// instead of staying `Pending` forever.
+/// `alive` is `false` when the worker thread could not be spawned, and turns `false`
+/// when it ends (a panic; see [`SpellWorkerExit`]): every word then reads
+/// `Unsupported` (left unmarked, exactly like a language without a dictionary) instead
+/// of staying `Pending` forever.
 #[derive(Clone)]
 struct SpellcheckService {
     tx: Sender<Vec<SpellRequest>>,
     cache: Arc<Mutex<HashMap<SpellCacheKey, SpellStatus>>>,
-    available: bool,
+    alive: Arc<AtomicBool>,
 }
 
 impl SpellcheckService {
@@ -218,20 +219,20 @@ impl SpellcheckService {
     fn spawn() -> Self {
         let cache = Arc::new(Mutex::new(HashMap::new()));
         let (tx, rx) = mpsc::channel();
+        let alive = Arc::new(AtomicBool::new(true));
         let worker_cache = Arc::clone(&cache);
-        let available = match thread::Builder::new()
+        let worker_alive = Arc::clone(&alive);
+        // The exit guard is built INSIDE the thread, so it exists only once the worker runs.
+        if let Err(err) = thread::Builder::new()
             .name("spellcheck-worker".to_string())
-            .spawn(move || spellcheck_worker_loop(worker_cache, rx))
+            .spawn(move || spellcheck_worker_loop(SpellWorkerExit { rx: Some(rx), cache: worker_cache, alive: worker_alive }))
         {
-            Ok(_) => true,
-            Err(err) => {
-                runtime_log::log_error(format!(
-                    "[widgets::spellchecked_line] failed to spawn the spellcheck worker; spellchecking is unavailable for this process (words stay unmarked); error={err}"
-                ));
-                false
-            }
-        };
-        Self { tx, cache, available }
+            alive.store(false, Ordering::Release);
+            runtime_log::log_error(format!(
+                "[widgets::spellchecked_line] failed to spawn the spellcheck worker; spellchecking is unavailable for this process (words stay unmarked); error={err}"
+            ));
+        }
+        Self { tx, cache, alive }
     }
 }
 
@@ -691,8 +692,8 @@ fn classify_word(word: &str) -> Option<ScriptGroup> {
 
 fn statuses_for_tokens(ui: &Ui, tokens: &[WordToken]) -> Vec<SpellStatus> {
     let service = SpellcheckService::global();
-    if !service.available {
-        // No worker (spawn failed, logged once): nothing is ever checked.
+    if !service.alive.load(Ordering::Acquire) {
+        // No worker (spawn failed, or it died; logged once): nothing is ever checked.
         return vec![SpellStatus::Unsupported; tokens.len()];
     }
     let mut requests = Vec::new();
@@ -746,16 +747,56 @@ fn statuses_for_tokens(ui: &Ui, tokens: &[WordToken]) -> Vec<SpellStatus> {
     statuses
 }
 
-fn spellcheck_worker_loop(
+/// The spellcheck worker's end, run by `Drop` on every exit path of the worker thread
+/// (a panic while checking included): it closes the request channel, marks the service
+/// dead and resolves every still-`Pending` verdict as `Unsupported`, so words queued
+/// before the death never stay pending (and the GUI never repaints for them forever).
+///
+/// The channel is closed BEFORE the sweep: a GUI send that races the death either lands
+/// before the close (its words were inserted as `Pending` first, so the sweep resolves
+/// them) or fails after it (`statuses_for_tokens` resolves the returned words itself).
+struct SpellWorkerExit {
+    /// The request channel; `Some` for the worker's whole life, taken only by `drop`.
+    rx: Option<Receiver<Vec<SpellRequest>>>,
     cache: Arc<Mutex<HashMap<SpellCacheKey, SpellStatus>>>,
-    rx: Receiver<Vec<SpellRequest>>,
-) {
+    alive: Arc<AtomicBool>,
+}
+
+impl Drop for SpellWorkerExit {
+    fn drop(&mut self) {
+        drop(self.rx.take());
+        self.alive.store(false, Ordering::Release);
+        let mut cache = match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut resolved = 0_usize;
+        for status in cache.values_mut() {
+            if *status == SpellStatus::Pending {
+                *status = SpellStatus::Unsupported;
+                resolved += 1;
+            }
+        }
+        drop(cache);
+        let cause = if std::thread::panicking() { "it panicked" } else { "its request channel closed" };
+        runtime_log::log_error(format!(
+            "[widgets::spellchecked_line] the spellcheck worker ended ({cause}); spellchecking is off for the rest of this process and {resolved} pending word(s) stay unmarked"
+        ));
+    }
+}
+
+/// The spellcheck worker thread: answers request batches until its channel closes; `exit`
+/// runs the death protocol on every way out ([`SpellWorkerExit`]).
+fn spellcheck_worker_loop(exit: SpellWorkerExit) {
+    let Some(rx) = exit.rx.as_ref() else {
+        return;
+    };
     let mut state = SpellcheckWorkerState::new();
     while let Ok(mut batch) = rx.recv() {
         while let Ok(mut extra) = rx.try_recv() {
             batch.append(&mut extra);
         }
-        process_spellcheck_batch(&cache, &mut state, batch);
+        process_spellcheck_batch(&exit.cache, &mut state, batch);
     }
 }
 
@@ -1464,6 +1505,53 @@ mod tests {
     use super::*;
     use ms_text_util::language::ScriptGroup as TextScriptGroup;
     use std::collections::HashSet;
+
+    /// A cache holding one `Pending` and one `Correct` verdict, plus the worker's exit parts.
+    fn exit_fixture() -> (Sender<Vec<SpellRequest>>, SpellWorkerExit, SpellCacheKey, SpellCacheKey) {
+        let pending = SpellCacheKey { language: TextLanguage::En, group: ScriptGroup::Latin, word: "queued".to_string() };
+        let correct = SpellCacheKey { language: TextLanguage::En, group: ScriptGroup::Latin, word: "checked".to_string() };
+        let cache = Arc::new(Mutex::new(HashMap::from([
+            (pending.clone(), SpellStatus::Pending),
+            (correct.clone(), SpellStatus::Correct),
+        ])));
+        let (tx, rx) = mpsc::channel();
+        let exit = SpellWorkerExit { rx: Some(rx), cache, alive: Arc::new(AtomicBool::new(true)) };
+        (tx, exit, pending, correct)
+    }
+
+    /// Words queued before the worker died must not stay `Pending`; the
+    /// service reads dead and the channel is closed, so later sends fail visibly.
+    #[test]
+    fn worker_death_resolves_pending_words_and_closes_the_channel() {
+        let (tx, exit, pending, correct) = exit_fixture();
+        let cache = Arc::clone(&exit.cache);
+        let alive = Arc::clone(&exit.alive);
+        let worker = std::thread::spawn(move || {
+            let _exit = exit;
+            panic!("simulated spellcheck worker panic");
+        });
+        assert!(worker.join().is_err(), "the simulated worker panicked");
+
+        assert!(!alive.load(Ordering::Acquire));
+        let guard = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(guard.get(&pending), Some(&SpellStatus::Unsupported));
+        assert_eq!(guard.get(&correct), Some(&SpellStatus::Correct), "finished verdicts are kept");
+        drop(guard);
+        assert!(tx.send(vec![SpellRequest(pending)]).is_err(), "the request channel is closed");
+    }
+
+    /// The same protocol runs on a normal end of the worker loop (its channel closed).
+    #[test]
+    fn worker_loop_end_resolves_pending_words() {
+        let (tx, exit, pending, _correct) = exit_fixture();
+        let cache = Arc::clone(&exit.cache);
+        let alive = Arc::clone(&exit.alive);
+        drop(tx);
+        spellcheck_worker_loop(exit);
+        assert!(!alive.load(Ordering::Acquire));
+        let guard = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(guard.get(&pending), Some(&SpellStatus::Unsupported));
+    }
 
     /// The widget-level (`Latin`/`Cyrillic`) script a language's dictionary must
     /// classify to. Derived from the language's segmentation group so the two

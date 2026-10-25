@@ -21,7 +21,7 @@ Order and rationale: "Save / page-op / discard / exit choreography" in `src/stud
 image-set session never runs this (its closes quiesce without a delete job, `SessionMode`).
 */
 
-use super::{PendingExitCleanup, ProjectSession};
+use super::{PendingExitCleanup, ProjectSession, WakeGuiOnDrop};
 use crate::studio::PendingCloseAction;
 use crate::studio::session::SessionParts;
 use crate::runtime_log;
@@ -43,14 +43,17 @@ impl ProjectSession {
     /// caller); it joins that thread BEFORE the delete, so a finishing autosave pass cannot re-create
     /// the staging dir after it was removed, and the GUI thread never waits on it. Spawning first is
     /// what lets a refused thread abort the discard before anything was latched or stopped.
+    /// `wake_gui` is held by the thread for its whole run, so its end wakes the GUI's poll.
     ///
     /// # Errors
     /// The OS error when the thread could not be started; nothing ran.
-    fn spawn_unsaved_delete_job(unsaved_dir: PathBuf) -> std::io::Result<UnsavedDeleteJob> {
+    fn spawn_unsaved_delete_job(unsaved_dir: PathBuf, wake_gui: WakeGuiOnDrop) -> std::io::Result<UnsavedDeleteJob> {
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let (start_tx, start_rx) = std::sync::mpsc::channel::<Option<JoinHandle<()>>>();
         // The handle is dropped: the job is detached and answers only through `tx`.
         let _detached = thread::Builder::new().name("discard-staging".to_owned()).spawn(move || {
+            // Declared first so it drops last: after the result was sent, on every return path.
+            let _wake_gui = wake_gui;
             // A closed start channel means `start_exit_cleanup` dropped the job without releasing
             // it; nothing was quiesced for it, so it must not delete anything. Dropping `tx` reports
             // that as a lost worker.
@@ -91,7 +94,7 @@ impl ProjectSession {
         if self.activity(parts).exit_cleanup_running() {
             return;
         }
-        let job = match Self::spawn_unsaved_delete_job(parts.project.paths.unsaved_dir.clone()) {
+        let job = match Self::spawn_unsaved_delete_job(parts.project.paths.unsaved_dir.clone(), self.job_waker("discard-staging")) {
             Ok(job) => job,
             Err(err) => {
                 runtime_log::log_error(format!(

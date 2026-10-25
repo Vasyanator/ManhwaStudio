@@ -7,7 +7,12 @@ Runs installer backend work outside the egui UI layer.
 Main responsibilities:
 - download and unpack uv and app release assets;
 - create the managed Python environment and install Python dependencies;
-- install static base dependencies for every install and torch-dependent extras only for full installs;
+- own THE Python package list (`BASE_DEPENDENCIES`, `TORCH_DEPENDENCIES`; the gitignored
+  `requirements/base.txt` / `torch.txt` mirror it, guarded by a test) and install the base group for every
+  install and the torch-dependent extras only for full installs;
+- decide which specs an existing environment still lacks (`missing_dependency_specs`: absent,
+  or installed outside the spec's version pin, read through `pip_spec`), shared by repair,
+  update continuation and the `--check-venv` readiness view;
 - sequence the Torch stage (owned by `torch/`: pins, options, command, readiness) inside the
   install, repair and update workers, and provide it the pip / uv runner, retry loop and
   progress helpers (`pub(crate)`);
@@ -52,6 +57,7 @@ use web_time::SystemTime;
 use web_time::Duration;
 
 use ms_config as config;
+use crate::pip_spec::{Pep440Version, Requirement};
 use ms_sysprobe::python_manager;
 use ms_config::version_format::{compare_release_versions, version_core};
 // The Windows records (registry entries, shortcuts, elevation) are owned by
@@ -108,6 +114,16 @@ const LINUX_BINARY_ASSET_NAME_AARCH64: &str = "manhwastudio_rs_linux_arm64";
 const PYTHON_VERSION_REQUEST: &str = "3.11";
 const PADDLE_CU126_INDEX_URL: &str = "https://www.paddlepaddle.org.cn/packages/stable/cu126/";
 pub(crate) const ENABLE_PADDLE_CUDA_EXTRA_PACKAGES_INSTALL: bool = false;
+// THE Python package list of the app (installer, repair, update continuation and the
+// `--check-venv` readiness check all read it): the base group for every install and the
+// torch-dependent extras for full installs, PyTorch itself excluded (`torch/`). The dev files
+// `requirements/base.txt` / `requirements/torch.txt` (gitignored) mirror these two lists spec for
+// spec; `tests::requirements_files_mirror_installer_lists` fails on drift.
+//
+// A version specifier is a REQUIREMENT on existing environments too: a package installed at a
+// version outside it counts as missing (`missing_dependency_specs`) and is reinstalled at the
+// spec. Every spec must parse with `pip_spec::Requirement` (guarded by a test) and use only the
+// markers `dependency_marker_matches_current_platform` understands.
 const BASE_DEPENDENCIES: &[&str] = &[
     "cloakbrowser",
     "deep-translator",
@@ -115,13 +131,19 @@ const BASE_DEPENDENCIES: &[&str] = &[
     "numpy",
     "onnxruntime; platform_system != \"Windows\"",
     "onnxruntime-directml; platform_system == \"Windows\"",
-    "opencv-python",
+    // The headless build, not `opencv-python`: surya-ocr pins `opencv-python-headless`,
+    // easyocr and reline require it, and the backend never opens an OpenCV window. Two
+    // distributions of the `cv2` module in one environment overwrite each other's files.
+    "opencv-python-headless",
     "Pillow",
     "playwright",
     "pyclipper",
     "requests",
     "selenium",
-    "transformers",
+    // Capped to the line the backend is tested on: remote-code and FLUX.3 klein text-encoder
+    // code depend on its internal API (a fresh resolve of 5.x breaks `flux3_klein/text_encoder.py`).
+    // 4.57 also caps huggingface-hub below 1.0 itself, so the hub needs no pin of its own.
+    "transformers>=4.57.1,<4.58",
     // Backs the loopback-WebSocket fallback transport used when AF_UNIX is
     // unavailable (Windows). Kept unconditional: wsproto is a tiny pure-Python
     // package, so installing it everywhere avoids a Windows-only branch that would
@@ -129,12 +151,20 @@ const BASE_DEPENDENCIES: &[&str] = &[
     "wsproto",
 ];
 const TORCH_DEPENDENCIES: &[&str] = &[
-    "diffusers",
+    // Empty-weights (meta-device) model construction of FLUX.2 / FLUX.3 klein
+    // (`flux2_klein/large_model.py`, `flux3_klein/text_encoder.py`).
+    "accelerate",
+    // >=0.39 for Flux2KleinInpaintPipeline (added in 0.38); 0.40 is avoided on purpose because
+    // it requires huggingface-hub>=1.23, which forces transformers 5.x.
+    "diffusers>=0.39,<0.40",
     "easydict",
     // easyocr / surya-ocr are pinned to the versions whose weight layout the app-managed model
-    // catalog mirrors (same pins as `requirements/torch.txt`).
+    // catalog mirrors (easyocr `config.py` file names + md5, Surya manifest checkpoints); a
+    // version change needs the catalog (`ms_sysprobe::ai_models`) changed together.
     "easyocr==1.7.2",
     "einops",
+    // GGUF checkpoint loading of FLUX Fill (`GGUFQuantizationConfig`; diffusers imports it lazily).
+    "gguf",
     "kornia",
     "manga-ocr",
     "omegaconf",
@@ -785,7 +815,8 @@ fn ensure_repair_python_environment(
     Ok(python_exe)
 }
 
-/// Installs only the dependencies of `request` that `installed` does not provide.
+/// Installs only the dependencies of `request` that `installed` does not provide, or provides
+/// at a version outside the spec's pin (see [`missing_dependency_specs`]).
 ///
 /// `installed` is a `pip freeze` snapshot (see [`freeze_installed_packages`]). When
 /// nothing is missing the request is skipped entirely — including the pip/wheel
@@ -1654,7 +1685,7 @@ fn parse_pip_freeze_line(line: &str) -> Option<(String, String)> {
 /// function never guesses a *smaller* requirement than reality.
 ///
 /// PyTorch itself is NOT in this list: its requirement is a version and flavour rule against
-/// the recorded choice, which a presence-only spec cannot express. Callers checking a `Full`
+/// the recorded choice, which a version specifier alone cannot express. Callers checking a `Full`
 /// environment must also consult [`installed_torch_is_current`].
 ///
 /// The returned specs are raw dependency strings (they may carry version pins and
@@ -1675,10 +1706,15 @@ pub fn required_dependency_specs(
 ///
 /// A spec is skipped when its environment marker does not apply to the current
 /// platform (e.g. `onnxruntime-directml; platform_system == "Windows"` off
-/// Windows). A spec counts as installed when its package name — normalized the
-/// same way as `pip freeze` output — is a key of `installed`. Versions are NOT
-/// compared: this answers "is the package present at all", which is what both the
-/// readiness check and the repair worker need.
+/// Windows). Otherwise it is missing when its package — name normalized the same way
+/// as `pip freeze` output — is not a key of `installed`, OR when the installed version
+/// does not satisfy the spec's version specifier (`transformers>=4.57.1,<4.58` with
+/// 5.20.1 installed). Installing the returned spec then brings that package to the pin,
+/// so the readiness check and the repair / update workers share one notion of
+/// "the environment has what this build needs".
+///
+/// Fail-open toward installing: a spec this module cannot parse, or an installed version
+/// that is not PEP 440, counts as missing (logged), never as satisfied.
 #[must_use]
 pub(crate) fn missing_dependency_specs<'a>(
     required: &[&'a str],
@@ -1688,12 +1724,40 @@ pub(crate) fn missing_dependency_specs<'a>(
         .iter()
         .copied()
         .filter(|dep| dependency_marker_matches_current_platform(dep))
-        .filter(|dep| {
-            dependency_package_name(dep)
-                .map(|name| !installed.contains_key(&normalize_package_name(name)))
-                .unwrap_or(false)
-        })
+        .filter(|dep| !dependency_spec_satisfied(dep, installed))
         .collect()
+}
+
+/// Whether `installed` holds `dep`'s package at a version its specifier accepts.
+///
+/// See [`missing_dependency_specs`] for the fail-open rule; this function does not look at
+/// the environment marker.
+fn dependency_spec_satisfied(dep: &str, installed: &HashMap<String, String>) -> bool {
+    let requirement = match Requirement::parse(dep) {
+        Ok(requirement) => requirement,
+        Err(err) => {
+            ms_log::runtime_log::log_error(format!(
+                "[Deps] cannot read dependency spec '{dep}': {err}. Treating it as missing so the installer asks pip for it."
+            ));
+            return false;
+        }
+    };
+    let Some(installed_version) = installed.get(&normalize_package_name(requirement.name)) else {
+        return false;
+    };
+    if requirement.specifier.is_any() {
+        return true;
+    }
+    match Pep440Version::parse(installed_version) {
+        Ok(version) => requirement.specifier.is_satisfied_by(&version),
+        Err(err) => {
+            ms_log::runtime_log::log_warn(format!(
+                "[Deps] installed version of '{}' is unreadable ({err}); reinstalling it at '{dep}'.",
+                requirement.name
+            ));
+            false
+        }
+    }
 }
 
 /// PyPI distributions that all ship the same importable `onnxruntime` module.
@@ -1711,6 +1775,21 @@ const ONNXRUNTIME_DISTRIBUTIONS: &[&str] = &[
     "onnxruntime-webgpu",
 ];
 
+/// PyPI distributions that all ship the same importable `cv2` module.
+///
+/// The app installs `opencv-python-headless`, but an environment built by an older installer
+/// (which named `opencv-python`) or by hand may provide `cv2` through another of them; they
+/// collide on the module just like the onnxruntime builds.
+const OPENCV_DISTRIBUTIONS: &[&str] = &[
+    "opencv-python-headless",
+    "opencv-python",
+    "opencv-contrib-python-headless",
+    "opencv-contrib-python",
+];
+
+/// The families of distributions that provide one Python module each.
+const EQUIVALENT_DISTRIBUTION_FAMILIES: &[&[&str]] = &[ONNXRUNTIME_DISTRIBUTIONS, OPENCV_DISTRIBUTIONS];
+
 /// Returns the interchangeable distributions of `normalized_name`, if it belongs to a
 /// family where several distributions provide the same Python module.
 ///
@@ -1721,20 +1800,26 @@ const ONNXRUNTIME_DISTRIBUTIONS: &[&str] = &[
 /// have chosen a different build of the same thing. Treating those as missing would
 /// offer a repair on every launch of a perfectly working environment.
 fn equivalent_distributions(normalized_name: &str) -> Option<&'static [&'static str]> {
-    ONNXRUNTIME_DISTRIBUTIONS
-        .iter()
-        .any(|candidate| normalize_package_name(candidate) == normalized_name)
-        .then_some(ONNXRUNTIME_DISTRIBUTIONS)
+    EQUIVALENT_DISTRIBUTION_FAMILIES.iter().copied().find(|family| {
+        family
+            .iter()
+            .any(|candidate| normalize_package_name(candidate) == normalized_name)
+    })
 }
 
 /// Whether `dep` is satisfied by an interchangeable distribution in `installed`.
 ///
-/// Returns `false` for every dependency outside [`equivalent_distributions`].
+/// Returns `false` for every dependency outside [`equivalent_distributions`], and for a
+/// spec with a version specifier: a pin names one distribution's version line, which another
+/// distribution's version says nothing about.
 fn dependency_satisfied_by_equivalent(dep: &str, installed: &HashMap<String, String>) -> bool {
-    let Some(name) = dependency_package_name(dep) else {
+    let Ok(requirement) = Requirement::parse(dep) else {
         return false;
     };
-    equivalent_distributions(&normalize_package_name(name)).is_some_and(|variants| {
+    if !requirement.specifier.is_any() {
+        return false;
+    }
+    equivalent_distributions(&normalize_package_name(requirement.name)).is_some_and(|variants| {
         variants
             .iter()
             .any(|variant| installed.contains_key(&normalize_package_name(variant)))
@@ -1783,15 +1868,6 @@ fn dependency_marker_matches_current_platform(dep: &str) -> bool {
         "platform_system == \"Windows\"" => cfg!(target_os = "windows"),
         _ => true,
     }
-}
-
-fn dependency_package_name(dep: &str) -> Option<&str> {
-    let without_marker = dep.split_once(';').map_or(dep, |(left, _)| left).trim();
-    let end = without_marker
-        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.'))
-        .unwrap_or(without_marker.len());
-    let name = without_marker[..end].trim();
-    (!name.is_empty()).then_some(name)
 }
 
 fn normalize_package_name(name: &str) -> String {
@@ -3724,7 +3800,7 @@ mod tests {
         MACOS_BINARY_ASSET_NAME_AARCH64, MACOS_BINARY_ASSET_NAME_X86_64,
         WINDOWS_BINARY_ASSET_NAME_AARCH64, WINDOWS_BINARY_ASSET_NAME_X86_64,
         BASE_DEPENDENCIES, ONNXRUNTIME_DISTRIBUTIONS, TORCH_DEPENDENCIES,
-        dependency_package_name, missing_dependency_specs,
+        OPENCV_DISTRIBUTIONS, Requirement, missing_dependency_specs,
         missing_specs_for_readiness, normalize_package_name,
         parse_executable_version_output, parse_pip_freeze_packages, platform_binary_asset_name,
         platform_executable_file_name, required_dependency_specs,
@@ -3767,11 +3843,11 @@ mod tests {
             BASE_DEPENDENCIES.len() + TORCH_DEPENDENCIES.len(),
             "Full must add exactly the torch extras"
         );
-        // torch has a MINIMUM VERSION requirement, which a presence-only spec cannot
+        // torch has a version AND flavour requirement, which a plain spec cannot
         // express, so it lives in `installed_torch_is_current` instead of this list.
         assert!(
             !full.contains(&"torch"),
-            "torch must not be a presence-only spec"
+            "torch must not be a plain dependency spec"
         );
         for dep in &base {
             assert!(full.contains(dep), "Full must be a superset of Base ({dep})");
@@ -3828,7 +3904,7 @@ mod tests {
         assert_eq!(
             missing_specs_for_readiness(&["numpy", "Pillow"], &installed),
             vec!["numpy", "Pillow"],
-            "the equivalence table must only cover the onnxruntime family"
+            "the equivalence table must only cover the onnxruntime and opencv families"
         );
     }
 
@@ -3842,17 +3918,93 @@ mod tests {
     }
 
     #[test]
-    fn missing_specs_ignore_version_pins_and_extras() {
-        let installed = installed_map(&[("torch", "2.9.1")]);
+    fn missing_specs_compare_installed_versions_with_pins() {
+        let installed = installed_map(&[
+            ("torch", "2.9.1+cu126"),
+            ("transformers", "5.20.1"),
+            ("diffusers", "0.39.0"),
+            ("easyocr", "1.7.1"),
+        ]);
         assert!(
-            missing_dependency_specs(&["torch==2.9.1"], &installed).is_empty(),
-            "a pinned spec must match the installed package by name"
+            missing_dependency_specs(&["torch==2.9.1", "diffusers>=0.39,<0.40"], &installed).is_empty(),
+            "an installed version inside the pin satisfies it (local build tags ignored)"
+        );
+        assert_eq!(
+            missing_dependency_specs(&["transformers>=4.57.1,<4.58", "easyocr==1.7.2"], &installed),
+            vec!["transformers>=4.57.1,<4.58", "easyocr==1.7.2"],
+            "a version outside the pin is missing and is returned as the spec to install"
         );
         assert_eq!(
             missing_dependency_specs(&["torchvision>=0.24"], &installed),
             vec!["torchvision>=0.24"],
             "an absent package stays missing and is returned as the original spec"
         );
+    }
+
+    #[test]
+    fn missing_specs_fail_open_toward_installing() {
+        let installed = installed_map(&[("easyocr", "not-a-version"), ("weird", "1.0")]);
+        assert_eq!(
+            missing_dependency_specs(&["easyocr==1.7.2", "weird[extra]>=1"], &installed),
+            vec!["easyocr==1.7.2", "weird[extra]>=1"],
+            "an unreadable installed version or spec must never count as satisfied"
+        );
+        // An unpinned spec never looks at the version, readable or not.
+        assert!(missing_dependency_specs(&["easyocr"], &installed).is_empty());
+    }
+
+    /// The readiness view must report an outdated pinned package too: a "ready" verdict
+    /// implies the repair worker has nothing left to do.
+    #[test]
+    fn readiness_reports_a_package_outside_its_pin() {
+        let installed = installed_map(&[("transformers", "5.20.1")]);
+        assert_eq!(
+            missing_specs_for_readiness(&["transformers>=4.57.1,<4.58"], &installed),
+            vec!["transformers>=4.57.1,<4.58"]
+        );
+    }
+
+    #[test]
+    fn readiness_accepts_every_opencv_distribution_for_the_unpinned_spec() {
+        for variant in OPENCV_DISTRIBUTIONS {
+            let installed = installed_map(&[(variant, "4.12.0.88")]);
+            assert!(
+                missing_specs_for_readiness(&["opencv-python-headless"], &installed).is_empty(),
+                "{variant} provides cv2 and must satisfy readiness"
+            );
+        }
+    }
+
+    #[test]
+    fn every_embedded_spec_parses() {
+        for dep in BASE_DEPENDENCIES.iter().chain(TORCH_DEPENDENCIES) {
+            assert!(Requirement::parse(dep).is_ok(), "embedded spec '{dep}' must parse");
+        }
+    }
+
+    /// The gitignored dev files `requirements/base.txt` / `requirements/torch.txt` mirror the
+    /// embedded lists spec for spec (comments, blank lines and `-r` includes aside). Skipped on a
+    /// checkout without them (they are untracked, so a fresh clone has none).
+    #[test]
+    fn requirements_files_mirror_installer_lists() {
+        let requirements_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../requirements");
+        for (file_name, embedded) in [("base.txt", BASE_DEPENDENCIES), ("torch.txt", TORCH_DEPENDENCIES)] {
+            let path = requirements_dir.join(file_name);
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("skipping requirements mirror check: {} is absent", path.display());
+                    continue;
+                }
+                Err(err) => panic!("cannot read {}: {err}", path.display()),
+            };
+            let listed: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("-r "))
+                .collect();
+            assert_eq!(listed, embedded.to_vec(), "{} must list exactly the installer's specs, in order", path.display());
+        }
     }
 
     #[test]
@@ -3921,11 +4073,9 @@ mod tests {
 
     #[test]
     fn dependency_package_name_ignores_versions_and_markers() {
-        assert_eq!(
-            dependency_package_name("onnxruntime; platform_system != \"Windows\""),
-            Some("onnxruntime")
-        );
-        assert_eq!(dependency_package_name("torch==2.9.1"), Some("torch"));
+        let name = |dep: &'static str| Requirement::parse(dep).ok().map(|requirement| requirement.name);
+        assert_eq!(name("onnxruntime; platform_system != \"Windows\""), Some("onnxruntime"));
+        assert_eq!(name("torch==2.9.1"), Some("torch"));
         assert_eq!(normalize_package_name("deep_translator"), "deep-translator");
     }
 

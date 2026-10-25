@@ -5278,10 +5278,8 @@ impl PsEditorTabState {
     /// * this frame's dock-panel rects — the tab's uniform statement of "a floating surface of mine
     ///   is here", independent of the panel widget staying an interactable `Area`;
     /// * z-order occlusion: anything above `Order::Background` at that point, which covers the
-    ///   effects-editor window, tooltips and context menus. This is the same test
-    ///   `ms_widgets::input_util::pointer_over_floating_area` performs, asked at the HOVER position
-    ///   rather than at `interact_pos`, which is the position the canvas gate is about; calling
-    ///   both would only add a second, drag-latched copy of the same answer.
+    ///   effects-editor window, tooltips and context menus — the z-order rule the migrated
+    ///   canvases get from `ms_input::Condition::PointerOnView`, asked here at the HOVER position.
     fn canvas_pointer_occluded(&self, ctx: &egui::Context, pointer_pos: Pos2) -> bool {
         ctx.any_popup_open()
             || self.pointer_in_any_panel(pointer_pos)

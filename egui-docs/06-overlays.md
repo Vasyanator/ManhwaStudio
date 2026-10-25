@@ -48,7 +48,9 @@ What DOES move a layer up, within its `Order`:
 Consequence for full-canvas capture surfaces: an `Order::Foreground` selection overlay entered by
 the user floats above `Order::Foreground` dock panels for as long as the mode lasts, and clicks over
 a panel go to the overlay. Fix such a case by giving the surface a LOWER `Order`, by excluding the
-panel rects from it, or by leaving it alone — never by reshuffling the creation order.
+panel rects from it, or by leaving it alone — never by reshuffling the creation order. The shared
+canvas takes the first fix: its capture area is on `Order::Background`
+(`crates/ms-canvas/src/input.rs`, `capture_layer_for`), below every dock panel.
 
 ## 2. `Area` — the floating container
 
@@ -102,14 +104,14 @@ a `Painter` (or live in an `Area` with `.interactable(false)`).
 
 ## 4. Reference implementation: the tutorial overlay
 
-`src/tutorial/engine.rs` is the canonical overlay in this repo; its header (src/tutorial/engine.rs:1-47)
+`crates/ms-settings-ui/src/tutorial/engine.rs` is the canonical overlay in this repo; its header (crates/ms-settings-ui/src/tutorial/engine.rs:1-47)
 states the contract. Summary of what it does and why:
 
 * **One full-viewport blocker `Area` on `Order::Middle`** (above the panels on `Order::Background`)
   containing exactly **one** `Sense::click_and_drag` rect covering the whole viewport:
 
 ```rust
-// src/tutorial/engine.rs:706-727
+// crates/ms-settings-ui/src/tutorial/engine.rs:714-735 (inside `paint_dim`)
 Area::new(Id::new("tutorial_blocker"))
     .order(Order::Middle)
     .fixed_pos(screen.min)
@@ -135,16 +137,16 @@ Area::new(Id::new("tutorial_blocker"))
   top-down; once a hit covers the pointer's search area it drops every widget in the layers beneath
   from both the click target and the hover set (engine.rs:17-27).
 * **The dim is four strips, the hitbox is one full rect.** The strips (top/bottom/left/right of the
-  spotlight hole, built in `paint_dim`, engine.rs:679-704) exist purely for the visual cut-out. Do **not** be tempted to
+  spotlight hole, built in `paint_dim`, engine.rs:683-712) exist purely for the visual cut-out. Do **not** be tempted to
   make the *hitbox* four strips: they leave the pointer's search area uncovered near the hole and at
-  the seams, and hover leaks through (engine.rs:24-27).
+  the seams, and hover leaks through (engine.rs:25-27).
 * **Consequence:** the spotlighted widget is visually highlighted but also inert — the requirement is
   that nothing under the overlay reacts (engine.rs:28-31).
 * **Decorations register no hitbox**: dashed outline + arrow go through `Context::layer_painter` on
   `Order::Tooltip`:
 
 ```rust
-// src/tutorial/engine.rs:915-932
+// crates/ms-settings-ui/src/tutorial/engine.rs:925-941
 let painter = ctx.layer_painter(LayerId::new(Order::Tooltip, Id::new("tutorial_decoration")));
 let stroke = Stroke::new(OUTLINE_WIDTH, ACCENT_COLOR);
 let corners = [hole.left_top(), hole.right_top(), hole.right_bottom(),
@@ -159,7 +161,7 @@ painter.arrow(tail, tip - tail, stroke);
 (egui-0.36.2/src/painter.rs:417).
 
 * **The interactive callout** is a separate `Area` on `Order::Foreground` (above the blocker) so its
-  buttons are clickable while everything below is inert (src/tutorial/engine.rs:751-757).
+  buttons are clickable while everything below is inert (crates/ms-settings-ui/src/tutorial/engine.rs:759-765).
 
 ## 5. THE TRAP: raw pointer reads leak under any overlay
 
@@ -167,7 +169,7 @@ painter.arrow(tail, tip - tail, stroke);
 `ctx.input(|i| i.pointer.latest_pos())` / `hover_pos()` return a position with no knowledge of
 layers; testing it against your own unclipped rect reacts *through* a modal, a combo popup, or the
 tutorial blocker. z-order occlusion cannot save you — the hit-test result is simply not consulted.
-This is documented in the repo at src/tutorial/MODULE_README.md:37 and was a real bug in
+This is documented in the repo at crates/ms-settings-ui/src/tutorial/MODULE_README.md:38-42 and was a real bug in
 `WheelSlider`.
 
 Correct pattern — always go through the `Response` produced by `allocate_rect`/`interact`, whose
@@ -188,20 +190,14 @@ fn pointer_over_response_rect(response: &Response) -> bool {
 ```
 
 If you genuinely need a raw position (e.g. hit-testing a warped mesh, as
-src/tabs/typing/tab/draw_page.rs:329 does), first gate it on a `Response` that egui hit-tested for
-you, or on the layer under the pointer:
+`crates/ms-tab-typing/src/tab/draw_page.rs:405` does), first gate it on a `Response` that egui
+hit-tested for you, or on the layer under the pointer. On a canvas that gate is
+`ms_input::Condition::PointerOnView`: the router (`crates/ms-input/src/router.rs`, `surface_at`)
+counts the pointer as on the view only where `Context::layer_id_at`
+(egui-0.36.2/src/context.rs:3104) reports an `Order::Background` layer or the view's own capture
+layer, so anything floating above the point shields it.
 
-```rust
-// src/input_util.rs:55-61 — "is the pointer over floating UI rather than bare canvas?"
-pub fn pointer_over_floating_area(ctx: &egui::Context) -> bool {
-    let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) else { return false; };
-    ctx.layer_id_at(pos)                       // egui-0.36.2/src/context.rs:3104
-        .is_some_and(|layer| layer.order != egui::Order::Background)
-}
-```
-
-Note the warning in that file's doc comment (src/input_util.rs:44-53): egui's
-`Context::is_pointer_over_egui` (egui-0.36.2/src/context.rs:2943) is **not** a substitute — a
+egui's `Context::is_pointer_over_egui` (egui-0.36.2/src/context.rs:2943) is **not** a substitute — a
 space-filling `CentralPanel` leaves the root ui's available rect empty, so it reports `true`
 everywhere over the central content.
 
@@ -257,18 +253,19 @@ panels (§1).
 ## 8. Canvas overlays (pointer only)
 
 Tabs paint on top of the page image through the `CanvasHooks` trait
-(`src/canvas/mod.rs:415` — `draw_canvas_overlay_on_page`, `draw_canvas_mask_overlay_on_page`,
-`draw_canvas_overlay_top_left`, `canvas_scrollbar_marks`, …), called from `src/canvas/scene.rs`
-(e.g. src/canvas/scene.rs:954), which paints via `ui.painter().with_clip_rect(clip_rect)`
-(src/canvas/scene.rs:995) — i.e. paint-only, no hitbox, same rule as §3. The canvas has its own
-`src/canvas/MODULE_README.md`; read it before touching that layer.
+(`crates/ms-canvas/src/lib.rs:677` — `draw_canvas_overlay_on_page`, `draw_canvas_mask_overlay_on_page`,
+`draw_canvas_overlay_top_left`, `canvas_scrollbar_marks`, …), called from
+`crates/ms-canvas/src/scene.rs` (e.g. `scene.rs:1449`) with the canvas `Ui`, whose painter the hooks
+paint through — i.e. paint-only, no hitbox, same rule as §3. The canvas has its own
+`crates/ms-canvas/src/MODULE_README.md`; read it before touching that layer.
 
 ## Editing map
 
-* To change the tutorial overlay (dim, spotlight, blocker, callout, arrow): `src/tutorial/engine.rs`
-  (contract in its header, engine.rs:1-47; module notes in `src/tutorial/MODULE_README.md`).
-* To change "did the click land on bare canvas vs. floating UI": `src/input_util.rs`.
+* To change the tutorial overlay (dim, spotlight, blocker, callout, arrow): `crates/ms-settings-ui/src/tutorial/engine.rs`
+  (contract in its header, engine.rs:1-47; module notes in `crates/ms-settings-ui/src/tutorial/MODULE_README.md`).
+* To change "did the click land on bare canvas vs. floating UI": `crates/ms-widgets/src/input_util.rs`.
 * To change hover/wheel occlusion behavior of a custom widget: `crates/ms-widgets/src/wheel_slider.rs` is the
   worked example of the correct `Response`-based pattern.
-* To change what tabs paint over the page: the `CanvasHooks` impls in `src/tabs/*/`, dispatched from
-  `src/canvas/scene.rs`; see `src/canvas/MODULE_README.md`.
+* To change what tabs paint over the page: the `CanvasHooks` impls in the canvas tab crates
+  (`crates/ms-tab-{translation,cleaning,typing}/`), dispatched from `crates/ms-canvas/src/scene.rs`;
+  see `crates/ms-canvas/src/MODULE_README.md`.

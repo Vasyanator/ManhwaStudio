@@ -16,10 +16,12 @@ Key items:
   - `source_page_window` / `wants_nearest_source`: answered by the tab's canvas;
   - `on_committed_tree_changed`: `request_orphan_clean_rescan`;
   - `poll_background`: the text-mask load and quick text clean polls
-    (`CleaningTabState::poll_background_jobs`), with a slow repaint while one runs.
+    (`CleaningTabState::poll_background_jobs`), with a slow repaint while one runs;
+  - `flush_debounced_stores_blocking`: the tools' settings writers
+    (`CleaningTabState::flush_tool_settings_blocking`: the region-edit engines' `SettingsSaver`s).
 
 Notes:
-- No exit-only setting or debounced store: those hooks keep their no-op defaults. The region-edit
+- No exit-only setting: that hook keeps its no-op default. The region-edit
   tools' jobs are polled only while the tab draws (their poll needs the canvas). Cleaning has
   no bottom hint, so it writes no `Canvas.*_hint_collapsed` key.
 - Zoom is the shared `view.*` set, executed by the canvas or, over an open legacy editor window,
@@ -93,6 +95,13 @@ impl StudioTab for CleaningTabState {
     /// A save-to-project merge rewrote the committed clean folders: rescan the «Клин» status area.
     fn on_committed_tree_changed(&mut self) {
         self.request_orphan_clean_rescan();
+    }
+
+    /// The region-edit engines' debounced settings writers (`SettingsSaver`): the value each one
+    /// still owes is written now, on the teardown worker, instead of by a detached drop flush the
+    /// process exit could cut off (`CleaningTabState::flush_tool_settings_blocking`).
+    fn flush_debounced_stores_blocking(&mut self) {
+        self.flush_tool_settings_blocking();
     }
 }
 

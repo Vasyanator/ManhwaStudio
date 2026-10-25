@@ -627,6 +627,27 @@ def resolve_model_source(model_path: str, *, config_dir: str, curated_model_dir:
     )
 
 
+def _diffusers_import_error_text(exc: BaseException) -> str:
+    """Return the user-facing text for a failed `diffusers` import.
+
+    Only a `ModuleNotFoundError` for `diffusers` itself means "not installed";
+    anything else (an import error raised INSIDE diffusers, e.g. by an
+    incompatible transformers) is reported as a broken installation with the
+    original `Type: message`, so the user and the log see the real cause instead
+    of a misleading "install diffusers".
+    """
+    if isinstance(exc, ModuleNotFoundError) and exc.name == "diffusers":
+        return (
+            "Для /inpaint/sdxl требуется пакет diffusers (и transformers). "
+            "Установите зависимости backend."
+        )
+    return (
+        "Не удалось импортировать diffusers для /inpaint/sdxl: "
+        f"{type(exc).__name__}: {exc}. "
+        "Восстановите зависимости backend (проверка окружения установщика)."
+    )
+
+
 def _build_sdxl_inpaint_pipeline(source: SdxlModelSource, device: str) -> Any:
     """Build a `StableDiffusionXLInpaintPipeline` from `source` and move it onto `device`.
 
@@ -640,17 +661,18 @@ def _build_sdxl_inpaint_pipeline(source: SdxlModelSource, device: str) -> Any:
     it is a strict no-op on every other build.
 
     # Raises
-    `RuntimeError` if `diffusers` is missing; loader errors (a missing
-    component file in an incomplete folder, for example) propagate.
+    `RuntimeError` if `diffusers` cannot be imported: absent, or present but
+    failing to import (an incompatible `transformers` / `huggingface_hub`, a
+    missing transitive package); the message carries the real import error, which
+    the IPC dispatcher passes through `sanitize_torch_error` on its way to the
+    user. Loader errors (a missing component file in an incomplete folder, for
+    example) propagate.
     """
     torch = _torch()
     try:
         from diffusers import StableDiffusionXLInpaintPipeline
     except Exception as exc:
-        raise RuntimeError(
-            "Для /inpaint/sdxl требуется пакет diffusers (и transformers). "
-            "Установите зависимости backend."
-        ) from exc
+        raise RuntimeError(_diffusers_import_error_text(exc)) from exc
 
     dtype = torch.float16 if str(device).startswith("cuda") else torch.float32
     if source.kind == "single_file":

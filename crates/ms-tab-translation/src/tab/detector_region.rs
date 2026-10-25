@@ -33,7 +33,9 @@ Main items:
   blocks it indexes).
 - Legacy pages (stored blocks, no stored mask) show a mask rasterized from their resolved blocks;
   a region merge first freezes that shown raster into the result (`rasterize_resolved_blocks`),
-  so the page looks the same outside the selection afterwards.
+  so the page looks the same outside the selection afterwards. The model then receives the
+  resolved boxes that raster was built from (merged with the region by `merge_region_blocks`),
+  so its boxes describe its mask; the tab's store keeps the raw lines.
 - `detection_pages_for_save`: the pages the Save button writes (see its doc).
 - `detector_overlay_visible_for`: the one owner of whether the detector mask and blocks are
   drawn — while the Detector tool is switched on, or while the selected OCR engine's "create mask
@@ -57,7 +59,7 @@ use crate::panels::ocr::OcrPanelOptions;
 use crate::ocr::{DetectMaskFlags, OcrEngine, OcrRegionWant, OcrRuntimeOptions};
 use crate::panels::text_detector::TextDetectorAlgorithm;
 use crate::text_detector::{
-    RegionDetectEngine, RegionDetectRequest, RegionDetection, SURYA_DETECTOR_SPECS, TextDetectorPageResult, empty_page_result,
+    RegionDetectEngine, RegionDetectRequest, RegionDetection, SURYA_DETECTOR_SPECS, TextDetectorPageResult, TextDetectorRect, empty_page_result, merge_region_blocks,
     merge_region_into_page,
 };
 
@@ -258,11 +260,20 @@ impl TranslationTabState {
     /// and reported; neither store is then changed.
     fn apply_region_detection(&mut self, ctx: &egui::Context, region: RegionDetection) {
         let page_idx = region.page_idx;
-        self.freeze_resolved_mask_before_region(page_idx, region.source_size);
+        let frozen_boxes = self.freeze_resolved_mask_before_region(page_idx, region.source_size);
         let had_result = self.text_detector_results.contains_key(&page_idx);
         let mut page = self.text_detector_results.remove(&page_idx).unwrap_or_else(|| empty_page_result(region.source_size));
         let merged = merge_region_into_page(&mut page, &region);
-        let page_blocks = merged.is_ok().then(|| detector_rects_to_blocks_px(&page.blocks));
+        // The model's boxes describe its mask. Outside the rect a frozen legacy page's mask is the
+        // raster of its RESOLVED boxes, so the model gets those (merged by the same block rule),
+        // while the tab's store keeps the raw lines the user edits.
+        let page_blocks = merged.is_ok().then(|| match frozen_boxes {
+            Some(mut boxes) => {
+                merge_region_blocks(&mut boxes, &region);
+                detector_rects_to_blocks_px(&boxes)
+            }
+            None => detector_rects_to_blocks_px(&page.blocks),
+        });
         // `merge_region_into_page` leaves `page` unchanged on error, so the old entry goes back.
         if merged.is_ok() || had_result {
             self.text_detector_results.insert(page_idx, page);
@@ -280,11 +291,7 @@ impl TranslationTabState {
             return;
         };
         // The merge re-sorts the page's blocks: an index into them is stale now.
-        let line_edit_on_page = self.text_detector_line_selection.is_some_and(|selection| selection.page_idx == page_idx)
-            || self.text_detector_line_drag_state.is_some_and(|drag| drag.selection.page_idx == page_idx);
-        if line_edit_on_page {
-            self.clear_text_detector_line_edit_state();
-        }
+        self.drop_line_edit_state_on_page(page_idx);
         self.text_detector_mask_textures.remove(&page_idx);
         self.merge_region_into_text_mask_model(&region, page_blocks);
         self.set_text_detector_status(tf!("translation.tab.region_detected_status", blocks = region.blocks.len()), Severity::Success);
@@ -294,26 +301,33 @@ impl TranslationTabState {
     /// a region is merged into it, that shown raster becomes the result's mask (and the shared
     /// model's, through the same materialization the display uses), so the page looks the same
     /// outside the selection afterwards. A page whose model mask was hand-edited keeps that mask.
-    fn freeze_resolved_mask_before_region(&mut self, page_idx: usize, source_size: [u32; 2]) {
+    ///
+    /// Returns the boxes the frozen raster was built from (the resolved, expanded / merged
+    /// lines), or `None` when nothing was frozen or those boxes are unknown (a hand-edited model
+    /// mask).
+    fn freeze_resolved_mask_before_region(&mut self, page_idx: usize, source_size: [u32; 2]) -> Option<Vec<TextDetectorRect>> {
         let needs_freeze = self
             .text_detector_results
             .get(&page_idx)
             .is_some_and(|result| result.source_size == source_size && result.mask_alpha.is_empty() && !result.blocks.is_empty());
         if !needs_freeze {
-            return;
+            return None;
         }
         self.materialize_text_mask_page_from_blocks_if_missing(page_idx);
         let shown = self.text_mask_page_snapshot(page_idx).filter(|page| page.source_size == source_size && mask_is_well_formed(page.mask_size, &page.mask_alpha));
-        let Some(result) = self.text_detector_results.get_mut(&page_idx) else {
-            return;
-        };
+        let result = self.text_detector_results.get_mut(&page_idx)?;
         if let Some(shown) = shown {
             result.mask_size = shown.mask_size;
             result.mask_alpha = shown.mask_alpha;
-        } else if let Some((mask_alpha, _)) = rasterize_resolved_blocks(result, &self.text_detector_options) {
+            // The materialized page stores the resolved boxes its raster was built from.
+            shown.blocks.map(|blocks| blocks.iter().filter_map(px_block_to_rect).collect())
+        } else if let Some((mask_alpha, resolved)) = rasterize_resolved_blocks(result, &self.text_detector_options) {
             // No shared model (or no shown page): the same raster the display would build.
             result.mask_size = result.source_size;
             result.mask_alpha = mask_alpha;
+            Some(resolved)
+        } else {
+            None
         }
     }
 
@@ -367,6 +381,14 @@ impl TranslationTabState {
         };
         model.lock().is_ok_and(|model| model.pages().any(|(page_idx, _)| !self.text_detector_results.contains_key(&page_idx)))
     }
+}
+
+/// A model box (`[x1, y1, x2, y2]`, source pixels) as a detector rect; `None` when degenerate.
+fn px_block_to_rect(block: &[i32; 4]) -> Option<TextDetectorRect> {
+    // i32 -> f32 is exact for every page coordinate the detector accepts (its pixel limit keeps
+    // sides far below 2^24); the boxes came from such rects (`detector_rects_to_blocks_px`).
+    let [x1, y1, x2, y2] = block.map(|value| value as f32);
+    TextDetectorRect::from_xyxy(x1, y1, x2, y2)
 }
 
 /// Whether a mask buffer holds exactly one byte per pixel of a non-empty `mask_size`.
@@ -598,6 +620,29 @@ mod tests {
             }
         }
         assert_eq!(model.lock().expect("model lock").page(0).map(|shown| shown.mask_alpha.clone()), Some(page.mask_alpha.clone()));
+    }
+
+    /// After a region merge onto a legacy page the model's boxes are the RESOLVED (expanded)
+    /// boxes its raster was built from outside the rect plus the region's, merged by the same
+    /// block rule; the tab's store keeps the raw lines.
+    #[test]
+    fn region_on_a_legacy_page_hands_the_model_its_resolved_boxes() {
+        let (mut tab, model) = tab_with_model();
+        let ctx = egui::Context::default();
+        tab.text_detector_options.block_expand_px = 2;
+        let legacy = TextDetectorPageResult { source_size: [6, 4], blocks: vec![rect(0.0, 0.0, 1.0, 1.0)], mask_size: [6, 4], mask_alpha: Vec::new() };
+        let (_, resolved) = rasterize_resolved_blocks(&legacy, &tab.text_detector_options).expect("legacy raster");
+        tab.apply_loaded_detection_pages(vec![(0, legacy)]);
+        tab.text_detection_storage_loaded_for = Some(PathBuf::from("/home/u/title/chapter"));
+        let region = region_on_page_0(Vec::new());
+        let mut expected = resolved;
+        merge_region_blocks(&mut expected, &region);
+        tab.receive_region_detection(&ctx, region);
+        let page = tab.text_detector_results.get(&0).expect("page kept");
+        assert_eq!(page.blocks, vec![rect(0.0, 0.0, 1.0, 1.0), rect(2.0, 2.0, 3.0, 3.0)], "raw lines in the tab");
+        let shown = model.lock().expect("model lock").page(0).and_then(|page| page.blocks.clone());
+        assert_eq!(shown, detector_rects_to_blocks_px(&expected));
+        assert_eq!(shown, Some(vec![[0, 0, 3, 3], [2, 2, 3, 3]]), "the expanded box, not the raw one");
     }
 
     /// A load that died leaves the stored detection unloaded: held regions keep waiting (never

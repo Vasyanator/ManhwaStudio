@@ -39,8 +39,13 @@ The first install no longer downloads application AI model weights. App-managed 
 resolved lazily by runtime code through `ms_sysprobe::ai_models`.
 
 Installer dependencies are embedded in code as two groups: base dependencies installed for every
-mode, and torch-dependent extras installed only after the full-mode PyTorch stage. The full extras
-exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stage.
+mode, and torch-dependent extras installed only after the full-mode PyTorch stage. PyTorch itself
+is installed by the explicit Torch stage and appears in neither group. These two lists in
+`utils.rs` are the ONE owner of the app's Python package set; the gitignored dev files
+`requirements/base.txt` / `requirements/torch.txt` are hand-kept mirrors (same specs, same order;
+comments allowed) that `utils::tests::requirements_files_mirror_installer_lists` compares when they
+exist. `requirements/torch.txt` names no torch / torchvision, so a dev install from it never
+replaces the PyTorch build the Torch stage chose.
 
 ## Files and submodules
 - `lib.rs`: crate boundary, public installer entry point export, and `HostVersion` — the
@@ -74,6 +79,9 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   `ms_window_geometry` for the shared window icon and the Android Activity handle.
 - `window.rs`: `prepare_window_context(ctx)`, the one window-context preparation
   every window of this crate calls first in its creator closure.
+- `pip_spec.rs`: the PEP 440 / PEP 508 subset (`Requirement`, `VersionSpecifier`,
+  `Pep440Version`) that reads the embedded specs and decides whether an installed version
+  satisfies a pin; unsupported forms (extras, URLs, `===`, wildcards) are typed errors.
 - `venv_check.rs`: the non-interactive, GUI-free readiness check behind `--check-venv`. It
   lives here rather than in `ms-sysprobe` because it reads `utils.rs`' own package
   requirements and shares `torch::installed_torch_is_current` / `utils::missing_specs_for_readiness`
@@ -164,7 +172,13 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   working environment either: an interpreter found by `python_manager` (including a user `venv/`
   in the root) is reused verbatim, and only a broken installer-owned `installer_files/venv` may be
   removed before a fresh uv-managed venv is created.
-- Repair installs only the packages that `pip freeze` does not report (`missing_dependency_specs`),
+- A version specifier in the embedded lists binds EXISTING environments too: `missing_dependency_specs`
+  reports a spec whose package `pip freeze` does not list OR lists at a version the specifier
+  rejects (PEP 440 order, local `+…` tags ignored), and installing that spec brings the package to
+  the pin (upgrade or downgrade). An unparsable spec or installed version counts as missing
+  (logged), never as satisfied. Every embedded spec must parse with `pip_spec::Requirement`
+  (test `every_embedded_spec_parses`).
+- Repair installs only the specs `missing_dependency_specs` reports,
   and skips the Torch stage exactly when `torch::installed_torch_is_current` (against the recorded
   torch choice, `torch::read_torch_choice_record`) says so.
 - Every PyPI install that runs while a torch is installed — the torch extras after the Torch
@@ -184,7 +198,8 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   `missing_dependency_specs` (one concrete distribution per spec). Readiness uses
   `missing_specs_for_readiness`, which additionally accepts any interchangeable distribution of the
   same Python module (`ONNXRUNTIME_DISTRIBUTIONS`, mirroring `ms_sysprobe::ai_install_probe` plus the
-  WebGPU build), because a working environment built on `onnxruntime-gpu`/`-webgpu`/`-migraphx`
+  WebGPU build; `OPENCV_DISTRIBUTIONS` for `cv2`) — only for a spec without a version
+  specifier — because a working environment built on `onnxruntime-gpu`/`-webgpu`/`-migraphx`
   must not be offered a repair on every launch. Readiness may only ever be SOFTER than installation.
 - `dependency_marker_matches_current_platform` understands exactly the two
   `platform_system == / != "Windows"` markers used by the embedded lists and treats anything else
@@ -297,5 +312,7 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 - To change install/update worker steps, release assets, command execution, or archive handling,
   edit `utils.rs`.
 - To change PyTorch pins, preflight, wheel options, the install command or the readiness rule,
-  edit `torch/`; to change dependency groups, edit `utils.rs`.
+  edit `torch/`; to change dependency groups or a package pin, edit `BASE_DEPENDENCIES` /
+  `TORCH_DEPENDENCIES` in `utils.rs`, then mirror it into `requirements/*.txt`.
+- To support another specifier or version form, edit `pip_spec.rs`.
 - To change app-managed AI model download behavior, edit `ms_sysprobe::ai_models`, not this module.

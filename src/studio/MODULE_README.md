@@ -116,7 +116,7 @@ Root responsibilities that stay in `studio.rs`:
   `StudioApp` (they need the dirty state and the running discard cleanup); the question's state
   lives in `CloseFlow`.
 - `session/`: `SessionMode`, the session strategy chosen once in `StudioApp::new`
-  (`Project(ProjectSession)` / `ImageSet(Box<ImageSetSession>)`), its dispatch methods and
+  (`Project(Box<ProjectSession>)` / `ImageSet(Box<ImageSetSession>)`), its dispatch methods and
   `SessionParts` (the app parts a flow borrows). `session/project/` owns the project persistence
   state and flows (save-to-project, page op, DISCARD, exit dialog, unsaved cache);
   `session/image_set/` the image-set save controller. See `session/MODULE_README.md`.

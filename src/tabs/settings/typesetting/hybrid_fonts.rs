@@ -13,8 +13,9 @@ Main responsibilities:
   drawn in its OWN compiled typeface that opens the properties window; an unavailable one
   (missing source, kind this build cannot compile, damaged recipe) is greyed with its
   localized reason and can only be deleted;
-- delete a saved font with the inline two-step confirm (the `font_groups.rs` pattern: arm,
-  confirm with a second single click, auto-disarm when the pointer leaves);
+- delete a saved font with the inline two-step confirm (`ms_widgets::ArmedDeleteButton`, shared
+  with `font_groups.rs`: arm, confirm with a second single click, auto-disarm when the pointer
+  leaves);
 - own the «+ Создать гибридный шрифт» dialog (`egui::Window`, pinned `Id`): a name field, the
   shared editor with a host-drawn commit («Сохранить» compiles the full face, then
   `font_admin::create_custom_font` stores it under the validated name);
@@ -25,11 +26,10 @@ Main responsibilities:
 Key types:
 - `HybridFontsSectionState` (owned by `FontSettingsEditorState`)
 - `CustomFontProperties` (owned by `FontPropertiesState` for a saved custom font)
-- `CustomFontNameError` / `DeleteStep`
+- `CustomFontNameError`
 
 Key functions:
 - `validate_custom_font_name` (pure: blank / case-insensitive clash, unit-tested)
-- `delete_step` (pure two-step delete transition, unit-tested)
 - `custom_row_name` (pure row naming, unit-tested)
 
 Notes:
@@ -44,6 +44,7 @@ Notes:
 */
 
 use crate::runtime_log;
+use crate::widgets::{ArmedDeleteButton, ArmedDeleteStep};
 use crate::tabs::typing::font_admin::{
     self, CommitButton, CustomFontRow, CustomFontStoreError, FontEntry, HybridEditorCx, HybridEditorOutcome,
     HybridEditorState, SourceCatalog,
@@ -109,34 +110,6 @@ fn store_error_message(err: &CustomFontStoreError) -> String {
         | CustomFontStoreError::Invalid(_)
         | CustomFontStoreError::Unsupported
         | CustomFontStoreError::IdentityCollision => t!("typing.font_settings.custom_font_save_failed_error").to_string(),
-    }
-}
-
-/// One frame's transition of the inline two-step delete control.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DeleteStep {
-    /// Nothing changes.
-    Stay,
-    /// The first click: this row becomes the armed one.
-    Arm,
-    /// The pointer left the armed button: disarm, so a later click elsewhere cannot confirm.
-    Disarm,
-    /// A second single click on the armed button: delete now.
-    Confirm,
-}
-
-/// Decides the delete control's transition from this frame's response.
-///
-/// A physical DOUBLE-click never confirms (its two presses would arm and confirm in one
-/// gesture), and an armed button the pointer no longer hovers disarms.
-#[must_use]
-pub(super) fn delete_step(armed: bool, clicked: bool, double_clicked: bool, hovered: bool) -> DeleteStep {
-    if clicked && !double_clicked {
-        if armed { DeleteStep::Confirm } else { DeleteStep::Arm }
-    } else if armed && !hovered {
-        DeleteStep::Disarm
-    } else {
-        DeleteStep::Stay
     }
 }
 
@@ -210,21 +183,21 @@ impl HybridFontsSectionState {
         self.create.is_some()
     }
 
-    /// Draws the inline two-step delete button of one row (see [`delete_step`]).
+    /// Draws the inline two-step delete button of one row (`ArmedDeleteButton`: two plain
+    /// clicks, a double click never deletes, an armed button the pointer leaves disarms).
     fn draw_delete_control(&mut self, ui: &mut egui::Ui, row: &CustomFontRow) {
         let armed = self.delete_armed.as_deref() == Some(row.identity.as_str());
-        let button = if armed {
-            egui::Button::new(t!("typing.font_settings.custom_font_delete_confirm_button"))
-                .fill(ms_theme::status::DESTRUCTIVE_ARMED_FILL)
-        } else {
-            egui::Button::new(t!("typing.font_settings.custom_font_delete_button"))
-        };
-        let response = ui.add(button).on_hover_text(t!("typing.font_settings.custom_font_delete_warning"));
-        match delete_step(armed, response.clicked(), response.double_clicked(), response.hovered()) {
-            DeleteStep::Stay => {}
-            DeleteStep::Arm => self.delete_armed = Some(row.identity.clone()),
-            DeleteStep::Disarm => self.delete_armed = None,
-            DeleteStep::Confirm => {
+        let (response, step) = ArmedDeleteButton::new(
+            t!("typing.font_settings.custom_font_delete_button"),
+            t!("typing.font_settings.custom_font_delete_confirm_button"),
+        )
+        .show(ui, armed);
+        response.on_hover_text(t!("typing.font_settings.custom_font_delete_warning"));
+        match step {
+            ArmedDeleteStep::Keep => {}
+            ArmedDeleteStep::Arm => self.delete_armed = Some(row.identity.clone()),
+            ArmedDeleteStep::Disarm => self.delete_armed = None,
+            ArmedDeleteStep::Confirm => {
                 self.delete_armed = None;
                 if font_admin::delete_custom_font(&row.identity) {
                     runtime_log::log_info(format!(
@@ -562,24 +535,6 @@ mod tests {
         assert_eq!(validate_custom_font_name("roboto", &[" Roboto "]), Err(CustomFontNameError::Taken));
         // A near miss is not a clash.
         assert_eq!(validate_custom_font_name("Roboto 2", &["Roboto"]), Ok("Roboto 2".to_string()));
-    }
-
-    #[test]
-    fn delete_needs_two_single_clicks() {
-        // First click arms, second click on the armed button confirms.
-        assert_eq!(delete_step(false, true, false, true), DeleteStep::Arm);
-        assert_eq!(delete_step(true, true, false, true), DeleteStep::Confirm);
-        // A physical double click never confirms: its second press is not a plain click.
-        assert_eq!(delete_step(true, true, true, true), DeleteStep::Stay);
-        assert_eq!(delete_step(false, true, true, true), DeleteStep::Stay);
-    }
-
-    #[test]
-    fn an_armed_delete_disarms_when_the_pointer_leaves() {
-        assert_eq!(delete_step(true, false, false, false), DeleteStep::Disarm);
-        assert_eq!(delete_step(true, false, false, true), DeleteStep::Stay);
-        // An unarmed button the pointer is not on does nothing.
-        assert_eq!(delete_step(false, false, false, false), DeleteStep::Stay);
     }
 
     /// An unavailable row as the font lists produce it.

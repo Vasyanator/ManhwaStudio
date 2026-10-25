@@ -20,8 +20,10 @@ Notes:
 Every long operation lives on a worker: the settings load and save, the presence scan, the
 unload call and the run. `poll` only drains channels, and it is where the settings saver
 lives — the host polls the selected engine EVERY frame, panel visible or not, so a finished
-run lands and a changed parameter is written even with the panel closed. The saver has no
-time debounce: it writes on the first poll `settings_save_due` answers yes on.
+run lands and a changed parameter is written even with the panel closed. The saver is the
+shared debounced, atomic `SettingsSaver` (`region_edit_v2::engine_settings_file`): a dragged
+dial is written once, after it settled, and the value still owed at teardown is written by
+`flush_settings_blocking`.
 
 The mask is MANDATORY (`allows_empty_mask` is unconditionally `false`): the mask means
 "remove what is under it", so with nothing painted there is nothing to remove. The host
@@ -53,8 +55,10 @@ pub struct LamaEngine {
     /// makes a user edit outrank a settings load that lands afterwards
     /// ([`Self::poll_settings_load`]).
     dirty: bool,
-    /// Channel of the save in flight, which keeps at most one writer on the file.
-    save_rx: Option<Receiver<()>>,
+    /// The settings writer (the shared `SettingsSaver`): one writer at a time, a quiet-time
+    /// debounce, a failed write retried with backoff, the teardown flush. Its `write` is
+    /// [`save_lama_settings`], which normalizes what it writes.
+    saver: SettingsSaver<LamaSettings>,
     /// Lifecycle of the background presence scan of both model directories.
     model_list: LamaModelListState,
     /// The run in flight, `None` when idle. Dropping it (cancel, engine drop) stops a
@@ -88,7 +92,7 @@ impl LamaEngine {
             settings_rx: None,
             settings_loaded: false,
             dirty: false,
-            save_rx: None,
+            saver: SettingsSaver::new(save_lama_settings, LAMA_LOG_LABEL),
             model_list: LamaModelListState::Idle,
             run_rx: None,
             run_status: None,
@@ -145,34 +149,15 @@ impl LamaEngine {
         }
     }
 
-    /// Writes dirty settings on a worker thread, at most one save in flight, never before
-    /// the initial load landed.
+    /// Drives the shared `SettingsSaver`: a change is written on a worker once it stayed
+    /// unchanged for its quiet time, at most one write in flight, never before the initial load
+    /// landed, a failure retried with backoff. `now` is the poll's clock.
     ///
     /// Driven from [`AiEngine::poll`] and nowhere else, which is why the host must poll the
     /// selected engine every frame: without that call nothing ever writes the file and the
     /// selected model and parameters are lost on exit, with no error anywhere.
-    fn poll_and_maybe_save(&mut self) {
-        if let Some(rx) = self.save_rx.as_ref() {
-            match rx.try_recv() {
-                Ok(()) | Err(TryRecvError::Disconnected) => self.save_rx = None,
-                Err(TryRecvError::Empty) => return,
-            }
-        }
-        if !settings_save_due(self.dirty, self.settings_loaded, self.save_rx.is_some()) {
-            return;
-        }
-        self.dirty = false;
-        let settings = self.settings.normalized();
-        let (tx, rx) = mpsc::channel();
-        self.save_rx = Some(rx);
-        thread::spawn(move || {
-            if let Err(err) = save_lama_settings(&settings) {
-                ms_log::runtime_log::log_warn(format!(
-                    "[cleaning] failed to save the Lama engine settings: {err}"
-                ));
-            }
-            let _send_result = tx.send(());
-        });
+    fn poll_and_maybe_save(&mut self, now: Instant) {
+        self.saver.poll(now, SaveGate { dirty: &mut self.dirty, loaded: self.settings_loaded, blocked: false }, &self.settings, str::to_string);
     }
 
     /// Starts the presence scan of both model directories on a worker thread.
@@ -361,6 +346,13 @@ impl LamaEngine {
 }
 
 impl AiEngine for LamaEngine {
+    /// The value the settings saver still owes, written now on the teardown worker. A settings
+    /// load that landed meanwhile is applied first, so its gate is the real one.
+    fn flush_settings_blocking(&mut self) {
+        self.poll_settings_load();
+        self.saver.flush_blocking(SaveGate { dirty: &mut self.dirty, loaded: self.settings_loaded, blocked: false }, &self.settings);
+    }
+
     fn id(&self) -> &'static str {
         "lama"
     }
@@ -520,10 +512,16 @@ impl AiEngine for LamaEngine {
     }
 
     fn poll(&mut self, ctx: &egui::Context) -> EnginePoll {
+        let now = Instant::now();
         self.poll_settings_load();
         self.poll_model_scan();
         self.poll_unload();
-        self.poll_and_maybe_save();
+        self.poll_and_maybe_save(now);
+        // The save's quiet time, a failed save's retry and a write in flight: the saver says
+        // when it next needs a poll.
+        if let Some(after) = self.saver.wake_after(now) {
+            ctx.request_repaint_after(after);
+        }
 
         let Some(job) = self.run_rx.as_mut() else {
             return EnginePoll::Idle;
@@ -591,6 +589,7 @@ impl AiEngine for LamaEngine {
 mod tests {
     use super::*;
     use crate::tools::region_edit_v2::engine::RunMarks;
+    use crate::tools::region_edit_v2::engine_settings::settings_save_due;
 
     /// A fresh engine names itself, sits in the no-prompt section, and REQUIRES a mask —
     /// the rule that makes the host disable «Обработать» on an empty one.
@@ -729,10 +728,10 @@ mod tests {
         );
         assert!(engine.settings_loaded, "the load is complete either way: saving is unblocked");
         assert!(engine.dirty, "the edit is still pending a write");
-        // The save GATE is asserted rather than driven: `poll_and_maybe_save` would write
-        // the real settings file of whoever runs the test suite.
+        // The save GATE is asserted rather than driven (a test build's writer writes nothing,
+        // but the gate is the contract under test).
         assert!(
-            settings_save_due(engine.dirty, engine.settings_loaded, engine.save_rx.is_some()),
+            settings_save_due(engine.dirty, engine.settings_loaded, engine.saver.rx.is_some()),
             "the surviving edit is what gets written next"
         );
     }
@@ -762,9 +761,9 @@ mod tests {
         let mut engine = LamaEngine::new();
         engine.settings_loaded = false;
         engine.note_settings_changed();
-        engine.poll_and_maybe_save();
+        engine.poll_and_maybe_save(Instant::now() + Duration::from_secs(60));
         assert!(
-            engine.save_rx.is_none(),
+            engine.saver.rx.is_none(),
             "saving the defaults before the load would clobber the user's file"
         );
         assert!(engine.dirty, "the change is still pending, not lost");

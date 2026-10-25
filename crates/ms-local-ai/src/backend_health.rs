@@ -26,6 +26,9 @@ Main types:
 - `AiBackendHealthSnapshot`: last health result for UI status
   (`connected`, `details`, `checked_at`, backend version); `unavailable(LocalAiOff)` is the
   fixed snapshot of a process whose backend is off (`--no-ai` or platform).
+- `AiBackendHealthSnapshot::revision`: process-unique change stamp; every write of the
+  shared snapshot goes through `lock_for_write` (which stamps it), and GUI consumers keep a
+  per-frame copy through `refresh_cached_snapshot`, which clones only on a revision change.
 - `AiBackendHealthSnapshot::large_pool`: the large-model pool part of the pushed
   `model_manager` payload, parsed by `large_models::parse_pool_status` (no polling).
 - `TorchBuildInfo` / `TorchGpuInfo` / `KernelMismatch` / `TorchBuildError`: the snapshot's
@@ -54,7 +57,8 @@ use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use ms_thread::{self as thread, JoinHandle};
 use web_time::{Duration, Instant};
 
@@ -83,8 +87,18 @@ pub struct AiBackendDeviceOption {
     pub label: String,
 }
 
+/// The backend health as the probe thread last wrote it; shared as
+/// `Arc<Mutex<AiBackendHealthSnapshot>>` between the probe (sole writer, through
+/// [`lock_for_write`]) and GUI consumers, which keep a per-frame copy refreshed by
+/// [`refresh_cached_snapshot`] (cloned only when [`Self::revision`] changed).
 #[derive(Debug, Clone)]
 pub struct AiBackendHealthSnapshot {
+    /// Change stamp: a process-unique value drawn from [`next_revision`] by every
+    /// constructor and by every write of the shared snapshot, kept by `Clone`. Two snapshots
+    /// with the same revision are the same state, so a cached copy is stale exactly when its
+    /// revision differs from the shared one. Public only so tests elsewhere can build a
+    /// snapshot with struct-update syntax; never set it by hand outside this module.
+    pub revision: u64,
     pub connected: bool,
     pub details: String,
     pub checked_at: Option<Instant>,
@@ -131,6 +145,7 @@ pub struct AiBackendHealthSnapshot {
 impl Default for AiBackendHealthSnapshot {
     fn default() -> Self {
         Self {
+            revision: next_revision(),
             connected: false,
             details: t!("translation.backend_health.awaiting_first_probe_status").to_string(),
             checked_at: None,
@@ -173,6 +188,7 @@ impl AiBackendHealthSnapshot {
     #[must_use]
     pub fn unavailable(off: LocalAiOff) -> Self {
         Self {
+            revision: next_revision(),
             connected: false,
             details: off.user_message(),
             checked_at: Some(Instant::now()),
@@ -205,6 +221,52 @@ impl AiBackendHealthSnapshot {
             torch_build: None,
         }
     }
+}
+
+/// Draws a fresh, process-unique snapshot revision.
+///
+/// A process-wide monotonic counter rather than a per-snapshot `+= 1`: a snapshot can be
+/// REPLACED wholesale (the supervisor builds `default()` or `unavailable()`), and a consumer's
+/// own initial copy is another `default()`; per-instance counters would let two different
+/// states share revision 0. Uniqueness is the only property used; `Relaxed` suffices because
+/// the value is always read and written under the snapshot mutex.
+fn next_revision() -> u64 {
+    static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+    NEXT_REVISION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Locks the shared snapshot for a WRITE and stamps it with a fresh revision while the lock
+/// is held, so no reader can observe the new state under the old revision. Every write of
+/// the shared snapshot goes through here (the revision invariant depends on it). A poisoned
+/// mutex (a writer panicked mid-update) is recovered, logged once and un-poisoned: the
+/// snapshot is plain status data that the next push overwrites.
+fn lock_for_write(snapshot: &Mutex<AiBackendHealthSnapshot>) -> MutexGuard<'_, AiBackendHealthSnapshot> {
+    let mut guard = match snapshot.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            ms_log::runtime_log::log_warn("[ai_backend_probe] health snapshot mutex was poisoned by a panicking writer; recovered");
+            snapshot.clear_poison();
+            poisoned.into_inner()
+        }
+    };
+    guard.revision = next_revision();
+    guard
+}
+
+/// Brings a consumer's cached copy `cached` up to date with the shared snapshot, cloning
+/// only when the shared revision differs from the cached one (the GUI calls this every
+/// frame; a health push arrives about once a second). Returns whether `cached` changed.
+/// Never blocks beyond the short snapshot lock; a poisoned mutex is read as is.
+pub fn refresh_cached_snapshot(shared: &Mutex<AiBackendHealthSnapshot>, cached: &mut AiBackendHealthSnapshot) -> bool {
+    let guard = match shared.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.revision == cached.revision {
+        return false;
+    }
+    cached.clone_from(&guard);
+    true
 }
 
 /// One GPU the backend's torch sees (`torch.devices[]` of the health snapshot).
@@ -486,8 +548,8 @@ fn health_large_pool(payload: &Value) -> Option<Result<LargePoolStatus, LargeMod
 }
 
 /// Folds parsed [`HealthFields`] into the shared snapshot and returns whether a
-/// device-info refresh is warranted (first successful connect). Poison-safe: a
-/// poisoned mutex is recovered via `get_mut`, mirroring the rest of this file.
+/// device-info refresh is warranted (first successful connect). Poison-safe through
+/// [`lock_for_write`], which also stamps the snapshot with a fresh revision.
 fn apply_health_fields(
     snapshot: &Arc<Mutex<AiBackendHealthSnapshot>>,
     fields: HealthFields,
@@ -496,10 +558,7 @@ fn apply_health_fields(
     ms_sysprobe::ai_backend_capabilities::set_torch_available(fields.is_torch_available);
     ms_sysprobe::ai_backend_capabilities::set_backend_available(Some(fields.connected));
 
-    let mut guard = match snapshot.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut guard = lock_for_write(snapshot);
     // Capture the previous connection state before overwriting it so we can detect
     // a disconnect->reconnect transition and force a fresh device re-enumeration
     // (a restarted backend may have different capabilities).
@@ -578,48 +637,26 @@ fn refresh_ai_backend_device_info(snapshot: &Arc<Mutex<AiBackendHealthSnapshot>>
     ms_log::runtime_log::log_info("[ai_backend_probe] refresh_device_info start");
     let checked_at = Instant::now();
     match fetch_ai_backend_device_info() {
-        Ok(device_state) => match snapshot.lock() {
-            Ok(mut guard) => {
-                ms_log::runtime_log::log_info(format!(
-                    "[ai_backend_probe] refresh_device_info ok {}",
-                    summarize_device_state(&device_state)
-                ));
-                apply_device_state_snapshot(&mut guard, &device_state);
-                guard.device_details = tf!("translation.backend_health.current_pytorch_device_status", device = device_state.selected_device);
-                guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
-                guard.device_checked_at = Some(checked_at);
-            }
-            Err(mut poisoned) => {
-                let guard = poisoned.get_mut();
-                ms_log::runtime_log::log_info(format!(
-                    "[ai_backend_probe] refresh_device_info ok poisoned_lock {}",
-                    summarize_device_state(&device_state)
-                ));
-                apply_device_state_snapshot(guard, &device_state);
-                guard.device_details = tf!("translation.backend_health.current_pytorch_device_status", device = device_state.selected_device);
-                guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
-                guard.device_checked_at = Some(checked_at);
-            }
-        },
-        Err(err) => match snapshot.lock() {
-            Ok(mut guard) => {
-                ms_log::runtime_log::log_warn(format!(
-                    "[ai_backend_probe] refresh_device_info failed: {err}"
-                ));
-                guard.device_details = err;
-                guard.onnx_details = guard.device_details.clone();
-                guard.device_checked_at = Some(checked_at);
-            }
-            Err(mut poisoned) => {
-                let guard = poisoned.get_mut();
-                ms_log::runtime_log::log_warn(format!(
-                    "[ai_backend_probe] refresh_device_info failed poisoned_lock: {err}"
-                ));
-                guard.device_details = err;
-                guard.onnx_details = guard.device_details.clone();
-                guard.device_checked_at = Some(checked_at);
-            }
-        },
+        Ok(device_state) => {
+            let mut guard = lock_for_write(snapshot);
+            ms_log::runtime_log::log_info(format!(
+                "[ai_backend_probe] refresh_device_info ok {}",
+                summarize_device_state(&device_state)
+            ));
+            apply_device_state_snapshot(&mut guard, &device_state);
+            guard.device_details = tf!("translation.backend_health.current_pytorch_device_status", device = device_state.selected_device);
+            guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
+            guard.device_checked_at = Some(checked_at);
+        }
+        Err(err) => {
+            let mut guard = lock_for_write(snapshot);
+            ms_log::runtime_log::log_warn(format!(
+                "[ai_backend_probe] refresh_device_info failed: {err}"
+            ));
+            guard.device_details = err;
+            guard.onnx_details = guard.device_details.clone();
+            guard.device_checked_at = Some(checked_at);
+        }
     }
 }
 
@@ -629,48 +666,26 @@ fn set_ai_backend_device(snapshot: &Arc<Mutex<AiBackendHealthSnapshot>>, device:
     ));
     let checked_at = Instant::now();
     match apply_ai_backend_device(&device) {
-        Ok(device_state) => match snapshot.lock() {
-            Ok(mut guard) => {
-                ms_log::runtime_log::log_info(format!(
-                    "[ai_backend_probe] set_torch_device ok {}",
-                    summarize_device_state(&device_state)
-                ));
-                apply_device_state_snapshot(&mut guard, &device_state);
-                guard.device_details = tf!("translation.backend_health.pytorch_device_applied_status", device = device_state.selected_device);
-                guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
-                guard.device_checked_at = Some(checked_at);
-            }
-            Err(mut poisoned) => {
-                let guard = poisoned.get_mut();
-                ms_log::runtime_log::log_info(format!(
-                    "[ai_backend_probe] set_torch_device ok poisoned_lock {}",
-                    summarize_device_state(&device_state)
-                ));
-                apply_device_state_snapshot(guard, &device_state);
-                guard.device_details = tf!("translation.backend_health.pytorch_device_applied_status", device = device_state.selected_device);
-                guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
-                guard.device_checked_at = Some(checked_at);
-            }
-        },
-        Err(err) => match snapshot.lock() {
-            Ok(mut guard) => {
-                ms_log::runtime_log::log_warn(format!(
-                    "[ai_backend_probe] set_torch_device failed: {err}"
-                ));
-                guard.device_details = err;
-                guard.onnx_details = guard.device_details.clone();
-                guard.device_checked_at = Some(checked_at);
-            }
-            Err(mut poisoned) => {
-                let guard = poisoned.get_mut();
-                ms_log::runtime_log::log_warn(format!(
-                    "[ai_backend_probe] set_torch_device failed poisoned_lock: {err}"
-                ));
-                guard.device_details = err;
-                guard.onnx_details = guard.device_details.clone();
-                guard.device_checked_at = Some(checked_at);
-            }
-        },
+        Ok(device_state) => {
+            let mut guard = lock_for_write(snapshot);
+            ms_log::runtime_log::log_info(format!(
+                "[ai_backend_probe] set_torch_device ok {}",
+                summarize_device_state(&device_state)
+            ));
+            apply_device_state_snapshot(&mut guard, &device_state);
+            guard.device_details = tf!("translation.backend_health.pytorch_device_applied_status", device = device_state.selected_device);
+            guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
+            guard.device_checked_at = Some(checked_at);
+        }
+        Err(err) => {
+            let mut guard = lock_for_write(snapshot);
+            ms_log::runtime_log::log_warn(format!(
+                "[ai_backend_probe] set_torch_device failed: {err}"
+            ));
+            guard.device_details = err;
+            guard.onnx_details = guard.device_details.clone();
+            guard.device_checked_at = Some(checked_at);
+        }
     }
 }
 
@@ -684,46 +699,25 @@ fn set_ai_backend_onnx_device(
     ));
     let checked_at = Instant::now();
     match apply_ai_backend_onnx_device(&provider, &device_id) {
-        Ok(device_state) => match snapshot.lock() {
-            Ok(mut guard) => {
-                ms_log::runtime_log::log_info(format!(
-                    "[ai_backend_probe] set_onnx_device ok {}",
-                    summarize_device_state(&device_state)
-                ));
-                apply_device_state_snapshot(&mut guard, &device_state);
-                guard.device_details = tf!("translation.backend_health.current_pytorch_device_status", device = device_state.selected_device);
-                guard.onnx_details = tf!("translation.backend_health.onnx_device_applied_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
-                guard.device_checked_at = Some(checked_at);
-            }
-            Err(mut poisoned) => {
-                let guard = poisoned.get_mut();
-                ms_log::runtime_log::log_info(format!(
-                    "[ai_backend_probe] set_onnx_device ok poisoned_lock {}",
-                    summarize_device_state(&device_state)
-                ));
-                apply_device_state_snapshot(guard, &device_state);
-                guard.device_details = tf!("translation.backend_health.current_pytorch_device_status", device = device_state.selected_device);
-                guard.onnx_details = tf!("translation.backend_health.onnx_device_applied_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
-                guard.device_checked_at = Some(checked_at);
-            }
-        },
-        Err(err) => match snapshot.lock() {
-            Ok(mut guard) => {
-                ms_log::runtime_log::log_warn(format!(
-                    "[ai_backend_probe] set_onnx_device failed: {err}"
-                ));
-                guard.onnx_details = err;
-                guard.device_checked_at = Some(checked_at);
-            }
-            Err(mut poisoned) => {
-                let guard = poisoned.get_mut();
-                ms_log::runtime_log::log_warn(format!(
-                    "[ai_backend_probe] set_onnx_device failed poisoned_lock: {err}"
-                ));
-                guard.onnx_details = err;
-                guard.device_checked_at = Some(checked_at);
-            }
-        },
+        Ok(device_state) => {
+            let mut guard = lock_for_write(snapshot);
+            ms_log::runtime_log::log_info(format!(
+                "[ai_backend_probe] set_onnx_device ok {}",
+                summarize_device_state(&device_state)
+            ));
+            apply_device_state_snapshot(&mut guard, &device_state);
+            guard.device_details = tf!("translation.backend_health.current_pytorch_device_status", device = device_state.selected_device);
+            guard.onnx_details = tf!("translation.backend_health.onnx_device_applied_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
+            guard.device_checked_at = Some(checked_at);
+        }
+        Err(err) => {
+            let mut guard = lock_for_write(snapshot);
+            ms_log::runtime_log::log_warn(format!(
+                "[ai_backend_probe] set_onnx_device failed: {err}"
+            ));
+            guard.onnx_details = err;
+            guard.device_checked_at = Some(checked_at);
+        }
     }
 }
 
@@ -733,60 +727,34 @@ fn set_ai_backend_max_loaded_models(
 ) {
     let checked_at = Instant::now();
     match apply_ai_backend_max_loaded_models(max_loaded_models) {
-        Ok(device_state) => match snapshot.lock() {
-            Ok(mut guard) => {
-                apply_device_state_snapshot(&mut guard, &device_state);
-                guard.device_details = tf!("translation.backend_health.max_models_applied_status", limit = device_state.max_loaded_models);
-                guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
-                guard.device_checked_at = Some(checked_at);
-            }
-            Err(mut poisoned) => {
-                let guard = poisoned.get_mut();
-                apply_device_state_snapshot(guard, &device_state);
-                guard.device_details = tf!("translation.backend_health.max_models_applied_status", limit = device_state.max_loaded_models);
-                guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
-                guard.device_checked_at = Some(checked_at);
-            }
-        },
-        Err(err) => match snapshot.lock() {
-            Ok(mut guard) => {
-                guard.device_details = err;
-                guard.device_checked_at = Some(checked_at);
-            }
-            Err(mut poisoned) => {
-                let guard = poisoned.get_mut();
-                guard.device_details = err;
-                guard.device_checked_at = Some(checked_at);
-            }
-        },
+        Ok(device_state) => {
+            let mut guard = lock_for_write(snapshot);
+            apply_device_state_snapshot(&mut guard, &device_state);
+            guard.device_details = tf!("translation.backend_health.max_models_applied_status", limit = device_state.max_loaded_models);
+            guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
+            guard.device_checked_at = Some(checked_at);
+        }
+        Err(err) => {
+            let mut guard = lock_for_write(snapshot);
+            guard.device_details = err;
+            guard.device_checked_at = Some(checked_at);
+        }
     }
 }
 
 fn refresh_ai_backend_cuda_diagnostics(snapshot: &Arc<Mutex<AiBackendHealthSnapshot>>) {
     let checked_at = Instant::now();
     match fetch_ai_backend_cuda_diagnostics() {
-        Ok(diagnostics) => match snapshot.lock() {
-            Ok(mut guard) => {
-                guard.cuda_diagnostics = diagnostics;
-                guard.cuda_checked_at = Some(checked_at);
-            }
-            Err(mut poisoned) => {
-                let guard = poisoned.get_mut();
-                guard.cuda_diagnostics = diagnostics;
-                guard.cuda_checked_at = Some(checked_at);
-            }
-        },
-        Err(err) => match snapshot.lock() {
-            Ok(mut guard) => {
-                guard.cuda_diagnostics = err;
-                guard.cuda_checked_at = Some(checked_at);
-            }
-            Err(mut poisoned) => {
-                let guard = poisoned.get_mut();
-                guard.cuda_diagnostics = err;
-                guard.cuda_checked_at = Some(checked_at);
-            }
-        },
+        Ok(diagnostics) => {
+            let mut guard = lock_for_write(snapshot);
+            guard.cuda_diagnostics = diagnostics;
+            guard.cuda_checked_at = Some(checked_at);
+        }
+        Err(err) => {
+            let mut guard = lock_for_write(snapshot);
+            guard.cuda_diagnostics = err;
+            guard.cuda_checked_at = Some(checked_at);
+        }
     }
 }
 
@@ -1452,11 +1420,38 @@ mod tests {
     use super::{
         AiBackendHealthSnapshot, apply_health_fields, device_set_header, health_backend_version,
         map_device_call_error, parse_device_state_payload, parse_health_payload,
-        render_cuda_diagnostics,
+        refresh_cached_snapshot, render_cuda_diagnostics,
     };
     use ms_backend_ipc::CallError;
     use serde_json::{Value, json};
     use std::sync::{Arc, Mutex};
+
+    /// Every constructor draws its own revision, so a consumer's initial `default()` copy
+    /// never matches a shared `unavailable()` (or another `default()`) snapshot.
+    #[test]
+    fn constructors_draw_distinct_revisions() {
+        let first = AiBackendHealthSnapshot::default();
+        let second = AiBackendHealthSnapshot::default();
+        assert_ne!(first.revision, second.revision);
+        assert_eq!(first.clone().revision, first.revision, "a clone is the same state");
+    }
+
+    /// The cached copy is refreshed exactly when the shared snapshot was written since.
+    #[test]
+    fn cached_snapshot_refreshes_only_after_a_write() {
+        let shared = Arc::new(Mutex::new(AiBackendHealthSnapshot::default()));
+        let mut cached = AiBackendHealthSnapshot::default();
+        assert!(refresh_cached_snapshot(&shared, &mut cached), "a distinct initial copy is stale");
+        assert!(!refresh_cached_snapshot(&shared, &mut cached), "nothing written since");
+
+        let before = cached.revision;
+        apply_health_fields(&shared, parse_health_payload(&json!({ "is_torch_available": true, "ocr": {} })));
+        assert!(refresh_cached_snapshot(&shared, &mut cached), "a write bumps the revision");
+        assert_ne!(cached.revision, before);
+        assert!(cached.connected);
+        assert_eq!(cached.is_torch_available, Some(true));
+        assert!(!refresh_cached_snapshot(&shared, &mut cached));
+    }
 
     #[test]
     fn reads_backend_version_from_health_payload() {

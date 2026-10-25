@@ -100,6 +100,20 @@ fn status_line_step(set_at: f64, now: f64) -> StatusLineStep {
     }
 }
 
+/// Wakes the GUI when dropped. A save-merge or DISCARD job thread owns one for its whole run, so
+/// the frame that polls its channel follows whether the job answered, returned early or
+/// panicked; the GUI never polls these jobs on a timer. `None` (no frame ticked yet, see
+/// [`ProjectSession::job_waker`]) wakes nothing.
+struct WakeGuiOnDrop(Option<egui::Context>);
+
+impl Drop for WakeGuiOnDrop {
+    fn drop(&mut self) {
+        if let Some(ctx) = &self.0 {
+            ctx.request_repaint();
+        }
+    }
+}
+
 /// The running DISCARD delete job (`discard.rs`) and the close it ends in.
 struct PendingExitCleanup {
     action: PendingCloseAction,
@@ -149,6 +163,9 @@ pub(in crate::studio) struct ProjectSession {
     /// A save-to-project merge succeeded since the last `take_committed_tree_changed`: the
     /// committed chapter tree changed under the tabs that cache a view of it.
     committed_tree_changed: bool,
+    /// The window's context, captured by the first `tick` (every frame ticks before any draw can
+    /// start a job), handed to job threads as a [`WakeGuiOnDrop`].
+    repaint_ctx: Option<egui::Context>,
 }
 
 impl ProjectSession {
@@ -170,7 +187,19 @@ impl ProjectSession {
             next_unsaved_dir_check_s: 0.0,
             staging_probe: StagingDirProbe::new(unsaved_dir),
             committed_tree_changed: false,
+            repaint_ctx: None,
         }
+    }
+
+    /// The wake handle for a job thread about to start ([`WakeGuiOnDrop`]). Jobs start from the
+    /// frame's draws and commands, which run after this frame's `tick` captured the context, so
+    /// `None` is not expected; if it happens anyway the job's result is applied on the next frame
+    /// some other event causes, and that is logged.
+    fn job_waker(&self, job: &str) -> WakeGuiOnDrop {
+        if self.repaint_ctx.is_none() {
+            runtime_log::log_warn(format!("[app] {job} started before the first session tick: its completion will not wake the GUI"));
+        }
+        WakeGuiOnDrop(self.repaint_ctx.clone())
     }
 
     /// Returns and clears the "committed tree changed" latch (set by a successful merge in
@@ -229,6 +258,9 @@ impl ProjectSession {
     /// refresh the unsaved cache, expire the status line, then — when a save-then-close is armed
     /// and its save ended — close on a clean success, or close the dialog and keep running.
     pub(in crate::studio) fn tick(&mut self, ctx: &egui::Context, now: f64, parts: &mut SessionParts<'_>) {
+        if self.repaint_ctx.is_none() {
+            self.repaint_ctx = Some(ctx.clone());
+        }
         // Advance a save deferred behind the whole-project layer preload (started by
         // `request_save_to_project` when not every page was resident). Runs every frame regardless of
         // the active tab and dispatches the real save once every page is resident.
@@ -245,12 +277,9 @@ impl ProjectSession {
                 StatusLineStep::Sticky => {}
             }
         }
-        // The save merge and the DISCARD cleanup workers answer only through their channels and do
-        // not wake the GUI: poll them at 1 Hz while they run (their sticky «Saving…» / «Cleaning…»
-        // line schedules nothing by itself).
-        if self.save_to_project_rx.is_some() || self.pending_exit_cleanup.is_some() {
-            ctx.request_repaint_after(web_time::Duration::from_secs(1));
-        }
+        // The save merge and the DISCARD cleanup need no timer poll: their threads wake the GUI
+        // when they end (`WakeGuiOnDrop`), and their sticky «Saving…» / «Cleaning…» line needs no
+        // repaint while they run.
 
         // A save-then-close armed by an exit dialog's Save ends with its save: close on a clean
         // success, otherwise drop the arm (it never outlives its save) and keep running.

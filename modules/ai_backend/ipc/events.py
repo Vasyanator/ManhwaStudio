@@ -4,8 +4,8 @@ File: modules/ai_backend/ipc/events.py
 Purpose:
 Publish/subscribe event bus for the v2 IPC protocol. Server-initiated `event`
 frames (id=0) are fanned out to every live connection. The health worker
-publishes `TOPIC_HEALTH` snapshots; later phases publish `TOPIC_DEVICE` /
-`TOPIC_MODEL_LOAD` / `TOPIC_LOG`.
+publishes `TOPIC_HEALTH` snapshots; `TOPIC_DEVICE` / `TOPIC_LOG` are the other
+valid topics.
 
 Main responsibilities:
 - track the set of live connections (register on connect, unregister on close);

@@ -111,7 +111,8 @@ impl StudioApp {
         persist_exit_settings(&self.tabs);
 
         // 5) Flush the tabs' debounced user-global stores (typing: the per-font settings write, then
-        // the default local-preset set). Their debounced writers are detached threads that die with
+        // the default local-preset set; cleaning: the region-edit engines' settings files, whose
+        // `SettingsSaver` waits at most 5 s for a write already in flight). Their debounced writers are detached threads that die with
         // the process, so an edit made a second before closing would otherwise be lost. Synchronous
         // by necessity: no GUI frame follows and no thread outlives this call. Why a deadline would
         // trade a visible hang for a silent loss is argued at

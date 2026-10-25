@@ -373,36 +373,19 @@ pub(super) fn apply_wheel_step_u8(value: &mut u8, steps: i32, step_size: u8, min
     *value != prev
 }
 
-pub(super) fn cycle_wrapped_index(index: &mut usize, len: usize, steps: i32) -> bool {
-    if len == 0 || steps == 0 {
-        return false;
-    }
-
-    let prev = (*index).min(len - 1);
-    let shift = (steps.unsigned_abs() as usize) % len;
-    if shift == 0 {
-        return false;
-    }
-
-    *index = if steps > 0 {
-        (prev + shift) % len
-    } else {
-        (prev + len - shift) % len
-    };
-    *index != prev
-}
-
 pub(super) fn cycle_text_shape(shape: &mut TextShape, steps: i32) -> bool {
-    let mut idx = match *shape {
+    let idx = match *shape {
         TextShape::Free => 0,
         TextShape::Rectangle => 1,
         TextShape::Oval => 2,
         TextShape::Hexagon => 3,
         TextShape::SoftPeak => 4,
     };
-    if !cycle_wrapped_index(&mut idx, 5, steps) {
+    let next = cycle_wrapped_index(idx, 5, steps);
+    if next == idx {
         return false;
     }
+    let idx = next;
 
     *shape = match idx {
         0 => TextShape::Free,
@@ -415,16 +398,18 @@ pub(super) fn cycle_text_shape(shape: &mut TextShape, steps: i32) -> bool {
 }
 
 pub(super) fn cycle_text_wrap_mode(mode: &mut TextWrapMode, steps: i32) -> bool {
-    let mut idx = match *mode {
+    let idx = match *mode {
         TextWrapMode::None => 0,
         TextWrapMode::WholeWords => 1,
         TextWrapMode::Minimal => 2,
         TextWrapMode::Moderate => 3,
         TextWrapMode::Aggressive => 4,
     };
-    if !cycle_wrapped_index(&mut idx, 5, steps) {
+    let next = cycle_wrapped_index(idx, 5, steps);
+    if next == idx {
         return false;
     }
+    let idx = next;
 
     *mode = match idx {
         0 => TextWrapMode::None,
@@ -439,16 +424,18 @@ pub(super) fn cycle_text_wrap_mode(mode: &mut TextWrapMode, steps: i32) -> bool 
 /// Wheel-step the anti-aliasing mode in enum order
 /// (None, Sharp, Crisp, Strong, Smooth). Returns `true` when the value changed.
 pub(super) fn cycle_anti_aliasing(mode: &mut AntiAliasingMode, steps: i32) -> bool {
-    let mut idx = match *mode {
+    let idx = match *mode {
         AntiAliasingMode::None => 0,
         AntiAliasingMode::Sharp => 1,
         AntiAliasingMode::Crisp => 2,
         AntiAliasingMode::Strong => 3,
         AntiAliasingMode::Smooth => 4,
     };
-    if !cycle_wrapped_index(&mut idx, 5, steps) {
+    let next = cycle_wrapped_index(idx, 5, steps);
+    if next == idx {
         return false;
     }
+    let idx = next;
 
     *mode = match idx {
         0 => AntiAliasingMode::None,
@@ -461,13 +448,15 @@ pub(super) fn cycle_anti_aliasing(mode: &mut AntiAliasingMode, steps: i32) -> bo
 }
 
 pub(super) fn cycle_text_line_mode(mode: &mut TextLineMode, steps: i32) -> bool {
-    let mut idx = match *mode {
+    let idx = match *mode {
         TextLineMode::Horizontal => 0,
         TextLineMode::Vertical => 1,
     };
-    if !cycle_wrapped_index(&mut idx, 2, steps) {
+    let next = cycle_wrapped_index(idx, 2, steps);
+    if next == idx {
         return false;
     }
+    let idx = next;
     *mode = if idx == 0 {
         TextLineMode::Horizontal
     } else {
@@ -477,13 +466,15 @@ pub(super) fn cycle_text_line_mode(mode: &mut TextLineMode, steps: i32) -> bool 
 }
 
 pub(super) fn cycle_vertical_line_direction(direction: &mut VerticalLineDirection, steps: i32) -> bool {
-    let mut idx = match *direction {
+    let idx = match *direction {
         VerticalLineDirection::LeftToRight => 0,
         VerticalLineDirection::RightToLeft => 1,
     };
-    if !cycle_wrapped_index(&mut idx, 2, steps) {
+    let next = cycle_wrapped_index(idx, 2, steps);
+    if next == idx {
         return false;
     }
+    let idx = next;
     *direction = if idx == 0 {
         VerticalLineDirection::LeftToRight
     } else {
@@ -493,15 +484,17 @@ pub(super) fn cycle_vertical_line_direction(direction: &mut VerticalLineDirectio
 }
 
 pub(super) fn cycle_text_layout_mode(mode: &mut TextLayoutMode, steps: i32) -> bool {
-    let mut idx = match *mode {
+    let idx = match *mode {
         TextLayoutMode::Normal => 0,
         TextLayoutMode::Formula => 1,
         TextLayoutMode::Shape => 1,
         TextLayoutMode::CustomRasterLines | TextLayoutMode::CustomVectorLines => 2,
     };
-    if !cycle_wrapped_index(&mut idx, 3, steps) {
+    let next = cycle_wrapped_index(idx, 3, steps);
+    if next == idx {
         return false;
     }
+    let idx = next;
     *mode = match idx {
         0 => TextLayoutMode::Normal,
         1 => TextLayoutMode::Formula,

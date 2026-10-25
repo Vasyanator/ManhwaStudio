@@ -594,28 +594,17 @@ impl TypingCreatePanelState {
     /// unlike a local preset's name this uniqueness is an INVARIANT and not a courtesy: a
     /// colliding name would silently OVERWRITE the preset holding it.
     ///
-    /// Both loops are BOUNDED by the pigeonhole argument (one more candidate than there are
-    /// stored presets), never open-ended: a catalog entry that lost its `{index}` placeholder
-    /// makes every indexed candidate the same string, and an unbounded search would then hang
-    /// the GUI thread instead of degrading to the suffixed fallback.
+    /// The search is the shared bounded allocator (`ms_config::preset_store::free_default_name`):
+    /// from 1 UP, so a hole left by a rename or a deletion is reused (after deleting «Пресет 2»
+    /// the next created preset is «Пресет 2» again), and a catalog entry that lost `{index}`
+    /// degrades to a suffix instead of hanging the GUI thread.
     #[must_use]
     fn free_default_preset_name(&self) -> String {
-        let taken = self.presets_by_name.len();
-        // From 1 UP, so a hole left by a rename or a deletion is reused: after deleting
-        // «Пресет 2» the next created preset is «Пресет 2» again, not «Пресет 4».
-        for index in 1..=taken + 1 {
-            let candidate = tf!("typing.presets.default_name", index = index);
-            if !self.presets_by_name.contains_key(&candidate) {
-                return candidate;
-            }
-        }
-        // Degenerate catalog (see above): disambiguate by suffix instead.
-        let base = tf!("typing.presets.default_name", index = taken + 1);
-        (2..=taken + 2)
-            .map(|suffix| format!("{base} ({suffix})"))
-            .find(|candidate| !self.presets_by_name.contains_key(candidate))
-            // Unreachable by the same bound: `taken + 1` candidates against `taken` names.
-            .unwrap_or_else(|| format!("{base} ({})", taken + 2))
+        ms_config::preset_store::free_default_name(
+            self.presets_by_name.len(),
+            |index| tf!("typing.presets.default_name", index = index),
+            |name| self.presets_by_name.contains_key(name),
+        )
     }
 
     /// Creates a new global preset that INHERITS everything on screen, selects it and
@@ -1105,11 +1094,14 @@ impl TypingCreatePanelState {
         true
     }
 
+    /// Stores the current formula layout under the typed name (VERBATIM, like every other preset
+    /// name: surrounding whitespace is part of it; an empty or all-whitespace name is ignored),
+    /// selects it and queues the whole map for the ordered writer.
     pub(super) fn save_current_formula_preset(&mut self) {
-        let preset_name = self.formula_preset_name_input.trim().to_string();
-        if preset_name.is_empty() {
+        if self.formula_preset_name_input.trim().is_empty() {
             return;
         }
+        let preset_name = self.formula_preset_name_input.clone();
         self.formula_presets_by_name.insert(
             preset_name.clone(),
             TypingFormulaPreset {
@@ -1117,12 +1109,41 @@ impl TypingCreatePanelState {
             },
         );
         self.selected_formula_preset_name = Some(preset_name);
-        let presets = self.formula_presets_by_name.clone();
-        let _ = thread::Builder::new()
-            .name("typing-save-formula-presets".to_string())
-            .spawn(move || {
-                let _ = save_text_tab_formula_presets(&presets);
-            });
+        self.queue_formula_presets_write();
+    }
+
+    /// Hands the whole formula-preset map to the ordered writer. A writer that cannot start or
+    /// has died is reported in the status line (the writer logs it).
+    ///
+    /// Test-gated like `spawn_presets_save`: a unit test must not write the real
+    /// `user_config.json`; the write itself is covered by `run_formula_presets_write`'s tests.
+    fn queue_formula_presets_write(&mut self) {
+        if cfg!(test) {
+            return;
+        }
+        let job = FormulaPresetsWrite { presets: self.formula_presets_by_name.clone(), file: None };
+        let reason = match self.formula_presets_writer.submit(job) {
+            Ok(()) => return,
+            Err(ms_config::preset_store::SubmitError::Spawn { error, .. }) => format!("cannot start the formula presets writer thread: {error}"),
+            Err(ms_config::preset_store::SubmitError::WorkerGone { .. }) => "the formula presets writer thread is gone".to_string(),
+        };
+        self.apply_formula_preset_write_outcome(Err(reason));
+    }
+
+    /// Drains the formula-preset writer's answers (once per frame, both panels): a failure
+    /// becomes the status line; a success changes nothing on screen.
+    pub(super) fn poll_formula_preset_writes(&mut self) {
+        while let Some(outcome) = self.formula_presets_writer.try_recv_outcome() {
+            self.apply_formula_preset_write_outcome(outcome);
+        }
+    }
+
+    /// Shows a failed formula-preset write in the status line; the technical reason is already
+    /// logged where it happened.
+    fn apply_formula_preset_write_outcome(&mut self, outcome: Result<(), String>) {
+        if let Err(reason) = outcome {
+            self.status_line = tf!("typing.presets.formula_save_error_status", err = reason);
+        }
     }
 
     pub(super) fn swap_formula_xy_expressions(&mut self) {
@@ -1701,4 +1722,35 @@ pub(super) fn font_fallback_status_lines(
 #[must_use]
 pub(super) fn custom_font_fallback_hint(report: &FontFallbackReport, selected_font_is_custom: bool) -> Option<&'static str> {
     (selected_font_is_custom && !report.fallbacks.is_empty()).then(|| t!("typing.hybrid_font.fallback_disabled_hint"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Formula preset names are verbatim (whitespace is part of the name); a blank name saves
+    /// nothing.
+    #[test]
+    fn formula_preset_names_are_verbatim_and_blank_names_are_ignored() {
+        let mut state = TypingCreatePanelState::new(false);
+        let before = state.formula_presets_by_name.len();
+        state.formula_preset_name_input = "   ".to_string();
+        state.save_current_formula_preset();
+        assert_eq!(state.formula_presets_by_name.len(), before, "a blank name saves nothing");
+        state.formula_preset_name_input = " Моя волна ".to_string();
+        state.save_current_formula_preset();
+        assert!(state.formula_presets_by_name.contains_key(" Моя волна "));
+        assert_eq!(state.selected_formula_preset_name.as_deref(), Some(" Моя волна "));
+    }
+
+    /// A failed background write reaches the status line; a success leaves it alone.
+    #[test]
+    fn a_failed_formula_preset_write_reaches_the_status_line() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.status_line = "idle".to_string();
+        state.apply_formula_preset_write_outcome(Ok(()));
+        assert_eq!(state.status_line, "idle");
+        state.apply_formula_preset_write_outcome(Err("disk full".to_string()));
+        assert!(state.status_line.contains("disk full"), "{}", state.status_line);
+    }
 }

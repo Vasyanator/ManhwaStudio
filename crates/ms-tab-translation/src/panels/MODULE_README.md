@@ -196,7 +196,7 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   version is read-only. Seeded from the pre-read `user_settings`
   (`TranslationTabState::seed_composition_presets`; the store path is injected by the host's
   caller, `None` in every test); every create / save / rename / delete is its own
-  read-modify-write on ONE ordered writer thread. An entry whose last write failed stays unsaved
+  read-modify-write on ONE ordered writer thread (`ms_config::preset_store::OrderedWriter`). An entry whose last write failed stays unsaved
   (and the write-error line stays) until a later write of that entry succeeds. A built-in edit is
   an override keyed by id (kept only while it differs from the factory values); deleting it
   restores the factory values, an unmodified built-in has no «Delete» and no built-in can be

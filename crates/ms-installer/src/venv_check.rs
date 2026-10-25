@@ -60,7 +60,8 @@ pub enum NotReadyReason {
     PythonEnvMissing(String),
     /// The installed-package probe itself failed; readiness is unknown, so not ready.
     ProbeFailed(String),
-    /// The interpreter works but required packages are absent (dependency specs).
+    /// The interpreter works but required packages are absent or installed at a version
+    /// outside their pin (the dependency specs to install).
     MissingPackages(Vec<String>),
     /// A `Full` environment whose PyTorch does not satisfy the recorded torch choice
     /// (`General.torch_flavour` / `torch_rocm_gfx`; legacy version-only rule when

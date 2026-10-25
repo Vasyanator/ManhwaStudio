@@ -454,6 +454,14 @@ pub trait AiEngine: Send {
     /// queried the backend on each of them would issue one request per frame. Defer such
     /// work to the first call that reports `true`.
     fn set_region(&mut self, region: Option<OverlayRectPx>, geometry_settled: bool);
+
+    /// Teardown only: synchronously writes the settings value the engine still owes to its
+    /// settings file (an edit waiting out the save debounce, or one made behind a write in
+    /// flight), so a process exit right after cannot lose it. The ONE exception to "return
+    /// within a frame": it runs on the studio's teardown worker, never on the GUI thread. An
+    /// engine with a `SettingsSaver` forwards to `SettingsSaver::flush_blocking`; one with no
+    /// settings writer keeps the no-op default.
+    fn flush_settings_blocking(&mut self) {}
 }
 
 /// The localized sentence that says which rule a size broke.

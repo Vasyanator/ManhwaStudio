@@ -136,3 +136,120 @@ fn the_tab_state_publishes_its_edit_mode() {
     assert!(state.input_contexts().is_empty());
     assert!(!state.input_contexts().contains(&ADV_REC_OPEN));
 }
+
+mod line_edits_reach_the_model {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use eframe::egui::pos2;
+    use ms_models::page_view::{PageImageInfo, SourcePageLoadState};
+    use ms_models::text_mask_model::TextMaskModel;
+
+    use crate::tab::{TextDetectorLineDragKind, TextDetectorLineDragState, TextDetectorLineSelection, TranslationTabState, detector_rects_to_blocks_px, rasterize_resolved_blocks};
+    use crate::text_detector::{TextDetectorPageResult, TextDetectorRect};
+
+    fn rect(x1: f32, y1: f32, x2: f32, y2: f32) -> TextDetectorRect {
+        TextDetectorRect::from_xyxy(x1, y1, x2, y2).unwrap_or_else(|| panic!("valid test rect {x1} {y1} {x2} {y2}"))
+    }
+
+    fn tab_with_page(result: TextDetectorPageResult) -> (TranslationTabState, Arc<Mutex<TextMaskModel>>) {
+        let mut tab = TranslationTabState::default();
+        let model = Arc::new(Mutex::new(TextMaskModel::new()));
+        tab.text_mask_model = Some(Arc::clone(&model));
+        tab.text_detector_results.insert(0, result);
+        tab.sync_text_mask_page_from_result(0);
+        (tab, model)
+    }
+
+    fn model_blocks(model: &Arc<Mutex<TextMaskModel>>) -> Option<Vec<[i32; 4]>> {
+        model.lock().expect("model lock").page(0).and_then(|page| page.blocks.clone())
+    }
+
+    fn drag_on_page_0() -> TextDetectorLineDragState {
+        TextDetectorLineDragState {
+            selection: TextDetectorLineSelection { page_idx: 0, line_idx: 0 },
+            start_pointer_src: pos2(0.0, 0.0),
+            start_rect: rect(0.0, 0.0, 1.0, 1.0),
+            kind: TextDetectorLineDragKind::Move,
+        }
+    }
+
+    /// A page with a detector mask: the edited lines become the model's boxes once the drag
+    /// ends (not while it runs); the model keeps its mask.
+    #[test]
+    fn edited_lines_reach_the_model_once_the_drag_ends() {
+        let (mut tab, model) = tab_with_page(TextDetectorPageResult { source_size: [6, 4], blocks: vec![rect(0.0, 0.0, 1.0, 1.0)], mask_size: [6, 4], mask_alpha: vec![255; 24] });
+        tab.text_detector_results.get_mut(&0).expect("page").blocks[0] = rect(1.0, 1.0, 2.0, 2.0);
+        tab.line_edited_pages.insert(0);
+        tab.text_detector_line_drag_state = Some(drag_on_page_0());
+        tab.flush_line_edits_to_text_mask_model();
+        assert_eq!(model_blocks(&model), Some(vec![[0, 0, 1, 1]]), "not while the drag runs");
+        tab.text_detector_line_drag_state = None;
+        tab.flush_line_edits_to_text_mask_model();
+        assert_eq!(model_blocks(&model), Some(vec![[1, 1, 2, 2]]));
+        assert_eq!(model.lock().expect("model lock").page(0).map(|page| page.mask_alpha.clone()), Some(vec![255; 24]), "mask kept");
+        assert!(tab.line_edited_pages.is_empty());
+    }
+
+    /// A hand-edited model mask (boxes unknown) keeps its boxes unknown after a line edit.
+    #[test]
+    fn a_hand_edited_mask_keeps_unknown_boxes() {
+        let (mut tab, model) = tab_with_page(TextDetectorPageResult { source_size: [6, 4], blocks: vec![rect(0.0, 0.0, 1.0, 1.0)], mask_size: [6, 4], mask_alpha: vec![255; 24] });
+        model.lock().expect("model lock").set_page(0, [6, 4], [6, 4], vec![0; 24]);
+        tab.text_detector_line_selection = Some(TextDetectorLineSelection { page_idx: 0, line_idx: 0 });
+        tab.delete_selected_text_detector_line();
+        tab.flush_line_edits_to_text_mask_model();
+        assert_eq!(model_blocks(&model), None);
+        assert_eq!(model.lock().expect("model lock").page(0).map(|page| page.mask_alpha.clone()), Some(vec![0; 24]));
+    }
+
+    /// A legacy page (no stored mask) shows the raster of its resolved lines: after a line is
+    /// deleted the model page is rebuilt from the remaining lines, boxes and raster alike.
+    #[test]
+    fn a_legacy_page_is_rebuilt_from_the_edited_lines() {
+        let legacy = TextDetectorPageResult { source_size: [6, 4], blocks: vec![rect(0.0, 0.0, 1.0, 1.0), rect(4.0, 2.0, 6.0, 4.0)], mask_size: [6, 4], mask_alpha: Vec::new() };
+        let (mut tab, model) = tab_with_page(legacy);
+        tab.materialize_text_mask_page_from_blocks_if_missing(0);
+        tab.text_detector_line_selection = Some(TextDetectorLineSelection { page_idx: 0, line_idx: 0 });
+        tab.delete_selected_text_detector_line();
+        tab.flush_line_edits_to_text_mask_model();
+        let result = tab.text_detector_results.get(&0).expect("page");
+        let (raster, resolved) = rasterize_resolved_blocks(result, &tab.text_detector_options).expect("remaining line raster");
+        let model = model.lock().expect("model lock");
+        let page = model.page(0).expect("model page");
+        assert_eq!(page.blocks, detector_rects_to_blocks_px(&resolved));
+        assert_eq!(page.mask_alpha, raster);
+    }
+
+    /// Dropping the line edit state of one page keeps another page's selection.
+    #[test]
+    fn dropping_line_state_touches_only_its_page() {
+        let mut tab = TranslationTabState::default();
+        tab.text_detector_line_selection = Some(TextDetectorLineSelection { page_idx: 1, line_idx: 0 });
+        tab.text_detector_line_drag_state = Some(drag_on_page_0());
+        tab.drop_line_edit_state_on_page(0);
+        assert!(tab.text_detector_line_drag_state.is_none());
+        assert!(tab.text_detector_line_selection.is_some());
+        tab.drop_line_edit_state_on_page(1);
+        assert!(tab.text_detector_line_selection.is_none());
+    }
+
+    /// A line on a page without a detector entry takes the page size the page loader knows; with
+    /// the size unknown nothing is created (no disk read).
+    #[test]
+    fn a_new_page_entry_takes_the_known_page_size() {
+        let mut tab = TranslationTabState::default();
+        assert!(tab.create_text_detector_line_at_uv(3, pos2(0.5, 0.5)).is_err(), "size unknown");
+        assert!(!tab.text_detector_results.contains_key(&3));
+        let loading = PageImageInfo { width_px: 0, height_px: 0, load_state: SourcePageLoadState::Loading };
+        let known = PageImageInfo { width_px: 600, height_px: 800, load_state: SourcePageLoadState::Available };
+        tab.note_page_sizes(&HashMap::from([(3, loading)]));
+        assert!(tab.create_text_detector_line_at_uv(3, pos2(0.5, 0.5)).is_err(), "still loading");
+        tab.note_page_sizes(&HashMap::from([(3, known)]));
+        tab.create_text_detector_line_at_uv(3, pos2(0.5, 0.5)).unwrap_or_else(|error| panic!("line created: {error}"));
+        let page = tab.text_detector_results.get(&3).expect("page entry");
+        assert_eq!(page.source_size, [600, 800]);
+        assert_eq!(page.blocks.len(), 1);
+        assert!(tab.line_edited_pages.contains(&3));
+    }
+}

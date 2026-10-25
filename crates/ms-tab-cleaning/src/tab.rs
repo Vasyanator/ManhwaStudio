@@ -67,6 +67,7 @@ use super::autoclean::{autoclean_page, AutocleanInputError, UnevenBackgroundTool
 use super::clean_status::{draw_clean_status, CleanFolderStatus, CleanStatusDismiss, CleanStatusView};
 use super::canvas_input::{StrokeDriver, StrokeEvent, claim_sample};
 use super::input::{self as cleaning_input, CleaningLabels, CleaningLabelsCache, StrokeModes};
+use super::text_mask_storage::read_stored_text_mask;
 use super::tools::{
     ai_api_editor_tool, ai_editor_tool, AotInpaintTool, CleaningCursorOccluder, CleaningTool,
     FluxFillInpaintTool, GradientFillTool, PatchTool, StampTool,
@@ -720,7 +721,9 @@ struct TextMaskLoadResult {
 struct QuickTextCleanTask {
     page_idx: usize,
     page_path: PathBuf,
-    mask_path: PathBuf,
+    /// The chapter's detector store (`ProjectPaths::text_detection_dir`): the disk fallback
+    /// when the shared model has no mask for the page.
+    storage_dir: PathBuf,
     mask_from_model: Option<TextMaskLoadPage>,
 }
 
@@ -897,6 +900,16 @@ impl CleaningTabState {
     /// has merged the staging tree. Entering the tab rescans on its own. Cheap; never blocks.
     pub fn request_orphan_clean_rescan(&mut self) {
         self.clean_folder_status.request_rescan();
+    }
+
+    /// Teardown only: synchronously writes every settings value a tool still owes to its own
+    /// settings file (`CleaningTool::flush_settings_blocking` of every registered tool, active
+    /// or not). Blocks; the tab's `StudioTab::flush_debounced_stores_blocking` body, run on the
+    /// studio's teardown worker.
+    pub(crate) fn flush_tool_settings_blocking(&mut self) {
+        for tool in &mut self.tools {
+            tool.flush_settings_blocking();
+        }
     }
 
     pub fn set_canvas_scroll_area_id_salt(&mut self, id_salt: &'static str) {
@@ -1329,9 +1342,11 @@ impl CleaningTabState {
                     && let Ok(mut model) = model.lock()
                 {
                     for page in result.pages {
+                        // The recorded source size, not the raster's: a mask stored at a
+                        // scaled size is still the mask of THIS page (`text_mask_storage`).
                         model.set_page(
                             page.page_idx,
-                            page.mask_size,
+                            page.source_size,
                             page.mask_size,
                             page.mask_alpha,
                         );
@@ -1382,10 +1397,7 @@ impl CleaningTabState {
             tasks.push(QuickTextCleanTask {
                 page_idx,
                 page_path: page.path.clone(),
-                mask_path: text_detection_mask_file_path(
-                    &project.paths.text_detection_dir,
-                    page_idx,
-                ),
+                storage_dir: project.paths.text_detection_dir.clone(),
                 mask_from_model,
             });
         }
@@ -2591,34 +2603,26 @@ fn scale_edge_to_i32(value: f64, ceil: bool) -> Option<i32> {
 }
 
 
+/// The mask the quick text clean of `task` works from: the shared model's page, else the
+/// stored detector mask (`text_mask_storage`, with its recorded sizes; no blocks, so autoclean
+/// uses the cluster bbox). `None` when neither exists or the stored one cannot be read (logged).
 fn resolve_quick_clean_mask_page(task: &QuickTextCleanTask) -> Option<TextMaskLoadPage> {
     if let Some(mask) = task.mask_from_model.as_ref() {
         return Some(mask.clone());
     }
-    if !task.mask_path.exists() {
-        return None;
+    match read_stored_text_mask(&task.storage_dir, task.page_idx) {
+        Ok(stored) => stored.map(|stored| TextMaskLoadPage {
+            page_idx: task.page_idx,
+            source_size: stored.source_size,
+            mask_size: stored.mask_size,
+            mask_alpha: stored.mask_alpha,
+            blocks: None,
+        }),
+        Err(error) => {
+            ms_log::runtime_log::log_warn(format!("[cleaning] quick text clean: the stored mask of page {} cannot be used: {error}", task.page_idx));
+            None
+        }
     }
-    let mask_img = image::open(&task.mask_path).ok()?.to_luma8();
-    let w = mask_img.width() as usize;
-    let h = mask_img.height() as usize;
-    if w == 0 || h == 0 {
-        return None;
-    }
-    let mut alpha = Vec::with_capacity(w.saturating_mul(h));
-    for px in mask_img.into_raw() {
-        alpha.push(if px > 0 { 255 } else { 0 });
-    }
-    Some(TextMaskLoadPage {
-        page_idx: task.page_idx,
-        // Disk fallback has no source_size/blocks JSON yet (remaining Phase 2 work):
-        // report the mask raster size and no blocks, so candidate B uses the cluster
-        // bbox fallback. `blocks` are only scaled against source_size, so its value is
-        // inert while blocks is None.
-        source_size: [w as u32, h as u32],
-        mask_size: [w as u32, h as u32],
-        mask_alpha: alpha,
-        blocks: None,
-    })
 }
 
 fn resize_binary_mask_nearest(
@@ -2688,35 +2692,21 @@ fn load_text_masks_from_storage(
     let mut failed = 0usize;
 
     for page_idx in page_indices {
-        let path = text_detection_mask_file_path(storage_dir, *page_idx);
-        if !path.exists() {
-            missing = missing.saturating_add(1);
-            continue;
-        }
-        match image::open(&path) {
-            Ok(img) => {
-                let luma = img.to_luma8();
-                let w = luma.width();
-                let h = luma.height();
-                if w == 0 || h == 0 {
-                    failed = failed.saturating_add(1);
-                    continue;
-                }
-                let mut alpha = Vec::with_capacity((w as usize).saturating_mul(h as usize));
-                for px in luma.into_raw() {
-                    alpha.push(if px > 0 { 255 } else { 0 });
-                }
+        match read_stored_text_mask(storage_dir, *page_idx) {
+            Ok(Some(stored)) => {
                 pages.push(TextMaskLoadPage {
                     page_idx: *page_idx,
-                    // Display-cache load: mask raster only, no detector blocks.
-                    source_size: [w, h],
-                    mask_size: [w, h],
-                    mask_alpha: alpha,
+                    // Display-cache load: the mask with its recorded sizes, no detector blocks.
+                    source_size: stored.source_size,
+                    mask_size: stored.mask_size,
+                    mask_alpha: stored.mask_alpha,
                     blocks: None,
                 });
                 loaded = loaded.saturating_add(1);
             }
-            Err(_) => {
+            Ok(None) => missing = missing.saturating_add(1),
+            Err(error) => {
+                ms_log::runtime_log::log_warn(format!("[cleaning] the stored text mask of page {page_idx} cannot be loaded: {error}"));
                 failed = failed.saturating_add(1);
             }
         }
@@ -2728,10 +2718,6 @@ fn load_text_masks_from_storage(
         missing,
         failed,
     })
-}
-
-fn text_detection_mask_file_path(dir: &Path, page_idx: usize) -> PathBuf {
-    dir.join(format!("{page_idx:05}_mask.png"))
 }
 
 struct TextMaskOverlayDrawParams<'a> {

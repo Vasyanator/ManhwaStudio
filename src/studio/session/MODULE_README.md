@@ -10,7 +10,7 @@ which kind is open.
 ## Architecture
 ```text
 StudioApp.session: SessionMode
-  Project(ProjectSession)          project/    save-to-project, page ops, DISCARD, unsaved cache
+  Project(Box<ProjectSession>)     project/    save-to-project, page ops, DISCARD, unsaved cache
   ImageSet(Box<ImageSetSession>)   image_set/  «Сохранить» / «Сохранить как», its dialogs and rules
 StudioApp::session_parts() -> (&mut SessionMode, SessionParts)
   SessionParts = project + StagingWriters + CloseFlow + typing / PS editor / translation canvas /

@@ -19,7 +19,8 @@ layer survives under this pixel" was previously answered separately per effect.
 
 Dilation comes in two production forms, both taking four independent per-side extents:
 `dilate_alpha_rect` (separable sliding-window maximum, O(width*height)) and
-`dilate_alpha_ellipse` (per-quadrant semi-axes, O(width*height*(up+down+1))). The legacy
+`dilate_alpha_ellipse` (per-quadrant semi-axes, exact lattice inequality — deliberately not the
+cv2 element of `ms_region_postprocess::dilate_ellipse`; O(width*height*(up+down+1))). The legacy
 iterated `dilate_alpha_max_filter3` is test-only now and serves as the reference the
 rectangle equivalence golden compares against.
 
@@ -425,6 +426,12 @@ pub(crate) fn dilate_alpha_rect(
 /// so the rayon-parallel result is bit-identical to a sequential pass. Zero-sized images, zero
 /// extents, extents larger than the image, and a `width * height` mismatch are all handled
 /// without panicking.
+///
+/// Deliberately a different element from `ms_region_postprocess::dilate_ellipse` (the region
+/// post-processing's cv2 element, binary and symmetric, row half-widths ROUNDED half to even, so
+/// at radius 6 row `dy = 2` spans ±6 where this exact inequality gives ±5): this one is
+/// grey-level, asymmetric and lattice-exact, and the soft-glow outlines are pinned on it. Neither
+/// may be routed through the other; `dilate_ellipse_is_not_the_cv2_element` pins the difference.
 pub(crate) fn dilate_alpha_ellipse(
     alpha: &mut [u8],
     width: usize,
@@ -1461,6 +1468,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Pins the element difference to `ms_region_postprocess::dilate_ellipse` (OpenCV's
+    /// `MORPH_ELLIPSE`, row half-widths `0, 3, 4, 5, 6, 6, 6, 6, 6, 5, 4, 3, 0` at radius 6): this
+    /// element's rows are `floor(6 * sqrt(36 - dy^2) / 6)`, i.e. `0, 3, 4, 5, 5, 5, 6, 5, 5, 5, 4,
+    /// 3, 0`, so rows `dy = ±1` and `±2` are one pixel narrower. A change that makes the two agree is a
+    /// change of the glow outline, not a deduplication.
+    #[test]
+    fn dilate_ellipse_is_not_the_cv2_element() {
+        let (width, height, centre) = (15usize, 15usize, 7usize);
+        let mut ellipse = dot_image(width, height, centre, centre);
+        dilate_alpha_ellipse(ellipse.as_mut_slice(), width, height, 6, 6, 6, 6);
+        let half_widths: Vec<usize> = (0..height)
+            .map(|y| ellipse[y * width..(y + 1) * width].iter().filter(|&&v| v == 255).count() / 2)
+            .collect();
+        assert_eq!(half_widths, vec![0, 0, 3, 4, 5, 5, 5, 6, 5, 5, 5, 4, 3, 0, 0]);
     }
 
     /// A zero vertical semi-axis degenerates to the horizontal axis line only.

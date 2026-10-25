@@ -35,8 +35,9 @@ Key functions:
   draw_local_preset_combo() / draw_local_preset_row() /
   draw_local_preset_name_row(): the parameter-identity controls drawn at the top
   of the font section, create panel only (`dev-docs/local_presets_plan.md` §7).
-- local_preset_wheel_target() (free fn): where a wheel notch over the closed
-  local-preset combo moves the selection — the "create" row is excluded there.
+- the wheel over the closed local-preset combo moves the selection by
+  `ms_widgets::preset_wheel_target` (the `PresetPicker` rule: the "create" row is
+  excluded there).
 - local_preset_popup_height() (free fn): the popup's row cap, derived from the
   live row pitch.
 - local_preset_popup_id_bucket() (free fn): the row-count bucket folded into the
@@ -155,28 +156,6 @@ enum LocalPresetRowAction {
     Create,
     /// A preset row: select it and apply its whole snapshot.
     Select(usize),
-}
-
-/// Where a wheel notch over the CLOSED local-preset combo moves the selection.
-///
-/// The wheel cycles a VIRTUAL list — the empty selection (`0`) plus the real presets
-/// (`1 + index`). The popup's «create» row is deliberately NOT in that list, so no amount
-/// of scrolling can create a preset; creation stays an explicit click.
-///
-/// `count` is the number of local presets. Returns `None` when the selection does not move
-/// (no steps, or a wrap that lands back on the current row); otherwise `Some(selection)`,
-/// whose inner `None` is the empty selection.
-#[must_use]
-fn local_preset_wheel_target(
-    selected: Option<usize>,
-    count: usize,
-    steps: i32,
-) -> Option<Option<usize>> {
-    let mut index = selected.map_or(0, |idx| idx + 1);
-    if !cycle_wrapped_index(&mut index, count + 1, steps) {
-        return None;
-    }
-    Some(index.checked_sub(1))
 }
 
 /// Maximum outer height of the local-preset popup, in logical points.
@@ -906,7 +885,7 @@ impl TypingCreatePanelState {
                 &group_combo.inner.response,
             );
             if let Some(steps) = group_combo.wheel_steps {
-                cycle_wrapped_index(&mut selected_group_idx, group_count, steps);
+                selected_group_idx = cycle_wrapped_index(selected_group_idx, group_count, steps);
             }
             let previous_group = self.selected_font_group.clone();
             self.selected_font_group = if selected_group_idx == 0 {
@@ -985,7 +964,7 @@ impl TypingCreatePanelState {
         // A font with one face (or none) offers no choice, so the combo is not drawn at all:
         // it could only ever re-select the face already selected. Nothing is lost by hiding
         // it — `selectable_value` cannot move a one-item list, `cycle_wrapped_index` returns
-        // early for `len <= 1` (`ui_helpers.rs:366-383`), and the write-back would store the
+        // the index unchanged for `len <= 1` (`ms_widgets::cycle_wrapped_index`), and the write-back would store the
         // value it just read. `clamp_face_index` still runs, so a `selected_face_idx` left
         // over from a font with more faces cannot survive behind the hidden widget.
         let face_count = self
@@ -1017,7 +996,7 @@ impl TypingCreatePanelState {
                     &face_combo.inner.response,
                 );
                 if let Some(steps) = face_combo.wheel_steps {
-                    cycle_wrapped_index(&mut face_idx, face_count, steps);
+                    face_idx = cycle_wrapped_index(face_idx, face_count, steps);
                 }
                 self.selected_face_idx = face_idx;
                 if self.selected_face_idx != prev_face_idx {
@@ -1148,7 +1127,7 @@ impl TypingCreatePanelState {
     /// local preset drawn as its rendered preview image.
     ///
     /// THE WHEEL NEVER CREATES A PRESET. Wheel steps go through
-    /// [`local_preset_wheel_target`], which cycles a virtual list holding only the empty
+    /// [`ms_widgets::preset_wheel_target`], which cycles a virtual list holding only the empty
     /// selection and the real presets; the «create» row exists in the popup alone. Cycling
     /// into a creation would silently grow the user's set on a stray scroll.
     ///
@@ -1216,7 +1195,7 @@ impl TypingCreatePanelState {
         // with a click collected above.
         if let Some(steps) = preset_combo.wheel_steps
             && let Some(target) =
-                local_preset_wheel_target(self.selected_local_preset, preset_count, steps)
+                ms_widgets::preset_wheel_target(self.selected_local_preset, preset_count, steps)
         {
             action = Some(match target {
                 Some(index) => LocalPresetRowAction::Select(index),
@@ -2191,7 +2170,7 @@ mod tests {
         LOCAL_PRESET_POPUP_TEXT_ROWS, LocalPreset, ParamIdentityMode, PreviewBackdrop,
         TypingCreatePanelState, fit_preview_size, local_preset_popup_height,
         local_preset_popup_id_bucket, local_preset_row_hover_tint,
-        local_preset_row_selection_stroke, local_preset_wheel_target,
+        local_preset_row_selection_stroke,
     };
     use crate::tab::render_store::shape_variant_luminance;
     use eframe::egui;
@@ -2273,46 +2252,6 @@ mod tests {
     fn the_popup_height_is_never_zero_or_negative() {
         assert!(local_preset_popup_height(0, 26.0) > 0.0);
         assert!(local_preset_popup_height(3, -5.0) >= 0.0);
-    }
-
-    /// The wheel walks the empty selection and the real presets, and wraps between them.
-    #[test]
-    fn wheel_walks_none_and_the_presets() {
-        assert_eq!(local_preset_wheel_target(None, 2, 1), Some(Some(0)));
-        assert_eq!(local_preset_wheel_target(Some(0), 2, 1), Some(Some(1)));
-        // Past the last preset the list wraps onto the empty selection, not onto «create».
-        assert_eq!(local_preset_wheel_target(Some(1), 2, 1), Some(None));
-        assert_eq!(local_preset_wheel_target(None, 2, -1), Some(Some(1)));
-    }
-
-    /// A notch that does not move the selection reports nothing, so no operation runs.
-    #[test]
-    fn wheel_reports_nothing_when_the_selection_does_not_move() {
-        assert_eq!(local_preset_wheel_target(None, 2, 0), None);
-        // An empty set is a one-row virtual list: every step lands back on «none».
-        assert_eq!(local_preset_wheel_target(None, 0, 1), None);
-        assert_eq!(local_preset_wheel_target(None, 0, -7), None);
-        // A full wrap (3 steps over 1 + 2 rows) is also a no-op.
-        assert_eq!(local_preset_wheel_target(Some(0), 2, 3), None);
-    }
-
-    /// THE contract of this helper: no wheel step ever reaches a "create" outcome, and no
-    /// step ever names a preset that does not exist.
-    #[test]
-    fn wheel_never_leaves_the_virtual_list() {
-        for count in 0..5usize {
-            for steps in -9..=9i32 {
-                for selected in std::iter::once(None).chain((0..count).map(Some)) {
-                    let Some(target) = local_preset_wheel_target(selected, count, steps) else {
-                        continue;
-                    };
-                    if let Some(index) = target {
-                        assert!(index < count, "count={count} steps={steps} index={index}");
-                    }
-                    assert_ne!(target, selected, "count={count} steps={steps}");
-                }
-            }
-        }
     }
 
     /// A preview narrower than the popup is drawn at its own size; a wider one is scaled

@@ -116,7 +116,12 @@ credential store only behind `keys.rs` / `key_state.rs`.
   deadline the adapter's cancel request is sent best effort (a submit answer that arrived after
   the cancel is still parsed for its job). Once the cancel flag is set, ANY error that ends
   the run (a poll out of retries, a non-transient transport error) resolves to `Cancelled` and
-  takes that same cancel-request path; a request already in flight is not aborted. A failing body reaches `runtime_log` only as the
+  takes that same cancel-request path; a request already in flight is not aborted. Without a
+  cancel, an error that ends the run while the provider job may still be live (polls out of
+  retries, a timeout, a non-success poll answer) also sends the cancel request and keeps its
+  own error; a job the provider answered finished (a result) or failed (a terminal status in a
+  success answer) is never cancelled. Only fal, Replicate and Runway have a cancel request; every
+  other adapter documents that its API has none. A failing body reaches `runtime_log` only as the
   provider's error message (`failing_body_summary`: bodies may echo the prompt); the 2 KB
   digest, base64 runs elided, goes to the trace log.
 - **Logging**: never a key; the prompt only by length in `runtime_log`, its text only in the

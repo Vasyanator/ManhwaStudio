@@ -28,7 +28,10 @@ A request already in flight cannot be aborted: its answer is dropped after a can
 is still parsed for the provider job it created, and a user cancel or the run deadline sends
 the adapter's cancel request for the latest job (best effort). Any error that ends a run after
 the user cancelled (a poll out of retries, an oversized body) counts as the cancel, so it never
-skips that request. Requests that carry a key never
+skips that request. Without a cancel, an error that ends the run while the provider job may
+still be live (a poll out of retries, a timeout, a non-success poll answer) sends the same
+cancel request and keeps its own error; a job the provider itself reported finished or failed
+is left alone. Requests that carry a key never
 follow redirects (a custom key header would otherwise travel to the redirect target);
 unauthenticated downloads do (both enforced by `crate::http::UreqTransport`). The key is never logged; `runtime_log` keeps only the provider's
 error message of a failing JSON body (bodies may echo the prompt), the 2 KB digest with base64
@@ -153,7 +156,7 @@ pub(crate) fn execute(transport: &dyn HttpTransport, limits: &ExecutorLimits, pr
     let exec = Execution { transport, limits, protocol, run, deadline: Instant::now() + limits.run_deadline };
     run.cancel.check()?;
     let submit = protocol.submit(run.call)?;
-    let mut state = JobState { phase: StepPhase::Submit, polls: 0, job: None };
+    let mut state = JobState { phase: StepPhase::Submit, polls: 0, job: None, settled: false };
     match exec.drive(&submit, &mut state, on_stage) {
         // Once the user cancelled, the cancel wins over whatever error ended the step loop (a
         // poll whose retries ran out, a non-transient transport error such as an oversized
@@ -172,6 +175,12 @@ pub(crate) fn execute(transport: &dyn HttpTransport, limits: &ExecutorLimits, pr
             exec.cancel_job(&state, "run deadline passed");
             Err(ImageEditError::Timeout { stage })
         }
+        // Polls that failed for good (out of retries, timed out, a non-success answer) leave a
+        // job the provider may still run — and bill — to completion: cancel it, keep the error.
+        Err(error) if state.job.is_some() && !state.settled => {
+            exec.cancel_job(&state, "run failed");
+            Err(error)
+        }
         other => other,
     }
 }
@@ -184,6 +193,10 @@ struct JobState {
     polls: u32,
     /// The latest job handle an adapter returned.
     job: Option<JobRef>,
+    /// The provider itself answered the job's outcome: a result (image or download) or a
+    /// failure inside a SUCCESS response (a terminal status). Such a job is over, so a run
+    /// that fails afterwards does not cancel it.
+    settled: bool,
 }
 
 /// The fixed context of one `execute` call.
@@ -220,9 +233,24 @@ impl Execution<'_> {
                 }
                 return Err(ImageEditError::Cancelled);
             }
-            match protocol.next(&step, &response)? {
-                NextStep::Image(bytes) => return Ok(bytes),
+            let next = match protocol.next(&step, &response) {
+                Ok(next) => next,
+                Err(error) => {
+                    // A success response the adapter refuses carries the job's own terminal
+                    // failure; a non-success one (a poll out of retries on 5xx, a 4xx) says
+                    // nothing about the job, which may still be running.
+                    state.settled |= is_success(response.status);
+                    return Err(error);
+                }
+            };
+            match next {
+                NextStep::Image(bytes) => {
+                    state.settled = true;
+                    return Ok(bytes);
+                }
                 NextStep::Download(request) => {
+                    // The job is finished; only fetching its result remains.
+                    state.settled = true;
                     on_stage(ImageEditStage::Downloading);
                     let download = self.send(&request, limits.download, limits.download_cap, "download")?;
                     if !is_success(download.status) {
@@ -554,6 +582,65 @@ pub(crate) mod tests {
         assert!(matches!(result, Err(ImageEditError::Cancelled)));
         let sent = transport.sent.borrow();
         assert_eq!(sent.iter().map(|sent| (sent.method, sent.url.as_str(), sent.stage)).collect::<Vec<_>>(), [(HttpMethod::Post, "https://queue.example.run/jobs", "submit"), (HttpMethod::Get, "https://queue.example.run/jobs/j1", "poll"), (HttpMethod::Put, "https://queue.example.run/jobs/j1/cancel", "cancel")]);
+    }
+
+    /// No cancel: polls that fail for good leave a job that may still be live, so the provider
+    /// cancel is sent and the run keeps its own error.
+    #[test]
+    fn a_poll_out_of_retries_cancels_the_live_job() {
+        let call = async_call();
+        let network = || Err(HttpError::Network { detail: "reset".to_string() });
+        let transport = FakeTransport::new(vec![Ok(resp(200, b"queued")), network(), network(), network(), network(), Ok(resp(200, b""))]);
+        let (result, _) = run(&transport, &AsyncProtocol { cancel_url: Some("https://queue.example.run/jobs/j1/cancel".to_string()) }, &call, &CancelFlag::new());
+        assert!(matches!(result, Err(ImageEditError::Network { .. })), "{result:?}");
+        let sent = transport.sent.borrow();
+        assert_eq!(sent.iter().map(|sent| (sent.method, sent.stage)).collect::<Vec<_>>(), [(HttpMethod::Post, "submit"), (HttpMethod::Get, "poll"), (HttpMethod::Get, "poll"), (HttpMethod::Get, "poll"), (HttpMethod::Get, "poll"), (HttpMethod::Put, "cancel")]);
+    }
+
+    /// A non-success poll answer says nothing about the job: it is cancelled too.
+    #[test]
+    fn a_refused_poll_answer_cancels_the_live_job() {
+        let call = async_call();
+        let transport = FakeTransport::new(vec![Ok(resp(200, b"queued")), Ok(resp(404, b"")), Ok(resp(200, b""))]);
+        let (result, _) = run(&transport, &AsyncProtocol { cancel_url: Some("https://queue.example.run/jobs/j1/cancel".to_string()) }, &call, &CancelFlag::new());
+        assert!(matches!(result, Err(ImageEditError::ProviderRejected { status: 404, .. })), "{result:?}");
+        let sent = transport.sent.borrow();
+        assert_eq!(sent.last().map(|sent| (sent.method, sent.stage)), Some((HttpMethod::Put, "cancel")));
+    }
+
+    /// [`AsyncProtocol`] whose poll answer `failed` (inside a 200) is the job's own terminal failure.
+    #[derive(Debug)]
+    struct FailingJob(AsyncProtocol);
+    impl EditProtocol for FailingJob {
+        fn submit(&self, call: &EditCall) -> Result<HttpRequestSpec, ImageEditError> {
+            self.0.submit(call)
+        }
+        fn next(&self, step: &StepCtx<'_>, response: &HttpResponse) -> Result<NextStep, ImageEditError> {
+            if matches!(step.phase, StepPhase::Poll { .. }) && response.body.as_slice() == b"failed" {
+                return Err(ImageEditError::ProviderFailed { detail: "the job failed".to_string() });
+            }
+            self.0.next(step, response)
+        }
+        fn cancel_request(&self, step: &StepCtx<'_>) -> Option<HttpRequestSpec> {
+            self.0.cancel_request(step)
+        }
+    }
+
+    /// A job the provider finished is never cancelled: a failed download, or a failure the
+    /// provider reported in a success answer, ends the run without a cancel request.
+    #[test]
+    fn a_settled_job_is_not_cancelled_when_the_run_fails() {
+        let call = async_call();
+        let protocol = AsyncProtocol { cancel_url: Some("https://queue.example.run/jobs/j1/cancel".to_string()) };
+        let transport = FakeTransport::new(vec![Ok(resp(200, b"queued")), Ok(resp(200, b"done")), Ok(resp(404, b""))]);
+        let (result, _) = run(&transport, &protocol, &call, &CancelFlag::new());
+        assert!(matches!(result, Err(ImageEditError::ProviderFailed { .. })), "{result:?}");
+        assert!(transport.sent.borrow().iter().all(|sent| sent.stage != "cancel"), "a finished job is not cancelled");
+
+        let transport = FakeTransport::new(vec![Ok(resp(200, b"queued")), Ok(resp(200, b"failed")), Ok(resp(200, b""))]);
+        let (result, _) = run(&transport, &FailingJob(protocol), &call, &CancelFlag::new());
+        assert!(matches!(result, Err(ImageEditError::ProviderFailed { .. })), "{result:?}");
+        assert!(transport.sent.borrow().iter().all(|sent| sent.stage != "cancel"), "a job the provider reported failed is not cancelled");
     }
 
     #[test]

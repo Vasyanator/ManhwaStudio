@@ -39,7 +39,13 @@ FILE HEADER (crates/ms-widgets/src/lib.rs)
     named-preset block — a wheel combo with «None», an optional «+ Create preset» row and the
     presets, then the rename field of the selection with «Save» and a two-step red «Delete»,
     and an unsaved-changes line. Draw only: it reports an action, the caller owns the list,
-    every decision and the name validation.
+    every decision and the name validation. `preset_wheel_target` is its wheel rule, shared
+    with preset combos that cannot be a picker.
+  - `ArmedDeleteButton` (+ `ArmedDeleteStep`, `armed_delete_step`): the two-click delete
+    button (first click arms, a second plain click confirms, a double click never deletes, an
+    armed button the pointer leaves disarms). Stateless: the caller owns what is armed.
+  - `cycle_wrapped_index`: the one wrapping wheel-step rule over a list index, shared by the
+    combo widgets and every hand-made wheel-cycled selector.
   - `MarkedScrollArea`: вертикальный скролл с разметкой бара (типизированные/
     свободные пометки под ползунком) и жёлобом элементов слева от бара.
   - `AiButton`: an AI-tool launch button that gates its own availability on the
@@ -126,6 +132,7 @@ pub mod ui_fonts;
 pub mod ui_scale;
 
 mod ai_button;
+mod armed_delete_button;
 mod autocomplete_line;
 mod byte_cap_edit;
 mod color_preset_picker;
@@ -157,6 +164,7 @@ mod wheel_spin_box;
 
 #[allow(unused_imports)]
 pub use ai_button::{AiButton, AiButtonResponse, AiCaps, AiRequirement, marker_badge_overhang};
+pub use armed_delete_button::{ArmedDeleteButton, ArmedDeleteStep, armed_delete_step};
 #[allow(unused_imports)]
 pub use autocomplete_line::{AutocompleteLine, AutocompleteLineResponse};
 pub use byte_cap_edit::{ByteCapEdit, bytes_to_gib, gib_to_bytes, snap_to_half_gib};
@@ -195,7 +203,7 @@ pub use panel_dock::{
     PanelLayoutWriter, PanelNode, PanelSizes, PanelTab, PanelTabHeader, SolvedLayout, SolvedPanel,
     SubWindowNode, TabExtras, TabId,
 };
-pub use preset_picker::{PresetPicker, PresetPickerAction, PresetPickerResponse, PresetPickerState};
+pub use preset_picker::{PresetPicker, PresetPickerAction, PresetPickerResponse, PresetPickerState, preset_wheel_target};
 #[allow(unused_imports)]
 pub use searchable_combo_box::{
     RowLayout, SearchableComboBox, SearchableComboItem, SearchableComboResponse,
@@ -216,7 +224,7 @@ pub use text_edit_plus::{TextEditPlus, TextEditPlusBackground, TextEditPlusTextC
 pub use viewport_color_selector::ViewportColorSelector;
 #[allow(unused_imports)]
 pub use wheel_combo_box::WheelComboBox;
-pub use wheel_input_guard::combo_popup_open;
+pub use wheel_input_guard::{combo_popup_open, cycle_wrapped_index};
 #[allow(unused_imports)]
 pub use wheel_slider::WheelSlider;
 #[allow(unused_imports)]

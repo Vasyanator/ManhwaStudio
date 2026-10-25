@@ -15,7 +15,9 @@ Key structures:
 
 Key functions:
 - `PresetPicker::show()`: draws the block and reports at most one action.
-- `wheel_target()`, `delete_step()`, `popup_id_bucket()`: the pure decisions the drawing uses.
+- `preset_wheel_target()` (public: the typing tab's image-row local-preset combo shares it),
+  `popup_id_bucket()`: the pure decisions the drawing uses. The two-click «Delete» is
+  `ArmedDeleteButton` (`armed_delete_button.rs`).
 
 Notes:
 - DRAW ONLY. The caller owns the preset list, every decision (what create / select / save /
@@ -31,8 +33,9 @@ Notes:
 - Texts are `widgets.preset_picker.*` except the combo label, which the caller hands in.
 */
 
-use crate::WheelComboBox;
+use crate::armed_delete_button::{ArmedDeleteButton, ArmedDeleteStep};
 use crate::wheel_input_guard::cycle_wrapped_index;
+use crate::WheelComboBox;
 use eframe::egui;
 use egui::{Id, Response, Ui, WidgetText};
 
@@ -227,7 +230,7 @@ impl<'a> PresetPicker<'a> {
         }
     }
 
-    /// Row 1: the combo. THE WHEEL NEVER CREATES: wheel steps go through [`wheel_target`],
+    /// Row 1: the combo. THE WHEEL NEVER CREATES: wheel steps go through [`preset_wheel_target`],
     /// which cycles «None» plus the presets only, so a stray scroll over the closed combo can
     /// never mint a preset.
     fn draw_combo(&self, ui: &mut Ui, selected_name: Option<&str>) -> (Response, Option<PresetPickerAction>) {
@@ -262,7 +265,7 @@ impl<'a> PresetPicker<'a> {
             // Wheel steps are only reported while the popup is CLOSED, so they can never race
             // with a click collected above.
             if let Some(steps) = combo.wheel_steps
-                && let Some(target) = wheel_target(self.selected, self.names.len(), steps)
+                && let Some(target) = preset_wheel_target(self.selected, self.names.len(), steps)
             {
                 action = Some(target.map_or(PresetPickerAction::Deselect, PresetPickerAction::Select));
             }
@@ -330,57 +333,20 @@ fn shows_unsaved_warning(selected_name: Option<&str>, unsaved: bool, rename: boo
     selected_name.is_some() && (unsaved || (rename && state.has_pending_rename(selected_name)))
 }
 
-/// The two-step delete button: the first click ARMS it (the caption switches to the confirm
-/// wording), a second PLAIN click confirms. Returns the button response and whether this frame
-/// confirmed. Red in both states — destructive at rest — and more strongly so once armed.
-///
-/// A physical DOUBLE-click cannot delete, and a stale arm auto-disarms as soon as the pointer
-/// leaves the button; see [`delete_step`].
+/// The two-step delete button ([`ArmedDeleteButton`], red at rest and more strongly so once
+/// armed) over the state's single arm. Returns the button response and whether this frame
+/// confirmed; the confirm leaves the arm as it is (the caller's deselect resets it).
 fn draw_delete_control(ui: &mut Ui, state: &mut PresetPickerState, enabled: bool) -> (Response, bool) {
-    // A disabled button reports neither clicks nor hovers, so an arm left behind by a selection
-    // change could otherwise sit there until the next selection.
-    let armed = state.delete_armed && enabled;
-    let button = if armed {
-        egui::Button::new(t!("widgets.preset_picker.delete_confirm_button"))
-            .fill(ms_theme::status::DESTRUCTIVE_ARMED_FILL)
-    } else {
-        egui::Button::new(t!("widgets.preset_picker.delete_button")).fill(ms_theme::status::DESTRUCTIVE_IDLE_FILL)
-    };
-    let response = ui.add_enabled(enabled, button);
-    let step = delete_step(armed, response.clicked(), response.double_clicked(), response.hovered());
+    let (response, step) = ArmedDeleteButton::new(t!("widgets.preset_picker.delete_button"), t!("widgets.preset_picker.delete_confirm_button"))
+        .idle_fill(ms_theme::status::DESTRUCTIVE_IDLE_FILL)
+        .enabled(enabled)
+        .show(ui, state.delete_armed);
     match step {
-        DeleteStep::Arm => state.delete_armed = true,
-        DeleteStep::Disarm => state.delete_armed = false,
-        DeleteStep::Confirm | DeleteStep::Keep => {}
+        ArmedDeleteStep::Arm => state.delete_armed = true,
+        ArmedDeleteStep::Disarm => state.delete_armed = false,
+        ArmedDeleteStep::Confirm | ArmedDeleteStep::Keep => {}
     }
-    (response, step == DeleteStep::Confirm)
-}
-
-/// One frame's transition of the two-step delete button.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeleteStep {
-    /// The armed button got a plain click: delete.
-    Confirm,
-    /// The idle button got a plain click: arm it.
-    Arm,
-    /// The armed button lost the pointer: disarm, so a later unrelated click cannot delete.
-    Disarm,
-    /// Nothing changes.
-    Keep,
-}
-
-/// Decides [`DeleteStep`] from the effective arm (`false` while the button is disabled) and the
-/// frame's response flags. A click that is also a double click never counts: a double-click
-/// delivers a press on two consecutive frames and must not arm-and-confirm in one gesture.
-#[must_use]
-fn delete_step(armed: bool, clicked: bool, double_clicked: bool, hovered: bool) -> DeleteStep {
-    if clicked && !double_clicked {
-        if armed { DeleteStep::Confirm } else { DeleteStep::Arm }
-    } else if armed && !hovered {
-        DeleteStep::Disarm
-    } else {
-        DeleteStep::Keep
-    }
+    (response, step == ArmedDeleteStep::Confirm)
 }
 
 /// Where a wheel notch over the CLOSED combo moves the selection.
@@ -391,8 +357,11 @@ fn delete_step(armed: bool, clicked: bool, double_clicked: bool, hovered: bool) 
 /// `selected` is the selection's position among the names (`None` for «None») and `count`
 /// their number. Returns `None` when the selection does not move (no steps, or a wrap that
 /// lands back on the current row); otherwise `Some(position)`, whose inner `None` is «None».
+///
+/// Public because a preset combo that cannot be a `PresetPicker` (the typing tab's local
+/// presets draw image rows) must still cycle exactly like one.
 #[must_use]
-fn wheel_target(selected: Option<usize>, count: usize, steps: i32) -> Option<Option<usize>> {
+pub fn preset_wheel_target(selected: Option<usize>, count: usize, steps: i32) -> Option<Option<usize>> {
     let index = selected.map_or(0, |pos| pos + 1);
     let next = cycle_wrapped_index(index, count + 1, steps);
     (next != index).then(|| next.checked_sub(1))
@@ -444,18 +413,37 @@ fn popup_id_bucket(ui: &Ui, row_count: usize) -> usize {
 mod tests {
     use super::*;
 
+    /// THE contract of the wheel: no step ever reaches a "create" outcome, names a preset that
+    /// does not exist, or reports the row that is already selected.
+    #[test]
+    fn wheel_never_leaves_the_virtual_list() {
+        for count in 0..5usize {
+            for steps in -9..=9i32 {
+                for selected in std::iter::once(None).chain((0..count).map(Some)) {
+                    let Some(target) = preset_wheel_target(selected, count, steps) else {
+                        continue;
+                    };
+                    if let Some(index) = target {
+                        assert!(index < count, "count={count} steps={steps} index={index}");
+                    }
+                    assert_ne!(target, selected, "count={count} steps={steps}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn wheel_cycles_none_and_presets_only() {
-        assert_eq!(wheel_target(None, 2, 1), Some(Some(0)));
-        assert_eq!(wheel_target(Some(0), 2, 1), Some(Some(1)));
+        assert_eq!(preset_wheel_target(None, 2, 1), Some(Some(0)));
+        assert_eq!(preset_wheel_target(Some(0), 2, 1), Some(Some(1)));
         // Past the last preset the wheel wraps to «None», never onto a create row.
-        assert_eq!(wheel_target(Some(1), 2, 1), Some(None));
-        assert_eq!(wheel_target(None, 2, -1), Some(Some(1)));
+        assert_eq!(preset_wheel_target(Some(1), 2, 1), Some(None));
+        assert_eq!(preset_wheel_target(None, 2, -1), Some(Some(1)));
         // Only «None» exists, or no step: nothing moves.
-        assert_eq!(wheel_target(None, 0, 1), None);
-        assert_eq!(wheel_target(Some(0), 2, 0), None);
+        assert_eq!(preset_wheel_target(None, 0, 1), None);
+        assert_eq!(preset_wheel_target(Some(0), 2, 0), None);
         // A full lap lands back on the current row.
-        assert_eq!(wheel_target(Some(0), 2, 3), None);
+        assert_eq!(preset_wheel_target(Some(0), 2, 3), None);
     }
 
     #[test]
@@ -469,19 +457,6 @@ mod tests {
         assert!(!action_changes_nothing(Some(0), PresetPickerAction::Create));
         assert!(!action_changes_nothing(Some(0), PresetPickerAction::Save));
         assert!(!action_changes_nothing(Some(0), PresetPickerAction::Delete(0)));
-    }
-
-    #[test]
-    fn delete_needs_an_armed_plain_click_and_disarms_off_hover() {
-        assert_eq!(delete_step(false, true, false, true), DeleteStep::Arm);
-        assert_eq!(delete_step(true, true, false, true), DeleteStep::Confirm);
-        // A double click neither arms nor confirms.
-        assert_eq!(delete_step(false, true, true, true), DeleteStep::Keep);
-        assert_eq!(delete_step(true, true, true, true), DeleteStep::Keep);
-        // An armed button that lost the pointer disarms; a hovered one stays armed.
-        assert_eq!(delete_step(true, false, false, false), DeleteStep::Disarm);
-        assert_eq!(delete_step(true, false, false, true), DeleteStep::Keep);
-        assert_eq!(delete_step(false, false, false, false), DeleteStep::Keep);
     }
 
     #[test]

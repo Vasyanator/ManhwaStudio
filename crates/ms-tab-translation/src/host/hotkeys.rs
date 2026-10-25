@@ -82,7 +82,7 @@ impl TranslationTab {
             TOGGLE_MT_PANEL => state.toggle_machine_translation_panel_hotkey(),
             TOGGLE_DETECTOR_PANEL => state.toggle_text_detector_panel_hotkey(),
             LINES_DELETE => state.delete_selected_text_detector_line(),
-            LINES_NEW => state.create_text_detector_line_at_page_center(canvas, project),
+            LINES_NEW => state.create_text_detector_line_at_page_center(canvas),
             // Modes and gestures never fire; every other id belongs to another owner.
             _ => return false,
         }

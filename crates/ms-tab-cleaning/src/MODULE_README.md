@@ -148,7 +148,14 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   polls `draw` runs), so their `TextMaskModel` / `CleanOverlaysModel` writes do not wait for the
   user to come back and quick-clean page patches do not pile up in the channel; a 100 ms repaint
   runs while one is in flight. The region-edit tools' jobs are still polled only while the tab
-  draws (their polls need the canvas and the open editor session).
+  draws (their polls need the canvas and the open editor session). At teardown
+  `flush_debounced_stores_blocking` writes what the tools' settings writers still owe
+  (`CleaningTool::flush_settings_blocking` of every tool; the region-edit engines' `SettingsSaver`s).
+- `text_mask_storage.rs`: reads a page's stored text-detector mask (`{idx:05}_mask.png`) with
+  the `source_size` / `mask_size` its `{idx:05}_blocks.json` records (format owned by
+  `ms-tab-translation`; a mask may be stored smaller than the page). Used by the display-cache
+  load and the quick text clean's disk fallback, so a scaled stored mask reaches `TextMaskModel`
+  with the page's real source size, never as a source-sized mask of another image.
 - `lib.rs`: module wiring and public re-export of `CleaningTabState`.
 
 ## Contracts and invariants
@@ -416,7 +423,7 @@ tab draws; `CleaningDrawParams::{input, input_registry}` carry the frame and the
   user bindings and must never be renamed); how a claimed canvas drag reaches the tool is
   `canvas_input.rs`; GPU eviction or any other studio-root hook is `studio_tab.rs`.
 - To change brush, stamp, inpaint, or fill behavior, edit the relevant file under `tools/`.
-- To change text-mask loading or tiled mask drawing, start in `tab.rs` and check
-  `TextMaskModel` contracts in `crates/ms-models/src/`.
+- To change text-mask loading or tiled mask drawing, start in `tab.rs` (the stored-file reader is
+  `text_mask_storage.rs`) and check `TextMaskModel` contracts in `crates/ms-models/src/`.
 - To change committed overlay mutation/history semantics, use `CanvasView` overlay APIs and
   `CleanOverlaysModel`; do not mutate shared overlay storage directly from tools.

@@ -600,10 +600,9 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   `publish_canvas_settings`. It decides NOTHING about z-order: within one `Order` egui keeps a
   persistent layer list and re-sorts it stably each pass, so creation order inside the frame is
   irrelevant; a layer rises only when `Area::begin` finds it was not visible last frame
-  (`egui-docs/06-overlays.md` §1.1). The standing consequence is that a tab's full-canvas
-  `Order::Foreground` capture surface floats above the dock's panels for as long as its selection
-  mode lasts and takes the clicks meant for them — the same clicks the pre-dock controls panel lost
-  on the lower `Order::Middle`, i.e. known behaviour, not a regression to "fix" by reordering.
+  (`egui-docs/06-overlays.md` §1.1), and only within its own order. The canvas' capture area is on
+  `Order::Background` (`input::capture_layer_for`), always below the dock's `Order::Foreground`
+  panels, so raising it never takes a click meant for a panel.
 - The canvas does NOT load fonts. Bubble text is drawn with the egui family named by
   `helpers::BUBBLE_TEXT_FONT_FAMILY_NAME`, which is an alias of
   `crate::ui_fonts::BUBBLE_TEXT_FAMILY_NAME`; the chain behind that family is installed once

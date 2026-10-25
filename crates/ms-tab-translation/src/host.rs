@@ -145,6 +145,7 @@ impl TranslationTab {
         canvas.set_bottom_hint(Some(CanvasBottomHint { rows: state.input_labels().hint_rows(state.lines_edit_active()) }));
         state.sync_with_project_settings(project);
         state.prepare_tool_frame(detector_page_size(page_infos.get(&canvas.current_page_idx())));
+        state.note_page_sizes(page_infos);
         canvas.set_overlay_render_suppressed(false);
         canvas.set_overlay_upload_min_interval_s(0.0);
         // `panel_dock` is lent for the frame and disjoint from `state` and `canvas`; the canvas

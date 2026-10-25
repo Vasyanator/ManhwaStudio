@@ -2677,6 +2677,12 @@ paths change.
     /// list at all.
     #[test]
     fn imported_system_font_labels_are_renumbered_after_the_cross_source_merge() {
+        // `load_fonts` ends in the fonts_data v1 migration over the PROCESS-GLOBAL font-settings
+        // store, so it takes the store lock like every other store test: unlocked, it could
+        // finish a migration another test had seeded mid-assertion (a `Folder.ttf` here matches
+        // that test's legacy key).
+        let _lock = super::font_settings_store::test_lock();
+        super::font_settings_store::test_reset();
         let Some(fixture) = committed_font_fixture() else {
             return;
         };
@@ -3377,6 +3383,12 @@ paths change.
     /// only sees files under the fonts dir — so the fold happens on the COMBINED list.
     #[test]
     fn a_folder_font_and_a_byte_identical_imported_copy_are_one_entry() {
+        // `load_fonts` ends in the fonts_data v1 migration over the PROCESS-GLOBAL font-settings
+        // store, so it takes the store lock like every other store test: unlocked, it could
+        // finish a migration another test had seeded mid-assertion (a `Folder.ttf` here matches
+        // that test's legacy key).
+        let _lock = super::font_settings_store::test_lock();
+        super::font_settings_store::test_reset();
         let Some(fixture) = committed_font_fixture() else {
             eprintln!("шрифт-фикстура репозитория недоступна, пропускаем тест");
             return;
@@ -4415,12 +4427,13 @@ paths change.
         );
     }
 
-    /// Repo fixture font used by the advanced-form width-metric tests: a single-face
-    /// Regular file, so a real Bold/Italic face request has nothing to match.
+    /// Fixture font used by the advanced-form width-metric tests and every test that needs one
+    /// real font file: a single-face Regular file, so a real Bold/Italic face request has
+    /// nothing to match. It is the TRACKED first face of the bundled `fonts/ui` stack, so the
+    /// suite runs on a fresh clone (a gitignored fixture under `test/` broke that).
     fn advanced_form_fixture_font_path() -> PathBuf {
-        // Workspace-root fixture; this crate sits two levels down (crates/ms-tab-typing).
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf")
+        // Workspace root: this crate sits two levels down (crates/ms-tab-typing).
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fonts/ui/core/00-NotoSans-Regular.ttf")
     }
 
     /// A create panel whose only font is the fixture file, selected face 0.
@@ -4647,11 +4660,11 @@ paths change.
         );
         assert!(
             !available.italic,
-            "LiberationSans-Regular ships no Italic face"
+            "NotoSans-Regular ships no Italic face"
         );
         assert!(
             !available.bold,
-            "LiberationSans-Regular ships no Bold-weight face"
+            "NotoSans-Regular ships no Bold-weight face"
         );
     }
 

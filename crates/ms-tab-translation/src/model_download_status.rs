@@ -149,6 +149,7 @@ mod tests {
 
     #[test]
     fn downloading_with_a_known_size_fills_the_bar_and_names_the_file() {
+        let _locale = crate::hold_locale_for_test();
         let view = model_download_status_view(&event(ModelDownloadPhase::Downloading, 0, 512, Some(2048)));
         assert_eq!(
             view.text,
@@ -166,6 +167,7 @@ mod tests {
 
     #[test]
     fn downloading_with_an_unknown_size_draws_no_bar() {
+        let _locale = crate::hold_locale_for_test();
         let view = model_download_status_view(&event(ModelDownloadPhase::Downloading, 1, 512, None));
         assert_eq!(view.fraction, None);
         assert_eq!(
@@ -177,6 +179,7 @@ mod tests {
     /// A retry reads as progress with its delay and attempt, and keeps the staged fill.
     #[test]
     fn retrying_names_the_delay_and_the_attempt() {
+        let _locale = crate::hold_locale_for_test();
         let phase = ModelDownloadPhase::Retrying { attempt: 2, max_attempts: 5, delay_secs: 4 };
         let view = model_download_status_view(&event(phase, 0, 1024, Some(2048)));
         assert_eq!(view.text, tf!("translation.model_download.retrying_status", file = "det.onnx", seconds = 4, attempt = 2, max = 5));
@@ -185,6 +188,7 @@ mod tests {
 
     #[test]
     fn waiting_for_another_download_is_a_line() {
+        let _locale = crate::hold_locale_for_test();
         let view = model_download_status_view(&event(ModelDownloadPhase::WaitingForOtherDownload, 0, 0, None));
         assert_eq!(view.text, tf!("translation.model_download.waiting_status", file = "det.onnx"));
         assert_eq!(view.fraction, None);

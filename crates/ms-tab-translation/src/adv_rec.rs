@@ -40,6 +40,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use ms_thread::{self as thread, JoinHandle};
 
 use crate::input::{ADV_REC_ERASE, ADV_REC_PAINT, ADV_REC_SELECT_RECT, TARGET_ADV_REC_IMAGE, TranslationInputLabels};
+use crate::page_crop;
 
 const ADV_REC_TEXTURE_OPTIONS: TextureOptions = TextureOptions::LINEAR;
 const ADV_REC_MIN_ZOOM: f32 = 0.1;
@@ -1528,28 +1529,17 @@ fn crop_page_image_to_color_image(
         return Err(tf!("translation.adv_rec.empty_image_error", page_path = page_path.display()));
     }
 
-    let [u1, v1, u2, v2] = normalized_uv(uv_rect);
-    let x1 = ((u1 * img_w as f32).floor() as u32).min(img_w.saturating_sub(1));
-    let y1 = ((v1 * img_h as f32).floor() as u32).min(img_h.saturating_sub(1));
-    let x2 = ((u2 * img_w as f32).ceil() as u32).min(img_w);
-    let y2 = ((v2 * img_h as f32).ceil() as u32).min(img_h);
-    if x2 <= x1 || y2 <= y1 {
+    // The one uv -> pixel rule (`page_crop`), so this preview crops exactly the pixels the OCR
+    // worker and the region detection crop for the same selection.
+    let Some(rect) = page_crop::uv_rect_to_pixel_rect(uv_rect, img_w, img_h) else {
         return Err(t!("translation.adv_rec.selection_too_small_window_error").to_string());
-    }
+    };
 
-    let crop = source.crop_imm(x1, y1, x2 - x1, y2 - y1).to_rgba8();
+    let crop = source.crop_imm(rect.x, rect.y, rect.width, rect.height).to_rgba8();
     Ok(ColorImage::from_rgba_unmultiplied(
         [crop.width() as usize, crop.height() as usize],
         crop.as_raw(),
     ))
-}
-
-fn normalized_uv(uv: [f32; 4]) -> [f32; 4] {
-    let left = uv[0].min(uv[2]).clamp(0.0, 1.0);
-    let right = uv[0].max(uv[2]).clamp(0.0, 1.0);
-    let top = uv[1].min(uv[3]).clamp(0.0, 1.0);
-    let bottom = uv[1].max(uv[3]).clamp(0.0, 1.0);
-    [left, top, right, bottom]
 }
 
 fn rotation_is_effectively_zero(rotation_degrees: f32) -> bool {

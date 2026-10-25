@@ -284,7 +284,7 @@ impl TypingCreatePanelState {
                     }
                 });
             if let Some(steps) = effect_combo.wheel_steps {
-                cycle_wrapped_index(&mut effect_idx, effect_kinds.len(), steps);
+                effect_idx = cycle_wrapped_index(effect_idx, effect_kinds.len(), steps);
             }
             self.effect_to_add = effect_kinds[effect_idx];
 

@@ -84,7 +84,7 @@ const ALIGN_EPSILON: f32 = 0.5;
 /// through `Ui::dnd_drag_source`, see `panel.rs`) and read by whatever the tab is
 /// released over. It must be read in the SAME pass as the release:
 /// egui's drag-and-drop plugin clears the payload in `on_end_pass` of any pass
-/// that saw `any_released()` (`egui-0.35.0/src/drag_and_drop.rs:52-62`).
+/// that saw `any_released()` (`egui-0.36.2/src/drag_and_drop.rs:53-63`).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct DraggedTab {
     /// The tab being moved.
@@ -617,9 +617,9 @@ pub fn empty_space_drop(area: Rect, occupied: &[Rect], pos: Pos2) -> Option<Pos2
 /// (`egui-docs/06-overlays.md` §3). The colour is the style's selection stroke,
 /// never a literal, so it follows the theme.
 pub fn paint_snap_preview(ctx: &egui::Context, candidate: &SnapCandidate) {
-    // `Context::style()` does not exist in 0.35: styles are per theme, and the
-    // active one is `style_of(theme())` (`egui-0.35.0/src/context.rs:2090`,
-    // `:2153`) — the same style a `Ui` resolves `visuals()` from.
+    // There is no `Context::style()`: styles are per theme, and the
+    // active one is `style_of(theme())` (fork `crates/egui/crates/egui/src/context.rs:2165`,
+    // `:2228`) — the same style a `Ui` resolves `visuals()` from.
     let color = ctx.style_of(ctx.theme()).visuals.selection.stroke.color;
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Tooltip,
@@ -672,7 +672,7 @@ pub fn paint_detach_preview(ctx: &egui::Context, outline: Rect) {
         egui::Id::new("ms_panel_dock_detach_preview"),
     ));
     // `dashed_line` only connects consecutive points, so the first corner is
-    // repeated to close the rectangle (`epaint-0.35.0/src/shapes/shape.rs:170`).
+    // repeated to close the rectangle (`epaint-0.36.2/src/shapes/shape.rs:170`).
     let corners = [
         outline.left_top(),
         outline.right_top(),

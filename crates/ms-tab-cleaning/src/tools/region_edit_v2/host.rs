@@ -1409,6 +1409,17 @@ impl RegionEditHost {
     }
 }
 
+/// The status line of a frame cancel: a pending result is "discarded"; without one the cancel
+/// only stopped work in flight (a run, a mask detection or the region load before either) and
+/// says so. The frame offers cancel only while one of the two exists (`FrameButtons::cancel`).
+fn cancel_status_text(had_result: bool) -> String {
+    if had_result {
+        t!("cleaning.tools.area_editor.cancelled_status").to_string()
+    } else {
+        t!("cleaning.mask_editor.processing_cancelled_status").to_string()
+    }
+}
+
 impl CleaningTool for RegionEditHost {
     fn title(&self) -> &'static str {
         (self.spec.title)()
@@ -1418,6 +1429,14 @@ impl CleaningTool for RegionEditHost {
     /// whose current engine wants Torch is offered exactly like the Torch tools beside it.
     fn pytorch_required(&self) -> bool {
         self.engine().is_some_and(AiEngine::requires_torch)
+    }
+
+    /// Every engine of the catalog, not only the selected one: an engine switched away from
+    /// within its save debounce still owes its last edit.
+    fn flush_settings_blocking(&mut self) {
+        for engine in &mut self.engines {
+            engine.flush_settings_blocking();
+        }
     }
 
     fn deactivate(&mut self, _canvas: &mut CanvasView) {
@@ -1549,8 +1568,10 @@ impl CleaningTool for RegionEditHost {
             self.frame.masks_mut().clear_all();
         }
         if outcome.cancel_requested {
+            // Read BEFORE `cancel_run` clears it: what the cancel threw away picks the sentence.
+            let had_result = self.frame.result().is_some();
             self.cancel_run();
-            self.report_info(t!("cleaning.tools.area_editor.cancelled_status").to_string());
+            self.report_info(cancel_status_text(had_result));
         }
         // Process before apply: the two are mutually exclusive by `FrameButtons`, and running
         // first keeps the order the buttons sit in.
@@ -1610,6 +1631,15 @@ mod tests {
 
     fn rect(x: usize, y: usize, w: usize, h: usize) -> OverlayRectPx {
         OverlayRectPx { x, y, w, h }
+    }
+
+    /// A cancel says "result discarded" only when a result was pending; a cancel that only
+    /// stopped work in flight says the processing was cancelled.
+    #[test]
+    fn the_cancel_line_names_what_was_thrown_away() {
+        assert_eq!(cancel_status_text(true), t!("cleaning.tools.area_editor.cancelled_status"));
+        assert_eq!(cancel_status_text(false), t!("cleaning.mask_editor.processing_cancelled_status"));
+        assert_ne!(cancel_status_text(true), cancel_status_text(false));
     }
 
     /// The spec every host test builds from. Its catalog is two idle [`RecordingEngine`]s, not

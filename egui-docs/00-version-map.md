@@ -106,7 +106,7 @@ fork in `crates/egui` (root `[patch.crates-io]`); two facts differ from upstream
   `unprocessed_wheel_delta` / `smooth_wheel_delta` (`input_state/wheel_state.rs:53,67`) are an
   implementation detail of smoothing, not a replacement for the old raw delta. Do not plan around them.
 
-**In this repo:** `src/input_util.rs:31` `raw_wheel_delta(&egui::InputState) -> Vec2` reconstructs the old
+**In this repo:** `crates/ms-widgets/src/input_util.rs:31` `raw_wheel_delta(&egui::InputState) -> Vec2` reconstructs the old
 semantics by summing this frame's `Event::MouseWheel` deltas. Use it for Ctrl+wheel zoom/rotate; do not
 read `smooth_scroll_delta` for modifier-gated wheel handling.
 
@@ -120,9 +120,10 @@ read `smooth_scroll_delta` for modifier-gated wheel handling.
   `!root_ui_available_rect.contains(pos)` (`context.rs:2951-2958`). An app whose root `Ui` is fully
   consumed by a space-filling `CentralPanel` leaves `root_ui_available_rect` empty, so this returns
   `true` for *every* point over the central content.
-* Workaround used in this repo (`src/input_util.rs:55`, `pointer_over_floating_area`): take
-  `ctx.layer_id_at(pos)` (`context.rs:3104`) and test `layer.order != egui::Order::Background`
-  (`egui-0.36.2/src/layers.rs:10-27`). That answers "is the pointer over a floating Window/menu/popup/
+* Workaround used in this repo (`ms_input::Condition::PointerOnView`, decided by the input router's
+  `surface_at` in `crates/ms-input/src/router.rs`): take `ctx.layer_id_at(pos)` (`context.rs:3104`) and
+  accept the point only when that layer is `Order::Background` (`egui-0.36.2/src/layers.rs:10-27`) or
+  the view's own capture layer. That answers "is the pointer over a floating Window/menu/popup/
   tooltip rather than the canvas", which is what canvas hit-testing actually needs.
 
 ---

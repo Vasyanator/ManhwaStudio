@@ -1,6 +1,11 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
-// A standalone eframe test app outside the studio: it has no input router, so the crate's
-// `clippy.toml` ban on raw key reads (input-migrated crate) does not apply to its `C` shortcut.
+// Documented exception to two project rules (PROJECT_RULES.md "Input" and "Localization"): this is
+// a standalone developer example, never shipped and never run inside the studio, so it has no
+// `InputRegistry` / `InputRouter` and no i18n. Its one shortcut (`C`) is read raw, which the crate's
+// `clippy.toml` ban on raw key reads (input-migrated crate) would otherwise reject, and its status
+// hint spells its bindings (`ПКМ`, `C`) as literals because there is no registry to take labels
+// from. Developer/test binaries are outside i18n per `dev-docs/i18n_exclusions.md`. A binding or
+// hint that ever moves into product code must go through `ms-input` and `t!` instead.
 #![expect(clippy::disallowed_methods, reason = "standalone dev example without the studio input router; reads its one test key directly")]
 
 /*

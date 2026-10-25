@@ -1529,7 +1529,7 @@ fn draw_host<'frame, C>(
         .and_then(|(window, pointer)| window.to_global(pointer));
     // Published only while the cursor is LIVE here (`latest_pos`), never from the
     // one extra frame `interact_pos` survives a `PointerGone` for
-    // (`egui-0.35.0/src/input_state/mod.rs:1103`, `:1204`): that frame's value is
+    // (`egui-0.36.2/src/input_state/mod.rs:1106`, `:1207`): that frame's value is
     // where the cursor WAS, and a window drawn after the one that really has it
     // would otherwise overwrite the live reading with it.
     if gesture_in_flight && latest_pos.is_some() && local_global.is_some() {
@@ -2060,7 +2060,7 @@ fn draw_host<'frame, C>(
 /// Geometry of every window of this dock, in the shared monitor frame.
 ///
 /// `RawInput::viewports` carries the info of ALL viewports in every pass
-/// (`eframe-0.35.0/src/native/glow_integration.rs:585-589`, `:1549-1554`), so one
+/// (fork `crates/egui/crates/eframe/src/native/glow_integration.rs:659-663`, `:1916-1921`), so one
 /// window can read where the others are without waiting for their passes. The
 /// entries for immediate viewports are one frame old, which a drag — repainting
 /// continuously — cannot notice.
@@ -2078,7 +2078,7 @@ fn draw_host<'frame, C>(
 /// there is no API that would let the dock do better.
 fn window_geometries(ctx: &egui::Context, state: &PanelDockState) -> Vec<WindowGeometry> {
     // Read outside `Context::input`: reading the context again from inside that
-    // closure deadlocks (`egui-0.35.0/src/context.rs:915-925`).
+    // closure deadlocks (fork `crates/egui/crates/egui/src/context.rs:988-998`).
     let zoom = ctx.zoom_factor();
     let main_viewport = state.main_viewport;
     ctx.input(|input| {
@@ -2094,7 +2094,7 @@ fn window_geometries(ctx: &egui::Context, state: &PanelDockState) -> Vec<WindowG
                 return;
             }
             // The factor egui-winit itself uses to turn points into the pixels
-            // the window manager speaks (`egui-winit-0.35.0/src/lib.rs:51-55`).
+            // the window manager speaks (fork `crates/egui/crates/egui-winit/src/lib.rs:54-58`).
             let pixels_per_point = zoom * info.native_pixels_per_point.unwrap_or(1.0);
             if let Some(window) = WindowGeometry::new(host, inner_rect, pixels_per_point) {
                 windows.push(window);
@@ -2739,7 +2739,8 @@ fn free_slot_in_host(layout: &DockLayout, host: HostId) -> Pos2 {
 /// went.
 ///
 /// `ViewportCommand::Focus` is sent TO the destination viewport
-/// (`egui-0.35.0/src/context.rs:3921`, `viewport.rs:1170`) and the window manager
+/// (fork `crates/egui/crates/egui/src/context.rs:4030`,
+/// `egui-0.36.2/src/viewport.rs:1169`) and the window manager
 /// does the rest. It is a REQUEST: egui states that it has no effect on Wayland,
 /// or on a minimised or hidden window, and nothing here depends on it succeeding
 /// — the move itself has already been applied to the model.
@@ -3118,7 +3119,7 @@ enum DragPhase {
 ///
 /// A pointer that leaves the window while the button is held does NOT end the
 /// gesture (`PointerGone` deliberately keeps the drag alive,
-/// `egui-0.35.0/src/input_state/mod.rs:1200-1210`): the session is latched as
+/// `egui-0.36.2/src/input_state/mod.rs:1203-1213`): the session is latched as
 /// "outside" and the panel simply stops following, so the user can come back —
 /// which clears the latch again — or release out there, which detaches. Ending it
 /// on the spot instead would make an accidental brush past the window border look

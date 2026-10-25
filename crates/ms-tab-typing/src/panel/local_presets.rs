@@ -488,7 +488,7 @@ impl TypingCreatePanelState {
     /// every indexed candidate the SAME string, and an unbounded search would then spin on the
     /// GUI thread forever instead of degrading to a repeated name. The runtime `locale/*.json`
     /// catalogs are user-editable, so that is a reachable state, not a hypothetical one — the
-    /// global-preset sibling (`create_presets::free_default_preset_name`) is bounded for the
+    /// global-preset allocator (`ms_config::preset_store::free_default_name`) is bounded for the
     /// same reason.
     #[must_use]
     fn free_local_preset_default_name(&self) -> String {

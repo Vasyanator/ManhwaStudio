@@ -87,7 +87,7 @@ fn draw_gradient_area_mode_combo(
             }
         });
     if let Some(steps) = combo.wheel_steps {
-        cycle_wrapped_index(&mut idx, 2, steps);
+        idx = cycle_wrapped_index(idx, 2, steps);
     }
     *mode = if idx == 0 {
         GradientAreaMode::FullImage
@@ -348,7 +348,7 @@ pub(super) fn draw_effect_card_controls(
                     }
                 });
             if let Some(steps) = stroke_opacity_combo.wheel_steps {
-                cycle_wrapped_index(&mut opacity_idx, 2, steps);
+                opacity_idx = cycle_wrapped_index(opacity_idx, 2, steps);
             }
             changed |= opacity_idx != stroke_opacity_prev;
             stroke.opacity_mode = if opacity_idx == 0 {
@@ -407,7 +407,7 @@ pub(super) fn draw_effect_card_controls(
                     }
                 });
             if let Some(steps) = color_mode_combo.wheel_steps {
-                cycle_wrapped_index(&mut color_mode_idx, 2, steps);
+                color_mode_idx = cycle_wrapped_index(color_mode_idx, 2, steps);
             }
             changed |= color_mode_idx != color_mode_prev;
             shadow.color_mode = if color_mode_idx == 0 {
@@ -455,7 +455,7 @@ pub(super) fn draw_effect_card_controls(
                     }
                 });
             if let Some(steps) = sharp_copy_combo.wheel_steps {
-                cycle_wrapped_index(&mut sharp_copy_idx, 3, steps);
+                sharp_copy_idx = cycle_wrapped_index(sharp_copy_idx, 3, steps);
             }
             changed |= sharp_copy_idx != sharp_copy_prev;
             blur.sharp_copy_mode = match sharp_copy_idx {
@@ -485,7 +485,7 @@ pub(super) fn draw_effect_card_controls(
                     }
                 });
             if let Some(steps) = material_combo.wheel_steps {
-                cycle_wrapped_index(&mut material_idx, 2, steps);
+                material_idx = cycle_wrapped_index(material_idx, 2, steps);
             }
             changed |= material_idx != material_prev;
             dry_media.material = if material_idx == 0 {
@@ -580,7 +580,7 @@ pub(super) fn draw_effect_card_controls(
                     }
                 });
             if let Some(steps) = kind_combo.wheel_steps {
-                cycle_wrapped_index(&mut kind_idx, 4, steps);
+                kind_idx = cycle_wrapped_index(kind_idx, 4, steps);
             }
             changed |= kind_idx != kind_prev;
             interference.kind = match kind_idx {
@@ -663,7 +663,7 @@ pub(super) fn draw_effect_card_controls(
                         }
                     });
                 if let Some(steps) = glow_shape_combo.wheel_steps {
-                    cycle_wrapped_index(&mut shape_idx, 2, steps);
+                    shape_idx = cycle_wrapped_index(shape_idx, 2, steps);
                 }
                 changed |= shape_idx != glow_shape_prev;
                 glow.outline_shape = if shape_idx == 0 {
@@ -760,7 +760,7 @@ pub(super) fn draw_effect_card_controls(
                         }
                     });
                 if let Some(steps) = glow_opacity_combo.wheel_steps {
-                    cycle_wrapped_index(&mut opacity_idx, 2, steps);
+                    opacity_idx = cycle_wrapped_index(opacity_idx, 2, steps);
                 }
                 changed |= opacity_idx != glow_opacity_prev;
                 glow.opacity_mode = if opacity_idx == 0 {
@@ -831,7 +831,7 @@ pub(super) fn draw_effect_card_controls(
                     }
                 });
             if let Some(steps) = gradient2_fill_combo.wheel_steps {
-                cycle_wrapped_index(&mut fill_mode_idx, 2, steps);
+                fill_mode_idx = cycle_wrapped_index(fill_mode_idx, 2, steps);
             }
             changed |= fill_mode_idx != gradient2_fill_prev;
             gradient.fill_mode = if fill_mode_idx == 0 {
@@ -898,7 +898,7 @@ pub(super) fn draw_effect_card_controls(
                     }
                 });
             if let Some(steps) = gradient4_fill_combo.wheel_steps {
-                cycle_wrapped_index(&mut fill_mode_idx, 2, steps);
+                fill_mode_idx = cycle_wrapped_index(fill_mode_idx, 2, steps);
             }
             changed |= fill_mode_idx != gradient4_fill_prev;
             gradient.fill_mode = if fill_mode_idx == 0 {
@@ -945,7 +945,7 @@ pub(super) fn draw_effect_card_controls(
                     }
                 });
             if let Some(steps) = reflect_axis_combo.wheel_steps {
-                cycle_wrapped_index(&mut axis_idx, 2, steps);
+                axis_idx = cycle_wrapped_index(axis_idx, 2, steps);
             }
             changed |= axis_idx != reflect_axis_prev;
             reflect.axis = if axis_idx == 0 {

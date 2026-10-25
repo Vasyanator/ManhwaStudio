@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `19` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `20` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `crates/ms-backend-ipc/src/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -78,7 +78,7 @@ WebSocket is only a carrier.
 
 | Field             | Type   | Required on            | Meaning                                                                 |
 |-------------------|--------|------------------------|-------------------------------------------------------------------------|
-| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 19. Optional/ignored on others.  |
+| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 20. Optional/ignored on others.  |
 | `id`              | u64    | all framed messages    | Correlation id. `0` means a server-initiated frame (events, hello).     |
 | `kind`            | string | all                    | One of `hello`,`request`,`response`,`progress`,`event`,`cancel`,`error`.|
 | `method`          | string | `request`              | Method name, e.g. `ocr.manga`. See §5.                                  |
@@ -180,7 +180,7 @@ or cancels explicitly.
 ```
 
 Events are not correlated to any request (`id = 0`). They replace health polling
-and add model-load progress and optional log streaming. See §7 for per-topic
+and carry device changes and optional log streaming. See §7 for per-topic
 payloads. Clients that do not care about a topic ignore it.
 
 ### 3.5 `error` — protocol-level error
@@ -1224,7 +1224,6 @@ Events are `kind:"event"`, `id:0`, with a `topic`. Payload fields are inline in
 |--------------|--------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------|
 | `health`     | periodic (~1s) snapshot push               | `ok: bool`, `service: "mf_ai_backend"`, `backend_version: string`, `snapshot_unix_s: float`, `is_torch_available: bool`, `ocr: {easyocr, mangaocr, paddleocr, paddleocrvl, suryaocr, baberuocr}` (each that service's own `health()` object with at least `ready: bool`; `paddleocrvl` is `{ready, device, model, last_error}` where `model` is the resident variant label or `null`, and `baberuocr` is `{ready, device, last_error}` where `device` is the effective vision device, e.g. `"CUDAExecutionProvider:0"` or `"CPUExecutionProvider"`, or `null` when nothing is resident; its decoders always run on the CPU), `text_detector: {ctd, paddle, surya}`, `inpaint: {lama_v2, lama_mpe, aot, flux_fill, flux2_klein, flux3_klein}` (`flux3_klein` since v15: `Flux3KleinService.health()`), `watermark: object`, `image_processing: {reline}`, `machine_translation: object`, `model_manager: object` (see "`model_manager` payload" below), `torch: object|null` (since v18, see "`torch` payload" below). (Warming-up form: `snapshot_state:"warming_up"` plus `ok/service/backend_version/snapshot_unix_s/is_torch_available`.) | none              |
 | `device`     | device/provider selection changed          | the full `device.get` result shape (selected/available torch + onnx fields)                                                                                                                                                    | none              |
-| `model_load` | model load/unload progress (new in v2)     | `model: string`, `phase: string` (e.g. `"start"\|"progress"\|"done"\|"unload"`), `loaded: int` (optional), `total: int` (optional), `message: string` (optional)                                                               | none              |
 | `log`        | optional backend log line stream (opt-in)  | `level: string` (e.g. `"info"\|"warn"\|"error"`), `message: string`, `ts_unix_s: float` (optional)                                                                                                                             | none              |
 
 The `health` snapshot payload mirrors `_build_health_snapshot` /

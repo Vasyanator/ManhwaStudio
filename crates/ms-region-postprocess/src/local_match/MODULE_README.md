@@ -38,7 +38,6 @@ each side's robust mode would pick different band pixels.
   `LocalMatchError`, geometry, the robust-moment cascade, the fields, the final remap.
 - `grid.rs`: `Field` and the low-pass helpers (block mean, fused moment block mean, bilinear
   up, Gaussian, sigma-adaptive smooth, reflect fill, numpy pairwise sum, row scheduling).
-- `lab.rs`: sRGB u8 <-> CIELAB (D65) f32 conversion tables.
 - `jitter.rs`: splitmix64 and the per-block sample positions of the coarse levels.
 - `tests.rs`: parity against the golden fixtures (`../../fixtures/`), contract tests,
   helper-equivalence tests, the ignored release benchmark.
@@ -66,5 +65,5 @@ each side's robust mode would pick different band pixels.
 - Constants, the three steps and the overall flow: `mod.rs`.
 - A numpy-order or border question in a low-pass helper: `grid.rs` (the equivalence tests in
   `tests.rs` pin the fused / tap-major fast paths to their direct forms).
-- Colour conversion: `lab.rs`. Sampling pattern: `jitter.rs` (change it only together with the
+- Colour conversion: the crate-level `../lab.rs` (`crate::lab::LabTables`). Sampling pattern: `jitter.rs` (change it only together with the
   fixture generator `tools/make_region_postprocess_fixtures.py`).

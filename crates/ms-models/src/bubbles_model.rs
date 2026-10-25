@@ -192,13 +192,21 @@ fn px_to_world(value: i32) -> f32 {
     value as f32
 }
 
-/// A shared-settings world length as persisted integer px: negative values clamp to 0 and the
-/// value is rounded to the nearest integer (the rounding of the project canvas writer).
-///
-/// Float-to-int `as` saturates at the `i32` bounds and maps NaN to 0; after `round()` no
-/// fraction is lost, so that documented saturation is the only possible change of value.
+/// A shared-settings world length as persisted integer px: negative values (and NaN) clamp to 0,
+/// the value is rounded to the nearest integer (the rounding of the project canvas writer), and
+/// a value beyond the `i32` range (infinity included) saturates to `i32::MAX`.
+#[must_use]
 fn world_to_px(value: f32) -> i32 {
-    value.max(0.0).round() as i32
+    /// 2^31: the first `f32` integer that no longer fits an `i32`.
+    const I32_LIMIT: f32 = 2_147_483_648.0;
+    // `f32::max` returns the other operand for NaN, so NaN becomes 0 here.
+    let rounded = value.max(0.0).round();
+    if rounded >= I32_LIMIT {
+        return i32::MAX;
+    }
+    // Checked above: `rounded` is a finite, non-negative whole number below 2^31, so the
+    // conversion is exact (no truncation, no sign or range loss; rules/rust.md cast exception).
+    rounded as i32
 }
 
 /// Assigns `value` to `slot` and reports whether the stored value changed.
@@ -1033,6 +1041,20 @@ fn send_snapshot_to_bubbles_saver(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// World lengths become persisted px exactly as the canvas writer rounds them, and every
+    /// out-of-range input lands on a defined value instead of an unchecked cast.
+    #[test]
+    fn world_to_px_rounds_clamps_and_saturates() {
+        assert_eq!(world_to_px(12.4), 12);
+        assert_eq!(world_to_px(12.5), 13);
+        assert_eq!(world_to_px(-3.0), 0);
+        assert_eq!(world_to_px(f32::NAN), 0);
+        assert_eq!(world_to_px(f32::NEG_INFINITY), 0);
+        assert_eq!(world_to_px(2_147_483_520.0), 2_147_483_520, "the largest f32 below 2^31 is exact");
+        assert_eq!(world_to_px(2_147_483_648.0), i32::MAX);
+        assert_eq!(world_to_px(f32::INFINITY), i32::MAX);
+    }
 
     /// `apply_layout` writes every layout field, reports a change exactly when one happened,
     /// leaves the other fields alone, and `layout` reads the applied values back.

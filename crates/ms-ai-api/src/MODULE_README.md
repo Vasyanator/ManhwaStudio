@@ -88,7 +88,8 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
   `image_input_support` over an ordered, hard-coded table, and `is_non_chat_model` (the
   non-chat markers alone).
 - `metadata.rs`: `AiApiMetadata`, `load_metadata` (wasm stub), private model listing.
-- `openrouter.rs` (native): `fetch_account_status` + pure `format_account_status`.
+- `openrouter.rs` (native): `fetch_account_status` (one GET over `http::UreqTransport` with its
+  own connect / request timeouts and body cap) + pure `format_account_status`.
 - `quota.rs`: `is_probable_quota_or_limit_error`.
 - `encoding.rs`: `base64_encode` / strict `base64_decode` (`Base64Error`), the one base64 codec
   (chat parts, image-edit bodies and responses).

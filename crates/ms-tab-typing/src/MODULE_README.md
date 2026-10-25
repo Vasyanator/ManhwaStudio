@@ -741,7 +741,10 @@ saving, and export.
     defaults, the legacy inline-tags flag — plus the formula/drawn/vector layout <-> `Value`
     conversions (free fns), and `TypingPanelSeed` (formula presets + parameter identity mode read
     once; `TypingTopPanelState::from_seed` / `TypingCreatePanelState::with_config` build the
-    panels from it without config I/O). Retains only the READ helper `load_text_tab_imported_system_fonts`
+    panels from it without config I/O). Formula presets are saved by name VERBATIM (a blank name
+    saves nothing) through each panel's ordered writer (`ms_config::preset_store::OrderedWriter`,
+    job `FormulaPresetsWrite`, step `run_formula_presets_write`); a failed write reaches that
+    panel's status line (`poll_formula_preset_writes`, both panels, every frame). Retains only the READ helper `load_text_tab_imported_system_fonts`
     for the one-time legacy migration (see `font_settings_store`); the imported-fonts WRITE path
     moved to `fonts_data.rs`, and the CREATE PRESETS moved to `presets_store.rs`.
   - `presets_store.rs`: the SINGLE owner of `fonts/presets.json` (version 2 — the version that

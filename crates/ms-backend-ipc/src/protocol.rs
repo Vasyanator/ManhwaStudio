@@ -105,7 +105,9 @@ use serde_json::{Map, Value, json};
 /// preset store, written by the Settings pane) and `TranslarionTab.composition_presets` (the
 /// composition panel's app-wide presets, written by the Translation tab). The backend reads none
 /// of them.
-pub const PROTOCOL_VERSION: u32 = 19;
+/// 20: the `model_load` event topic is removed (it was declared but never published or
+/// subscribed to); the valid topics are `health`, `device`, `log`.
+pub const PROTOCOL_VERSION: u32 = 20;
 
 // ============================================================================
 // FRAME SIZE GUARDS
@@ -145,7 +147,6 @@ pub const STATUS_INTERRUPTED: &str = "interrupted";
 
 pub const TOPIC_HEALTH: &str = "health";
 pub const TOPIC_DEVICE: &str = "device";
-pub const TOPIC_MODEL_LOAD: &str = "model_load";
 pub const TOPIC_LOG: &str = "log";
 
 // ============================================================================

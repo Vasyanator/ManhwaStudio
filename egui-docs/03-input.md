@@ -72,24 +72,17 @@ of the same helper, `raw_wheel_events_delta` — `crates/ms-widgets/src/wheel_sl
 `egui-0.31.1/src/context.rs:2581`). The surviving `Context::is_pointer_over_egui`
 (`egui-0.36.2/src/context.rs:2943`) is **not** a drop-in: with a space-filling `CentralPanel` the root
 ui's available rect is empty, so it reports `true` for every point over the central content. That
-permanently suppressed deselect-on-empty-click in the typing tab (see the doc comment at
-`crates/ms-widgets/src/input_util.rs:42-53`).
+permanently suppressed deselect-on-empty-click in the typing tab.
 
-**Project replacement:**
+**Project replacement:** `ms_input::Condition::PointerOnView`. A viewer publishes its surface to the
+input router each frame; the router (`crates/ms-input/src/router.rs`, `surface_at`) counts the
+pointer as on that view only where `Context::layer_id_at` (`egui-0.36.2/src/context.rs:3104`)
+reports an `Order::Background` layer or the view's own capture layer (`Order` at
+`egui-0.36.2/src/layers.rs:10`: `Background, Middle, Foreground, Tooltip, Debug`). That answers
+"is a `Window`/menu/popup/tooltip/dock panel drawn above this point", which is the question canvas
+code actually has. Canvas actions declare the condition; nothing tests the layer by hand.
 
-```rust
-// crates/ms-widgets/src/input_util.rs:55
-pub fn pointer_over_floating_area(ctx: &egui::Context) -> bool
-// = ctx.layer_id_at(interact_pos).is_some_and(|l| l.order != egui::Order::Background)
-```
-Built on `Context::layer_id_at` (`egui-0.36.2/src/context.rs:3104`) and `Order`
-(`egui-0.36.2/src/layers.rs:10`: `Background, Middle, Foreground, Tooltip, Debug`). It answers
-"is a `Window`/menu/popup/tooltip drawn above this point", which is the question canvas code actually
-has. No product caller remains: the input-migrated canvases ask the same question through
-`ms_input::Condition::PointerOnView` (the router's `Context::layer_id_at` test against the published
-view surface).
-
-Which to use: `pointer_over_floating_area` for "did this canvas click land on bare canvas";
+Which to use: `Condition::PointerOnView` for "did this canvas click land on bare canvas";
 `egui_wants_keyboard_input()` (`context.rs:2986`) for "is a text field eating my key presses".
 
 ## PointerState
@@ -316,7 +309,8 @@ Facts the canvas finger gestures rely on (owner: `ms_input::touch`,
   never synthesize a mouse press.
 - Wheel/zoom on a migrated canvas → an `ms-input` axis (`view.zoom` is shared); elsewhere (page
   manager) `ms_widgets::input_util::raw_wheel_delta` (`crates/ms-widgets/src/input_util.rs:31`).
-- "Did the click hit bare canvas?" → `ms_widgets::input_util::pointer_over_floating_area` (`crates/ms-widgets/src/input_util.rs:55`).
+- "Did the click hit bare canvas?" → declare the action with `ms_input::Condition::PointerOnView`
+  (`crates/ms-input/src/context.rs`); the router's `surface_at` does the z-order test.
 - New hotkey, held modifier, wheel axis or tool gesture → declare it in its owner's `ms-input`
   declarations and read the `InputFrame` (`crates/ms-input/MODULE_README.md`, "Editing map");
   display it with `InputRegistry::label`.

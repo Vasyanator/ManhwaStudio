@@ -4,8 +4,8 @@ File: src/tabs/settings/canvas_layout_presets.rs
 Purpose:
 The layout preset block of Settings › «Лента и пузыри»: an `ms_widgets::PresetPicker` over the
 built-in presets «Pages» / «Webtoon» and the user's own presets, the decisions behind each
-picker action, and the ordered off-thread writer that persists every store operation into
-`user_config` (`Canvas.layout_presets`).
+picker action, and the ordered off-thread writer (`ms_config::preset_store::OrderedWriter`) that
+persists every store operation into `user_config` (`Canvas.layout_presets`).
 
 Key structures:
 - LayoutPresetsPane: the in-memory store (`ms_project::CanvasLayoutPresets`), the picker state,
@@ -48,13 +48,12 @@ Notes:
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::models::bubbles_model::SharedCanvasSettings;
 use crate::project::{BuiltinLayoutPreset, CanvasLayout, CanvasLayoutPresets, LayoutPresetOp, LayoutPresetSelection, apply_layout_preset_op};
 use crate::runtime_log;
 use crate::widgets::{PresetPicker, PresetPickerAction, PresetPickerState};
-use ms_thread::{self as thread, JoinHandle};
+use ms_config::preset_store::{OrderedWriter, SubmitError, free_default_name};
 
 /// i18n key of the combo label, also the picker's stable id salt.
 const PRESET_LABEL_KEY: &str = "settings.canvas_ribbon.preset_label";
@@ -112,14 +111,8 @@ struct WriteOutcome {
     error: Option<String>,
 }
 
-/// The ordered store writer: one thread applying [`LayoutPresetOp`]s to one `user_config` file
-/// in arrival order, answering every operation with a [`WriteOutcome`].
-#[derive(Debug)]
-struct PresetWriter {
-    /// `None` only while dropping (closing it ends the thread's loop).
-    tx: Option<Sender<LayoutPresetOp>>,
-    handle: Option<JoinHandle<()>>,
-}
+/// One job of the ordered writer: an operation and the `user_config` file it goes to.
+type WriteJob = (PathBuf, LayoutPresetOp);
 
 /// The layout preset block and its store. See the file header for the rules.
 #[derive(Debug)]
@@ -135,16 +128,13 @@ pub(super) struct LayoutPresetsPane {
     failed: BTreeSet<PresetRow>,
     /// Where writes go; `None` keeps every operation in memory.
     store_path: Option<PathBuf>,
-    /// Started on the first write.
-    writer: Option<PresetWriter>,
-    outcomes_tx: Sender<WriteOutcome>,
-    outcomes_rx: Receiver<WriteOutcome>,
+    /// The ordered writer (`ms_config::preset_store`); its thread starts on the first write.
+    writer: OrderedWriter<WriteJob, WriteOutcome>,
 }
 
 impl Default for LayoutPresetsPane {
     /// An empty store without persistence (the state before the studio binds a title).
     fn default() -> Self {
-        let (outcomes_tx, outcomes_rx) = mpsc::channel();
         Self {
             presets: CanvasLayoutPresets::default(),
             picker: PresetPickerState::default(),
@@ -152,26 +142,7 @@ impl Default for LayoutPresetsPane {
             write_error: None,
             failed: BTreeSet::new(),
             store_path: None,
-            writer: None,
-            outcomes_tx,
-            outcomes_rx,
-        }
-    }
-}
-
-impl Drop for LayoutPresetsPane {
-    /// Closes the writer's queue and waits for the queued writes, so an operation made just
-    /// before the studio closes still reaches the disk. The settings tab is dropped by the studio's
-    /// teardown worker, never on the GUI thread.
-    fn drop(&mut self) {
-        let Some(mut writer) = self.writer.take() else {
-            return;
-        };
-        drop(writer.tx.take());
-        if let Some(handle) = writer.handle.take()
-            && handle.join().is_err()
-        {
-            runtime_log::log_error("[settings::layout_presets] the layout preset writer thread panicked; the last preset operations may not be saved");
+            writer: OrderedWriter::new("layout-presets-writer", run_write_job),
         }
     }
 }
@@ -180,7 +151,8 @@ impl LayoutPresetsPane {
     /// Installs `presets` (pre-read from `user_config` at studio open; no I/O here) and the
     /// `store_path` later operations persist to, and validates the title's `selection` against
     /// it: a user preset that no longer exists becomes «Нет» (saved with the next canvas-settings
-    /// save). A writer that is already running is kept (same document).
+    /// save). A writer that is already running is kept; every job carries its own file, so later
+    /// operations go to the new `store_path`.
     pub(super) fn rebind(&mut self, presets: CanvasLayoutPresets, store_path: Option<PathBuf>, selection: &mut LayoutPresetSelection) {
         self.presets = presets;
         self.store_path = store_path;
@@ -397,23 +369,11 @@ impl LayoutPresetsPane {
     }
 
     /// `settings.canvas_ribbon.preset_default_name` with the lowest 1-based index no preset
-    /// carries. Bounded: `count + 1` candidates against `count` names, with a suffix fallback for
-    /// a catalog entry that lost `{index}`.
+    /// carries, by the shared bounded allocator (`ms_config::preset_store::free_default_name`).
     #[must_use]
     fn free_default_name(&self) -> String {
         let taken = self.presets.user_names().count() + BuiltinLayoutPreset::ALL.len();
-        for index in 1..=taken + 1 {
-            let candidate = tf!("settings.canvas_ribbon.preset_default_name", index = index);
-            if !self.name_taken(&candidate) {
-                return candidate;
-            }
-        }
-        let base = tf!("settings.canvas_ribbon.preset_default_name", index = taken + 1);
-        (2..=taken + 2)
-            .map(|suffix| format!("{base} ({suffix})"))
-            .find(|candidate| !self.name_taken(candidate))
-            // Unreachable by the same bound: `taken + 1` candidates against `taken` names.
-            .unwrap_or_else(|| format!("{base} ({})", taken + 2))
+        free_default_name(taken, |index| tf!("settings.canvas_ribbon.preset_default_name", index = index), |name| self.name_taken(name))
     }
 
     /// Hands `op` to the writer thread (started on first use). Without a store path the operation
@@ -423,32 +383,18 @@ impl LayoutPresetsPane {
         let Some(path) = self.store_path.clone() else {
             return;
         };
-        if self.writer.is_none() {
-            match spawn_writer(path.clone(), self.outcomes_tx.clone()) {
-                Ok(writer) => self.writer = Some(writer),
-                Err(err) => {
-                    runtime_log::log_error(format!("[settings::layout_presets] could not start the layout preset writer thread; op={} path={} error={err}", op.describe(), path.display()));
-                    self.apply_write_outcome(WriteOutcome { entries: op_entries(&op), error: Some(err.to_string()) });
-                    return;
-                }
-            }
-        }
-        let description = op.describe();
-        let entries = op_entries(&op);
-        let sent = self.writer.as_ref().and_then(|writer| writer.tx.as_ref()).is_some_and(|tx| tx.send(op).is_ok());
-        if !sent {
-            runtime_log::log_error(format!("[settings::layout_presets] the layout preset writer thread is gone; an operation was not saved; op={description} path={}", path.display()));
-            self.apply_write_outcome(WriteOutcome { entries, error: Some(t!("settings.canvas_ribbon.preset_writer_lost_error").to_owned()) });
-            // A fresh writer is started by the next operation.
-            self.writer = None;
-        }
+        let (path, op, error) = match self.writer.submit((path, op)) {
+            Ok(()) => return,
+            Err(SubmitError::Spawn { job: (path, op), error }) => (path, op, error.to_string()),
+            Err(SubmitError::WorkerGone { job: (path, op) }) => (path, op, t!("settings.canvas_ribbon.preset_writer_lost_error").to_owned()),
+        };
+        runtime_log::log_error(format!("[settings::layout_presets] a layout preset operation was not saved; op={} path={} error={error}", op.describe(), path.display()));
+        self.apply_write_outcome(WriteOutcome { entries: op_entries(&op), error: Some(error) });
     }
 
     /// Applies every answer the writer sent since the last frame.
     fn poll_write_outcomes(&mut self) {
-        // The pane holds a sender itself, so the channel cannot disconnect while `self` lives; an
-        // `Err` (empty) simply means "nothing more to read".
-        while let Ok(outcome) = self.outcomes_rx.try_recv() {
+        while let Some(outcome) = self.writer.try_recv_outcome() {
             self.apply_write_outcome(outcome);
         }
     }
@@ -496,24 +442,10 @@ fn persist(path: &Path, op: &LayoutPresetOp) -> Result<(), String> {
     }
 }
 
-/// Starts the ordered writer over `path`; every operation is answered on `outcomes` (failures
-/// are logged too).
-///
-/// # Errors
-/// The OS error when the thread cannot be spawned.
-fn spawn_writer(path: PathBuf, outcomes: Sender<WriteOutcome>) -> std::io::Result<PresetWriter> {
-    let (tx, rx) = mpsc::channel::<LayoutPresetOp>();
-    let handle = thread::Builder::new().name("layout-presets-writer".to_owned()).spawn(move || {
-        while let Ok(op) = rx.recv() {
-            let outcome = WriteOutcome { entries: op_entries(&op), error: persist(&path, &op).err() };
-            // The pane outlives the writer (it joins it on drop), so a send can only fail during
-            // that drop, when nobody would read the answer anyway.
-            if outcomes.send(outcome).is_err() {
-                runtime_log::log_warn("[settings::layout_presets] a layout preset write outcome had no reader (the pane is closing)");
-            }
-        }
-    })?;
-    Ok(PresetWriter { tx: Some(tx), handle: Some(handle) })
+/// The writer thread's step: persists one operation (logged by [`persist`]) and answers with the
+/// operation's entries and the error, if any.
+fn run_write_job((path, op): WriteJob) -> WriteOutcome {
+    WriteOutcome { entries: op_entries(&op), error: persist(&path, &op).err() }
 }
 
 #[cfg(test)]
@@ -682,7 +614,7 @@ mod tests {
         pane.rebind(CanvasLayoutPresets::default(), Some(path.clone()), &mut selection);
         let settings = SharedCanvasSettings::default();
         assert!(pane.create(&mut selection, &settings));
-        let outcome = pane.outcomes_rx.recv_timeout(std::time::Duration::from_secs(30)).map_err(|err| err.to_string())?;
+        let outcome = pane.writer.recv_outcome_timeout(std::time::Duration::from_secs(30)).map_err(|err| err.to_string())?;
         assert!(outcome.error.is_some(), "{outcome:?}");
         pane.apply_write_outcome(outcome);
         assert!(pane.is_unsaved(&selection, &settings));

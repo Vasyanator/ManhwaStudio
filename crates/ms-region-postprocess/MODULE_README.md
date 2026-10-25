@@ -14,6 +14,19 @@ The crate also owns the FLUX.2 klein LATENT mask: the engine builds it BEFORE a 
 colour-match `sample_mask` of the result. The name says "postprocess"; the dilation is shared on
 purpose so the latent mask and the colour-match margins use one kernel rule.
 
+It is also the project's one owner of the sRGB <-> CIELAB (D65) conversion (`lab`, public:
+`LabTables`, `encode_srgb`): the local match and the cleaning tab's gradient fill use the same
+tables. A new CIELAB consumer calls it instead of writing its own matrices.
+
+Look-alike rules that are deliberately NOT routed here (each documents why at its site):
+- the patch tool's coverage ramp (`ms-tools` `patch::membrane`): city-block depth, image border
+  not a contour, outer ring at 0 — the patch blend is pinned on that ramp, not on this feather;
+- the text renderer's `dilate_alpha_ellipse` (`ms-text-render` effects): grey-level, four
+  per-side semi-axes, exact lattice inequality — a styling element, not cv2's;
+- the cloud editor's `composite_feathered` (`ms-ai-api` `image_edit`): an OUTWARD feather
+  (square dilation + box blur) — a provider re-renders the whole frame, so the paint must be
+  covered completely and the soft edge falls on source pixels.
+
 Layer: the `ms-studio-tab` line of `ARCHITECTURE.md` §2 (above `ms-raster`, `ms-widgets`,
 `ms-i18n`). Consumers: `ms-tab-cleaning` (the region-edit host and the FLUX engines); the cloud
 editor (`ms-ai-api::image_edit`) may use it later. It never depends on a tab crate, `ms-models`
@@ -47,6 +60,7 @@ run's mode (`Ring` for a painted mask, `EdgeBand` for a whole-region run), fixed
 - `src/settings.rs`: `PostprocessSettings` (persisted keys), `EffectiveSettings`, ranges and defaults.
 - `src/pipeline.rs`: `RegionInputs`, `ColourReference`, `RegionPostprocessor` (stage caches, `render`,
   `render_masked_into`), `postprocess_region`; the cache keys and the field-cache bounds.
+- `src/lab.rs`: `LabTables` (sRGB u8 <-> CIELAB f32, numpy-exact) and `encode_srgb`; public.
 - `src/mask.rs`: `dilate_ellipse` (public, radius capped at `MAX_DILATE_RADIUS_PX`; also used by
   `local_match/` for its 3 px margin).
 - `src/global_match.rs`: mean/std match — ring selection (`match_color_global`) or edge band
@@ -144,6 +158,7 @@ All paths below are under `src/`.
 - Defaults or ranges: `settings.rs` (the UI dials read them).
 - A new stage or a cache key: `pipeline.rs` (extend `alternating_settings_equal_fresh_renders`).
 - The ring / band statistics: `global_match.rs`; the band geometry: `edge_band.rs`; the local
-  CIELAB match (both modes): `local_match/`.
+  CIELAB match (both modes): `local_match/`; the colour conversion itself: `lab.rs` (pinned by
+  the parity fixtures AND by the gradient fill's characterization tests in `ms-tab-cleaning`).
 - The edge ramp: `feather.rs`; the blend: `composite.rs`.
 - Labels and hints: `ui.rs` + `cleaning.region_postprocess.*` in `ms-i18n` `en.json` / `ru.json`.

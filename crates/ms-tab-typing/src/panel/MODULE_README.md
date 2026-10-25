@@ -441,9 +441,10 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
     `create_global_preset` names the preset itself (`typing.presets.default_name`, the LOWEST
     free 1-based index, so an index freed by a rename or a deletion is reused) and inherits
     `capture_current_preset`, so creation never depends on the name box.
-    **THE WHEEL MUST NEVER REACH THE CREATE ROW** (the widget's `wheel_target` cycles «Нет» +
+    **THE WHEEL MUST NEVER REACH THE CREATE ROW** (the widget's `preset_wheel_target` cycles «Нет» +
     the real presets only) — the create row exists in the popup alone, or a stray scroll over
-    the closed combo would mint presets. Same rule and same shape as the local-preset combo.
+    the closed combo would mint presets. The local-preset combo (image rows, not a picker) calls
+    the same `ms_widgets::preset_wheel_target`.
     The popup's TOTAL ROW COUNT is folded into its `id_salt`
     (the widget's `popup_id_bucket`) for the reason spelled out for the
     local-preset combo below — the list grows in place, and a popup `Area` remembers its size
@@ -694,7 +695,7 @@ computed from.
 
 THE FACE COMBO IS HIDDEN WHEN THE FONT HAS ONE FACE OR NONE
 (`create_main_text::draw_font_section`). Nothing is lost by not drawing it — a one-item
-`selectable_value` cannot move, `cycle_wrapped_index` returns early for `len <= 1`, and the
+`selectable_value` cannot move, `ms_widgets::cycle_wrapped_index` leaves a `len <= 1` index unchanged, and the
 write-back would store what it just read — but `clamp_face_index` MUST still run on the hidden
 path, otherwise a `selected_face_idx` inherited from a many-faced font would survive with no
 widget left to reveal it.

@@ -4,12 +4,12 @@ File: ai_api_editor/settings.rs
 Purpose:
 Everything the cloud engine persists to `ms_config::ai_api_edit_settings_path()` — the selected
 provider, each visited provider's model id and endpoint (region id or server address), the
-prompt and the mask blend — plus the file IO. The save gate is the shared
-`region_edit_v2::engine_settings::settings_save_due`.
+prompt and the mask blend — plus the file IO. WHEN the file is written is the shared
+`SettingsSaver`'s decision (`region_edit_v2::engine_settings_file`: quiet-time debounce, retry,
+teardown flush); this file only writes it, atomically, through the shared `write_settings_json`.
 
 Key structures:
 - `ApiEditSettings`, `StoredChoice`
-- `SettingsSaveError`
 
 Key functions:
 - `load_api_edit_settings()`, `save_api_edit_settings()`
@@ -26,6 +26,7 @@ is armed (`persistence_suppressed_by_tests`, the pattern of
 `ms-tab-typing/src/panel/font_settings_store.rs`).
 */
 
+use crate::tools::region_edit_v2::engine_settings_file::{SettingsWriteError, write_settings_json};
 use ms_ai_api::image_edit::{ImageEditProvider, ImageEditSelection, MaskBlend, ProviderChoice};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -129,17 +130,6 @@ impl ApiEditSettings {
     }
 }
 
-/// Why the settings file could not be written. Logged by the saver; never shown as a dialog.
-#[derive(Debug, thiserror::Error)]
-pub(super) enum SettingsSaveError {
-    #[error("could not create the settings directory {path}: {source}")]
-    CreateDir { path: String, source: std::io::Error },
-    #[error("could not serialize the settings: {0}")]
-    Serialize(#[from] serde_json::Error),
-    #[error("could not write {path}: {source}")]
-    Write { path: String, source: std::io::Error },
-}
-
 /// Reads the settings file. A missing file is the first-run case and yields the defaults
 /// silently; an unreadable or malformed one yields the defaults and a warning in the log (the
 /// next user edit then replaces it). Runs on a worker thread.
@@ -191,21 +181,31 @@ fn persistence_suppressed_by_tests() -> bool {
     cfg!(test) || TEST_PROCESS_LATCH.load(Ordering::Acquire)
 }
 
-/// Writes `settings` to the settings file. Runs on a worker thread. A test process writes
-/// nothing (`persistence_suppressed_by_tests`): the path is the user's real data directory.
+/// Names this engine in the shared settings saver's log lines.
+pub(super) const API_EDIT_LOG_LABEL: &str = "cloud image edit (API)";
+
+/// Writes `settings` to the settings file, replacing it atomically (the shared
+/// `write_settings_json`). Runs on a worker thread (the saver's, or the studio teardown
+/// worker). A test process writes nothing (`persistence_suppressed_by_tests`): the path is the
+/// user's real data directory.
 ///
 /// # Errors
-/// `CreateDir` / `Write` on IO failure, `Serialize` when the document cannot be encoded.
-pub(super) fn save_api_edit_settings(settings: &ApiEditSettings) -> Result<(), SettingsSaveError> {
+/// A technical description naming the failed step and the path. It is only LOGGED (by the
+/// saver), never shown in the panel, so it is not localized (`dev-docs/i18n_exclusions.md`:
+/// log text).
+pub(super) fn save_api_edit_settings(settings: &ApiEditSettings) -> Result<(), String> {
     if persistence_suppressed_by_tests() {
         return Ok(());
     }
     let path = ms_config::ai_api_edit_settings_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| SettingsSaveError::CreateDir { path: parent.display().to_string(), source })?;
-    }
-    let raw = serde_json::to_string_pretty(settings)?;
-    fs::write(&path, raw).map_err(|source| SettingsSaveError::Write { path: path.display().to_string(), source })
+    write_settings_json(&path, settings).map_err(|err| {
+        let step = match &err {
+            SettingsWriteError::CreateDir(_) => "could not create the settings directory for",
+            SettingsWriteError::Serialize(_) => "could not serialize the settings for",
+            SettingsWriteError::Write(_) => "could not write",
+        };
+        format!("{step} {}: {err}", path.display())
+    })
 }
 
 #[cfg(test)]

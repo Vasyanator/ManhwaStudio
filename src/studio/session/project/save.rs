@@ -249,7 +249,10 @@ impl ProjectSession {
         // in a staging dir re-created after the merge deleted it, while the app reported "saved".
         let overlay_autosave_control = parts.writers.overlay_control();
         let (tx, rx) = std::sync::mpsc::channel::<Result<MergeDone, String>>();
+        let wake_gui = self.job_waker("save-to-project");
         let spawned = thread::Builder::new().name("save-to-project".to_owned()).spawn(move || {
+            // Declared first so it drops last: after the result was sent, on every return path.
+            let _wake_gui = wake_gui;
             // Hold later bubble snapshots until every destructive staging operation below is done.
             // Dropping this guard on any return path resumes the saver.
             let bubbles_barrier = match bubbles_saver_handle.barrier_and_hold_blocking() {

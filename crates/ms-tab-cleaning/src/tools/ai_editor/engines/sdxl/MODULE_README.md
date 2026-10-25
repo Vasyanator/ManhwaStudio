@@ -52,8 +52,9 @@ subtree and it is one-directional.
   sampler list, a parameter range, or the preview width.
 - `settings.rs`: `SdxlMode` and its wire spelling, `SdxlSettings` (one full parameter set per mode)
   with the per-mode defaults, `SdxlPersisted` (the document), `SdxlRunConfig` (the worker snapshot),
-  the file IO (the save gate `settings_save_due` is shared, in
-  `../../../region_edit_v2/engine_settings.rs`). Edit it to add, rename or re-default a persisted field.
+  the file IO (`save_sdxl_settings`: atomic through the shared `write_settings_json`, nothing in a
+  test build; when it is written is the shared `SettingsSaver`'s decision,
+  `../../../region_edit_v2/engine_settings_file.rs`). Edit it to add, rename or re-default a persisted field.
 - `progress.rs`: `SdxlSharedProgress`, the poison-tolerant lock, the generation claim/retire/publish
   helpers, the bar fraction, `draw_sdxl_progress_bar` (drawn by `AiEngine::draw_progress`, pinned
   above the parameters) and `draw_sdxl_latent_preview` (inside the scrolled parameters, because it

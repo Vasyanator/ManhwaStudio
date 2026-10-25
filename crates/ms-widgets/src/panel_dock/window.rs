@@ -41,11 +41,11 @@ Key functions:
 Notes:
 NO GLOBAL CURSOR POSITION EXISTS. egui exposes none at all, and on Wayland
 `ViewportInfo::inner_rect` / `outer_rect` are always `None`
-(`egui-0.35.0/src/data/input/viewport_info.rs:52-66`), so it cannot be derived
+(`egui-0.36.2/src/data/input/viewport_info.rs:52-66`), so it cannot be derived
 either. Every decision here is therefore taken from window-LOCAL facts: whether
 the pointer left the window while a button was held (`PointerGone` clears
 `latest_pos` but deliberately does not end the drag,
-`egui-0.35.0/src/input_state/mod.rs:1200-1210`), and how far outside the dock
+`egui-0.36.2/src/input_state/mod.rs:1203-1213`), and how far outside the dock
 area the pointer is — the only "how far out" a window can measure at all.
 
 IMMEDIATE WHILE IT HOLDS PANELS, DEFERRED WHILE IDLE. `Context::show_viewport_immediate`
@@ -82,8 +82,17 @@ const SUB_WINDOW_VIEWPORT_SALT: &str = "ms_panel_subwindow";
 /// Outer size, in points, a freshly detached sub-window opens at.
 pub const DEFAULT_SUB_WINDOW_SIZE: Vec2 = Vec2::new(420.0, 560.0);
 
-/// Smallest size, in points, a sub-window may be resized to. Below this the
-/// panels inside it cannot draw their header strip.
+/// Smallest inner size, in points, a sub-window may be resized to: the OS window
+/// is built with it as its minimum (`sub_window_builder`), and a restored size
+/// below it is raised to it ([`SubWindowNode::new`]).
+///
+/// A chosen usability floor (a window the user can still see, grab and drop a
+/// tab onto), NOT a measurement of the hosted panels. Header captions wrap, so a
+/// panel's own floor is its measured caption `min_width`, which this constant
+/// does not know; in a sub-window narrower than that floor the panel keeps its
+/// floor and is shifted, not shrunk further. Deriving the window minimum from
+/// those measurements would feed panel layout back into the viewport builder
+/// one frame late, so it is deliberately not done.
 pub const MIN_SUB_WINDOW_SIZE: Vec2 = Vec2::new(260.0, 200.0);
 
 /// Distance, in points, the pointer must be pulled BEYOND the dock area's border
@@ -233,7 +242,7 @@ pub fn drag_tension(area: Rect, pointer: Option<Pos2>, pointer_left_window: bool
     };
     // Zero inside the rect, and the euclidean distance to the nearest point of
     // it outside — including diagonally past a corner
-    // (`emath-0.35.0/src/rect.rs:391-425`).
+    // (`emath-0.36.2/src/rect.rs:391-425`).
     let pull = area.distance_to_pos(pos);
     if !pull.is_finite() {
         return DragTension::Inside;
@@ -455,8 +464,8 @@ pub fn sub_window_name(index: u32) -> String {
 /// of the window's identity without a separate invalidation path: eframe diffs
 /// the `ViewportBuilder` and emits `ViewportCommand::Title` for a title that
 /// differs from the one the window already carries
-/// (`eframe-0.35.0/src/native/glow_integration.rs:1454`,
-/// `egui-0.35.0/src/viewport.rs:752`).
+/// (fork `crates/egui/crates/eframe/src/native/glow_integration.rs:1821`,
+/// `egui-0.36.2/src/viewport.rs:751`).
 #[must_use]
 pub fn sub_window_title(index: u32) -> String {
     tf!(
@@ -605,7 +614,7 @@ pub fn sub_window_viewport_id(index: u32) -> egui::ViewportId {
 /// `title` is already localised; only the id above is a literal. `position` is
 /// applied when the platform reports window positions at all — on Wayland
 /// `ViewportBuilder::with_position` is ignored and `ViewportInfo::outer_rect` is
-/// always `None` (`egui-0.35.0/src/viewport.rs:610`,
+/// always `None` (`egui-0.36.2/src/viewport.rs:613`,
 /// `data/input/viewport_info.rs:52-66`), so the caller passes `None` there and
 /// logs the reason instead of pretending the window landed where it asked.
 #[must_use]

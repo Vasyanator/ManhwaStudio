@@ -316,6 +316,7 @@ mod tests {
 
     #[test]
     fn missing_and_partial_offer_the_owned_download_caption() {
+        let _locale = crate::hold_locale_for_test();
         for state in [OcrModelDownloadState::Missing, OcrModelDownloadState::Partial { bytes_present: 1024 }] {
             let shown = snapshot(state.clone());
             let view = download_block_view(&shown);
@@ -332,6 +333,7 @@ mod tests {
     /// state's own button, never a separate "Retry" caption.
     #[test]
     fn notices_keep_the_reprobed_button() {
+        let _locale = crate::hold_locale_for_test();
         let state = OcrModelDownloadState::Partial { bytes_present: 1024 };
         let caption = offered_download_label(&snapshot(state.clone())).expect("a download state");
         let cancelled = OcrModelPanelSnapshot { notice: Some(DownloadNotice::Cancelled), ..snapshot(state.clone()) };
@@ -348,6 +350,7 @@ mod tests {
     /// M2: another bundle's download is named with its progress and disables the button.
     #[test]
     fn another_running_download_is_named_and_disables_the_button() {
+        let _locale = crate::hold_locale_for_test();
         let other_specs = vec![&SURYA_DETECTION_2025_05_07, &SURYA_RECOGNITION_2025_09_23];
         let other = OtherDownload { specs: other_specs, kind: JobKind::Download, progress: progress(ExternalDownloadPhase::Downloading, 1024) };
         let blocked = OcrModelPanelSnapshot { other_download: Some(other.clone()), ..snapshot(OcrModelDownloadState::Missing) };
@@ -377,6 +380,7 @@ mod tests {
     /// verify shows its progress and Cancel and blocks loading.
     #[test]
     fn installed_offers_verify_and_a_running_verify_shows_progress() {
+        let _locale = crate::hold_locale_for_test();
         let installed = download_block_view(&snapshot(OcrModelDownloadState::Installed));
         let verify = Some(BlockButton { caption: t!("translation.ocr_model.verify_button").to_string(), action: ModelDownloadAction::Verify, enabled: true });
         assert_eq!(installed.button, verify);
@@ -396,6 +400,7 @@ mod tests {
     /// re-probed state's Download button, cancelled.
     #[test]
     fn verify_notices_are_shown_next_to_the_state() {
+        let _locale = crate::hold_locale_for_test();
         let intact = OcrModelPanelSnapshot { notice: Some(DownloadNotice::VerifyIntact), ..snapshot(OcrModelDownloadState::Installed) };
         let view = download_block_view(&intact);
         assert_eq!(view.lines.last(), Some(&(StatusTone::Weak, t!("translation.ocr_model.verify_intact_status").to_string())));
@@ -414,6 +419,7 @@ mod tests {
 
     #[test]
     fn checking_and_unavailable_offer_no_button() {
+        let _locale = crate::hold_locale_for_test();
         for state in [
             OcrModelDownloadState::Checking,
             OcrModelDownloadState::Unknown,
@@ -427,6 +433,7 @@ mod tests {
 
     #[test]
     fn downloading_shows_progress_and_cancel() {
+        let _locale = crate::hold_locale_for_test();
         let half = BABERU_OCR.total_bytes() / 2;
         let view = download_block_view(&snapshot(OcrModelDownloadState::Downloading(progress(ExternalDownloadPhase::Downloading, half))));
         assert_eq!(
@@ -453,6 +460,7 @@ mod tests {
     /// the byte counters kept; the block still offers Cancel.
     #[test]
     fn retrying_shows_the_attempt_and_the_countdown() {
+        let _locale = crate::hold_locale_for_test();
         let waiting = progress(ExternalDownloadPhase::Retrying { attempt: 2, max_attempts: 5, delay_secs: 4 }, 1024);
         let total = format_bytes(BABERU_OCR.total_bytes());
         assert_eq!(
@@ -474,6 +482,7 @@ mod tests {
     /// different bundle (stale for one frame after a switch) never counts as installed.
     #[test]
     fn load_blocked_reason_follows_the_state_and_the_bundle() {
+        let _locale = crate::hold_locale_for_test();
         let key = bundle_key(BABERU);
         let checking = t!("translation.ocr_model.checking_status").to_string();
         assert_eq!(load_blocked_reason(&key, None), Some(checking.clone()));
@@ -494,6 +503,7 @@ mod tests {
     /// Every catalog spec a panel can show has its own name, never the raw id.
     #[test]
     fn display_names_cover_every_external_spec() {
+        let _locale = crate::hold_locale_for_test();
         assert_eq!(external_model_display_name(&BABERU_OCR), "Baberu OCR");
         for variant in PaddleVlVariant::ALL {
             assert_eq!(external_model_display_name(variant.spec()), crate::panels::ocr::paddle_vl_variant_label(variant));

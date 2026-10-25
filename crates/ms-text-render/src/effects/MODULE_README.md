@@ -114,7 +114,11 @@ max 0/255 for both the RGBA and alpha paths).
   extents, and `dilate_alpha_ellipse` walks each `dy` of the per-quadrant ellipse with the same
   row kernel, costing `O(width * height * (up + down + 1))` — seconds, not milliseconds, at
   radii in the hundreds, so callers must treat a large round dilation as a long uninterruptible
-  pass. With equal extents the rectangle is byte-identical to the legacy iterated
+  pass. The ellipse is this renderer's own element (grey-level, four semi-axes, exact lattice
+  inequality `floor`) and deliberately NOT `ms_region_postprocess::dilate_ellipse` (binary,
+  symmetric, OpenCV's `round`-half-even element: at radius 6 its row `dy = 2` spans ±6 where this
+  one spans ±5); the glow outlines are pinned on it and that crate is above this one anyway.
+  With equal extents the rectangle is byte-identical to the legacy iterated
   `dilate_alpha_max_filter3`, which is now a test-only reference. The EDT is owned
   by `ms-raster` (`squared_distance_to_mask` / `squared_distance_with_costs`, the
   Felzenszwalb-Huttenlocher transform evaluated in `f32` over a binary mask or an arbitrary

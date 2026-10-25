@@ -8,7 +8,7 @@ image set (`ImageSetSession`). Every place where `StudioApp` behaves differently
 dispatch method here; nothing else in `src/studio` asks which kind is open.
 
 Key structures:
-- `SessionMode`: `Project(ProjectSession)` | `ImageSet(Box<ImageSetSession>)`.
+- `SessionMode`: `Project(Box<ProjectSession>)` | `ImageSet(Box<ImageSetSession>)`.
 - `SessionParts`: the `StudioApp` parts a session flow borrows for one call (project, staging
   writers, close intent, the tab states it flushes or notifies).
 - `DeferredTabEdits`: the ONE answer to "do the tabs hold edits not yet handed to a staging
@@ -157,9 +157,10 @@ const fn project_has_unsaved_changes(cached: bool, discarding: bool, deferred: D
 /// for the life of the app (a reload builds a new app).
 pub(in crate::studio) enum SessionMode {
     /// A chapter of a project: staging merged by save-to-project, structural page ops, DISCARD.
-    Project(ProjectSession),
+    /// Boxed like the other variant: both states are a few hundred bytes, the enum stays a pointer.
+    Project(Box<ProjectSession>),
     /// One image or an ordered image set: saved to its files, never merged, every close discards.
-    /// Boxed: the controller is several hundred bytes, the project state a few dozen.
+    /// Boxed: the controller is several hundred bytes.
     ImageSet(Box<ImageSetSession>),
 }
 
@@ -173,7 +174,7 @@ impl SessionMode {
     pub(in crate::studio) fn from_project(project: &ProjectData, user_settings: &Value, has_staging: bool) -> Self {
         match ImageSetSession::from_project(project, user_settings) {
             Some(image_set) => Self::ImageSet(Box::new(image_set)),
-            None => Self::Project(ProjectSession::new(has_staging, project.paths.unsaved_dir.clone())),
+            None => Self::Project(Box::new(ProjectSession::new(has_staging, project.paths.unsaved_dir.clone()))),
         }
     }
 

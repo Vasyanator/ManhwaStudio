@@ -3239,6 +3239,7 @@ mod tests {
 
     #[test]
     fn imagebubble_request_preview_renders_single_target_image() {
+        let _locale = crate::hold_locale_for_test();
         // Two context replicas then one image target: the preview must describe exactly one image and
         // carry the per-image system contract.
         let mut items = vec![

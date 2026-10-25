@@ -108,13 +108,15 @@ compile (mod.rs)
   by glyph index. The one font-wide input is the transfer measurement: fixed reference glyphs
   of each face, read once per source before the parallel loop and independent of the compile
   scope (a preview subset equals the full face).
-- `sdf.rs` exposes its raster kit crate-wide (`flatten_checked` (`flatten` is the unbudgeted
-  test reference), `bounds` / `checked_bounds`, `choose_alignment` + `AxisMap::apply`,
+- `sdf.rs` exposes its raster kit crate-wide (`flatten_checked` / `flatten_checked_at`
+  (`flatten` is the unbudgeted test reference), `bounds` / `checked_bounds`, `choose_alignment` + `AxisMap::apply`,
   `grid_for`, `signed_distance_field`, `winding_inside`, `marching_squares`, and
   `offset_outline` for the transfer thickness step); other paths reuse it rather than copy it.
-- Bounded work on hostile sources: the raster paths (SDF, transfer measurement and offset,
-  skeleton) flatten through `sdf::flatten_checked` (`outline::flatten_contour_within`) with a
-  point budget — SDF / transfer `sdf::MAX_FLATTENED_POINTS` = 32768 (4x the largest bundled
+- Bounded work on hostile sources: every blend path that flattens (SDF, matched, transfer
+  measurement and offset, skeleton) goes through `sdf::flatten_checked` / `flatten_checked_at`
+  (`outline::flatten_contour_within`) with a point budget — SDF / matched / transfer
+  `sdf::MAX_FLATTENED_POINTS` = 32768 (matched over budget -> no match, so Auto reaches the SDF,
+  which rejects it) (4x the largest bundled
   glyph, 8302 points in PlangothicP2), skeleton `MAX_SKELETON_POINTS` = 16384 plus `MAX_SKELETON_CONTOURS` = 512 and
   `MAX_OVERLAP_WORK` = 2^26 (over budget -> `SkeletonFallback::TooComplex`, then SDF). The SDF
   path rejects an aligned glyph wider or taller than `MAX_BLEND_EXTENT_UNITS` (8x the storable

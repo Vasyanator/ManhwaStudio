@@ -98,8 +98,8 @@ FILE HEADER (tabs/typing/panel.rs)
     `draw_actions_tab_body`: тела вкладок дока `typing.params`, `typing.effects`
     и `typing.actions`; для image-оверлея вкладка `Параметры` показывает только
     трансформацию, а `Эффекты` остаётся доступной.
-  - wheel-helpers (`cycle_wrapped_index`, scroll helpers): обслуживают
-    переключение индексов и прокрутку панелей.
+  - wheel-helpers (scroll helpers; index cycling is `ms_widgets::cycle_wrapped_index`):
+    обслуживают переключение индексов и прокрутку панелей.
   - загрузка шрифтов config-driven: список = папка `fonts` ПЛЮС пользовательский набор
     импортированных путей к файлам системных шрифтов (`font_settings_store`). Панели
     `Create/Edit` берут снимок путей при создании и подхватывают правки из настроек вживую
@@ -173,7 +173,7 @@ use crate::render_next::types::{
 };
 use ms_widgets::{
     ColorPresets, PresetPickerState, SeedSpinBox, TabExtras, TextEditPlus, TextEditPlusTextColor,
-    ViewportColorSelector, WheelComboBox, WheelSlider, WheelSpinBox, random_seed,
+    ViewportColorSelector, WheelComboBox, WheelSlider, WheelSpinBox, cycle_wrapped_index, random_seed,
 };
 use cosmic_text::{Attrs, FontSystem, Metrics, fontdb};
 use eframe::egui;
@@ -2536,6 +2536,10 @@ struct TypingCreatePanelState {
     formula_presets_by_name: HashMap<String, TypingFormulaPreset>,
     selected_formula_preset_name: Option<String>,
     formula_preset_name_input: String,
+    /// Persists the formula-preset map into `user_config` (`TextTab.formula_presets`) on one
+    /// ordered thread, so two quick saves never land reversed; a failure comes back as an
+    /// outcome that `poll_formula_preset_writes` turns into the status line.
+    formula_presets_writer: ms_config::preset_store::OrderedWriter<FormulaPresetsWrite, Result<(), String>>,
     preview_enabled: bool,
     selected_font_idx: usize,
     selected_face_idx: usize,

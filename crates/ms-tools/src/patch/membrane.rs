@@ -560,6 +560,13 @@ fn solve_channel(levels: &[MaskLevel], fine_diff: &[f32]) -> Vec<f32> {
 /// same metric (`max(depth) − 1`), so the deepest pixel always lands exactly on the ramp's `1.0`
 /// end. Without the clamp an oversized feather would cap the whole selection far below `1.0` —
 /// feather 10 on a six-pixel-wide selection topped out at 0.104, a patch the user cannot see.
+///
+/// Deliberately NOT the region post-processing feather (`ms-region-postprocess`, which also ramps
+/// a smoothstep inwards): that one measures the EXACT Euclidean distance, treats the region
+/// border as a contour (a 1 px unmasked ring) and puts the outermost mask ring at `1 / width`;
+/// this one measures city-block depth, never ramps from the ROI border (the ROI is padded around
+/// the selection, so the selection's own contour is the only edge) and puts the outermost ring at
+/// `0.0`. Every patch commit's coverage depends on these choices, so the two stay separate rules.
 fn build_coverage(mask: &[bool], w: usize, h: usize, feather: usize) -> Vec<f32> {
     let mut coverage = vec![0.0f32; mask.len()];
     if feather == 0 {

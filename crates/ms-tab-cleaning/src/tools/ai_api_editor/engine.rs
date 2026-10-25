@@ -15,8 +15,10 @@ Main responsibilities:
   (`draw_image_edit_picker`), the prompt, the blend, the size line, the billing and privacy
   notes; and, in the section the host pins above it, the run's progress and outcome
   (`draw_progress`);
-- drive the key block's single-flight worker (`ImageEditKeyRunner::pump`) and the settings
-  load/save workers from `poll`.
+- drive the key block's single-flight worker (`ImageEditKeyRunner::pump`), the settings load
+  worker and the settings writer (the shared debounced, atomic `SettingsSaver` of
+  `region_edit_v2::engine_settings_file`) from `poll`; write the value it still owes at
+  teardown (`flush_settings_blocking`).
 
 Key structures:
 - `CloudEditEngine`, `RunInFlight` (the run in flight, and the cancelled one still ending)
@@ -41,10 +43,10 @@ the provider, model and error — never the key, never the prompt.
 
 use super::constraints::frame_constraints;
 use super::decisions::{RunGate, run_block_reason};
-use super::settings::{ApiEditSettings, BLEND_RADIUS_MAX_PX, load_api_edit_settings, save_api_edit_settings};
+use super::settings::{API_EDIT_LOG_LABEL, ApiEditSettings, BLEND_RADIUS_MAX_PX, load_api_edit_settings, save_api_edit_settings};
 use super::worker::{RunJob, WorkerEvent, spawn_run};
 use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MarksMode, MarksSupport, MaskLayerSpec, RunMarks, region_size_refusal};
-use crate::tools::region_edit_v2::engine_settings::settings_save_due;
+use crate::tools::region_edit_v2::engine_settings_file::{SaveGate, SettingsSaver};
 use crate::tools::region_edit_v2::geometry::{FrameConstraints, upscale_factor_for};
 use ms_ai_api::image_edit::{CancelFlag, ImageEditKeyRunner, ImageEditKeySlot, ImageEditKeyState, ImageEditProvider, ImageEditSelection, ImageEditStage, MaskBlend, draw_image_edit_picker, key_slot};
 use ms_ai_api::{AiApiNotice, KeyBlockActions};
@@ -54,6 +56,7 @@ use eframe::egui;
 use ms_widgets::WheelSlider;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
+use web_time::Instant;
 
 /// Log prefix of this engine (the host's tag for this tool).
 const LOG_TAG: &str = "[cleaning/ai_api_editor]";
@@ -114,12 +117,15 @@ pub(super) struct CloudEditEngine {
     blend: MaskBlend,
     /// Channel of the initial settings load, `None` once it landed.
     settings_rx: Option<Receiver<ApiEditSettings>>,
-    /// Whether the initial load landed; gates saving (see `settings_save_due`).
+    /// Whether the initial load landed; gates saving (writing before it would overwrite the
+    /// user's file with the defaults).
     settings_loaded: bool,
     /// Raised by every persisted edit; a user edit also outranks a load that lands later.
     dirty: bool,
-    /// Channel of the save in flight (at most one writer).
-    save_rx: Option<Receiver<()>>,
+    /// The settings writer (the shared `SettingsSaver`): one writer at a time, a quiet-time
+    /// debounce, a failed write retried with backoff, the teardown flush. Its `write` is
+    /// [`save_api_edit_settings`].
+    saver: SettingsSaver<ApiEditSettings>,
     /// The key block's state (presence, password buffer, status).
     key_state: ImageEditKeyState<ImageEditKeySlot>,
     /// Runs the key block's one credential-store operation at a time.
@@ -155,7 +161,7 @@ impl CloudEditEngine {
             settings_rx: None,
             settings_loaded: false,
             dirty: false,
-            save_rx: None,
+            saver: SettingsSaver::new(save_api_edit_settings, API_EDIT_LOG_LABEL),
             key_state: ImageEditKeyState::default(),
             key_runner: ImageEditKeyRunner::default(),
             key_actions: KeyBlockActions::default(),
@@ -212,28 +218,23 @@ impl CloudEditEngine {
         self.key_slot_stale = true;
     }
 
-    /// Starts a save on a worker when one is due (`settings_save_due`).
-    fn poll_and_maybe_save(&mut self) {
-        if let Some(rx) = self.save_rx.as_ref() {
-            match rx.try_recv() {
-                Ok(()) | Err(TryRecvError::Disconnected) => self.save_rx = None,
-                Err(TryRecvError::Empty) => return,
-            }
-        }
-        if !settings_save_due(self.dirty, self.settings_loaded, self.save_rx.is_some()) {
+    /// The document persisted to the settings file, captured from the live state.
+    fn persisted(&self) -> ApiEditSettings {
+        ApiEditSettings::capture(&self.selection, &self.prompt, self.blend)
+    }
+
+    /// Drives the shared `SettingsSaver`: a change is written on a worker once it stayed
+    /// unchanged for its quiet time, at most one write in flight, never before the initial load
+    /// landed, a failure retried with backoff (and logged by the saver). `now` is the poll's
+    /// clock.
+    fn poll_and_maybe_save(&mut self, now: Instant) {
+        // Nothing dirty and no write to drain: the saver has nothing to do, so the document is
+        // not captured (its map and strings cloned) on every idle frame.
+        if !self.dirty && self.saver.rx.is_none() {
             return;
         }
-        self.dirty = false;
-        let settings = ApiEditSettings::capture(&self.selection, &self.prompt, self.blend);
-        let (tx, rx) = mpsc::channel();
-        self.save_rx = Some(rx);
-        thread::spawn(move || {
-            if let Err(error) = save_api_edit_settings(&settings) {
-                ms_log::runtime_log::log_warn(format!("{LOG_TAG} failed to save the tool settings: {error}"));
-            }
-            // A send fails only when the engine is gone; nobody waits for the save then.
-            let _detached = tx.send(());
-        });
+        let persisted = self.persisted();
+        self.saver.poll(now, SaveGate { dirty: &mut self.dirty, loaded: self.settings_loaded, blocked: false }, &persisted, str::to_string);
     }
 
     /// Re-resolves the key slot when it is stale, then runs one step of the key block's
@@ -606,9 +607,23 @@ impl AiEngine for CloudEditEngine {
         if self.key_runner.is_running() {
             ctx.request_repaint_after(BUSY_REPAINT);
         }
-        self.poll_and_maybe_save();
+        let now = Instant::now();
+        self.poll_and_maybe_save(now);
+        // The save's quiet time, a failed save's retry and a write in flight: the saver says
+        // when it next needs a poll.
+        if let Some(after) = self.saver.wake_after(now) {
+            ctx.request_repaint_after(after);
+        }
         self.poll_detached(ctx);
         self.poll_run(ctx)
+    }
+
+    /// The value the settings saver still owes, written now on the teardown worker. A settings
+    /// load that landed meanwhile is applied first, so its gate is the real one.
+    fn flush_settings_blocking(&mut self) {
+        self.poll_settings_load();
+        let persisted = self.persisted();
+        self.saver.flush_blocking(SaveGate { dirty: &mut self.dirty, loaded: self.settings_loaded, blocked: false }, &persisted);
     }
 
     /// Raises the run's cancel flag and detaches it: the pipeline stops between steps, and an
@@ -748,7 +763,7 @@ mod tests {
         assert!(engine.settings_loaded);
         // Asserted, not driven: driving the saver would spawn a worker (which writes nothing
         // in a test build, but the gate is the contract under test).
-        assert!(settings_save_due(engine.dirty, engine.settings_loaded, engine.save_rx.is_some()));
+        assert!(crate::tools::region_edit_v2::engine_settings::settings_save_due(engine.dirty, engine.settings_loaded, engine.saver.rx.is_some()));
     }
 
     /// With nothing edited the load applies, and the key slot must be resolved again.

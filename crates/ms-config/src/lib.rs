@@ -57,6 +57,8 @@ Main items:
 - `load_raw_user_settings_for_startup`: startup-safe read before default backfilling.
 - `load_user_settings_for_startup`: startup-safe read of user settings without creating files.
 - `single_image` (module): single-image mode input types, scratch root and `SingleImage` section.
+- `preset_store` (module): the ordered preset writer thread (`OrderedWriter`) and the default
+  preset-name allocator shared by the app's named-preset stores.
 */
 
 #![warn(clippy::all)]
@@ -142,6 +144,11 @@ pub use runtime_root::repo_build_root;
 // `update_user_config_file` border; its feeders (window geometry, panel-dock layout)
 // stay above. The binary names it directly as `ms_config::config_saver`.
 pub mod config_saver;
+// The ordered writer thread and the free default-name allocator shared by every named-preset
+// store (typing formula presets, translation composition presets, Settings layout presets).
+// Here because each of those stores persists into `user_config.json` through this crate's
+// `update_user_config_file`, and this is the lowest crate all three consumers depend on.
+pub mod preset_store;
 // On-disk editable UI locale catalog (`data_dir()/locale`): unpack + reconcile the
 // catalogs `ms-i18n` embeds, then install the active one. It reads the active locale
 // out of `user_config.json`, so it belongs to this layer. Native-only, exactly as in

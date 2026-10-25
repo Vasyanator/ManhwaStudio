@@ -69,8 +69,7 @@ callers' workers — the OCR and text-detector workers in `ms-tab-translation` (
 `text_detector/`, the latter also reached from Cleaning mask generation) — while the AI
 backend panel in `ms-settings-ui` reads status and resets the load latch.
 
-Entry points: `recognize_manga`, `recognize_paddle` (OCR), `detect_paddle` (whole-page
-detection: single 960-px pass + postprocess) and `paddle_det_forward` (forward-only pass on
+Entry points: `recognize_manga`, `recognize_paddle` (OCR) and `paddle_det_forward` (forward-only pass on
 tiles prepared by `ms_text_detect`'s plan, returning `ms_text_detect::ProbMap`s; the
 translation text-detector pipeline wraps it as its native Paddle runner).
 `paddle_det_max_batch` is that runner's batch size: 4 tiles on the CPU provider, 1 on any
@@ -105,8 +104,7 @@ for the process and `reset_load_latch` drops every engine, so a cached engine ne
 outlives the provider it was built for.
 
 ## Contracts and invariants
-- Every op on the ONE shared `PaddleDetector` (`recognize_paddle`, `detect_paddle`,
-  `paddle_det_forward`) runs inside `run_guarded`, holds `lock_paddle_op` for its whole
+- Every op on the ONE shared `PaddleDetector` (`recognize_paddle`, `paddle_det_forward`) runs inside `run_guarded`, holds `lock_paddle_op` for its whole
   ensure + inference span, and uses the detector through `with_shared_detector`. A new
   detector op must follow the same sequence.
 - The SIGILL-guard scope key is `{build}:{provider}[:{device}]@{version}`

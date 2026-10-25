@@ -677,13 +677,10 @@ impl StudioApp {
     /// Refreshes the per-frame AI backend health cache from the shared probe state.
     ///
     /// Must be called once per frame before any helper that reads
-    /// `ai_backend_health_cached`, so the shared mutex is locked and cloned at most once
-    /// per frame instead of per consumer.
+    /// `ai_backend_health_cached`, so the shared mutex is locked at most once per frame
+    /// instead of per consumer; the snapshot is cloned only when its revision changed.
     fn refresh_ai_backend_health_cache(&mut self) {
-        self.ai_backend_health_cached = match self.ai_backend_health.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
+        ms_local_ai::backend_health::refresh_cached_snapshot(&self.ai_backend_health, &mut self.ai_backend_health_cached);
     }
 
     /// Switches to a page-capable tab and applies the selected page without letting viewport

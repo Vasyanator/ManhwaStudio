@@ -66,6 +66,10 @@ impl TypingTopPanelState {
         // migration once its background read lands, adopt what another app instance wrote,
         // and surface any background save failure instead of losing it.
         self.create_panel.poll_preset_store_events();
+        // Formula presets exist in BOTH panels, each with its own ordered writer: surface a
+        // failed background write in the panel that made it.
+        self.create_panel.poll_formula_preset_writes();
+        self.edit_panel.poll_formula_preset_writes();
         // Closes the DEFAULT local-set debounce window: an edit in local-preset mode with no
         // global preset applied marks the set dirty, and this is the tick that turns it into
         // one off-thread document write per burst (`local_presets::LOCAL_PRESETS_SAVE_DEBOUNCE`).

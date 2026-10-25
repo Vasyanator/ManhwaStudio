@@ -82,10 +82,10 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   "Identity comparison and availability" below). BOTH create AND rename validation reject a blank name or a
   case-insensitive collision with an existing virtual group OR a real folder-group name (the
   folder names are passed in from `font_settings.rs`'s off-thread pass, and threaded into the
-  editor window for rename); each surfaces a red error near its row. Deletion uses an inline
-  two-step confirm (NOT a child-viewport modal — those have an input-routing bug here); the
-  confirm is guarded against a physical double-click and auto-disarms when the pointer leaves the
-  armed button. A group holding at least one member the typing panel will not show has its
+  editor window for rename); each surfaces a red error near its row. Deletion uses the inline
+  two-step `ms_widgets::ArmedDeleteButton` (NOT a child-viewport modal — those have an
+  input-routing bug here): a physical double-click never confirms and the arm auto-disarms when
+  the pointer leaves the armed button. A group holding at least one member the typing panel will not show has its
   LIST row name painted in `Visuals::warn_fg_color` with an explaining hover — those members are
   dropped by the panel's group merge, so the group silently behaves smaller than it looks. The
   availability rule is `member_is_available` (the module's ONLY one, shared with the member
@@ -131,7 +131,7 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   it draws in the interface font) opening the properties window; an unavailable one (missing
   source, kind this build cannot compile, damaged recipe) is greyed with the localized reason
   (`CustomFontUnavailability::tooltip`) and can only be deleted. Delete is the inline two-step
-  confirm (pure transition `delete_step`: arm, confirm with a second SINGLE click, a double
+  confirm (`ms_widgets::ArmedDeleteButton`: arm, confirm with a second SINGLE click, a double
   click never confirms, auto-disarm when the pointer leaves) through
   `font_admin::delete_custom_font` (which also drops the font's own kerning record and group
   memberships). «+ Создать гибридный шрифт» opens the create DIALOG — an `egui::Window` with a

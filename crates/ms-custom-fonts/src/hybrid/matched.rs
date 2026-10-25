@@ -13,7 +13,9 @@ Key functions:
 
 Notes:
 - Frame: every source is scaled horizontally by `blended advance / own advance` (the natural
-  frame of the distance-field path); contours are flattened at `FLATTEN_TOLERANCE`.
+  frame of the distance-field path); contours are flattened at `FLATTEN_TOLERANCE` within the
+  distance field's point budget (`sdf::flatten_checked_at`, `sdf::MAX_FLATTENED_POINTS`); an
+  outline over it is `None`, so Auto falls through to the distance field, which rejects it.
 - Pairing: same contour count in every source; the reference (highest weight, first on ties)
   pairs each contour, largest first, with the unused contour of the same orientation whose
   centroid is nearest.
@@ -34,8 +36,8 @@ Notes:
 
 use kurbo::{Point, Vec2};
 
-use crate::hybrid::trace;
-use crate::outline::{Outline, flatten_contour};
+use crate::hybrid::{sdf, trace};
+use crate::outline::Outline;
 
 /// Flattening tolerance of the source contours, font units.
 const FLATTEN_TOLERANCE: f64 = 0.2;
@@ -126,16 +128,14 @@ pub(crate) fn interpolate(outlines: &[&Outline], weights: &[f64], advances: &[f6
         .zip(advances)
         .map(|(outline, &advance)| {
             let scale = if advance >= 1.0 && target_advance >= 1.0 { target_advance / advance } else { 1.0 };
-            let mut polygon = Vec::new();
-            outline
-                .iter()
-                .filter_map(|contour| {
-                    flatten_contour(contour, FLATTEN_TOLERANCE, &mut polygon);
-                    Ring::new(polygon.iter().map(|point| Point::new(point.x * scale, point.y)).collect())
-                })
-                .collect()
+            // Budgeted like every other blend path: an outline denser than
+            // `MAX_FLATTENED_POINTS` is no match here (`None`), and Auto falls through to the
+            // distance field, which rejects it. Within the budget the polygons are exactly the
+            // unbudgeted flattening's (dropped short polygons were never rings anyway).
+            let polygons = sdf::flatten_checked_at(outline, FLATTEN_TOLERANCE, sdf::MAX_FLATTENED_POINTS).ok()?;
+            Some(polygons.into_iter().filter_map(|polygon| Ring::new(polygon.iter().map(|point| Point::new(point.x * scale, point.y)).collect())).collect())
         })
-        .collect();
+        .collect::<Option<_>>()?;
     let count = sources.first()?.len();
     if count == 0 || sources.iter().any(|rings| rings.len() != count) {
         return None;
@@ -428,7 +428,7 @@ fn segments_cross(p1: Point, p2: Point, q1: Point, q2: Point) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::outline::{Contour, Seg};
+    use crate::outline::{Contour, Seg, flatten_contour};
 
     fn polygon(points: &[(f64, f64)]) -> Contour {
         let mut iter = points.iter().map(|&(x, y)| Point::new(x, y));
@@ -448,6 +448,30 @@ mod tests {
         flatten_contour(&blended[0], 0.2, &mut polygon_points);
         let near = |x: f64, y: f64| polygon_points.iter().any(|point| point.distance(Point::new(x, y)) < 4.0);
         assert!(near(100.0, 350.0) && near(100.0, 430.0), "bar corners moved to the average height");
+    }
+
+    /// A same-topology pair whose outline flattens beyond the distance field's budget is no
+    /// match: the flattening stops at the budget (no input-proportional work) and Auto falls
+    /// through to the distance field, which rejects the glyph.
+    #[test]
+    fn an_outline_over_the_flattening_budget_is_no_match() {
+        // One contour of 2000 cubics that each flatten into dozens of points at this path's
+        // tolerance: far beyond `MAX_FLATTENED_POINTS`, yet one contour like its partner.
+        let wavy = Contour {
+            start: Point::new(0.0, 0.0),
+            segs: (0..2000)
+                .map(|k| {
+                    let x = f64::from(k + 1);
+                    Seg::Cubic(Point::new(x - 0.7, 5000.0), Point::new(x - 0.3, -5000.0), Point::new(x, 0.0))
+                })
+                .chain([Seg::Line(Point::new(2000.0, -100.0)), Seg::Line(Point::new(0.0, -100.0))])
+                .collect(),
+        };
+        let hostile = vec![wavy];
+        assert!(sdf::flatten_checked_at(&hostile, FLATTEN_TOLERANCE, sdf::MAX_FLATTENED_POINTS).is_err(), "the fixture must exceed the budget");
+        let plain = vec![polygon(&[(0.0, -100.0), (0.0, 100.0), (2000.0, 100.0), (2000.0, -100.0)])];
+        assert!(interpolate(&[&hostile, &plain], &[0.5, 0.5], &[2000.0, 2000.0]).is_none());
+        assert!(interpolate(&[&plain, &hostile], &[0.5, 0.5], &[2000.0, 2000.0]).is_none());
     }
 
     #[test]

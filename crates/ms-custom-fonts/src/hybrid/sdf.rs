@@ -44,7 +44,7 @@ Notes:
   `MAX_FLATTENED_POINTS` (4x the largest bundled glyph), rejecting a too-dense outline while
   flattening (`TooManyPoints`, also `GlyphTooComplex`).
 - Crate-visible raster kit (reused by the other blend paths, never duplicated there):
-  `flatten_checked` (`flatten` is the unbudgeted test reference), `bounds` / `checked_bounds` (`Bounds`, `ExtentTooLarge::of`), `choose_alignment`
+  `flatten_checked` / `flatten_checked_at` (`flatten` is the unbudgeted test reference), `bounds` / `checked_bounds` (`Bounds`, `ExtentTooLarge::of`), `choose_alignment`
   (`AxisMap::apply`), `grid_for` (`Grid`), `signed_distance_field`, `winding_inside`,
   `marching_squares`.
 */
@@ -478,11 +478,21 @@ pub(crate) fn flatten(outline: &Outline) -> Vec<Vec<Point>> {
 /// # Errors
 /// `TooManyPoints` when the outline needs more than `limit` points.
 pub(crate) fn flatten_checked(outline: &Outline, limit: usize) -> Result<Vec<Vec<Point>>, TooManyPoints> {
+    flatten_checked_at(outline, FLATTEN_TOLERANCE, limit)
+}
+
+/// [`flatten_checked`] at a caller-chosen `tolerance` (font units), for a blend path that
+/// flattens coarser than the distance field (the matched path) but must stay inside the same
+/// budget. Polygons of fewer than 2 points are dropped, as in `flatten_checked`.
+///
+/// # Errors
+/// `TooManyPoints` when the outline needs more than `limit` points.
+pub(crate) fn flatten_checked_at(outline: &Outline, tolerance: f64, limit: usize) -> Result<Vec<Vec<Point>>, TooManyPoints> {
     let mut polygons = Vec::with_capacity(outline.len().min(limit));
     let mut used = 0_usize;
     for contour in outline {
         let mut polygon = Vec::new();
-        flatten_contour_within(contour, FLATTEN_TOLERANCE, limit.saturating_sub(used), &mut polygon).map_err(|_| TooManyPoints { limit })?;
+        flatten_contour_within(contour, tolerance, limit.saturating_sub(used), &mut polygon).map_err(|_| TooManyPoints { limit })?;
         used += polygon.len();
         if polygon.len() >= 2 {
             polygons.push(polygon);

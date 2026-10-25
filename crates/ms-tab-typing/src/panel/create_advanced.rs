@@ -321,7 +321,7 @@ impl TypingCreatePanelState {
                         }
                     });
             if let Some(steps) = combo_resp.wheel_steps {
-                cycle_wrapped_index(&mut preset_idx, preset_len, steps);
+                preset_idx = cycle_wrapped_index(preset_idx, preset_len, steps);
             }
             self.selected_formula_preset_name = if preset_idx == 0 {
                 None
@@ -549,7 +549,7 @@ impl TypingCreatePanelState {
                         }
                     });
             if let Some(steps) = combo_resp.wheel_steps {
-                cycle_wrapped_index(&mut kind_idx, 6, steps);
+                kind_idx = cycle_wrapped_index(kind_idx, 6, steps);
             }
             self.shape_layout_kind = match kind_idx {
                 0 => TypingShapeLayoutKind::Arc,
@@ -596,7 +596,7 @@ impl TypingCreatePanelState {
                         }
                     });
                     if let Some(steps) = combo_resp.wheel_steps {
-                        cycle_wrapped_index(&mut orientation_idx, 2, steps);
+                        orientation_idx = cycle_wrapped_index(orientation_idx, 2, steps);
                     }
                     self.arc_shape_layout.orientation = match orientation_idx {
                         0 => TypingArcOrientation::Horizontal,

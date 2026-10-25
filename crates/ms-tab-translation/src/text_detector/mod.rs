@@ -85,7 +85,7 @@ pub(crate) use backend::SURYA_DETECTOR_SPECS;
 // An OCR selection's region detection: the tab's trigger, its worker answer and the page merge.
 // The two types the public controller event carries are `pub`; the rest stays in the crate.
 pub use region_detect::{RegionDetectEngine, RegionDetection};
-pub(crate) use region_detect::{RegionDetectRequest, empty_page_result, merge_region_into_page};
+pub(crate) use region_detect::{RegionDetectRequest, empty_page_result, merge_region_blocks, merge_region_into_page};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

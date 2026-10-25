@@ -229,7 +229,7 @@ fn recent_character_card_caption(key_label: &str, character_name: &str) -> Strin
 /// exactly what `egui::Frame` allocated for the same card before: its
 /// `outer_rect` is `content_rect + inner_margin + Margin::from(stroke.width) +
 /// outer_margin`, and the outer margin is zero here
-/// (`egui-0.35.0/src/containers/frame.rs:349-352`, `:456-462`).
+/// (`egui-0.36.2/src/containers/frame.rs:349-352`, `:456-462`).
 #[must_use]
 fn recent_character_card_size(caption_size: Vec2) -> Vec2 {
     caption_size
@@ -261,17 +261,17 @@ fn recent_character_card_caption_pos(card_rect: Rect) -> Pos2 {
 /// gesture, never by clicking the card. The body only reads the tab's
 /// `recent_characters` history; the allocation senses `hover` and
 /// nothing else, exactly as `Frame::allocate_space` did
-/// (`egui-0.35.0/src/containers/frame.rs:466-468`), and nothing is painted from
+/// (`egui-0.36.2/src/containers/frame.rs:466-468`), and nothing is painted from
 /// the response, so there is no hover highlight and no click target.
 ///
 /// **A card may NOT be an `egui::Frame`, and that is the whole reason this function
 /// paints by hand.** `Frame::begin` takes its bounds from
 /// `Ui::available_rect_before_wrap` and reserves the space only afterwards, through
 /// `Prepared::allocate_space` → `Ui::allocate_rect` → `advance_cursor_after_rect`
-/// (`frame.rs:378-397`, `:466-468`, `egui-0.35.0/src/ui.rs:1256-1270`). That path
+/// (`frame.rs:378-397`, `:466-468`, `egui-0.36.2/src/ui.rs:1257-1271`). That path
 /// calls `Placer::advance_after_rects` DIRECTLY and never reaches
 /// `Placer::next_space`, which is where `Layout::next_frame` starts a new row
-/// (`egui-0.35.0/src/placer.rs:113-125`, `src/layout.rs:506-528`). A framed card
+/// (`egui-0.36.2/src/placer.rs:113-125`, `src/layout.rs:506-528`). A framed card
 /// therefore cannot wrap: the whole history ran off the right edge of the panel
 /// and the body grew a horizontal scrollbar. `egui::Button` wraps in
 /// `cleaning::tab::draw_tool_button_rows` for the opposite reason — it measures
@@ -289,7 +289,7 @@ fn recent_character_card_caption_pos(card_rect: Rect) -> Pos2 {
 /// `Frame::paint`, which draws its `RectShape` with the same `StrokeKind::Inside`
 /// on `widget_rect = content_rect + inner_margin + stroke.width`
 /// (`frame.rs:423-445`), and the galley comes from the same `FontSelection::Default`
-/// the removed `ui.label` resolved through (`egui-0.35.0/src/widgets/label.rs:173`).
+/// the removed `ui.label` resolved through (`egui-0.36.2/src/widgets/label.rs:185`).
 fn draw_recent_characters_tab_body(ui: &mut egui::Ui, cx: &mut TranslationDockCx<'_>) {
     let fill = Color32::from_rgba_unmultiplied(110, 110, 110, 170);
     let stroke = Stroke::new(
@@ -482,7 +482,7 @@ mod tests {
     /// in one and not the other slides the text off the card.
     ///
     /// The inset reproduces `egui::Frame` exactly — one inner margin plus one border
-    /// on every side (`egui-0.35.0/src/containers/frame.rs:349-352`), which is what
+    /// on every side (`egui-0.36.2/src/containers/frame.rs:349-352`), which is what
     /// makes the hand-painted card look identical to the framed one it replaced.
     #[test]
     fn a_recent_character_card_insets_its_caption_equally_on_every_side() {

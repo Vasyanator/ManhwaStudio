@@ -3,8 +3,9 @@ File: cleaning/tools/ai_editor/engines/sdxl/settings.rs
 
 Purpose:
 The channel mode, the per-mode generation parameters, the document persisted to
-`config::sdxl_inpaint_settings_path()`. The save gate that decides when to write it is the
-shared `region_edit_v2::engine_settings::settings_save_due`.
+`config::sdxl_inpaint_settings_path()`. WHEN it is written is the shared `SettingsSaver`'s
+decision (`region_edit_v2::engine_settings_file`: quiet-time debounce, retry, teardown flush);
+this file only writes it, atomically, through the shared `write_settings_json`.
 
 Main responsibilities:
 - own `SdxlMode` and its wire spelling;
@@ -192,20 +193,30 @@ pub(super) fn load_sdxl_settings() -> SdxlPersisted {
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
-/// Writes `persisted` to the engine's settings file. Runs on a worker thread.
+/// Names this engine in the shared settings saver's log lines.
+pub(super) const SDXL_LOG_LABEL: &str = "SDXL Inpaint";
+
+/// Writes `persisted` to the engine's settings file, replacing it atomically (the shared
+/// `write_settings_json`). Runs on a worker thread (the saver's, or the studio teardown worker).
+///
+/// A test build of this crate writes NOTHING and answers `Ok(())`, like the FLUX engines'
+/// writers: the path is the user's real data directory, and the saver's teardown flush can
+/// reach this function from any test that leaves a loaded, dirty engine behind (the engines
+/// are built only inside this crate, so `cfg!(test)` covers every test that reaches it).
 ///
 /// # Errors
 /// Returns a user-facing message when the data directory cannot be created, when the
 /// document cannot be serialized, or when the write fails.
 pub(super) fn save_sdxl_settings(persisted: &SdxlPersisted) -> Result<(), String> {
-    let path = config::sdxl_inpaint_settings_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| tf!("cleaning.settings_io.create_dir_error", err = err))?;
+    if cfg!(test) {
+        ms_log::runtime_log::log_info(format!("[cleaning] {SDXL_LOG_LABEL} settings not written: a test build never writes the user's settings file"));
+        return Ok(());
     }
-    let raw = serde_json::to_string_pretty(persisted)
-        .map_err(|err| tf!("cleaning.tools.sdxl.serialize_settings_error", err = err))?;
-    fs::write(&path, raw).map_err(|err| tf!("cleaning.tools.sdxl.write_settings_error", err = err))
+    write_settings_json(&config::sdxl_inpaint_settings_path(), persisted).map_err(|err| match err {
+        SettingsWriteError::CreateDir(err) => tf!("cleaning.settings_io.create_dir_error", err = err),
+        SettingsWriteError::Serialize(err) => tf!("cleaning.tools.sdxl.serialize_settings_error", err = err),
+        SettingsWriteError::Write(err) => tf!("cleaning.tools.sdxl.write_settings_error", err = err),
+    })
 }
 
 #[cfg(test)]

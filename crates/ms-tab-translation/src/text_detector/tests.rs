@@ -416,6 +416,7 @@ fn backend_fallback_only_for_native_specific_failures() {
 /// technical variant is wrapped with the engine name.
 #[test]
 fn detect_errors_map_to_localized_texts() {
+    let _locale = crate::hold_locale_for_test();
     let runner = DetectError::Runner(RunnerError { message: "backend said no".to_string() });
     assert_eq!(detect_error_message(EngineKind::Ctd, &runner), "backend said no");
     assert_eq!(
@@ -576,6 +577,7 @@ fn ipc_runner_sends_the_surya_detection_dir() {
 /// the detector panel's download button, and creates nothing.
 #[test]
 fn surya_gate_refuses_a_missing_checkpoint() {
+    let _locale = crate::hold_locale_for_test();
     use ms_sysprobe::ai_models::ModelEnsureError;
     use ms_sysprobe::ai_models::external::ExternalModelStatus;
     let root = std::env::temp_dir().join(format!("ms_tab_translation_surya_gate_{}_absent", std::process::id()));
@@ -593,6 +595,7 @@ fn surya_gate_refuses_a_missing_checkpoint() {
 /// wire error; a transport failure passes through unchanged.
 #[test]
 fn ipc_runner_rejects_malformed_responses() {
+    let _locale = crate::hold_locale_for_test();
     let tiles = vec![RgbImage::new(32, 32)];
     let good_header = json!({"engine": "paddle", "n": 1, "map_width": 32, "map_height": 32, "channels": ["prob"]});
     let cases = [
@@ -658,6 +661,7 @@ fn region_mask_over_a_fake_backend_has_the_region_size() {
 /// The region reaches the detector as its UNMULTIPLIED colour with alpha dropped.
 #[test]
 fn region_conversion_uses_unmultiplied_colour() {
+    let _locale = crate::hold_locale_for_test();
     let rgba = [200u8, 100, 50, 128, 10, 20, 30, 255];
     let image = egui::ColorImage::from_rgba_unmultiplied([2, 1], &rgba);
     let rgb = color_image_to_rgb(&image).expect("convert");

@@ -99,8 +99,10 @@ from __future__ import annotations
 # app-wide layout preset store, written by the Settings pane) and
 # `TranslarionTab.composition_presets` (the composition panel's app-wide
 # presets, written by the Translation tab). The backend reads none of them.
+# 20: the `model_load` event topic is removed (it was declared but never
+# published or subscribed to); the valid topics are `health`, `device`, `log`.
 # ============================================================================
-PROTOCOL_VERSION = 19
+PROTOCOL_VERSION = 20
 
 # ============================================================================
 # FRAME SIZE GUARDS
@@ -155,14 +157,12 @@ VALID_STATUSES = frozenset({STATUS_OK, STATUS_ERROR, STATUS_INTERRUPTED})
 # ============================================================================
 TOPIC_HEALTH = "health"          # Periodic health snapshot push.
 TOPIC_DEVICE = "device"          # Device/provider selection state changed.
-TOPIC_MODEL_LOAD = "model_load"  # Model load/unload progress.
 TOPIC_LOG = "log"                # Optional backend log line stream.
 
 VALID_TOPICS = frozenset(
     {
         TOPIC_HEALTH,
         TOPIC_DEVICE,
-        TOPIC_MODEL_LOAD,
         TOPIC_LOG,
     }
 )

@@ -37,6 +37,10 @@
 //   the result is published, so every engine path and the stored last result
 //   share the same text: character substitution (`CharReplacementRule`) first,
 //   then the optional ALL-CAPS -> sentence-case fix (`ocr_case_fix`).
+// - Terminal events: every request ends in exactly one `Recognized` / `RecognizeFailed` /
+//   `RecognizeCancelled`, including the ones the controller drops itself (a pending request a
+//   newer one replaces, a backend recognize superseded by a newer selection: cancelled; a send
+//   to a dead worker, requests in flight when the worker disconnects: failed).
 // - Вспомогательные функции: crop по UV, PNG-кодирование, сборка/разбор
 //   framed-заголовков `BackendClient`/`CallHandle` и JSON.
 // - External models (Baberu OCR, PaddleOCR-VL variants, the EasyOCR model of the selected
@@ -417,6 +421,12 @@ pub struct TranslationOcrController {
     last_error: Option<String>,
     last_result: Option<OcrRecognizeResult>,
     pending_request: Option<OcrRecognizeRequest>,
+    /// Ids of the Recognize commands sent to the worker and not answered yet: a worker that
+    /// disconnects fails each of them, so no request ends without an event.
+    in_flight: Vec<u64>,
+    /// Terminal events of requests the controller itself dropped between two polls (a
+    /// superseded pending request, a send to a dead worker); `poll_events` returns them first.
+    dropped_events: Vec<OcrControllerEvent>,
     cmd_tx: Sender<WorkerCommand>,
     evt_rx: Receiver<WorkerEvent>,
     worker_thread: Option<JoinHandle<()>>,
@@ -445,6 +455,8 @@ impl TranslationOcrController {
             last_error: None,
             last_result: None,
             pending_request: None,
+            in_flight: Vec::new(),
+            dropped_events: Vec::new(),
             cmd_tx,
             evt_rx,
             worker_thread: Some(worker_thread),
@@ -496,6 +508,9 @@ impl TranslationOcrController {
         self.last_result.as_ref()
     }
 
+    /// Starts loading `engine` unless a load or download already runs. If the worker is gone,
+    /// the state becomes `Error` and the request waiting for a load (if any) is failed: its
+    /// `RecognizeFailed` comes out of the next `poll_events`.
     pub fn request_load(&mut self, engine: OcrEngine, options: OcrRuntimeOptions) {
         if self.state.is_busy() {
             return;
@@ -508,34 +523,62 @@ impl TranslationOcrController {
             .send(WorkerCommand::Load { engine, options, cancel })
             .is_err()
         {
-            self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
+            let error = t!("translation.ocr.worker_unavailable_error").to_string();
+            self.last_error = Some(error.clone());
             self.set_state(OcrLoadState::Error);
+            if let Some(request) = self.pending_request.take() {
+                self.dropped_events.push(OcrControllerEvent::RecognizeFailed { request_id: request.request_id, error });
+            }
         }
     }
 
+    /// Queues one recognize. Every request ends in exactly one terminal event out of
+    /// `poll_events` (`Recognized`, `RecognizeFailed` or `RecognizeCancelled`): a request still
+    /// waiting for a load that a newer one replaces ends as `RecognizeCancelled`, one the worker
+    /// can no longer take ends as `RecognizeFailed`.
     pub fn request_recognize(&mut self, request: OcrRecognizeRequest) {
         match self.state {
-            OcrLoadState::Ready => {
-                let cancel = self.next_command_cancel();
-                if self.cmd_tx.send(WorkerCommand::Recognize { request, cancel }).is_err() {
-                    self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
-                    self.set_state(OcrLoadState::Error);
-                }
-            }
+            OcrLoadState::Ready => self.send_recognize(request),
             OcrLoadState::DownloadingModel | OcrLoadState::Loading => {
-                self.pending_request = Some(request);
+                self.replace_pending_request(request);
             }
             OcrLoadState::NotLoaded | OcrLoadState::Error => {
                 let engine = request.engine;
                 let options = request.options.clone();
-                self.pending_request = Some(request);
+                self.replace_pending_request(request);
                 self.request_load(engine, options);
             }
         }
     }
 
+    /// Makes `request` the one waiting for the load; the request it replaces (latest wins)
+    /// ends as `RecognizeCancelled`.
+    fn replace_pending_request(&mut self, request: OcrRecognizeRequest) {
+        if let Some(replaced) = self.pending_request.replace(request) {
+            self.dropped_events.push(OcrControllerEvent::RecognizeCancelled { request_id: replaced.request_id });
+        }
+    }
+
+    /// Sends a Recognize to the worker and records it as in flight. A dead worker fails it
+    /// (`Error` state; the `RecognizeFailed` comes out of the next `poll_events`).
+    fn send_recognize(&mut self, request: OcrRecognizeRequest) {
+        let request_id = request.request_id;
+        let cancel = self.next_command_cancel();
+        if self.cmd_tx.send(WorkerCommand::Recognize { request, cancel }).is_err() {
+            let error = t!("translation.ocr.worker_unavailable_error").to_string();
+            ms_log::runtime_log::log_error(format!("[ocr] recognize request {request_id} not sent: the OCR worker is gone"));
+            self.last_error = Some(error.clone());
+            self.set_state(OcrLoadState::Error);
+            self.dropped_events.push(OcrControllerEvent::RecognizeFailed { request_id, error });
+        } else {
+            self.in_flight.push(request_id);
+        }
+    }
+
+    /// Drains this frame's worker events (bounded by `OCR_EVENT_POLL_BUDGET`), preceded by the
+    /// terminal events of requests the controller dropped itself since the last poll.
     pub fn poll_events(&mut self) -> Vec<OcrControllerEvent> {
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut self.dropped_events);
         for _ in 0..OCR_EVENT_POLL_BUDGET {
             match self.evt_rx.try_recv() {
                 Ok(WorkerEvent::ExternalModelMissing(specs)) => {
@@ -582,11 +625,10 @@ impl TranslationOcrController {
                         out.push(OcrControllerEvent::StateChanged(OcrLoadState::Ready));
                     }
                     if let Some(request) = self.pending_request.take() {
-                        let cancel = self.next_command_cancel();
-                        if self.cmd_tx.send(WorkerCommand::Recognize { request, cancel }).is_err() {
-                            self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
-                            self.set_state(OcrLoadState::Error);
+                        self.send_recognize(request);
+                        if self.state == OcrLoadState::Error {
                             out.push(OcrControllerEvent::StateChanged(OcrLoadState::Error));
+                            out.append(&mut self.dropped_events);
                         }
                     }
                 }
@@ -603,6 +645,7 @@ impl TranslationOcrController {
                     }
                 }
                 Ok(WorkerEvent::RecognizeOk { request_id, result, region }) => {
+                    self.in_flight.retain(|&id| id != request_id);
                     self.last_error = None;
                     if self.state != OcrLoadState::Ready {
                         self.set_state(OcrLoadState::Ready);
@@ -612,6 +655,7 @@ impl TranslationOcrController {
                     out.push(OcrControllerEvent::Recognized { request_id, result, region });
                 }
                 Ok(WorkerEvent::RecognizeCancelled { request_id }) => {
+                    self.in_flight.retain(|&id| id != request_id);
                     // The engine itself is fine: a stop is not an error, so any earlier error
                     // text is cleared like after a successful recognize.
                     self.last_error = None;
@@ -622,6 +666,7 @@ impl TranslationOcrController {
                     out.push(OcrControllerEvent::RecognizeCancelled { request_id });
                 }
                 Ok(WorkerEvent::RecognizeErr { request_id, error }) => {
+                    self.in_flight.retain(|&id| id != request_id);
                     self.last_error = Some(error.clone());
                     self.set_state(OcrLoadState::Error);
                     out.push(OcrControllerEvent::StateChanged(OcrLoadState::Error));
@@ -629,9 +674,17 @@ impl TranslationOcrController {
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.last_error = Some(t!("translation.ocr.worker_disconnected_error").to_string());
+                    let error = t!("translation.ocr.worker_disconnected_error").to_string();
+                    self.last_error = Some(error.clone());
                     self.set_state(OcrLoadState::Error);
                     out.push(OcrControllerEvent::StateChanged(OcrLoadState::Error));
+                    // The worker is gone: nothing it was given will ever answer, so every
+                    // request it held, and the one waiting for its load, fails now.
+                    let pending = self.pending_request.take().map(|request| request.request_id);
+                    for request_id in self.in_flight.drain(..).chain(pending) {
+                        ms_log::runtime_log::log_error(format!("[ocr] recognize request {request_id} lost: the OCR worker disconnected"));
+                        out.push(OcrControllerEvent::RecognizeFailed { request_id, error: error.clone() });
+                    }
                     break;
                 }
             }
@@ -1595,7 +1648,7 @@ fn native_failure_should_surface(backend_available: bool) -> bool {
 /// Handles one `Recognize` command, including real cancellation: while the
 /// backend call is in flight, the worker keeps draining `cmd_rx`. If a newer
 /// `Recognize` arrives it cancels the in-flight request (the backend replies
-/// `status:"interrupted"`), drops the superseded request silently, and starts
+/// `status:"interrupted"`), publishes the superseded request as `RecognizeCancelled`, and starts
 /// the newer one. A `Stop` cancels and breaks the worker loop.
 ///
 /// Returns `ControlFlow::Break` only when the worker should stop (Stop received
@@ -1678,15 +1731,15 @@ fn run_recognize_command(
             BackendRecognizeFlow::Cancelled => {
                 return publish_worker_event(WorkerEvent::RecognizeCancelled { request_id }, evt_tx);
             }
-            // The in-flight request was superseded but no follow-up was captured
-            // (e.g. cancel raced an empty queue): drop it silently, like the old
-            // server-side "latest wins" did.
+            // The backend interrupted the call with no follow-up captured (e.g. a cancel raced
+            // an empty queue): the request ends as cancelled, so its waiters are released.
             BackendRecognizeFlow::Outcome(RecognizeOutcome::Superseded) => {
-                return std::ops::ControlFlow::Continue(());
+                return publish_worker_event(WorkerEvent::RecognizeCancelled { request_id }, evt_tx);
             }
-            // A newer selection superseded this one: drop the old request silently
-            // and loop to process the newer request next.
+            // A newer selection superseded this one (latest wins): the old request ends as
+            // cancelled, then the loop processes the newer request.
             BackendRecognizeFlow::Superseded(next) => {
+                publish_worker_event(WorkerEvent::RecognizeCancelled { request_id }, evt_tx)?;
                 job = *next;
             }
             BackendRecognizeFlow::Stop => return std::ops::ControlFlow::Break(()),
@@ -3123,6 +3176,7 @@ mod tests {
     /// codes and the recognizer file name.
     #[test]
     fn easyocr_language_errors_are_localized_per_variant() {
+        let _locale = crate::hold_locale_for_test();
         use ms_sysprobe::ai_models::easyocr::{EasyOcrLangError, EasyOcrScript};
         assert_eq!(super::easyocr_lang_error_message(&EasyOcrLangError::Empty), t!("translation.ocr.easyocr_no_language_error"));
         let unsupported = EasyOcrLangError::Unsupported { codes: vec!["xx".to_owned(), "yy".to_owned()] };
@@ -3217,6 +3271,7 @@ mod tests {
     /// error and no bundle. Stat-only, nothing is written.
     #[test]
     fn gate_reports_not_downloaded_on_an_empty_root() {
+        let _locale = crate::hold_locale_for_test();
         use ms_sysprobe::ai_models::easyocr::{EasyOcrScript, easyocr_spec};
         use ms_sysprobe::ai_models::external_catalog::{BABERU_OCR, PaddleVlVariant};
         let root = std::env::temp_dir().join(format!("ms_tab_translation_gate_{}_absent", std::process::id()));
@@ -3278,6 +3333,8 @@ mod tests {
             last_error: None,
             last_result: None,
             pending_request: None,
+            in_flight: Vec::new(),
+            dropped_events: Vec::new(),
             cmd_tx,
             evt_rx,
             worker_thread: None,
@@ -3356,5 +3413,83 @@ mod tests {
         assert!(!second.load(std::sync::atomic::Ordering::Relaxed));
         drop(controller);
         assert!(second.load(std::sync::atomic::Ordering::Relaxed), "the drop stops the newest download");
+    }
+
+    fn request_with_id(request_id: u64) -> OcrRecognizeRequest {
+        OcrRecognizeRequest { request_id, ..sample_post_processing_request(Vec::new(), false) }
+    }
+
+    /// A request waiting for the load that a newer one replaces ends as `RecognizeCancelled`
+    /// (latest wins); only the newer one is sent once the load is done.
+    #[test]
+    fn a_replaced_pending_request_ends_as_cancelled() {
+        let (mut controller, evt_tx, cmd_rx) = controller_with_fake_worker();
+        controller.request_recognize(request_with_id(1));
+        controller.request_recognize(request_with_id(2));
+        assert!(matches!(cmd_rx.try_recv(), Ok(super::WorkerCommand::Load { .. })));
+        assert!(matches!(controller.poll_events().as_slice(), [super::OcrControllerEvent::RecognizeCancelled { request_id: 1 }]));
+        evt_tx.send(super::WorkerEvent::LoadOk).expect("the controller listens");
+        let _ = controller.poll_events();
+        assert!(matches!(cmd_rx.try_recv(), Ok(super::WorkerCommand::Recognize { request, .. }) if request.request_id == 2));
+        assert!(cmd_rx.try_recv().is_err(), "the replaced request is never sent");
+    }
+
+    /// A Recognize the worker can no longer take fails at once: `Error` state and a
+    /// `RecognizeFailed` for that request.
+    #[test]
+    fn a_send_to_a_dead_worker_fails_the_request() {
+        let (mut controller, _evt_tx, cmd_rx) = controller_with_fake_worker();
+        controller.state = super::OcrLoadState::Ready;
+        drop(cmd_rx);
+        controller.request_recognize(request_with_id(4));
+        assert_eq!(controller.state(), super::OcrLoadState::Error);
+        assert!(matches!(controller.poll_events().as_slice(), [super::OcrControllerEvent::RecognizeFailed { request_id: 4, .. }]));
+    }
+
+    /// A load that cannot be sent fails the request that waited for it.
+    #[test]
+    fn a_load_send_to_a_dead_worker_fails_the_waiting_request() {
+        let (mut controller, _evt_tx, cmd_rx) = controller_with_fake_worker();
+        drop(cmd_rx);
+        controller.request_recognize(request_with_id(5));
+        assert_eq!(controller.state(), super::OcrLoadState::Error);
+        assert!(matches!(controller.poll_events().as_slice(), [super::OcrControllerEvent::RecognizeFailed { request_id: 5, .. }]));
+    }
+
+    /// The pending Recognize sent after a finished load fails when the worker is gone.
+    #[test]
+    fn a_pending_request_sent_to_a_dead_worker_after_the_load_fails() {
+        let (mut controller, evt_tx, cmd_rx) = controller_with_fake_worker();
+        controller.request_recognize(request_with_id(6));
+        assert!(matches!(cmd_rx.try_recv(), Ok(super::WorkerCommand::Load { .. })));
+        drop(cmd_rx);
+        evt_tx.send(super::WorkerEvent::LoadOk).expect("the controller listens");
+        let events = controller.poll_events();
+        assert!(events.iter().any(|event| matches!(event, super::OcrControllerEvent::RecognizeFailed { request_id: 6, .. })));
+        assert_eq!(controller.state(), super::OcrLoadState::Error);
+    }
+
+    /// A worker that disconnects fails every request it was given and not answered, and the
+    /// one waiting for a load; an answered request is not failed again.
+    #[test]
+    fn a_disconnected_worker_fails_every_unanswered_request() {
+        let (mut controller, evt_tx, _cmd_rx) = controller_with_fake_worker();
+        controller.state = super::OcrLoadState::Ready;
+        controller.request_recognize(request_with_id(7));
+        controller.request_recognize(request_with_id(8));
+        evt_tx.send(super::WorkerEvent::RecognizeErr { request_id: 7, error: "boom".to_string() }).expect("the controller listens");
+        controller.state = super::OcrLoadState::Loading;
+        controller.request_recognize(request_with_id(9));
+        drop(evt_tx);
+        let failed: Vec<u64> = controller
+            .poll_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                super::OcrControllerEvent::RecognizeFailed { request_id, .. } => Some(request_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed, vec![7, 8, 9]);
+        assert!(controller.poll_events().iter().all(|event| !matches!(event, super::OcrControllerEvent::RecognizeFailed { .. })), "each request fails once");
     }
 }

@@ -94,7 +94,7 @@ use super::font_settings::{
 use crate::runtime_log;
 use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, Picked};
 use crate::tabs::typing::font_admin::{self, FontEntry, VirtualFontGroupInfo, VirtualFontGroupMemberInfo};
-use crate::widgets::{PreviewFontFamily, combo_font_family_name, is_font_family_bound};
+use crate::widgets::{ArmedDeleteButton, ArmedDeleteStep, PreviewFontFamily, combo_font_family_name, is_font_family_bound};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -579,39 +579,26 @@ impl FontGroupsEditorState {
         }
     }
 
-    /// Draws the inline two-step delete control for one group. First click ARMS the group
-    /// (button switches to "Удалить?"); a second click while armed deletes it. Clicking a
-    /// different group's control re-arms to that group instead.
-    ///
-    /// Hardening: a physical DOUBLE-click cannot delete — the confirming click is gated on
-    /// `!response.double_clicked()`, so the arm and confirm can never land in one gesture.
-    /// The armed state also AUTO-DISARMS once the pointer leaves the armed button (it is not
-    /// hovered this frame), so a stale arm cannot linger and turn a later unrelated click into
-    /// an accidental delete.
+    /// Draws the inline two-step delete control for one group (`ArmedDeleteButton`): the first
+    /// click ARMS the group (button switches to "Удалить?"), a second plain click while armed
+    /// deletes it. Clicking a different group's control re-arms to that group instead. A
+    /// physical double click never deletes, and the arm auto-disarms once the pointer leaves the
+    /// armed button, so a stale arm cannot turn a later unrelated click into a delete.
     fn draw_delete_control(&mut self, ui: &mut egui::Ui, group_name: &str) {
         let armed = self.delete_armed.as_deref() == Some(group_name);
-        let button = if armed {
-            // Armed state is tinted red so the destructive confirm reads clearly.
-            egui::Button::new(t!("typing.font_settings.group_delete_confirm_button"))
-                .fill(ms_theme::status::DESTRUCTIVE_ARMED_FILL)
-        } else {
-            egui::Button::new(t!("typing.font_settings.group_delete_button"))
-        };
-        let response = ui.add(button);
-        // A double-click delivers a press on two consecutive frames; without this guard the
-        // first press arms and the second confirms, deleting on a single physical gesture.
-        // Requiring a plain single click for the confirm step forces two deliberate clicks.
-        if response.clicked() && !response.double_clicked() {
-            if armed {
+        let (_, step) = ArmedDeleteButton::new(
+            t!("typing.font_settings.group_delete_button"),
+            t!("typing.font_settings.group_delete_confirm_button"),
+        )
+        .show(ui, armed);
+        match step {
+            ArmedDeleteStep::Confirm => {
                 font_admin::delete_virtual_group(group_name);
                 self.delete_armed = None;
-            } else {
-                self.delete_armed = Some(group_name.to_string());
             }
-        } else if armed && !response.hovered() {
-            // Pointer moved away from the armed button: disarm so a later click elsewhere
-            // cannot be mistaken for the confirm step.
-            self.delete_armed = None;
+            ArmedDeleteStep::Arm => self.delete_armed = Some(group_name.to_string()),
+            ArmedDeleteStep::Disarm => self.delete_armed = None,
+            ArmedDeleteStep::Keep => {}
         }
     }
 

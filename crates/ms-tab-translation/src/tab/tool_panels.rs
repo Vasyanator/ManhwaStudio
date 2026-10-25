@@ -283,15 +283,18 @@ impl TranslationTabState {
     }
 
     /// Per-frame tool bookkeeping the host runs before the canvas draw: caches the current page's
-    /// size for the detector body (the overlay hook has no `page_infos`), and while any tool is
-    /// on refreshes the backend health snapshot and the throttled OCR route inputs the tool
-    /// bodies gate on.
+    /// size for the detector body (the overlay hook has no `page_infos`), refreshes the backend
+    /// health snapshot every frame, and while any tool is on refreshes the throttled OCR route
+    /// inputs the tool bodies gate on.
     pub fn prepare_tool_frame(&mut self, current_page_size: Option<[u32; 2]>) {
         self.current_page_size = current_page_size;
+        // Every frame, not only while a tool is on: the canvas quick-OCR gesture gates on
+        // backend availability with every tool off too. Cheap: it clones only on a revision
+        // change of the shared snapshot.
+        self.refresh_ai_backend_health_snapshot_cache();
         if !self.tools.any_on() {
             return;
         }
-        self.refresh_ai_backend_health_snapshot_cache();
         // Kept fresh for every tool, not just OCR: the detector also gates its algorithm buttons
         // on onnx availability, so the native-armed signal must be published whichever tool is
         // shown. Throttled internally, so this is a cheap no-op most frames.

@@ -23,8 +23,10 @@ Modules:
 - `clean_status`: the «Клин» tab's clean-folder status area (worker scan + dismissible warnings).
 - `watermark_chapter`: the GUI-free chapter-level watermark decomposition engine.
 - `studio_tab`: `impl ms_studio_tab::StudioTab` (input declarations and contexts, dock builder,
-  GPU eviction, source-page window, committed-tree rescan) — the studio root's order-free per-tab
-  hooks.
+  GPU eviction, source-page window, committed-tree rescan, the teardown flush of the tools'
+  settings writers) — the studio root's order-free per-tab hooks.
+- `text_mask_storage`: reads a page's stored text-detector mask with the sizes the store
+  recorded (the display-cache load and the quick text clean's disk fallback).
 - `input`: the tab's `ms-input` declarations, contexts, gesture targets and hint labels.
 - `canvas_input`: the stroke driver — the canvas-wide claim (mouse drag or finger long-press
   drag) -> the active tool's stroke calls.
@@ -44,6 +46,7 @@ mod clean_status;
 mod input;
 mod studio_tab;
 mod tab;
+mod text_mask_storage;
 mod tools;
 // GUI-free chapter-level watermark decomposition engine (`I = c + s*B`, solved from several
 // occurrences), consumed by the «По главе (точное вычитание)» mode of

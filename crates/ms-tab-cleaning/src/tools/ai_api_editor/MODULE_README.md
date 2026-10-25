@@ -72,8 +72,10 @@ worker.rs          read_key -> RgbaRegion (+ marks_reference) -> run_image_edit(
   run (`detached`) and `poll` drains it until its worker ends (its answer dropped and logged);
   meanwhile the gate refuses a new run with `cancelled_run_closing_status` (second reason, after
   "run in flight"), so cancel-and-restart never stacks workers blocked in HTTP calls.
-- **Settings.** A user edit outranks a load that lands later; nothing is written before the load
-  landed (`settings_save_due`); unknown provider keys are skipped, never remapped; a test process
+- **Settings.** A user edit outranks a load that lands later; writes go through the shared
+  `SettingsSaver` (`region_edit_v2::engine_settings_file`: nothing before the load landed, a
+  700 ms quiet-time debounce, atomic replace, retry with backoff, the value still owed written
+  at teardown by `flush_settings_blocking`); unknown provider keys are skipped, never remapped; a test process
   never writes the file: `save_api_edit_settings` refuses under `cfg!(test)` OR once the sticky
   latch is armed by the test-only door `suppress_settings_persistence_for_tests` (re-exported at
   the crate root behind the `test-support` feature for other crates' tests that build the tab).

@@ -841,6 +841,7 @@ mod tests {
     /// Q7c: a PyTorch detector with PyTorch missing names that reason, not "AI disabled".
     #[test]
     fn torch_missing_hint_names_pytorch() {
+        let _locale = crate::hold_locale_for_test();
         for algorithm in [TextDetectorAlgorithm::Ai, TextDetectorAlgorithm::Surya] {
             assert_eq!(
                 DetectorUnavailable::TorchMissing.panel_hint_text(algorithm),

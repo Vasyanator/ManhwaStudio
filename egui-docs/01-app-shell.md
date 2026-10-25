@@ -185,7 +185,8 @@ Consequences worth knowing before you write the body:
 * **The body scrolls on both axes by itself.** Do not add your own `ScrollArea` around the whole
   body; you would nest two scroll areas and the outer one would win.
 * **Panels live on `Order::Foreground`.** Canvas input gating is z-order based
-  (`ms_widgets::input_util::pointer_over_floating_area`), so a panel lowered below that order stops
+  (`ms_input::Condition::PointerOnView`: `Context::layer_id_at` must report `Order::Background` or the
+  view's own capture layer), so a panel lowered to `Order::Background` stops
   shielding the canvas underneath it and clicks fall through onto the artwork.
 
 What is still legitimately an `Area`: toasts, tooltips, scene-anchored overlays, the tutorial

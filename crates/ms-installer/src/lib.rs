@@ -63,6 +63,10 @@ pub mod window;
 // second copy of those rules would be free to drift from the installer's.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod utils;
+// The PEP 440 / PEP 508 subset that reads the embedded dependency specs and decides whether an
+// installed version satisfies a pin; crate-private, used by `utils`' missing-package check.
+#[cfg(not(target_arch = "wasm32"))]
+mod pip_spec;
 // The PyTorch seam: pins, wheel options, preflight, install stage and the "installed PyTorch
 // is current" predicate. `pub` because the launcher's settings page runs the same preflight
 // and upgrade worker, and `venv_check` shares the readiness predicate.

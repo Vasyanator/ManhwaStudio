@@ -89,3 +89,12 @@ pub use host::{TranslationDrawParams, TranslationTab};
 /// The tab state the root constructs (services injected) before wrapping it in a
 /// `TranslationTab`.
 pub use tab::TranslationTabState;
+
+/// Test-only: holds the process-wide locale lock (`ms_config::locale_store::GLOBAL_LOCALE_LOCK`,
+/// the one every test that switches the active catalog takes) for the life of the guard, so a
+/// test comparing localized strings sees one catalog throughout — whichever one is active.
+/// Not reentrant: a test that holds it must not also take a locale-installing helper's guard.
+#[cfg(test)]
+pub(crate) fn hold_locale_for_test() -> std::sync::MutexGuard<'static, ()> {
+    ms_config::locale_store::GLOBAL_LOCALE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}

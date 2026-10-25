@@ -20,13 +20,13 @@ Key items:
   `pipeline::detect_image` + Rust dilation + offset to page pixels, or for NeuroLate one paid
   `MASK` request on the crop converted by `neurolate::region_from_image`).
 - `merge_region_into_page()` / `empty_page_result()`: pure "replace inside the rect" merge into a
-  page result.
+  page result; `merge_region_blocks()`: its block rule alone.
 
 Notes:
 The mask raster rule of the merge has one owner, `ms_models::text_mask_model::replace_mask_region`
 (also used by `TextMaskModel::merge_region` for the shared model). The block rule lives only here
-(`region_contains_block_centre` + `finalize_blocks`): the shared model receives the merged,
-finalized block set of the tab's store instead of re-deciding it. Dilation is applied to the
+(`merge_region_blocks`: `region_contains_block_centre` + `finalize_blocks`): the shared model
+receives a block set merged by it instead of re-deciding it. Dilation is applied to the
 crop, so it stops at the selection border. Worker-thread only, except the pure merge.
 */
 
@@ -241,10 +241,18 @@ pub(crate) fn merge_region_into_page(page: &mut TextDetectorPageResult, region: 
         page.mask_size = region.source_size;
         page.mask_alpha = mask_alpha;
     }
-    page.blocks.retain(|block| !region_contains_block_centre(region.rect, block));
-    page.blocks.extend_from_slice(&region.blocks);
-    ms_text_detect::blocks::finalize_blocks(&mut page.blocks);
+    merge_region_blocks(&mut page.blocks, region);
     Ok(())
+}
+
+/// The block rule of a region merge, the one owner of it: the blocks centred in `region.rect` are
+/// replaced by the region's blocks, then the set is finalized (`ms_text_detect` order and cap).
+/// Used for the tab's page blocks (`merge_region_into_page`) and for the box set the shared model
+/// receives when the page outside the rect is a raster of other boxes (a frozen legacy page).
+pub(crate) fn merge_region_blocks(blocks: &mut Vec<TextDetectorRect>, region: &RegionDetection) {
+    blocks.retain(|block| !region_contains_block_centre(region.rect, block));
+    blocks.extend_from_slice(&region.blocks);
+    ms_text_detect::blocks::finalize_blocks(blocks);
 }
 
 /// The result of a page with no detection yet: no blocks and no mask (`merge_region_into_page`

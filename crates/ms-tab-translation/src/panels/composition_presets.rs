@@ -6,7 +6,8 @@ Named presets of the composition panel's options («Компоновка» › �
 presets («Экспорт перевода», «Перевод через ИИ») with their factory values, the app-wide preset
 store (built-in overrides + user presets), the per-title selection codec, the
 `ms_widgets::PresetPicker` block drawn at the top of the Params sub-tab, and the ordered
-off-thread writer that persists every preset operation into `user_config`.
+off-thread writer (`ms_config::preset_store::OrderedWriter`) that persists every preset
+operation into `user_config`.
 
 Key structures:
 - BuiltinCompositionPreset: `TranslationExport` / `AiTranslation`, with a stable persistence
@@ -61,12 +62,11 @@ Notes:
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
 
 use eframe::egui;
 use ms_config::mt_transport::TRANSLATION_TAB_SECTION;
+use ms_config::preset_store::{OrderedWriter, SubmitError, free_default_name};
 use ms_log::runtime_log;
-use ms_thread::{self as thread, JoinHandle};
 use ms_widgets::{PresetPicker, PresetPickerAction, PresetPickerState};
 use serde_json::{Map, Value};
 
@@ -466,14 +466,8 @@ struct WriteOutcome {
     error: Option<String>,
 }
 
-/// The ordered writer: one thread applying [`PresetWrite`]s to one `user_config` file in
-/// arrival order, answering every operation with a [`WriteOutcome`].
-#[derive(Debug)]
-struct PresetWriter {
-    /// `None` only while dropping (closing it ends the thread's loop).
-    tx: Option<Sender<PresetWrite>>,
-    handle: Option<JoinHandle<()>>,
-}
+/// One job of the ordered writer: an operation and the `user_config` file it goes to.
+type WriteJob = (PathBuf, PresetWrite);
 
 /// Runs one operation against the document at `path` (blocking; the writer thread only).
 ///
@@ -508,33 +502,15 @@ pub struct CompositionPresets {
     failed: BTreeSet<CompositionPresetRef>,
     /// Where writes go; `None` keeps every operation in memory (tests, the default state).
     store_path: Option<PathBuf>,
-    /// Started on the first write.
-    writer: Option<PresetWriter>,
-    outcomes_tx: Sender<WriteOutcome>,
-    outcomes_rx: Receiver<WriteOutcome>,
+    /// The ordered writer (`ms_config::preset_store`); its thread starts on the first write and
+    /// is joined when the store drops — on the studio's teardown worker, never the GUI thread.
+    writer: OrderedWriter<WriteJob, WriteOutcome>,
 }
 
 impl Default for CompositionPresets {
     /// The built-ins with their factory values, no user presets, no persistence.
     fn default() -> Self {
         Self::from_parts(BTreeMap::new(), BTreeMap::new(), None, None)
-    }
-}
-
-impl Drop for CompositionPresets {
-    /// Closes the writer's queue and waits for the queued writes, so an operation made just
-    /// before the studio closes still reaches the disk. The tab state is dropped by the
-    /// studio's teardown worker, never on the GUI thread.
-    fn drop(&mut self) {
-        let Some(mut writer) = self.writer.take() else {
-            return;
-        };
-        drop(writer.tx.take());
-        if let Some(handle) = writer.handle.take()
-            && handle.join().is_err()
-        {
-            runtime_log::log_error("[translation::composition_presets] the preset writer thread panicked; the last preset operations may not be saved");
-        }
     }
 }
 
@@ -546,7 +522,6 @@ impl CompositionPresets {
         unsupported_version: Option<String>,
         store_path: Option<PathBuf>,
     ) -> Self {
-        let (outcomes_tx, outcomes_rx) = mpsc::channel();
         Self {
             overrides,
             user,
@@ -557,9 +532,7 @@ impl CompositionPresets {
             write_error: None,
             failed: BTreeSet::new(),
             store_path,
-            writer: None,
-            outcomes_tx,
-            outcomes_rx,
+            writer: OrderedWriter::new("composition-presets-writer", run_write_job),
         }
     }
 
@@ -872,23 +845,10 @@ impl CompositionPresets {
     }
 
     /// `translation.composition.preset_default_name` with the lowest 1-based index no preset
-    /// carries. Bounded like the typing panel's allocator: `count + 1` candidates against
-    /// `count` names, with a suffix fallback for a catalog entry that lost `{index}`.
+    /// carries, by the shared bounded allocator (`ms_config::preset_store::free_default_name`).
     #[must_use]
     fn free_default_name(&self) -> String {
-        let taken = self.rows().len();
-        for index in 1..=taken + 1 {
-            let candidate = tf!("translation.composition.preset_default_name", index = index);
-            if !self.name_taken(&candidate) {
-                return candidate;
-            }
-        }
-        let base = tf!("translation.composition.preset_default_name", index = taken + 1);
-        (2..=taken + 2)
-            .map(|suffix| format!("{base} ({suffix})"))
-            .find(|candidate| !self.name_taken(candidate))
-            // Unreachable by the same bound: `taken + 1` candidates against `taken` names.
-            .unwrap_or_else(|| format!("{base} ({})", taken + 2))
+        free_default_name(self.rows().len(), |index| tf!("translation.composition.preset_default_name", index = index), |name| self.name_taken(name))
     }
 
     /// Hands `op` to the writer thread (started on first use). Without a store path the
@@ -898,31 +858,19 @@ impl CompositionPresets {
         let Some(path) = self.store_path.clone() else {
             return;
         };
-        if self.writer.is_none() {
-            match spawn_writer(path.clone(), self.outcomes_tx.clone()) {
-                Ok(writer) => self.writer = Some(writer),
-                Err(err) => {
-                    runtime_log::log_error(format!("[translation::composition_presets] could not start the preset writer thread; op={} path={} error={err}", op.describe(), path.display()));
-                    self.apply_write_outcome(WriteOutcome { entries: op.entries(), error: Some(err.to_string()) });
-                    return;
-                }
-            }
-        }
-        let entries = op.entries();
-        let sent = self.writer.as_ref().and_then(|writer| writer.tx.as_ref()).is_some_and(|tx| tx.send(op).is_ok());
-        if !sent {
-            runtime_log::log_error(format!("[translation::composition_presets] the preset writer thread is gone; an operation was not saved; entries={entries:?} path={}", path.display()));
-            self.apply_write_outcome(WriteOutcome { entries, error: Some(t!("translation.composition.preset_writer_lost_error").to_string()) });
-            // A fresh writer is started by the next operation.
-            self.writer = None;
-        }
+        let (path, op, error) = match self.writer.submit((path, op)) {
+            Ok(()) => return,
+            // Both are logged by the writer; the op's entries are marked failed here.
+            Err(SubmitError::Spawn { job: (path, op), error }) => (path, op, error.to_string()),
+            Err(SubmitError::WorkerGone { job: (path, op) }) => (path, op, t!("translation.composition.preset_writer_lost_error").to_string()),
+        };
+        runtime_log::log_error(format!("[translation::composition_presets] a preset operation was not saved; op={} path={} error={error}", op.describe(), path.display()));
+        self.apply_write_outcome(WriteOutcome { entries: op.entries(), error: Some(error) });
     }
 
     /// Applies every answer the writer sent since the last frame.
     fn poll_write_outcomes(&mut self) {
-        // The store holds a sender itself, so the channel cannot disconnect while `self` lives;
-        // an `Err` (empty) simply means "nothing more to read".
-        while let Ok(outcome) = self.outcomes_rx.try_recv() {
+        while let Some(outcome) = self.writer.try_recv_outcome() {
             self.apply_write_outcome(outcome);
         }
     }
@@ -948,37 +896,24 @@ impl CompositionPresets {
     }
 }
 
-/// Starts the ordered writer over `path`; every operation is answered on `outcomes` (failures are
-/// logged too).
-///
-/// # Errors
-/// The OS error when the thread cannot be spawned.
-fn spawn_writer(path: PathBuf, outcomes: Sender<WriteOutcome>) -> std::io::Result<PresetWriter> {
-    let (tx, rx) = mpsc::channel::<PresetWrite>();
-    let handle = thread::Builder::new().name("composition-presets-writer".to_string()).spawn(move || {
-        while let Ok(op) = rx.recv() {
-            let error = match persist_preset_write(&path, &op) {
-                Ok(()) => {
-                    runtime_log::log_info(format!("[translation::composition_presets] saved preset operation ({}) to {}", op.describe(), path.display()));
-                    None
-                }
-                Err(err) => {
-                    runtime_log::log_error(format!(
-                        "[translation::composition_presets] failed to save a preset operation; op={} path={} error={err} possible_cause=malformed or unwritable user_config, or a preset store of a newer build (both are left untouched)",
-                        op.describe(),
-                        path.display()
-                    ));
-                    Some(err)
-                }
-            };
-            // The GUI side outlives the writer (it joins it on drop), so a send can only fail
-            // during that drop, when nobody would read the answer anyway.
-            if outcomes.send(WriteOutcome { entries: op.entries(), error }).is_err() {
-                runtime_log::log_warn("[translation::composition_presets] a preset write outcome had no reader (the store is closing)");
-            }
+/// The writer thread's step: persists one operation, logs the result and answers with the
+/// operation's entries and the error, if any.
+fn run_write_job((path, op): WriteJob) -> WriteOutcome {
+    let error = match persist_preset_write(&path, &op) {
+        Ok(()) => {
+            runtime_log::log_info(format!("[translation::composition_presets] saved preset operation ({}) to {}", op.describe(), path.display()));
+            None
         }
-    })?;
-    Ok(PresetWriter { tx: Some(tx), handle: Some(handle) })
+        Err(err) => {
+            runtime_log::log_error(format!(
+                "[translation::composition_presets] failed to save a preset operation; op={} path={} error={err} possible_cause=malformed or unwritable user_config, or a preset store of a newer build (both are left untouched)",
+                op.describe(),
+                path.display()
+            ));
+            Some(err)
+        }
+    };
+    WriteOutcome { entries: op.entries(), error }
 }
 
 #[cfg(test)]
@@ -1410,7 +1345,7 @@ mod tests {
         std::fs::write(&path, "{ not json").map_err(|err| err.to_string())?;
         let mut presets = CompositionPresets::from_parts(BTreeMap::new(), BTreeMap::new(), None, Some(path.clone()));
         presets.create(&user_preset());
-        let outcome = presets.outcomes_rx.recv_timeout(std::time::Duration::from_secs(30)).map_err(|err| err.to_string())?;
+        let outcome = presets.writer.recv_outcome_timeout(std::time::Duration::from_secs(30)).map_err(|err| err.to_string())?;
         assert!(outcome.error.is_some(), "{outcome:?}");
         presets.apply_write_outcome(outcome);
         assert!(presets.selected_write_failed());

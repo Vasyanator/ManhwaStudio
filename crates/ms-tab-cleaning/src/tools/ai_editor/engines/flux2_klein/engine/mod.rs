@@ -789,6 +789,16 @@ pub(super) fn same_region_size(a: Option<&OverlayRectPx>, b: Option<&OverlayRect
 }
 
 impl AiEngine for Flux2KleinEngine {
+    /// The value the shared `SettingsSaver` still owes, written now on the teardown worker. A
+    /// settings load that landed meanwhile is applied first, so its gate is the real one.
+    fn flush_settings_blocking(&mut self) {
+        self.poll_settings_load();
+        self.saver.flush_blocking(
+            SaveGate { dirty: &mut self.dirty, loaded: self.settings_loaded, blocked: self.settings_save_blocked },
+            &self.settings,
+        );
+    }
+
     fn id(&self) -> &'static str {
         self.variant.engine_id()
     }

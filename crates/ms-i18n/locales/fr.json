@@ -3771,8 +3771,6 @@
   "translation.tab.no_results_to_save_status": "Aucun résultat à enregistrer",
   "translation.tab.no_selection_status": "Aucune sélection trouvée pour la reconnaissance.",
   "translation.tab.ocr_already_running_status": "L'OCR est déjà en cours",
-  "translation.tab.page_image_size_error": "Impossible d'obtenir la taille de l'image pour la page #{page_idx} ({page}) : {err}",
-  "translation.tab.page_not_found_error": "Page #{page_idx} introuvable.",
   "translation.tab.panel_composition_title": "Composition",
   "translation.tab.panel_mt_short_title": "Trad. auto/IA",
   "translation.tab.panel_mt_title": "Traduction automatique/IA",

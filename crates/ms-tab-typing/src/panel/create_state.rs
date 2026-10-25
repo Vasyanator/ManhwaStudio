@@ -179,6 +179,7 @@ impl TypingCreatePanelState {
             formula_presets_by_name,
             selected_formula_preset_name: None,
             formula_preset_name_input: String::new(),
+            formula_presets_writer: ms_config::preset_store::OrderedWriter::new("typing-save-formula-presets", run_formula_presets_write),
             preview_enabled,
             selected_font_idx: 0,
             selected_face_idx: 0,

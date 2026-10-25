@@ -76,8 +76,9 @@ use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunReques
 // The engines' shared run-path re-check of `FrameConstraints`, so this engine's refusal
 // wording is the host's own.
 use crate::tools::region_edit_v2::engine::region_size_refusal;
-// The save gate every engine's settings saver consults; one owner for all hosted engines.
-use crate::tools::region_edit_v2::engine_settings::settings_save_due;
+// The debounced, atomic settings writer every hosted engine shares (save gate, quiet time,
+// retry backoff, teardown flush).
+use crate::tools::region_edit_v2::engine_settings_file::{SaveGate, SettingsSaver, SettingsWriteError, write_settings_json};
 use ms_sysprobe::ai_models;
 use ms_backend_ipc::{self as backend_ipc, CallError};
 use ms_canvas::OverlayRectPx;
@@ -94,7 +95,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use web_time::Duration;
+use web_time::{Duration, Instant};
 // The run in flight (worker + channel + cancel flag set on drop), shared with `sdxl`.
 use super::run_job::EngineRunJob;
 use ms_tab_translation::model_download_status::draw_model_download_status;

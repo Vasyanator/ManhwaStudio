@@ -13,7 +13,8 @@ Key structures:
 - `TtPoint` / `TtContour`: quantized TrueType points (on/off-curve, `i16`).
 
 Key functions:
-- `reverse_contour`, `flatten_contour` / `flatten_contour_within` (point-budgeted).
+- `reverse_contour`, `flatten_contour_within` (point-budgeted; `flatten_contour`, its unbudgeted
+  form, is the test-only reference).
 - `to_truetype`: cubic -> quadratic (`kurbo`), rounding with range checks, cleanup of
   degenerate points and contours.
 
@@ -167,6 +168,11 @@ pub(crate) fn reverse_contour(contour: &Contour) -> Contour {
 
 /// Flattens a contour into a closed polygon (the start is not repeated at the end) whose
 /// deviation from the curves is at most about `tolerance` units.
+///
+/// Unbudgeted, so test-only: every runtime path flattens through `flatten_contour_within`
+/// (via `hybrid::sdf::flatten_checked*`), which bounds the work a hostile outline can cause;
+/// tests use this as the reference the budgeted form must equal.
+#[cfg(test)]
 pub(crate) fn flatten_contour(contour: &Contour, tolerance: f64, out: &mut Vec<Point>) {
     // With `usize::MAX` as the limit the check can never fire (`out` would exhaust memory long
     // before), so the result carries no information here.

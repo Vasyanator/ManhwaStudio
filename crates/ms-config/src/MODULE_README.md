@@ -99,6 +99,13 @@ that defines the type.
   `update_user_config_file`; the feeders stay above. Owns the durability policy — 700 ms
   coalescing, a failed write HELD and retried with a capped backoff, a final attempt on
   shutdown, a definitive loss logged with cause/path/context.
+- `preset_store.rs`: what every named-preset store shares — `OrderedWriter<Job, Outcome>` (ONE
+  lazily started thread per store running jobs in arrival order, answering each on an outcome
+  channel the owner drains per frame; a dead thread hands the job back as `SubmitError` and is
+  replaced on the next submit; dropping joins it, so owners drop on a worker) and
+  `free_default_name` (lowest free numbered default name, bounded). Consumers: typing formula
+  presets, translation composition presets, Settings layout presets; each keeps its own job type,
+  write step and failed-entry bookkeeping.
 - `settings_deep_link.rs`: `SettingsDeepLink` — the reveal targets one part of the app can ask the
   settings surface to open. It sits here because its REQUESTER (crate `ms-tab-typing`) and its
   CONSUMER (the binary's settings tab) may not depend on each other; `ms-settings-ui`'s

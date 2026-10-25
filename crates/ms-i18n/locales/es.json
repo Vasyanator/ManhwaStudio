@@ -3771,8 +3771,6 @@
   "translation.tab.no_results_to_save_status": "No hay resultados que guardar",
   "translation.tab.no_selection_status": "No se encontró ninguna selección para el reconocimiento.",
   "translation.tab.ocr_already_running_status": "El OCR ya está en ejecución",
-  "translation.tab.page_image_size_error": "No se pudo obtener el tamaño de la imagen de la página #{page_idx} ({page}): {err}",
-  "translation.tab.page_not_found_error": "Página #{page_idx} no encontrada.",
   "translation.tab.panel_composition_title": "Composición",
   "translation.tab.panel_mt_short_title": "Trad. autom./IA",
   "translation.tab.panel_mt_title": "Traducción automática/IA",

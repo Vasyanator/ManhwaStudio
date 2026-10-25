@@ -75,8 +75,10 @@ Notes:
   used to read the drawn rect back into the request and the panel grew by the
   stroke on every dragged frame.
 - The panel must stay on `Order::Foreground`: canvas input gating is z-order
-  based (`crate::input_util::pointer_over_floating_area`), so a panel on any
-  lower order would stop shielding the canvas underneath it.
+  based (`ms_input::Condition::PointerOnView` counts a view as under the pointer
+  only where `Context::layer_id_at` reports `Order::Background` or the view's own
+  capture layer), so a panel on `Order::Background` would stop shielding the
+  canvas underneath it.
 - Every egui `Id` here derives from `PanelId` / `TabId` literals and the layout
   key, never from the localised caption (`egui-docs/05-ids-and-i18n.md` §2).
 - `egui::Resize` is deliberately not used: its size lives in egui memory, which
@@ -632,7 +634,7 @@ impl<'a> CollapsiblePanel<'a> {
         let chrome_opacity = self.chrome_opacity(ui);
         // `multiply_with_opacity` scales `fill`, `stroke.color` and
         // `shadow.color` and NOTHING else
-        // (`egui-0.35.0/src/containers/frame.rs:313-318`). The inner margin and
+        // (`egui-0.36.2/src/containers/frame.rs:313-318`). The inner margin and
         // the stroke WIDTH survive it untouched, which is exactly what keeps the
         // transparent mode geometry-neutral: `margin`, `border`, the body budget
         // and the reported `PanelChrome` below are the same numbers in both
@@ -642,7 +644,7 @@ impl<'a> CollapsiblePanel<'a> {
         let margin = frame.inner_margin.sum();
         // `Frame` draws its stroke OUTSIDE the inner margin and allocates
         // `content + inner_margin + stroke` in the parent
-        // (`egui-0.35.0/src/containers/frame.rs:340-352`). Charging the border to
+        // (`egui-0.36.2/src/containers/frame.rs:340-352`). Charging the border to
         // the content is what makes the DRAWN outer rect exactly the rect the
         // solver produced; leaving it out made the drawn panel `2 * stroke`
         // wider and `stroke` taller than the solve, which the resize grip then
@@ -655,7 +657,7 @@ impl<'a> CollapsiblePanel<'a> {
         if !self.collapsed {
             // THE HEIGHT CEILING. An `Area`'s `Ui` is built with the size the area
             // measured on the PREVIOUS frame as its `max_rect`
-            // (`egui-0.35.0/src/containers/area.rs:610`, `:666`), and a
+            // (`egui-0.36.2/src/containers/area.rs:612`, `:668`), and a
             // `ScrollArea` never allocates more than
             // `available_rect_before_wrap()` (`scroll_area.rs:763-766`). Without
             // this line the body is therefore capped at the height the panel
@@ -724,7 +726,7 @@ impl<'a> CollapsiblePanel<'a> {
                 // Reserve the drag handle's slot right of the collapse button and
                 // LEFT of the first caption. Space is advanced, never allocated:
                 // in a left-to-right layout `Ui::add_space` expands the region's
-                // x only (`egui-0.35.0/src/layout.rs:674-679`), so the strip stays
+                // x only (`egui-0.36.2/src/layout.rs:674-679`), so the strip stays
                 // exactly as tall as the button and the captions make it. That
                 // height is reported as this panel's `PanelChrome`, so a header
                 // grown by one point grows every panel in the layout by one point.
@@ -834,7 +836,7 @@ impl<'a> CollapsiblePanel<'a> {
             // leave a bright bar floating on the bare canvas. `ScrollArea` reads
             // this style from the `Ui` it is shown in, both for its sizes
             // (`scroll_area.rs:756`) and for the two colours it paints
-            // (`:1268`, `:1469-1519`), so fading the style here is the whole
+            // (`:1270`, `:1469-1519`), so fading the style here is the whole
             // fix. Restored INSIDE the body: a scroll area of the tab's own
             // content is content, and content never fades.
             let unfaded_scroll = body_ui.spacing().scroll;
@@ -850,7 +852,7 @@ impl<'a> CollapsiblePanel<'a> {
                 .id_salt(("ms_panel_dock_body", self.id_scope, active.as_str()))
                 .max_height(body_max_height)
                 // Explicit although it is egui's default
-                // (`egui-0.35.0/src/containers/scroll_area.rs:129-134`): a bar
+                // (`egui-0.36.2/src/containers/scroll_area.rs:129-134`): a bar
                 // that appears only when the content does not fit is a contract
                 // of this widget, not a style detail.
                 .scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded)
@@ -880,7 +882,7 @@ impl<'a> CollapsiblePanel<'a> {
                 body_ui.spacing_mut().scroll = unfaded_scroll;
             }
             // `ScrollAreaOutput::inner_rect` is the rect the body was given
-            // BEFORE any auto-shrink adjustment (`scroll_area.rs:1040`), i.e.
+            // BEFORE any auto-shrink adjustment (`scroll_area.rs:1039`), i.e.
             // exactly the budget above — which is what makes the subtraction
             // below the panel's overhead and nothing else.
             body_budget_height = scroll.inner_rect.height();
@@ -1020,12 +1022,13 @@ impl<'a> CollapsiblePanel<'a> {
     /// at the cursor: a widget sensing click AND drag is only marked `dragged`
     /// once the press became "decidedly a drag" — the pointer moved further than
     /// [`egui::InputOptions::max_click_dist`] or was held longer than
-    /// [`egui::InputOptions::max_click_duration`]
-    /// (`egui-0.35.0/src/interaction.rs:191-206`,
-    /// `egui-0.35.0/src/input_state/mod.rs:1512-1518`).
+    /// [`egui::InputOptions::max_click_duration`] — or once the pointer left the
+    /// widget, where no click can land any more
+    /// (`egui-0.36.2/src/interaction.rs:191-221`,
+    /// `egui-0.36.2/src/input_state/mod.rs:1515-1521`).
     ///
     /// [`egui::Ui::dnd_drag_source`] is deliberately NOT used: it allocates its
-    /// source with `Sense::drag()` alone (`egui-0.35.0/src/ui.rs:2676-2680`), so
+    /// source with `Sense::drag()` alone (`egui-0.36.2/src/ui.rs:2677-2681`), so
     /// the header started moving on the first pressed frame — and because it
     /// then re-parents the caption into a tooltip layer, the click target the
     /// press had latched onto disappears from the next frame's widget rects and
@@ -1259,7 +1262,7 @@ impl<'a> CollapsiblePanel<'a> {
     /// `dnd_hover_payload`), never by `hovered()`: while a drag is in flight egui
     /// reports `hovered() == false` for every widget, which is exactly why
     /// `dnd_drop_zone` uses the same accessor
-    /// (`egui-0.35.0/src/ui.rs:2705-2712`).
+    /// (`egui-0.36.2/src/ui.rs:2706-2713`).
     ///
     /// A panel the driver marked as not accepting drops
     /// ([`CollapsiblePanel::accepts_drop`]) neither paints the marker nor takes
@@ -1391,10 +1394,11 @@ impl<'a> CollapsiblePanel<'a> {
     /// [`CollapsiblePanel::transparent_until_hover`] was set.
     ///
     /// The two states are crossfaded with
-    /// [`egui::Context::animate_bool_responsive`] (`egui-0.35.0/src/context.rs:3099`),
-    /// which requests the repaints the animation needs by itself
-    /// (`:3145-3148`) and returns the TARGET value on the first call for an id
-    /// (`egui-0.35.0/src/animation_manager.rs:38-46`), so a panel never flashes
+    /// [`egui::Context::animate_bool_responsive`]
+    /// (fork `crates/egui/crates/egui/src/context.rs:3208`), which requests the
+    /// repaints the animation needs by itself (`:3254-3257`) and returns the
+    /// TARGET value on the first call for an id
+    /// (`egui-0.36.2/src/animation_manager.rs:38-46`), so a panel never flashes
     /// on the frame it is first drawn. The animation id derives from the panel's
     /// own `Ui` id — the layout key plus the `PanelId` — never from a caption.
     ///
@@ -1415,7 +1419,7 @@ impl<'a> CollapsiblePanel<'a> {
         // CONTEXT by id rather than of a `Response`, because the answer is
         // needed before the zones are sensed — and because `Response::hovered()`
         // is useless here anyway: while a button is held egui reports only the
-        // dragged widget as hovered (`egui-0.35.0/src/interaction.rs:239-243`),
+        // dragged widget as hovered (`egui-0.36.2/src/interaction.rs:256-260`),
         // so a panel would vanish from under its own resize grip. The header
         // strip's drop zone is deliberately absent: it senses hover only, and a
         // drop is already covered by the driver's `force_visible`.
@@ -1428,8 +1432,8 @@ impl<'a> CollapsiblePanel<'a> {
         .any(|key| ctx.is_being_dragged(base.with(key)));
         // Everything the pointer press says, read once. `press_origin` is set on
         // every press and cleared on every release
-        // (`egui-0.35.0/src/input_state/mod.rs:1146`, `:1194`), and a
-        // `PointerGone` clears NEITHER it nor `down` (`:1200-1206`) — which is
+        // (`egui-0.36.2/src/input_state/mod.rs:1149`, `:1197`), and a
+        // `PointerGone` clears NEITHER it nor `down` (`:1203-1209`) — which is
         // exactly what makes it survive a drag pulled out of the window.
         let (any_down, press_origin) =
             ctx.input(|input| (input.pointer.any_down(), input.pointer.press_origin()));
@@ -1438,7 +1442,7 @@ impl<'a> CollapsiblePanel<'a> {
             forced: self.force_visible,
             // Occlusion-aware, unlike a raw pointer read: a panel covered by
             // another one does not light up through it
-            // (`egui-0.35.0/src/context.rs:3036-3057`).
+            // (fork `crates/egui/crates/egui/src/context.rs:3145-3166`).
             pointer_inside: ui.rect_contains_pointer(self.rect),
             // The generic form of "a gesture aimed at this panel is in flight",
             // and the only one that reaches a widget of the BODY: a scroll
@@ -1449,7 +1453,7 @@ impl<'a> CollapsiblePanel<'a> {
             gesture,
             // `Popup::is_any_open`, not the exact `Popup::is_id_open`. A context
             // menu's id is `response.id.with("popup")`
-            // (`egui-0.35.0/src/containers/popup.rs:639`, `:653`), which IS
+            // (`egui-0.36.2/src/containers/popup.rs:653`, `:667`), which IS
             // derivable for the two move zones — but not for a tab caption,
             // whose `Button::selectable` takes its id from the `Ui`'s auto-id
             // counter. A caption's «Переместить в окно →» menu has to keep its
@@ -1533,10 +1537,10 @@ impl ChromeGate {
 /// Both inputs come from [`egui::PointerState`], and their exact semantics are
 /// what make the rule a latch that cannot get stuck:
 /// * `press_origin` is written on every press and cleared on every release
-///   (`egui-0.35.0/src/input_state/mod.rs:1146`, `:1194`), and the release frame
-///   clears `down` too (`:1197`), so the latch drops exactly when the gesture
+///   (`egui-0.36.2/src/input_state/mod.rs:1149`, `:1197`), and the release frame
+///   clears `down` too (`:1200`), so the latch drops exactly when the gesture
 ///   ends and never one frame later;
-/// * a `PointerGone` clears NEITHER (`:1200-1206`, deliberately, so a drag
+/// * a `PointerGone` clears NEITHER (`:1203-1209`, deliberately, so a drag
 ///   survives leaving the window), which is precisely the case this rule exists
 ///   for.
 ///
@@ -1562,9 +1566,9 @@ fn press_started_inside(rect: Rect, any_down: bool, press_origin: Option<Pos2>) 
 /// advances the parent's cursor by what that child used, which is a layout
 /// change — and this widget's contract is that the transparent mode changes
 /// nothing about geometry. Opacity lives on the painter alone
-/// (`egui-0.35.0/src/ui.rs:560`), so setting and restoring it paints differently
+/// (`egui-0.36.2/src/ui.rs:561`), so setting and restoring it paints differently
 /// and lays out identically. It is also not [`egui::Ui::set_invisible`]
-/// (`egui-0.35.0/src/ui.rs:537-540`), which additionally DISABLES the `Ui`: a
+/// (`egui-0.36.2/src/ui.rs:538-541`), which additionally DISABLES the `Ui`: a
 /// faded panel stays fully interactive.
 fn faded<R>(ui: &mut egui::Ui, opacity: f32, draw: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let restore = ui.opacity();
@@ -1597,14 +1601,14 @@ fn caption_opacity(shown_captions: usize, chrome_opacity: f32) -> f32 {
 ///
 /// `ScrollArea` multiplies `*_handle_opacity` straight into the handle's colour
 /// and `*_background_opacity` into the bar's background
-/// (`egui-0.35.0/src/containers/scroll_area.rs:1469-1519`), so scaling the six
+/// (`egui-0.36.2/src/containers/scroll_area.rs:1469-1519`), so scaling the six
 /// of them is exactly "paint this bar `opacity` as strongly" and nothing else.
 ///
 /// **Not one size-bearing field is touched** — `floating`, `bar_width`,
 /// `floating_width`, `floating_allocated_width`, `bar_inner_margin`,
 /// `bar_outer_margin`, `handle_min_length`, `content_margin`. That is a
 /// contract, not tidiness: `ScrollStyle::allocated_width()`
-/// (`egui-0.35.0/src/style.rs:652-658`) is `0.0` for a floating bar, which is
+/// (`egui-0.36.2/src/style.rs:656-662`) is `0.0` for a floating bar, which is
 /// what lets a bar appear without taking room from the content and therefore
 /// without being able to oscillate the measurement the panel's size is derived
 /// from (see this directory's `MODULE_README.md`, "The body FILLS its budget").
@@ -1614,7 +1618,7 @@ fn caption_opacity(shown_captions: usize, chrome_opacity: f32) -> f32 {
 /// `1.0` for a SOLID scroll style (`scroll_area.rs:1483-1484`, `:1495-1496`), so
 /// this function fades nothing there. It is not a problem today — no code in
 /// this repo assigns `Spacing::scroll`, so every scroll area runs on egui's
-/// default `ScrollStyle::floating()` (`egui-0.35.0/src/style.rs:639-650`) — but
+/// default `ScrollStyle::floating()` (`egui-0.36.2/src/style.rs:643-654`) — but
 /// a project-wide switch to solid bars would have to fade them another way, and
 /// would break the no-oscillation contract above first.
 #[must_use]
@@ -1698,7 +1702,7 @@ struct HeaderMenuOutcome {
 /// `targets` must be non-empty; the caller hides the whole submenu otherwise.
 ///
 /// `Ui::menu_button` turns itself into a SUBMENU button automatically when it is
-/// called inside a menu (`egui-0.35.0/src/ui.rs:2787-2798`), so no `SubMenuButton`
+/// called inside a menu (`egui-0.36.2/src/ui.rs:2788-2799`), so no `SubMenuButton`
 /// is spelled out here. Each entry is wrapped in `Ui::push_id` keyed by its
 /// TARGET rather than by its localised label, which is the loop rule of
 /// `egui-docs/05-ids-and-i18n.md` §4 and keeps the ids stable across a language
@@ -1717,7 +1721,7 @@ fn move_to_window_submenu(
                 chosen = Some(entry.target);
                 // Closes the submenu; egui's menu machinery propagates that to
                 // the context menu that opened it
-                // (`egui-0.35.0/src/containers/menu.rs`, `SubMenu::show`).
+                // (`egui-0.36.2/src/containers/menu.rs:426`, `SubMenu::show`).
                 ui.close();
             }
         }

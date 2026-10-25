@@ -24,8 +24,9 @@ Notes:
 Every long operation lives on a worker: the settings load and save, the unload call and the
 run. `poll` only drains channels, and it is where the settings saver lives — the host polls
 the selected engine EVERY frame, panel visible or not, so a finished run lands and a changed
-parameter is written even with the panel closed. The saver has no time debounce: it writes on
-the first poll `settings_save_due` answers yes on.
+parameter is written even with the panel closed. The saver is the shared debounced, atomic
+`SettingsSaver` (`region_edit_v2::engine_settings_file`): a dragged dial is written once, after
+it settled, and the value still owed at teardown is written by `flush_settings_blocking`.
 
 The mask is MANDATORY (`allows_empty_mask` is unconditionally `false`): SDXL inpainting has
 no whole-region mode, so an empty mask describes no work at all. The host disables
@@ -64,8 +65,10 @@ pub struct SdxlEngine {
     /// makes a user edit outrank a settings load that lands afterwards
     /// ([`Self::poll_settings_load`]).
     dirty: bool,
-    /// Channel of the save in flight, which keeps at most one writer on the file.
-    save_rx: Option<Receiver<()>>,
+    /// The settings writer (the shared `SettingsSaver`): one writer at a time, a quiet-time
+    /// debounce, a failed write retried with backoff, the teardown flush. Its `write` is
+    /// [`save_sdxl_settings`].
+    saver: SettingsSaver<SdxlPersisted>,
     /// Progress of the run in flight, written by the worker and read by the panel.
     progress: Arc<Mutex<SdxlSharedProgress>>,
     /// The uploaded latent preview, `None` while none has been produced.
@@ -105,7 +108,7 @@ impl SdxlEngine {
             settings_rx: None,
             settings_loaded: false,
             dirty: false,
-            save_rx: None,
+            saver: SettingsSaver::new(save_sdxl_settings, SDXL_LOG_LABEL),
             progress: Arc::new(Mutex::new(SdxlSharedProgress::default())),
             preview_texture: None,
             preview_uploaded_seq: 0,
@@ -169,38 +172,30 @@ impl SdxlEngine {
         }
     }
 
-    /// Writes dirty settings on a worker thread, at most one save in flight, never before the
-    /// initial load landed.
+    /// The document persisted to the settings file: the selected mode and BOTH parameter sets.
+    fn persisted(&self) -> SdxlPersisted {
+        SdxlPersisted {
+            mode: self.mode.wire().to_string(),
+            nine_channel: self.nine_channel.clone(),
+            four_channel: self.four_channel.clone(),
+        }
+    }
+
+    /// Drives the shared `SettingsSaver`: a change is written on a worker once it stayed
+    /// unchanged for its quiet time, at most one write in flight, never before the initial load
+    /// landed, a failure retried with backoff. `now` is the poll's clock.
     ///
     /// Driven from [`AiEngine::poll`] and nowhere else, which is why the host must poll the
     /// selected engine every frame: without that call nothing ever writes the file and the
     /// mode and parameters are lost on exit, with no error anywhere.
-    fn poll_and_maybe_save(&mut self) {
-        if let Some(rx) = self.save_rx.as_ref() {
-            match rx.try_recv() {
-                Ok(()) | Err(TryRecvError::Disconnected) => self.save_rx = None,
-                Err(TryRecvError::Empty) => return,
-            }
-        }
-        if !settings_save_due(self.dirty, self.settings_loaded, self.save_rx.is_some()) {
+    fn poll_and_maybe_save(&mut self, now: Instant) {
+        // Nothing dirty and no write to drain: the saver has nothing to do, so the document is
+        // not rebuilt (its strings cloned) on every idle frame.
+        if !self.dirty && self.saver.rx.is_none() {
             return;
         }
-        self.dirty = false;
-        let persisted = SdxlPersisted {
-            mode: self.mode.wire().to_string(),
-            nine_channel: self.nine_channel.clone(),
-            four_channel: self.four_channel.clone(),
-        };
-        let (tx, rx) = mpsc::channel();
-        self.save_rx = Some(rx);
-        thread::spawn(move || {
-            if let Err(err) = save_sdxl_settings(&persisted) {
-                ms_log::runtime_log::log_warn(format!(
-                    "[cleaning] failed to save the SDXL engine settings: {err}"
-                ));
-            }
-            let _send_result = tx.send(());
-        });
+        let persisted = self.persisted();
+        self.saver.poll(now, SaveGate { dirty: &mut self.dirty, loaded: self.settings_loaded, blocked: false }, &persisted, str::to_string);
     }
 
     /// Drains the unload call and writes its outcome into the panel's status slot.
@@ -422,6 +417,14 @@ impl SdxlEngine {
 }
 
 impl AiEngine for SdxlEngine {
+    /// The value the settings saver still owes, written now on the teardown worker. A settings
+    /// load that landed meanwhile is applied first, so its gate is the real one.
+    fn flush_settings_blocking(&mut self) {
+        self.poll_settings_load();
+        let persisted = self.persisted();
+        self.saver.flush_blocking(SaveGate { dirty: &mut self.dirty, loaded: self.settings_loaded, blocked: false }, &persisted);
+    }
+
     fn id(&self) -> &'static str {
         "sdxl"
     }
@@ -608,9 +611,15 @@ impl AiEngine for SdxlEngine {
     }
 
     fn poll(&mut self, ctx: &egui::Context) -> EnginePoll {
+        let now = Instant::now();
         self.poll_settings_load();
         self.poll_unload();
-        self.poll_and_maybe_save();
+        self.poll_and_maybe_save(now);
+        // The save's quiet time, a failed save's retry and a write in flight: the saver says
+        // when it next needs a poll.
+        if let Some(after) = self.saver.wake_after(now) {
+            ctx.request_repaint_after(after);
+        }
         // Probed here, not in the panel: the run gate reads this state with the panel closed.
         let required = self.required_download();
         self.downloads.probe_unknown(required);
@@ -686,6 +695,7 @@ impl AiEngine for SdxlEngine {
 mod tests {
     use super::*;
     use crate::tools::region_edit_v2::engine::RunMarks;
+    use crate::tools::region_edit_v2::engine_settings::settings_save_due;
 
     /// An absolute local path for the host platform (`Path::is_absolute` is platform-defined).
     fn local(tail: &str) -> String {
@@ -947,10 +957,10 @@ mod tests {
         assert_eq!(engine.mode, SdxlMode::NineChannel, "nor the mode that edit was made in");
         assert!(engine.settings_loaded, "the load is complete either way: saving is unblocked");
         assert!(engine.dirty, "the edit is still pending a write");
-        // The save GATE is asserted rather than driven: `poll_and_maybe_save` would write the
-        // real settings file of whoever runs the test suite.
+        // The save GATE is asserted rather than driven (a test build's writer writes nothing,
+        // but the gate is the contract under test).
         assert!(
-            settings_save_due(engine.dirty, engine.settings_loaded, engine.save_rx.is_some()),
+            settings_save_due(engine.dirty, engine.settings_loaded, engine.saver.rx.is_some()),
             "the surviving edit is what gets written next"
         );
     }
@@ -987,9 +997,9 @@ mod tests {
         let mut engine = SdxlEngine::new();
         engine.settings_loaded = false;
         engine.note_settings_changed();
-        engine.poll_and_maybe_save();
+        engine.poll_and_maybe_save(Instant::now() + Duration::from_secs(60));
         assert!(
-            engine.save_rx.is_none(),
+            engine.saver.rx.is_none(),
             "saving the defaults before the load would clobber the user's file"
         );
         assert!(engine.dirty, "the change is still pending, not lost");

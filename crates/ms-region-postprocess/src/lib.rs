@@ -9,6 +9,8 @@ body UI.
 Exports:
 - `PostprocessSettings` / `EffectiveSettings` and the range/default constants (`settings`).
 - `RegionInputs`, `ColourReference`, `RegionPostprocessor`, `postprocess_region` (`pipeline`).
+- `LabTables`, `encode_srgb` (`lab`): the project's one sRGB <-> CIELAB (D65) conversion, shared
+  with the cleaning tab's gradient fill.
 - `dilate_ellipse`, `MAX_DILATE_RADIUS_PX`: cv2-exact elliptical mask dilation (also the FLUX.2
   latent mask) and its radius cap.
 - `draw_postprocess_body`, `section_title` (`ui`).
@@ -16,7 +18,8 @@ Exports:
 
 Notes:
 The core is GUI-free, does no I/O and no logging; callers own threads, logs and textures. The
-local CIELAB match lives in `local_match/` behind one crate-private function.
+local CIELAB match lives in `local_match/` behind one crate-private function; its colour
+conversion (`lab`) is public because this crate is that conversion's one owner.
 */
 
 #![warn(clippy::all)]
@@ -31,6 +34,7 @@ mod composite;
 mod edge_band;
 mod feather;
 mod global_match;
+pub mod lab;
 mod local_match;
 mod mask;
 mod pipeline;
@@ -42,6 +46,7 @@ mod band_mode_tests;
 #[cfg(test)]
 mod fixture_tests;
 
+pub use lab::{LabTables, encode_srgb};
 pub use mask::{MAX_DILATE_RADIUS_PX, dilate_ellipse};
 pub use pipeline::{ColourReference, RegionInputs, RegionPostprocessor, postprocess_region};
 pub use settings::{
