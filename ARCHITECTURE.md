@@ -206,9 +206,11 @@ shared wiki view). The studio never references
   dependencies in `[workspace.dependencies]`); their local checkouts under `crates/` are
   gitignored. `egui-large-image` does the tiled display of very large images (launcher ribbon
   and crop editor, page-manager viewer).
-- `crates/winit`, `crates/egui` — Android-port forks of winit 0.30 and the egui family
-  (separate git repositories, gitignored), wired in by root `[patch.crates-io]`; fork changes are
-  Android-only, so desktop builds compile the released code.
+- `winit`, egui family — Android-port forks of winit 0.30 and the egui family, published as
+  `github.com/Vasyanator/{winit,egui}` (branch `manhwastudio-android`) and wired in by root
+  `[patch.crates-io]` as git sources pinned by `Cargo.lock`; optional local checkouts under
+  `crates/winit`, `crates/egui` are gitignored. Fork changes are Android-only, so desktop builds
+  compile the released code.
 
 ## 3. Startup and process lifetime
 

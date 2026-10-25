@@ -14,8 +14,8 @@ rust-version = "1.95"
 
 [workspace]
 members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-docstore", "crates/ms-atomic-file", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-custom-fonts", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-download", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-theme", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-raster", "crates/ms-region-postprocess", "crates/ms-text-detect", "crates/ms-native-runtime", "crates/ms-local-ai", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-studio-tab", "crates/ms-tab-translation", "crates/ms-ai-api", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-os-integration", "crates/ms-input", "crates/ms-platform", "crates/ms-browser-ext", "crates/ms-browser-bridge", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
-# The Android port forks under `crates/` are separate workspaces patched in below; without
-# this exclusion Cargo would adopt them as implicit members of this workspace.
+# Optional local checkouts of the Android port forks (patched in below from GitHub) are
+# separate workspaces; without this exclusion Cargo would adopt them as implicit members.
 exclude = ["crates/winit", "crates/egui"]
 
 # Single pin for every third-party crate used by MORE THAN ONE manifest in this workspace.
@@ -384,22 +384,25 @@ ms-tab-typing = { path = "crates/ms-tab-typing", features = ["test-support"] }
 # tab's tests drive. Test builds only, for the same reason.
 ms-models = { path = "crates/ms-models", features = ["test-support"] }
 
-# Android port forks (plan: dev-docs/ANDROID_PORT.md). `winit` and the egui family are
-# separate git repositories checked out under `crates/` (branch `manhwastudio-android`,
-# gitignored here). Fork changes stay inside `cfg(target_os = "android")` code, so desktop
-# builds compile the same code as the crates.io releases. Every egui-family crate in the
-# graph is patched together: patching only `eframe` would pull a second, path-sourced `egui`
-# next to the crates.io one. These local paths become GitHub URLs once the forks are
-# published.
+# Android port forks (plan: dev-docs/ANDROID_PORT.md): `winit` and the egui family come from
+# the user's GitHub forks, branch `manhwastudio-android`; `Cargo.lock` pins the exact commit
+# (move it with `cargo update -p winit` / `cargo update -p egui`). Fork changes stay inside
+# `cfg(target_os = "android")` code, so desktop builds compile the same code as the crates.io
+# releases. Every egui-family crate in the graph is patched together: patching only `eframe`
+# would pull a second, git-sourced `egui` next to the crates.io one. To build against local
+# checkouts under `crates/winit` / `crates/egui` (gitignored), override the same keys from a
+# config (a config `[patch]` wins over this one), e.g.
+# `--config 'patch.crates-io.winit.path="crates/winit"'`; that rewrites `Cargo.lock` to the
+# path source, so never commit the lock from such a build.
 [patch.crates-io]
-winit = { path = "crates/winit" }
-ecolor = { path = "crates/egui/crates/ecolor" }
-eframe = { path = "crates/egui/crates/eframe" }
-egui = { path = "crates/egui/crates/egui" }
-egui_extras = { path = "crates/egui/crates/egui_extras" }
-egui_glow = { path = "crates/egui/crates/egui_glow" }
-egui-wgpu = { path = "crates/egui/crates/egui-wgpu" }
-egui-winit = { path = "crates/egui/crates/egui-winit" }
-emath = { path = "crates/egui/crates/emath" }
-epaint = { path = "crates/egui/crates/epaint" }
-epaint_default_fonts = { path = "crates/egui/crates/epaint_default_fonts" }
+winit = { git = "https://github.com/Vasyanator/winit", branch = "manhwastudio-android" }
+ecolor = { git = "https://github.com/Vasyanator/egui", branch = "manhwastudio-android" }
+eframe = { git = "https://github.com/Vasyanator/egui", branch = "manhwastudio-android" }
+egui = { git = "https://github.com/Vasyanator/egui", branch = "manhwastudio-android" }
+egui_extras = { git = "https://github.com/Vasyanator/egui", branch = "manhwastudio-android" }
+egui_glow = { git = "https://github.com/Vasyanator/egui", branch = "manhwastudio-android" }
+egui-wgpu = { git = "https://github.com/Vasyanator/egui", branch = "manhwastudio-android" }
+egui-winit = { git = "https://github.com/Vasyanator/egui", branch = "manhwastudio-android" }
+emath = { git = "https://github.com/Vasyanator/egui", branch = "manhwastudio-android" }
+epaint = { git = "https://github.com/Vasyanator/egui", branch = "manhwastudio-android" }
+epaint_default_fonts = { git = "https://github.com/Vasyanator/egui", branch = "manhwastudio-android" }

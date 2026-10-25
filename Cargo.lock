@@ -1526,6 +1526,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "ecolor"
 version = "0.36.2"
+source = "git+https://github.com/Vasyanator/egui?branch=manhwastudio-android#342a683e08742b4849e8efa5e7e8e97611c70c3c"
 dependencies = [
  "bytemuck",
  "emath",
@@ -1535,6 +1536,7 @@ dependencies = [
 [[package]]
 name = "eframe"
 version = "0.36.2"
+source = "git+https://github.com/Vasyanator/egui?branch=manhwastudio-android#342a683e08742b4849e8efa5e7e8e97611c70c3c"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -1568,6 +1570,7 @@ dependencies = [
 [[package]]
 name = "egui"
 version = "0.36.2"
+source = "git+https://github.com/Vasyanator/egui?branch=manhwastudio-android#342a683e08742b4849e8efa5e7e8e97611c70c3c"
 dependencies = [
  "accesskit",
  "ahash",
@@ -1613,6 +1616,7 @@ dependencies = [
 [[package]]
 name = "egui-wgpu"
 version = "0.36.2"
+source = "git+https://github.com/Vasyanator/egui?branch=manhwastudio-android#342a683e08742b4849e8efa5e7e8e97611c70c3c"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -1631,6 +1635,7 @@ dependencies = [
 [[package]]
 name = "egui-winit"
 version = "0.36.2"
+source = "git+https://github.com/Vasyanator/egui?branch=manhwastudio-android#342a683e08742b4849e8efa5e7e8e97611c70c3c"
 dependencies = [
  "accesskit_winit",
  "arboard",
@@ -1650,6 +1655,7 @@ dependencies = [
 [[package]]
 name = "egui_extras"
 version = "0.36.2"
+source = "git+https://github.com/Vasyanator/egui?branch=manhwastudio-android#342a683e08742b4849e8efa5e7e8e97611c70c3c"
 dependencies = [
  "ahash",
  "egui",
@@ -1663,6 +1669,7 @@ dependencies = [
 [[package]]
 name = "egui_glow"
 version = "0.36.2"
+source = "git+https://github.com/Vasyanator/egui?branch=manhwastudio-android#342a683e08742b4849e8efa5e7e8e97611c70c3c"
 dependencies = [
  "bytemuck",
  "egui",
@@ -1675,6 +1682,7 @@ dependencies = [
 [[package]]
 name = "egui_inspection"
 version = "0.36.2"
+source = "git+https://github.com/Vasyanator/egui?branch=manhwastudio-android#342a683e08742b4849e8efa5e7e8e97611c70c3c"
 dependencies = [
  "egui",
  "image 0.25.10",
@@ -1693,6 +1701,7 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 [[package]]
 name = "emath"
 version = "0.36.2"
+source = "git+https://github.com/Vasyanator/egui?branch=manhwastudio-android#342a683e08742b4849e8efa5e7e8e97611c70c3c"
 dependencies = [
  "bytemuck",
  "serde",
@@ -1778,6 +1787,7 @@ dependencies = [
 [[package]]
 name = "epaint"
 version = "0.36.2"
+source = "git+https://github.com/Vasyanator/egui?branch=manhwastudio-android#342a683e08742b4849e8efa5e7e8e97611c70c3c"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -1802,6 +1812,7 @@ dependencies = [
 [[package]]
 name = "epaint_default_fonts"
 version = "0.36.2"
+source = "git+https://github.com/Vasyanator/egui?branch=manhwastudio-android#342a683e08742b4849e8efa5e7e8e97611c70c3c"
 
 [[package]]
 name = "equator"
@@ -8087,6 +8098,7 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 [[package]]
 name = "winit"
 version = "0.30.13"
+source = "git+https://github.com/Vasyanator/winit?branch=manhwastudio-android#84b0081c54fd58220c5cdbf948537848f6cfd5fc"
 dependencies = [
  "ahash",
  "android-activity",
