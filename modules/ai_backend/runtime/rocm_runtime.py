@@ -20,10 +20,14 @@ Main responsibilities:
 - disable cuDNN/MIOpen benchmark auto-tuning explicitly;
 - tell `error_text` whether this process runs on ROCm, so the user-facing
   rewrite of Torch's `expandable_segments` advice happens only where the advice
-  is actually harmful.
+  is actually harmful;
+- remove a truthy `DIFFUSERS_GGUF_CUDA_KERNELS`, so diffusers' GGUF utilities
+  never fetch and run their CUDA dequant kernel on a HIP device (the GGUF
+  layers in `gguf_layers` use the pure-torch block functions only).
 
 Key functions:
 - `configure_rocm_runtime()`
+- `_drop_gguf_cuda_kernels_flag()`
 
 Notes:
 - A no-op on CPU-only, CUDA, MPS, or absent-Torch installs: it only acts when
@@ -39,6 +43,11 @@ Notes:
   included (`c10/core/AllocatorConfig.cpp`, `c10/util/env.cpp::get_env`).
   Writing our value into `PYTORCH_HIP_ALLOC_CONF` while the environment already
   carries `PYTORCH_CUDA_ALLOC_CONF` would therefore be silently inert.
+- diffusers evaluates `DIFFUSERS_GGUF_CUDA_KERNELS` once, when
+  `diffusers.quantizers.gguf.utils` is first imported; a ROCm device reports a
+  CUDA capability (gfx1201: 12.0) that passes its `>= 7` gate, so the flag
+  would download an NVIDIA kernel from the network. Removing it is the second
+  deliberate override of a user value; see `_drop_gguf_cuda_kernels_flag`.
 - MIOpen reads `MIOPEN_FIND_MODE` at convolution Find time and the cache paths
   at handle creation (first GPU convolution), so configuring this before the
   first inference request is sufficient.
@@ -48,6 +57,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 from .error_text import configure_error_text
@@ -88,6 +98,13 @@ _EXPANDABLE_SEGMENTS_OFF_TOKENS = frozenset({"false", "0", "no", "off"})
 # is its own undebuggable surprise; the reversal is still logged either way.
 _ALLOW_EXPANDABLE_SEGMENTS_ENV = "MS_ALLOW_EXPANDABLE_SEGMENTS"
 _TRUTHY_TOKENS = frozenset({"1", "true", "yes", "on"})
+
+# diffusers' switch for its GGUF CUDA kernels and the values IT treats as on
+# (`diffusers/quantizers/gguf/utils.py`: `.lower() in ["1", "true", "yes"]`, no
+# strip). Any other value already leaves the kernels off and is left alone.
+_GGUF_CUDA_KERNELS_ENV = "DIFFUSERS_GGUF_CUDA_KERNELS"
+_GGUF_CUDA_KERNELS_ON_TOKENS = frozenset({"1", "true", "yes"})
+_DIFFUSERS_GGUF_UTILS_MODULE = "diffusers.quantizers.gguf.utils"
 
 
 def _effective_alloc_conf_var() -> str:
@@ -190,6 +207,31 @@ def _configure_hip_allocator() -> None:
     os.environ[var_name] = pinned
 
 
+def _drop_gguf_cuda_kernels_flag() -> None:
+    """Remove a value of `DIFFUSERS_GGUF_CUDA_KERNELS` that diffusers would read as on.
+
+    On a ROCm build diffusers' gate (`torch.cuda.is_available()` and capability
+    `>= 7`) passes, so the flag would fetch the NVIDIA `ggml` kernel from the
+    network and route GGUF matmuls through it on a HIP device. The removal is
+    logged at WARNING; if diffusers' GGUF utilities were already imported the
+    warning also says the removal came too late for this process. Never raises.
+    """
+    raw = os.environ.get(_GGUF_CUDA_KERNELS_ENV)
+    if raw is None or raw.lower() not in _GGUF_CUDA_KERNELS_ON_TOKENS:
+        return
+    del os.environ[_GGUF_CUDA_KERNELS_ENV]
+    already_imported = _DIFFUSERS_GGUF_UTILS_MODULE in sys.modules
+    log.warning(
+        "Removing %s=%s: on a ROCm build it would make diffusers download and run its CUDA "
+        "GGUF kernel on a HIP device. GGUF weights are dequantized by the pure-torch block "
+        "functions instead.%s",
+        _GGUF_CUDA_KERNELS_ENV,
+        raw,
+        " diffusers' GGUF utilities were already imported, so this process keeps the value "
+        "they read at import." if already_imported else "",
+    )
+
+
 def _resolve_cache_root() -> Path:
     """Resolve the app cache root (`ManhwaStudio_AI_Models/.cache`).
 
@@ -211,7 +253,8 @@ def configure_rocm_runtime() -> bool:
     Forces `expandable_segments:False` into the allocator-config variable Torch
     will actually read (`_configure_hip_allocator`) - the one setting here that
     overrides an explicit user value, because that allocator mode corrupts
-    computation on this ROCm stack and yields black images.
+    computation on this ROCm stack and yields black images - and removes a
+    truthy `DIFFUSERS_GGUF_CUDA_KERNELS` (`_drop_gguf_cuda_kernels_flag`).
 
     Also records for `error_text.sanitize_torch_error` whether this process runs
     on ROCm, so the user-facing rewrite of Torch's `expandable_segments` advice
@@ -257,6 +300,10 @@ def configure_rocm_runtime() -> bool:
     # `import torch`, and this function runs in `ai_backend.py::main()` before
     # `run_server()` and before anything touches the GPU.
     _configure_hip_allocator()
+
+    # Before anything imports diffusers' GGUF utilities (they read the flag at
+    # import): this function runs in `ai_backend.py::main()` before any service.
+    _drop_gguf_cuda_kernels_flag()
 
     # Pin MIOpen user perf-db and compiled-kernel cache to the app cache root so
     # any kernel state that is still produced is reused across backend restarts.

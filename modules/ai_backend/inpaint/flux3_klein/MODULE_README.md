@@ -90,7 +90,8 @@ keeps nothing before its first use.
   (multiple of 16, side >= 128, 4 MP, aspect 4:1), `MAX_EXTRA_REFERENCES` (9), `FIELDS`.
 - `region.py`: `edit_region_bytes` — the region editor: decode and check region / mask /
   references, the seed (`null` = random, echoed), `Flux3Request(region as reference #0, explicit
-  size)`, the progress frames (`progress_stages()`, stable `stage` ids), cancellation through the
+  size)`, the progress frames (`progress_stages()`, stable `stage` ids) and the disk-read frames
+  (`file_component_id`, `file_label`; see "Progress frames" below), cancellation through the
   observer and the step callback, the size check and the answer dict. The answer is the RAW
   generated region (`packing.to_pil`, rounded): the colour match and the composite inside the
   painted mask are the Rust host's (`crates/ms-region-postprocess`); the mask travels for
@@ -202,6 +203,23 @@ reported in `Flux3Result.applied.fp8_compute` and `health()["fp8_compute"]`.
   logged at INFO and does not touch `last_error`; the next run starts normally.
 - `generate(..., step_callback=)`: `(step, total)` after every flow-map step (repeats steps after a
   degrade retry; exceptions propagate).
+- `generate(..., load_progress=)`: registered as the session's disk-read sink
+  (`Session.set_load_progress`) right after the admission, so every checkpoint read of the run —
+  load scope, transitions, reloads after a degrade retry, DISK / DROPPED re-reads — reaches it as
+  `loader.LoadProgress` on the run's thread. The service adds no throttle (the manager's
+  `ByteProgress`, 0.2 s per stream + one 100% frame) and a raising sink cannot cancel a read.
+
+### Progress frames (`region.py`, wire `inpaint.flux3_klein`)
+- Step level: `phase:"load"` per observer phase begin (`step` = its index in `progress_stages()`,
+  `total` = the last index, stable `stage` id), `phase:"generate"` per denoise step.
+- Byte level: each `LoadProgress` re-emits the `load` frame of the stage IN FORCE (the observer
+  phase whose step performs the read; a degrade reload during the denoise is a `load` frame of
+  stage `denoise`) plus `file_step` / `file_total` (bytes of this read of the component; a re-read
+  counts only the units it brings back), `file_label` (the file name; the folder name for a
+  component of several files in one folder) and `file_component` (`transformer` = DiT,
+  `text_encoder` = encoder, `vae` = AE). The shared Rust bar (`engines/shared/stream_progress*`)
+  draws it as the second bar with a client-side read speed; it localizes `transformer` and
+  `text_encoder` and shows the file name alone for `vae`.
 - `status(params)` (the `.status` answer: file checks through `large_model.formats` with a
   placeholder fp8 path, never a probe) and the profiles adapter (`large_model_name`,
   `large_model_inputs`: the fp8 path is probed once per device, cached) read the wire through

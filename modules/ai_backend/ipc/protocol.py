@@ -101,8 +101,37 @@ from __future__ import annotations
 # presets, written by the Translation tab). The backend reads none of them.
 # 20: the `model_load` event topic is removed (it was declared but never
 # published or subscribed to); the valid topics are `health`, `device`, `log`.
+# 21: FLUX.2 klein weight formats: the `inpaint.flux2_klein*` params and their
+# `large_models.profiles` params gain optional `transformer_format` /
+# `transformer_formats` and `text_encoder_format` / `text_encoder_formats`
+# (selected id + candidates [{id, path}], best first, ids ^[a-z0-9_]{1,32}$
+# opaque to the backend; a present list must hold the selected id with `path`
+# equal to that component's `*_path`; absent, the id is derived from the
+# container: `bf16` for safetensors or a folder, `gguf` for a GGUF file);
+# `transformer_path` and `text_encoder_path` may name a `.gguf` file
+# (`text_encoder_fp8: true` with a GGUF encoder is refused);
+# `inpaint.flux2_klein.download.*` refuses `variant: "4b"` (the app's model
+# catalog downloads 4B); the FLUX.2 `large_models.profiles` answer gains
+# additive `encoder_formats`, and its `encoder: null` now means "not needed AND
+# not resident" (a resident encoder is counted even when the prompt is cached;
+# `selected` stays the pipeline's plan, the client sums the two; each of the
+# two `forecast` objects gains additive `host_baseline`, the baseline RSS its
+# `host_peak` includes, so the sum counts the process once); FLUX.2
+# `phase:"load"` frames carry the additive byte level `file_step` /
+# `file_total` / `file_label` for the text encoder too (on step 7,
+# `LOAD_STEP_TEXT_ENCODER`) and for a transformer folder (on step 1;
+# `file_label` = the file or folder name; a read inside a later phase rides on
+# the step current then, a `generate` frame during the denoise), plus additive
+# `file_component` (`"transformer"` / `"text_encoder"`; absent = transformer).
+# FLUX.3 klein: every checkpoint read of `inpaint.flux3_klein` adds the same
+# byte level to the `phase:"load"` frame of the current stage (`stage:"denoise"`
+# for a reload during the denoise): `file_step` / `file_total` (bytes of this
+# read), `file_label` (file name; folder name when sharded) and
+# `file_component` (`transformer` = DiT, `text_encoder`, `vae` = AE).
+# Load byte frames of both klein models: at most one per 0.2 s per read, plus
+# one 100% frame.
 # ============================================================================
-PROTOCOL_VERSION = 20
+PROTOCOL_VERSION = 21
 
 # ============================================================================
 # FRAME SIZE GUARDS

@@ -79,13 +79,16 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   downloading / not downloaded). An EasyOCR language list easyocr refuses shows its localized
   error in red and blocks the load button.
 - `ocr_model_download.rs`: the shared external-model download block of one bundle (status line,
-  the last cancel / failure / verify notice, Download / Resume button, "Verify files" once
+  the last cancel / failure / verify / adoption notice, Download / Resume button, "Verify files" once
   installed (`ModelDownloadAction::Verify`, the repair path for a same-size corruption), `ProgressBar` with file N of M and
-  byte counters over the bundle or the automatic-retry countdown, Cancel; while ANOTHER bundle
-  downloads, a line naming it with its progress over a disabled Download button). The pure
+  byte counters over the bundle, the automatic-retry countdown or "checking files found on disk"
+  during an automatic adoption, Cancel; while ANOTHER bundle downloads, verifies or adopts, a line
+  naming it with its progress over a disabled Download button). The pure
   `download_block_view` maps `OcrModelPanelSnapshot` -> what is shown; button captions come from
   `crate::ocr_model_download::offered_download_label` (shared with the "not downloaded" errors);
-  `external_model_display_name` names every catalog spec. `pub` items (`draw_ocr_model_download`,
+  `external_model_display_name` names every catalog spec (the FLUX.2 klein 4B parts through the
+  catalog's `flux2_klein_spec` over `Flux2WeightFormat::offered_for`, a GGUF part with its
+  `{quant}` token; a test walks `all_specs()`). `pub` items (`draw_ocr_model_download`,
   `load_blocked_reason`, `ModelDownloadAction`): the OCR and detector panels here and the
   Cleaning tab's SDXL engine draw it. The detector panel draws it for
   `text_detector::SURYA_DETECTOR_SPECS` while Surya is selected

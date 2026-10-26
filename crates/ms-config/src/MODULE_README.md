@@ -79,6 +79,12 @@ that defines the type.
   in with `include!("crates/ms-config/src/version_format.rs")`, so the code the build script
   runs is the code `cargo test` covers — which is why it must stay std-only: no `t!`, no
   logging, no reference to any other item of this crate.
+- `flux2_weight_format.rs`: `Flux2WeightFormat` (bf16 + GGUF `Q8_0` / `Q6_K` / `Q5_K_M` /
+  `Q4_K_M`; frozen wire ids `bf16` / `q8_0` / …, the llama.cpp `quant_token`, `is_gguf`) and
+  `Flux2WeightAxis` (transformer / text encoder): the ONE list of FLUX.2 klein weight formats
+  for both axes, with `offered_for(variant, axis)` (4B: all five on both axes; 9B: bf16 only).
+  The files of each offered format are pinned in `ms_sysprobe::ai_models::external_catalog`;
+  the Python backend lists no quants (the ids are opaque to it).
 - `app_tab.rs`: `AppTab` — the editor tab set. `ALL` + `key()` (the persistence contract) and
   the localized `title()` (display only). Edit when a tab is added or removed.
 - `bubble_status.rs`: the GUI-free half of the bubble status rule model — kinds, fields,
@@ -219,7 +225,7 @@ binary that installs a UI locale). Those crates enable `test-support` from their
   Its `DocKind` is inferred from the file name (`settings.json` → `ProjectSettings`, else
   `UserConfig`) unless `JsonConfig::with_kind` names it.
 - **Persisted spellings are frozen.** `AppTab::key()`, `Flux2Variant::wire()` /
-  `dir_name()` / `settings_file_name()`, `MemoryProfile::as_config_str()`,
+  `dir_name()` / `settings_file_name()`, `Flux2WeightFormat::wire()`, `MemoryProfile::as_config_str()`,
   `StorageMode::as_config_str()` (A11), `TorchFlavour::as_token()`, the `GfxArch` spelling and the
   `bubble_status` field names are on disk in users' documents. They are byte-stable across
   releases AND across UI languages, and are never localized
@@ -270,4 +276,7 @@ binary that installs a UI locale). Those crates enable `test-support` from their
   across two mapping tables. If it is PRESENTATION (a caption, a repository id), it belongs to
   the `Flux2VariantPresentation` extension trait in
   `crates/ms-tab-cleaning/src/tools/ai_editor/engines/flux2_klein/variant_presentation.rs`
-  instead: this crate is below the UI and the engine is the only consumer.
+  instead: this crate is below the UI and the engine is the only consumer. Who downloads a
+  variant is `Flux2Variant::downloads_from_catalog` (4B: the pinned catalog; 9B: the backend).
+- A new FLUX.2 klein weight format or a change of which variant offers it:
+  `flux2_weight_format.rs`, then its pinned spec in `ms_sysprobe::ai_models::external_catalog`.

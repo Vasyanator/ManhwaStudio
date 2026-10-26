@@ -237,7 +237,7 @@ impl Flux3PanelCtx<'_> {
             Flux3ModelReadiness::Ready => self
                 .resources
                 .profiles
-                .and_then(|profiles| forecast_line(&profiles.selected).map(|line| Flux3MemorySummary { line, fits: profiles.selected.fits })),
+                .and_then(|profiles| forecast_line(profiles).map(|line| Flux3MemorySummary { line, fits: profiles.selected.fits })),
             Flux3ModelReadiness::Missing(_) | Flux3ModelReadiness::NoRoot | Flux3ModelReadiness::Unknown => None,
         };
         let line = flux3_readiness_line(&self.readiness, memory);

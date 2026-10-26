@@ -7,17 +7,17 @@ Acquisition of the FLUX.2 klein weights from Hugging Face into
 methods `inpaint.flux2_klein.download.check` and `.start`. The wire contract is
 `dev-docs/flux2_model_download.md`; this module is its Python half.
 
-Two VARIANTS are downloadable and the request selects one with the `variant`
-field (`"9b"` — the default when the field is absent — or `"4b"`):
+One VARIANT is downloadable here, selected by the request's `variant` field
+(`"9b"`, also the default when the field is absent):
 
     9b  black-forest-labs/FLUX.2-klein-9B  gated, needs a token, ~34.7 GB,
-        has an uncensored text encoder;
-    4b  black-forest-labs/FLUX.2-klein-4B  PUBLIC (apache-2.0), downloads with
-        NO token, ~15.98 GB, no uncensored encoder.
+        has an uncensored text encoder.
 
-The two repositories have the identical folder layout, so a variant carries no
-manifest of its own: `manifest_entries` derives the rules from `variant.repo`
-and the two cannot drift apart. Everything else in this module is variant-blind.
+`"4b"` is REFUSED (`RETIRED_VARIANTS`): the 4B package is downloaded by the
+application itself from its pinned model catalog (Rust
+`ms_sysprobe::ai_models::external_catalog`), so each variant has exactly one
+download owner. A variant carries no manifest of its own: `manifest_entries`
+derives the rules from `variant.repo`.
 
 The generic plan / access check / transfer machinery is
 `hf_gated_download.py`; this module maps the FLUX.2 wire fields (`variant`,
@@ -41,20 +41,22 @@ Main responsibilities:
 - the FLUX.2 manifest (prefix rules over the variant's repositories);
 - `check_access()` / `download()`: the two wire answers, over
   `hf_gated_download.check_access` / `.download` (plan by prefixes, size + LFS
-  sha256 publish gate, per-repository token, free-space guard, throttled
+  sha256 publish gate, token routing, free-space guard, throttled
   two-level progress, resumable transfer).
 
 Key structures:
 - `ModelVariant` — one downloadable variant (repo, destination directory,
-  uncensored encoder if any, whether the repository is gated).
+  uncensored encoder if any; every repository is gated).
+- `RETIRED_VARIANTS` — wire names this module refuses, with the user-facing
+  reason (`"4b"`).
 - `DownloadCanceled` — re-exported from `hf_gated_download` (the handler's
   one cancellation type).
 
 Key functions:
-- `resolve_variant()` — wire string -> `ModelVariant`, a typed refusal otherwise.
-- `require_uncensored_supported()` — the second typed refusal (`4b` + uncensored).
-- `token_required()` / `repo_token()` — whether the REQUEST needs a token, and
-  whether a given REPOSITORY is sent one.
+- `resolve_variant()` — wire string -> `ModelVariant`, a typed refusal otherwise
+  (an unknown or a retired name).
+- `require_uncensored_supported()` — the second typed refusal (a variant that
+  has no uncensored encoder; the 9B table entry has one).
 - `download_target()` — variant + toggle -> `DownloadTarget`.
 - `resolve_plan()` — the pure plan builder (a listing in, a plan out).
 - `check_access()` — the `.check` answer (`plan` is NULLABLE; see its docstring).
@@ -68,15 +70,10 @@ error message; a message that must mention it says "токен" and nothing more
 Messages coming back from `huggingface_hub` are additionally scrubbed of the
 token value before they leave this module.
 
-A token is REQUIRED only for a gated repository (`token_required`). The 4B
-repository is public, so an empty token there is a normal request that reaches
-the hub and downloads; only the 9B repositories short-circuit to `no_token`.
-
-A token is SENT only to a gated repository (`repo_token`), and that decision is
-made per REPOSITORY at all three network sites — the access probe, the listing
-fetch and the file transfer. A public repository is therefore contacted
-anonymously even when the request carries a token, which is what stops a stale
-9B token from making the public 4B repository answer 401.
+Every repository this module touches is gated, so every request needs a token
+and an empty one short-circuits to `no_token` (`hf_gated_download`). The token
+is sent at all three network sites — the access probe, the listing fetch and
+the file transfer.
 
 `HfApi.model_info()` succeeds for the gated repositories WITHOUT a token — the
 metadata of a `gated: auto` repo is public — so a returned listing proves
@@ -108,13 +105,8 @@ from . import hf_gated_download
 #: repository. A token AND accepted conditions are both required.
 OFFICIAL_REPO_9B = "black-forest-labs/FLUX.2-klein-9B"
 
-#: The official FLUX.2 klein 4B repository. PUBLIC (apache-2.0, not gated), so
-#: it downloads with no Hugging Face token at all — see `token_required`.
-OFFICIAL_REPO_4B = "black-forest-labs/FLUX.2-klein-4B"
-
 #: The gated uncensored text encoder of the 9B variant. Only fetched while the
-#: toggle is on. There is no 4B counterpart, which is what `ModelVariant`'s
-#: `uncensored_repo = None` records.
+#: toggle is on.
 UNCENSORED_REPO_9B = "ponpoke/flux2-klein-9b-uncensored-text-encoder"
 
 # --- Destination subdirectories -------------------------------------------
@@ -126,7 +118,7 @@ VAE_SUBDIR = "vae"
 #: The model name in logs and user messages of the shared machinery.
 LABEL = "FLUX.2 klein"
 
-#: The `download` refusal for an empty token on a gated request.
+#: The `download` refusal for an empty token (every FLUX.2 repository is gated).
 NO_TOKEN_MESSAGE = (
     "Не указан токен Hugging Face. Оба репозитория FLUX.2 klein закрыты "
     "условиями, поэтому загрузка без токена невозможна."
@@ -142,27 +134,27 @@ class ModelVariant:
 
     A frozen data table rather than an enum on purpose: what distinguishes the
     variants is DATA — a repository id, a destination directory, whether an
-    uncensored encoder exists, whether the repository is gated — and an enum
+    uncensored encoder exists — and an enum
     would need exactly this table beside it anyway.
 
-    The two repositories have the IDENTICAL folder layout (`transformer/`,
-    `text_encoder/`, `tokenizer/`, `vae/`, `scheduler/`, `model_index.json`,
-    `LICENSE.md`), so a variant deliberately carries no manifest of its own:
-    `manifest_entries` derives the rules from `repo`, and the two variants
-    therefore cannot drift apart file by file.
+    A variant deliberately carries no manifest of its own: the FLUX.2 klein
+    repositories share one folder layout (`transformer/`, `text_encoder/`,
+    `tokenizer/`, `vae/`, `scheduler/`, `model_index.json`, `LICENSE.md`), and
+    `manifest_entries` derives the rules from `repo`.
 
     - `key` is the wire value of the `variant` request field.
     - `dir_name` is the directory under `side_models/` that receives everything.
     - `uncensored_repo` is `None` when no uncensored encoder exists for this
       variant; asking for one is then a refusal, never a silent downgrade.
-    - `gated` says whether the repository needs a Hugging Face token at all.
+
+    Every variant's repositories are gated (`hf_gated_download` serves gated
+    repositories only).
     """
 
     key: str
     repo: str
     dir_name: str
     uncensored_repo: str | None
-    gated: bool
 
     @property
     def supports_uncensored(self) -> bool:
@@ -176,34 +168,26 @@ VARIANT_9B = ModelVariant(
     repo=OFFICIAL_REPO_9B,
     dir_name="FLUX.2-klein-9B",
     uncensored_repo=UNCENSORED_REPO_9B,
-    gated=True,
-)
-
-#: FLUX.2 klein 4B: public, ~15.98 GB, no uncensored encoder yet.
-VARIANT_4B = ModelVariant(
-    key="4b",
-    repo=OFFICIAL_REPO_4B,
-    dir_name="FLUX.2-klein-4B",
-    uncensored_repo=None,
-    gated=False,
 )
 
 #: Every variant the two `.download.*` methods accept, keyed by wire value.
-VARIANTS: dict[str, ModelVariant] = {VARIANT_9B.key: VARIANT_9B, VARIANT_4B.key: VARIANT_4B}
+VARIANTS: dict[str, ModelVariant] = {VARIANT_9B.key: VARIANT_9B}
+
+#: Wire names that WERE downloadable here and are now refused, each with the
+#: user-facing reason. FLUX.2 klein 4B is downloaded by the application's own
+#: pinned model catalog (Rust), so a backend download would be a second owner of
+#: the same folder. A retired name is refused, never mapped onto another
+#: variant: that would fetch weights the user did not ask for.
+RETIRED_VARIANTS: dict[str, str] = {
+    "4b": (
+        "FLUX.2 klein 4B скачивается самим приложением (каталог моделей), "
+        "а не бэкендом. Обновите ManhwaStudio."
+    ),
+}
 
 #: The variant a request that carries no `variant` field means. Pinned by the
 #: wire contract so a client built before the field existed keeps working.
 DEFAULT_VARIANT = VARIANT_9B
-
-#: Repositories the variant table DECLARES public. Derived from the table so a
-#: new variant cannot forget to appear here, and used by `repo_token` to decide
-#: per repository whether a token is sent at all.
-#:
-#: The uncensored encoder repositories are deliberately absent: they are gated,
-#: which is what `token_required` already assumes when the toggle is on.
-PUBLIC_REPOS: frozenset[str] = frozenset(
-    variant.repo for variant in VARIANTS.values() if not variant.gated
-)
 
 
 def resolve_variant(value: Any) -> ModelVariant:
@@ -214,10 +198,11 @@ def resolve_variant(value: Any) -> ModelVariant:
     matched case-insensitively after stripping.
 
     # Errors
-    Raises `ValueError` naming the accepted values for a non-string or an
-    unknown name. An unknown variant is NEVER downgraded to the default: that
-    would fetch tens of gigabytes the user did not ask for into a directory
-    they did not name.
+    Raises `ValueError` for a non-string, for a `RETIRED_VARIANTS` name (its
+    reason as the message: `"4b"` is downloaded by the application, not here)
+    and, naming the accepted values, for an unknown name. Neither is ever
+    downgraded to the default: that would fetch tens of gigabytes the user did
+    not ask for into a directory they did not name.
     """
     if value is None:
         return DEFAULT_VARIANT
@@ -226,6 +211,9 @@ def resolve_variant(value: Any) -> ModelVariant:
     key = value.strip().lower()
     if not key:
         return DEFAULT_VARIANT
+    retired = RETIRED_VARIANTS.get(key)
+    if retired is not None:
+        raise ValueError(retired)
     variant = VARIANTS.get(key)
     if variant is None:
         offered = ", ".join(f"«{name}»" for name in sorted(VARIANTS))
@@ -253,65 +241,15 @@ def require_uncensored_supported(variant: ModelVariant, uncensored: bool) -> Non
     )
 
 
-def token_required(variant: ModelVariant, uncensored: bool) -> bool:
-    """Whether this request needs a Hugging Face token at all.
-
-    True when any repository it touches is gated: the official one for 9B, and
-    the uncensored encoder whenever the toggle selects it. The 4B repository is
-    public, so a 4B request with an empty token is a NORMAL request that reaches
-    the hub — it must not short-circuit to `no_token`, which would tell the user
-    to create a token they do not need.
-
-    Callers must have run `require_uncensored_supported` first; `uncensored` is
-    only meaningful for a variant that has an uncensored repository.
-    """
-    return variant.gated or (uncensored and variant.supports_uncensored)
-
-
-def repo_token(repo: str, token: str) -> str:
-    """The token to send to `repo`: `token` for a gated repository, `""` otherwise.
-
-    **A repository that does not require a token is contacted ANONYMOUSLY.**
-    `token_required` answers for the request as a whole and only gates the
-    no-token short-circuit; this function answers per REPOSITORY and gates
-    whether the token is put on the wire at all. Both the access probe, the
-    listing fetch and the file transfer route their token through here, so a
-    request that touches a public and a gated repository at once stays correct.
-
-    The reason is not hygiene but a dead end observed in the field: a user who
-    configured 9B earlier and whose token has since expired sent that token to
-    the PUBLIC 4B repository, the hub answered 401, `probe_repo_access` mapped
-    it to `invalid_token`, no plan was built and the download button stayed
-    disabled — with no token editor on the 4B panel to recover from.
-
-    Only repositories the variant table declares public (`PUBLIC_REPOS`) are
-    contacted anonymously. Anything else keeps today's behaviour exactly, which
-    is the safe direction for a repository whose status is not known here.
-
-    `repo` is a Hugging Face repository id; `token` is the request's token,
-    possibly empty. The token value is never logged.
-    """
-    return hf_gated_download.repo_token(repo_spec(repo), token)
-
-
-def repo_spec(repo: str) -> RepoSpec:
-    """`repo` with its gated flag: everything but the table's `PUBLIC_REPOS` is gated (the safe direction)."""
-    return RepoSpec(repo, gated=repo not in PUBLIC_REPOS)
-
-
 def shared_manifest(variant: ModelVariant) -> tuple[ManifestEntry, ...]:
     """Everything the pipeline needs except the text encoder, for `variant`.
 
     Taken from the variant's official repository in BOTH toggle states. The
     `transformer/` FOLDER is the one we take, never the same weights as the
-    repository-root single file (`flux-2-klein-9b.safetensors` /
-    `flux-2-klein-4b.safetensors`): diffusers 0.39 loads a single file through
+    repository-root single file (`flux-2-klein-9b.safetensors`): diffusers 0.39 loads a single file through
     `from_single_file`, which accepts `device_map` and silently discards it, so
     the layered offload this engine depends on would be lost — and the file
     would be a second, duplicate copy of a transformer already on disk.
-
-    Both repositories share this layout exactly, which is why one function
-    serves both and a variant carries no manifest of its own.
     """
     return (
         ManifestEntry(variant.repo, "transformer/", TRANSFORMER_SUBDIR),
@@ -430,7 +368,7 @@ def download_target(variant: ModelVariant, uncensored: bool) -> DownloadTarget:
     """
     return DownloadTarget(
         label=LABEL,
-        repos=tuple(repo_spec(repo) for repo in required_repos(variant, uncensored)),
+        repos=tuple(RepoSpec(repo) for repo in required_repos(variant, uncensored)),
         manifest=manifest_entries(variant, uncensored),
         root=model_root(variant),
         no_token_message=NO_TOKEN_MESSAGE,
@@ -461,13 +399,13 @@ def check_access(hf_token: str, *, uncensored: bool, variant: Any = None) -> dic
 
     `variant` is the RAW wire field (absent/`None`/`""` means `"9b"`); the
     answer echoes the key it was computed for. An empty token is `no_token`
-    without a network call only when the request touches a gated repository
-    (`token_required`): the public 4B check goes to the hub. `plan` is
+    without a network call, because every repository is gated. `plan` is
     NULLABLE (see `hf_gated_download.check_access`).
 
     # Errors
-    Raises `ValueError` for an unknown `variant` and for `uncensored` on a
-    variant without one: malformed requests, not states of the world.
+    Raises `ValueError` for an unknown or retired `variant` (`"4b"`) and for
+    `uncensored` on a variant without one: malformed requests, not states of
+    the world.
     """
     selected = resolve_variant(variant)
     require_uncensored_supported(selected, uncensored)
@@ -493,9 +431,9 @@ def download(
     destination directory. Transfer semantics: `hf_gated_download.download`.
 
     # Errors
-    Raises `ValueError` for an unknown variant, for an uncensored request on a
-    variant that has no uncensored encoder, and for an empty token on a gated
-    request; `DownloadCanceled` when the caller canceled; `RuntimeError` for an
+    Raises `ValueError` for an unknown or retired variant (`"4b"`), for an
+    uncensored request on a variant that has no uncensored encoder, and for an
+    empty token; `DownloadCanceled` when the caller canceled; `RuntimeError` for an
     inaccessible repository, a manifest prefix that resolved to nothing,
     insufficient free space, or a transport failure.
     """

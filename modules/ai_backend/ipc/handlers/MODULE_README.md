@@ -90,11 +90,13 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
   variable and never inside `params`; nothing in this layer logs it, echoes it back or names it in
   an error. The `variant` field (`_read_variant`) is forwarded VERBATIM for the same reason
   `component` and `action` are: which variants exist, that an absent field means `"9b"`, that an
-  unknown name is a refusal and that `"4b"` has no uncensored encoder are the downloader's single
-  answer (`resolve_variant` / `require_uncensored_supported`). Re-deriving any of it here is the
-  drift the contract puts it in one place to avoid — and note that an EMPTY `hf_token` is a legal,
-  servable request for `"4b"`, whose repository is public, so this layer must not gate on it. The download's second progress level (`file_step` / `file_total` / `file_label`) is
-  ADDITIVE: `streaming.progress_forwarder` takes the three as keyword-only optionals and omits each one it
+  unknown name and the retired `"4b"` (protocol 21: the app's model catalog downloads 4B) are
+  refusals — all of it is the downloader's single answer (`resolve_variant` /
+  `require_uncensored_supported`). Re-deriving any of it here is the drift the contract puts it in
+  one place to avoid; the empty-token refusal is the downloader's too, so this layer never gates
+  on the token. The download's second progress level (`file_step` / `file_total` / `file_label`) is
+  ADDITIVE: `streaming.progress_forwarder` takes them (and `file_component`, the component a FLUX.2
+  load reads, and `stage`) as keyword-only optionals and omits each one it
   was not given, so `step`/`total` keep meaning the overall level and every four-positional-argument
   caller emits exactly the frame it always did. See `PROTOCOL.md` and
   `dev-docs/flux2_model_download.md`.

@@ -10,8 +10,11 @@ Main responsibilities:
 - the per-component load/unload actions (`start_component_action`, `poll_component_action`);
 - the Hugging Face token, which travels in the request and never into the settings file
   (the shared `HfTokenControl`, drained by `poll_hf_token`);
-- the model download: the pre-flight check, the transfer, its cancellation, and the
+- the backend model download (9B only; a catalog variant is refused locally,
+  `refuse_backend_download`): the pre-flight check, the transfer, its cancellation, and the
   derivation it applies when it finishes (`start_download_check` .. `apply_download_outcome`);
+  the catalog download of 4B is the engine's `OcrModelDownloadController`, driven from
+  `mod.rs`;
 - the prompt translation (`start_translate`, `poll_translate`) and the non-blocking file
   dialogs (`start_picker`, `poll_picker`);
 - the six `.prompt_cache.*` jobs, the header they share and the outcome they apply
@@ -140,7 +143,7 @@ impl Flux2KleinEngine {
     /// stored — otherwise a typo that was never saved would report access the download
     /// then cannot use.
     pub(super) fn start_download_check(&mut self) {
-        if self.download_check_rx.is_some() || self.pipeline_busy() {
+        if self.download_check_rx.is_some() || self.pipeline_busy() || self.refuse_backend_download("check") {
             return;
         }
         let uncensored = self.settings.uncensored_encoder_active();
@@ -229,7 +232,7 @@ impl Flux2KleinEngine {
     /// a `.prompt_cache.build` do: that is what lets a cancel retire it and what makes the
     /// four operations mutually exclusive.
     pub(super) fn start_download(&mut self) {
-        if self.pipeline_busy() {
+        if self.pipeline_busy() || self.refuse_backend_download("start") {
             return;
         }
         let header = flux2_download_header(
@@ -246,6 +249,21 @@ impl Flux2KleinEngine {
         thread::spawn(move || {
             let _ = tx.send(run_flux2_download(header, &progress, &claim));
         });
+    }
+
+    /// Whether this variant must NOT use the backend's `.download.*` (its package comes from
+    /// the Rust catalog: the panel draws the catalog block instead, and since protocol 21 the
+    /// backend refuses `variant = "4b"`). Unreachable from the UI; a refused call is logged,
+    /// never sent.
+    fn refuse_backend_download(&self, method: &str) -> bool {
+        if !self.variant.downloads_from_catalog() {
+            return false;
+        }
+        ms_log::runtime_log::log_warn(format!(
+            "[cleaning] FLUX.2 klein {}: .download.{method} refused locally; this variant downloads from the app's catalog",
+            self.variant.wire()
+        ));
+        true
     }
 
     /// Abandons the download in flight: its answer is discarded, its progress generation is
@@ -424,6 +442,7 @@ impl Flux2KleinEngine {
                 match purpose {
                     Flux2PickerPurpose::PromptCacheExport | Flux2PickerPurpose::PromptCacheImport => self.prompt_cache_status = message,
                     Flux2PickerPurpose::TextEncoderDir
+                    | Flux2PickerPurpose::TextEncoderFile
                     | Flux2PickerPurpose::TransformerFile
                     | Flux2PickerPurpose::TransformerDir
                     | Flux2PickerPurpose::VaeFile
@@ -446,7 +465,7 @@ impl Flux2KleinEngine {
         }
         let path = match purpose {
             Flux2PickerPurpose::TextEncoderDir | Flux2PickerPurpose::TransformerDir | Flux2PickerPurpose::VaeDir => picked.into_directory_path(),
-            Flux2PickerPurpose::TransformerFile | Flux2PickerPurpose::VaeFile | Flux2PickerPurpose::PromptCacheImport | Flux2PickerPurpose::PromptCacheExport => {
+            Flux2PickerPurpose::TextEncoderFile | Flux2PickerPurpose::TransformerFile | Flux2PickerPurpose::VaeFile | Flux2PickerPurpose::PromptCacheImport | Flux2PickerPurpose::PromptCacheExport => {
                 picked.into_file().map(|file| file.path)
             }
         };
@@ -456,7 +475,7 @@ impl Flux2KleinEngine {
         };
         let value = path.to_string_lossy().to_string();
         match purpose {
-            Flux2PickerPurpose::TextEncoderDir => self.settings.text_encoder_path = value,
+            Flux2PickerPurpose::TextEncoderDir | Flux2PickerPurpose::TextEncoderFile => self.settings.text_encoder_path = value,
             Flux2PickerPurpose::TransformerFile | Flux2PickerPurpose::TransformerDir => {
                 self.settings.transformer_path = value;
             }
@@ -616,6 +635,11 @@ impl Flux2KleinEngine {
                     {
                         self.prompt_cache_selected = None;
                     }
+                    // A CHANGED library (not the first listing) re-asks the forecast: what the
+                    // backend counts for the encoder may follow the prompt caches it holds.
+                    if self.prompt_cache_library.as_ref().is_some_and(|previous| *previous != library) {
+                        self.invalidate_forecast();
+                    }
                     self.prompt_cache_library = Some(library);
                 }
                 Ok(Err(err)) => {
@@ -644,8 +668,9 @@ impl Flux2KleinEngine {
     /// Drains the prompt-cache channel into the status line under the prompt field.
     ///
     /// A finished BUILD re-arms `.status`, which is what turns the line above the buttons
-    /// green. A finished LOAD additionally writes the prompt the file was built from into
-    /// the field, so the user sees exactly what they loaded, and persists it.
+    /// green, and invalidates the forecast (the encoder may no longer be part of the run). A
+    /// finished LOAD additionally writes the prompt the file was built from into the field,
+    /// so the user sees exactly what they loaded, and persists it.
     pub(super) fn poll_prompt_cache(&mut self) {
         let Some(rx) = self.prompt_cache_rx.as_ref() else {
             return;
@@ -678,8 +703,11 @@ impl Flux2KleinEngine {
     pub(super) fn apply_prompt_cache_outcome(&mut self, outcome: Flux2PromptCacheOutcome) -> String {
         match outcome {
             Flux2PromptCacheOutcome::Built => {
-                // The live cache changed, so the catalog's `prompt_cached` is stale.
+                // The live cache changed, so the catalog's `prompt_cached` is stale — and so is
+                // the forecast: whether the run will ENCODE (and so whether the encoder counts
+                // into the total) is the backend's answer about that same cache.
                 self.status_wanted = true;
+                self.invalidate_forecast();
                 t!("cleaning.tools.flux2_klein.prompt_cache_built_status").to_string()
             }
             Flux2PromptCacheOutcome::Saved(name) => {
@@ -974,5 +1002,33 @@ mod tests {
                 vae: "/home/u/sd_models/vae".to_string(),
             }
         );
+    }
+
+    /// A finished «Кэшировать» changes what the run will encode, so the held forecast is
+    /// marked stale and asked again; a CHANGED library listing does the same, while the
+    /// first listing and an identical one do not re-ask.
+    #[test]
+    fn a_built_prompt_cache_and_a_changed_library_re_ask_the_forecast() {
+        let _locale_guard = ms_config::locale_store::GLOBAL_LOCALE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut engine = Flux2KleinEngine::default();
+        engine.resources.wanted = false;
+        engine.apply_prompt_cache_outcome(Flux2PromptCacheOutcome::Built);
+        assert!(engine.resources.wanted, "a built cache re-arms the forecast");
+
+        let listing = |names: &[&str]| Flux2PromptCacheList {
+            entries: names.iter().map(|name| Flux2PromptCacheEntry { name: (*name).to_string(), ..Flux2PromptCacheEntry::default() }).collect(),
+            ..Flux2PromptCacheList::default()
+        };
+        let deliver = |engine: &mut Flux2KleinEngine, library: Flux2PromptCacheList| {
+            let (tx, rx) = mpsc::channel();
+            tx.send(Ok(library)).expect("the receiver is alive");
+            engine.prompt_cache_list_rx = Some(rx);
+            engine.resources.wanted = false;
+            engine.poll_and_maybe_query_prompt_cache_list();
+            engine.resources.wanted
+        };
+        assert!(!deliver(&mut engine, listing(&["sfx"])), "the first listing is not a change");
+        assert!(!deliver(&mut engine, listing(&["sfx"])), "an identical listing is not a change");
+        assert!(deliver(&mut engine, listing(&["sfx", "title"])), "a changed listing re-arms the forecast");
     }
 }

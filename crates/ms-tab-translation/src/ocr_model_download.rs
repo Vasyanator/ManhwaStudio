@@ -28,6 +28,16 @@ Key items:
   corruption the stat-only probe cannot see) — reporting one progress over the whole bundle;
   progress is coalesced in a mutex slot that `poll` reads. A finished verify re-probes the
   bundle and every spec it invalidated and leaves a neutral notice (intact / N files removed).
+- Automatic ADOPTION (`Adoption`, the third job kind): a spec probed `Missing` whose files are
+  all on disk at their pinned sizes without its marker (`unmarked_files_present`, e.g. left by
+  an older downloader) is adopted once per process — hashed against its pins and given its
+  marker by `adopt_external_model`, with no network and nothing deleted. A bundle registered
+  through `probe_unknown` / `request_bundle_status` is checked once all its specs are probed,
+  then kept as decided (so the per-frame `probe_unknown` costs no allocation) until a status
+  answer for one of its specs or an explicit re-ask; the job shows as `Verifying` with phase
+  `Adopting`; a mismatch leaves a notice and the regular Download then fetches only the
+  differing files. Only files with NO marker are adoptable (`unmarked_files_present`).
+- `running_job`: the kind of the one running job, for owners that gate other work on it.
 - `offered_download_label`: the one owner of "which download button caption is visible for a
   snapshot" — used by the panel block AND (through `download_label_for_statuses`, the same
   aggregation over probe answers) by the "model is not downloaded" errors, so an error names
@@ -58,11 +68,14 @@ Notes:
   controller's first probe finds the staged bytes and reports `Partial`, whose status line
   says the download was interrupted, next to the Resume button. No process-global state is
   kept for it: the on-disk staging is the durable record, and it also covers a crash.
-- The worker bodies are injected as plain function pointers (`Jobs`) so the state machine
-  is unit-tested with fakes and no filesystem or network.
+- The worker bodies are injected as plain function pointers (`Jobs`, `Adoption`) so the
+  state machine is unit-tested with fakes and no filesystem or network.
+- The once-per-process adoption record (`AUTO_ADOPT_ATTEMPTED`, spec ids) is the one piece of
+  process-global state here: a tab rebuild creates a new controller, and re-hashing ~16 GB on
+  every rebuild after a refused adoption is exactly what it prevents. Tests inject their own.
 */
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -71,7 +84,7 @@ use std::sync::{Arc, Mutex};
 use ms_config as config;
 use ms_sysprobe::ai_models::external::{
     ExternalDownloadPhase, ExternalDownloadProgress, ExternalModelError, ExternalModelSpec, ExternalModelStatus, VerifyReport,
-    download_external_model, external_model_status, verify_external_model,
+    adopt_external_model, download_external_model, external_model_status, unmarked_files_present, verify_external_model,
 };
 use ms_sysprobe::ai_models::external_catalog::all_specs;
 use ms_thread::{self as thread, JoinHandle};
@@ -115,6 +128,14 @@ pub enum DownloadNotice {
     VerifyRemoved { files: usize },
     /// The user cancelled the verify; damaged files found before that are already deleted.
     VerifyCancelled,
+    /// An automatic adoption found the catalog file `file` on disk with another size or
+    /// content; nothing was deleted, and a download fetches only the differing files.
+    AdoptMismatch { file: &'static str },
+    /// An automatic adoption failed for another reason; the localized reason.
+    AdoptFailed(String),
+    /// The user cancelled an automatic adoption (it is not retried automatically in this
+    /// process; a download keeps the matching files).
+    AdoptCancelled,
 }
 
 impl DownloadNotice {
@@ -123,7 +144,7 @@ impl DownloadNotice {
     pub fn is_verify(&self) -> bool {
         match self {
             Self::VerifyIntact | Self::VerifyRemoved { .. } | Self::VerifyCancelled => true,
-            Self::Cancelled | Self::Failed(_) => false,
+            Self::Cancelled | Self::Failed(_) | Self::AdoptMismatch { .. } | Self::AdoptFailed(_) | Self::AdoptCancelled => false,
         }
     }
 }
@@ -135,6 +156,8 @@ pub enum JobKind {
     Download,
     /// Hashing the bundle's files against their pins.
     Verify,
+    /// Adopting files found on disk without their markers (automatic, see [`Adoption`]).
+    Adopt,
 }
 
 /// A download of ANOTHER bundle that currently blocks downloading the shown one (at most one
@@ -174,6 +197,12 @@ pub fn bundle_key(specs: &[&'static ExternalModelSpec]) -> String {
     specs.iter().map(|spec| spec.id).collect::<Vec<_>>().join("+")
 }
 
+/// Whether two bundles hold the same specs in the same order (what [`bundle_key`] would say,
+/// without allocating the keys).
+fn same_bundle(left: &[&'static ExternalModelSpec], right: &[&'static ExternalModelSpec]) -> bool {
+    left.len() == right.len() && left.iter().zip(right).all(|(a, b)| a.id == b.id)
+}
+
 /// Blocking stat-only status probe of one spec (worker thread only).
 pub(crate) type StatusProbe = fn(&'static ExternalModelSpec) -> ExternalModelStatus;
 /// Blocking download of one spec with a cancel flag and a per-chunk progress callback
@@ -186,6 +215,12 @@ pub(crate) type DownloadJob =
 pub(crate) type VerifyJob =
     fn(&'static ExternalModelSpec, &AtomicBool, &mut dyn FnMut(&ExternalDownloadProgress)) -> Result<VerifyReport, ExternalModelError>;
 
+/// Blocking stat-only "present but unmarked" probe of one spec (worker thread only).
+pub(crate) type UnmarkedProbe = fn(&'static ExternalModelSpec) -> bool;
+/// Blocking adoption of one spec with a cancel flag and a per-read progress callback (worker
+/// thread only); never downloads, never deletes.
+pub(crate) type AdoptJob = DownloadJob;
+
 /// The worker bodies. Production uses the real `ms_sysprobe` functions under
 /// `ms_config::side_models_dir()`; tests (also the tab's) inject fakes.
 #[derive(Clone, Copy)]
@@ -194,6 +229,18 @@ pub(crate) struct Jobs {
     pub(crate) download: DownloadJob,
     pub(crate) verify: VerifyJob,
 }
+
+/// The worker bodies of automatic adoption: the probe the status worker runs for every spec
+/// that reads `Missing`, and the job that adopts one spec.
+#[derive(Clone, Copy)]
+pub(crate) struct Adoption {
+    pub(crate) unmarked: UnmarkedProbe,
+    pub(crate) adopt: AdoptJob,
+}
+
+/// Spec ids an automatic adoption was started for in this process (D9: at most once each,
+/// whatever its outcome); see the file header for why this is process-global.
+static AUTO_ADOPT_ATTEMPTED: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
 
 /// Production status probe: resolves the `side_models` root on the worker (path
 /// resolution may stat program markers) and stats the spec there.
@@ -208,6 +255,20 @@ fn real_download_job(
     progress: &mut dyn FnMut(&ExternalDownloadProgress),
 ) -> Result<PathBuf, ExternalModelError> {
     download_external_model(&config::side_models_dir(), spec, cancel, progress)
+}
+
+/// Production "present but unmarked" probe under `ms_config::side_models_dir()`.
+fn real_unmarked_probe(spec: &'static ExternalModelSpec) -> bool {
+    unmarked_files_present(&config::side_models_dir(), spec)
+}
+
+/// Production adoption job under `ms_config::side_models_dir()`.
+fn real_adopt_job(
+    spec: &'static ExternalModelSpec,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(&ExternalDownloadProgress),
+) -> Result<PathBuf, ExternalModelError> {
+    adopt_external_model(&config::side_models_dir(), spec, cancel, progress)
 }
 
 /// Production verify job under `ms_config::side_models_dir()`.
@@ -227,7 +288,8 @@ enum StatusCommand {
 
 /// Events the status worker and the download thread send back to the controller.
 enum WorkerEvent {
-    Status { spec_id: &'static str, status: ExternalModelStatus },
+    /// A probe answer; `adoptable` is the "present but unmarked" probe, run only for `Missing`.
+    Status { spec_id: &'static str, status: ExternalModelStatus, adoptable: bool },
     /// One spec of the running bundle finished and is installed.
     SpecInstalled { spec_id: &'static str },
     DownloadFinished { key: String, specs: Vec<&'static ExternalModelSpec>, result: Result<(), ExternalModelError> },
@@ -239,6 +301,9 @@ enum WorkerEvent {
         invalidated: Vec<&'static str>,
         result: Result<usize, ExternalModelError>,
     },
+    /// An automatic adoption of `specs` (the adoptable specs of bundle `key`) ended: the first
+    /// failure, or `Ok` when every spec was adopted.
+    AdoptFinished { key: String, specs: Vec<&'static ExternalModelSpec>, result: Result<(), ExternalModelError> },
 }
 
 /// The one running job: its kind, bundle, cancel switch and coalesced progress slot.
@@ -263,7 +328,8 @@ impl ActiveDownload {
     fn state(&self) -> OcrModelDownloadState {
         match self.kind {
             JobKind::Download => OcrModelDownloadState::Downloading(self.latest),
-            JobKind::Verify => OcrModelDownloadState::Verifying(self.latest),
+            // An adoption hashes files like a verify; its progress phase says `Adopting`.
+            JobKind::Verify | JobKind::Adopt => OcrModelDownloadState::Verifying(self.latest),
         }
     }
 }
@@ -275,6 +341,18 @@ impl ActiveDownload {
 /// [`Self::is_active`].
 pub struct OcrModelDownloadController {
     jobs: Jobs,
+    adoption: Adoption,
+    /// Spec ids whose last probe read `Missing` with every file present but unmarked.
+    adoptable: HashSet<&'static str>,
+    /// Bundles registered for the automatic-adoption check, decided once all their specs
+    /// are probed (see `start_auto_adoption`).
+    adopt_watch: Vec<Vec<&'static ExternalModelSpec>>,
+    /// Bundles already decided, so the per-frame [`Self::probe_unknown`] does not register them
+    /// again. A bundle leaves this list when a status answer arrives for one of its specs or
+    /// [`Self::request_bundle_status`] re-asks it (its disk state may have changed).
+    adopt_decided: Vec<Vec<&'static ExternalModelSpec>>,
+    /// The once-per-process adoption record ([`AUTO_ADOPT_ATTEMPTED`] in production).
+    auto_adopt_attempted: &'static Mutex<BTreeSet<&'static str>>,
     /// Probed state per spec id (never `Downloading`: the active download owns that).
     states: HashMap<&'static str, OcrModelDownloadState>,
     /// Outcome of the last unsuccessful download per bundle key (see [`DownloadNotice`]).
@@ -305,21 +383,39 @@ impl Default for OcrModelDownloadController {
 }
 
 impl OcrModelDownloadController {
-    /// Creates the controller and its status worker over the real `ms_sysprobe` probes.
+    /// Creates the controller and its status worker over the real `ms_sysprobe` probes, with
+    /// automatic adoption recorded process-wide.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_jobs(Jobs { status: real_status_probe, download: real_download_job, verify: real_verify_job })
+        Self::with_parts(
+            Jobs { status: real_status_probe, download: real_download_job, verify: real_verify_job },
+            Adoption { unmarked: real_unmarked_probe, adopt: real_adopt_job },
+            &AUTO_ADOPT_ATTEMPTED,
+        )
     }
 
-    /// Creates the controller over the given worker bodies.
+    /// Creates the controller over the given worker bodies, with automatic adoption disabled
+    /// (nothing is ever adoptable); for the tests of the download / verify state machine.
+    #[cfg(test)]
     pub(crate) fn with_jobs(jobs: Jobs) -> Self {
+        Self::with_parts(jobs, fakes::NO_ADOPTION, Box::leak(Box::new(Mutex::new(BTreeSet::new()))))
+    }
+
+    /// Creates the controller over the given worker bodies, adoption bodies and adoption
+    /// record.
+    pub(crate) fn with_parts(jobs: Jobs, adoption: Adoption, auto_adopt_attempted: &'static Mutex<BTreeSet<&'static str>>) -> Self {
         let (status_tx, status_rx) = mpsc::channel::<StatusCommand>();
         let (evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
         let worker_tx = evt_tx.clone();
-        let probe = jobs.status;
-        let status_worker = thread::spawn(move || status_worker_loop(&status_rx, &worker_tx, probe));
+        let (probe, unmarked) = (jobs.status, adoption.unmarked);
+        let status_worker = thread::spawn(move || status_worker_loop(&status_rx, &worker_tx, probe, unmarked));
         Self {
             jobs,
+            adoption,
+            adoptable: HashSet::new(),
+            adopt_watch: Vec::new(),
+            adopt_decided: Vec::new(),
+            auto_adopt_attempted,
             states: HashMap::new(),
             notices: HashMap::new(),
             status_tx,
@@ -347,21 +443,52 @@ impl OcrModelDownloadController {
         self.states.insert(spec.id, OcrModelDownloadState::Checking);
     }
 
-    /// [`Self::request_status`] for every spec of a bundle.
+    /// [`Self::request_status`] for every spec of a bundle; also registers the bundle for
+    /// the automatic-adoption check again, even when it was decided before (see
+    /// [`Self::probe_unknown`]).
     pub fn request_bundle_status(&mut self, specs: &[&'static ExternalModelSpec]) {
         for spec in specs {
             self.request_status(spec);
         }
+        self.adopt_decided.retain(|decided| !same_bundle(decided, specs));
+        self.watch_for_adoption(specs);
     }
 
     /// Probes the specs of a bundle that were never probed in this session (opening a panel
-    /// on, or switching to, a model).
+    /// on, or switching to, a model), and registers the bundle for the automatic-adoption
+    /// check: once every spec of it is probed, a [`Self::poll`] adopts the specs that read
+    /// `Missing` with all files present but unmarked, unless this process already tried.
+    ///
+    /// Meant to be called every frame: when every spec is probed and the bundle is watched or
+    /// already decided, it allocates nothing and sends nothing.
     pub fn probe_unknown(&mut self, specs: &[&'static ExternalModelSpec]) {
         for spec in specs {
-            if self.state_for(spec.id) == OcrModelDownloadState::Unknown {
+            // `request_status` itself skips a spec the running job owns.
+            if matches!(self.states.get(spec.id), None | Some(OcrModelDownloadState::Unknown)) {
                 self.request_status(spec);
             }
         }
+        self.watch_for_adoption(specs);
+    }
+
+    /// Registers a non-empty bundle for the automatic-adoption check unless it is watched or
+    /// already decided (callers may call this every frame; the comparison allocates nothing).
+    fn watch_for_adoption(&mut self, specs: &[&'static ExternalModelSpec]) {
+        if specs.is_empty()
+            || self.adopt_watch.iter().any(|watched| same_bundle(watched, specs))
+            || self.adopt_decided.iter().any(|decided| same_bundle(decided, specs))
+        {
+            return;
+        }
+        self.adopt_watch.push(specs.to_vec());
+    }
+
+    /// The kind of the one running job (download, verify or automatic adoption), or `None`
+    /// when no job runs. Owners that must not start a competing transfer elsewhere (the FLUX.2
+    /// klein engine's switch gate) read it.
+    #[must_use]
+    pub fn running_job(&self) -> Option<JobKind> {
+        self.download.as_ref().map(|active| active.kind)
     }
 
     /// Starts downloading (or resuming) the bundle `specs` on a new thread and clears its
@@ -501,12 +628,20 @@ impl OcrModelDownloadController {
         let mut changed = false;
         loop {
             match self.evt_rx.try_recv() {
-                Ok(WorkerEvent::Status { spec_id, status }) => {
+                Ok(WorkerEvent::Status { spec_id, status, adoptable }) => {
                     self.pending_probes = self.pending_probes.saturating_sub(1);
                     // A probe answered after a download started describes the old disk
                     // state; the download owns the state until it finishes.
+                    // A fresh answer may change what is adoptable: the bundles holding this spec
+                    // are decided again the next time they are watched.
+                    self.adopt_decided.retain(|decided| !decided.iter().any(|spec| spec.id == spec_id));
                     if !self.download.as_ref().is_some_and(|active| active.contains(spec_id)) {
                         changed |= self.set_state(spec_id, state_from_status(status));
+                        if adoptable {
+                            self.adoptable.insert(spec_id);
+                        } else {
+                            self.adoptable.remove(spec_id);
+                        }
                     }
                 }
                 Ok(WorkerEvent::SpecInstalled { spec_id }) => {
@@ -557,6 +692,36 @@ impl OcrModelDownloadController {
                         .collect();
                     self.request_bundle_status(&others);
                 }
+                Ok(WorkerEvent::AdoptFinished { key, specs, result }) => {
+                    if self.download.as_ref().is_some_and(|active| active.key == key) {
+                        self.download = None;
+                    }
+                    changed = true;
+                    let notice = match result {
+                        Ok(()) => None,
+                        Err(ExternalModelError::Cancelled) => Some(DownloadNotice::AdoptCancelled),
+                        Err(ExternalModelError::HashMismatch { file, .. } | ExternalModelError::SizeMismatch { file, .. }) => {
+                            Some(DownloadNotice::AdoptMismatch { file })
+                        }
+                        Err(err) => Some(DownloadNotice::AdoptFailed(external_error_message(&err))),
+                    };
+                    match notice {
+                        None => {
+                            self.notices.remove(&key);
+                            for spec in &specs {
+                                self.adoptable.remove(spec.id);
+                                self.states.insert(spec.id, OcrModelDownloadState::Installed);
+                            }
+                        }
+                        Some(notice) => {
+                            // Adopted specs were reported installed on the way; the re-probe
+                            // shows the real state of the rest (`Missing`, with the Download
+                            // button that repairs only the differing files).
+                            self.notices.insert(key, notice);
+                            self.request_bundle_status(&specs);
+                        }
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 // Impossible while `self.evt_tx` is alive; kept exhaustive.
                 Err(TryRecvError::Disconnected) => break,
@@ -574,7 +739,101 @@ impl OcrModelDownloadController {
                 changed = true;
             }
         }
+        changed |= self.start_auto_adoption();
         changed
+    }
+
+    /// Decides the watched bundles whose specs are all probed: starts ONE automatic adoption
+    /// of the first bundle with adoptable specs (probed `Missing`, files present but unmarked,
+    /// never tried in this process) and moves every decided bundle to `adopt_decided`. Waits
+    /// while any job runs. Returns `true` when an adoption started.
+    fn start_auto_adoption(&mut self) -> bool {
+        if self.download.is_some() || self.adopt_watch.is_empty() {
+            return false;
+        }
+        // Copied out of `self` so the guard does not borrow it; held only for this in-memory
+        // pass (no I/O, no thread start under it).
+        let record = self.auto_adopt_attempted;
+        // A poisoned record only means a panic while inserting ids; its set is intact.
+        let mut attempted = match record.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut chosen: Option<(String, Vec<&'static ExternalModelSpec>)> = None;
+        let mut undecided = Vec::new();
+        for bundle in std::mem::take(&mut self.adopt_watch) {
+            let probed = bundle.iter().all(|spec| {
+                !matches!(self.states.get(spec.id), None | Some(OcrModelDownloadState::Unknown | OcrModelDownloadState::Checking))
+            });
+            if !probed || chosen.is_some() {
+                undecided.push(bundle);
+                continue;
+            }
+            let candidates: Vec<&'static ExternalModelSpec> = bundle
+                .iter()
+                .copied()
+                .filter(|spec| {
+                    self.adoptable.contains(spec.id)
+                        && self.states.get(spec.id) == Some(&OcrModelDownloadState::Missing)
+                        && !attempted.contains(spec.id)
+                })
+                .collect();
+            if !candidates.is_empty() {
+                chosen = Some((bundle_key(&bundle), candidates));
+            }
+            self.adopt_decided.push(bundle);
+        }
+        self.adopt_watch = undecided;
+        let Some((key, specs)) = chosen else { return false };
+        attempted.extend(specs.iter().map(|spec| spec.id));
+        drop(attempted);
+        self.start_adoption(key, specs);
+        true
+    }
+
+    /// Starts adopting `specs` (the adoptable specs of the bundle with key `key`, so that
+    /// bundle's snapshot shows the job as its own) on a new thread and clears the bundle's
+    /// notice. Callers ensure no job runs.
+    fn start_adoption(&mut self, key: String, specs: Vec<&'static ExternalModelSpec>) {
+        self.notices.remove(&key);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(None::<ExternalDownloadProgress>));
+        let adopt = self.adoption.adopt;
+        let evt_tx = self.evt_tx.clone();
+        let thread_cancel = Arc::clone(&cancel);
+        let thread_progress = Arc::clone(&progress);
+        let thread_specs = specs.clone();
+        let thread_key = key.clone();
+        ms_log::runtime_log::log_info(format!(
+            "[ocr-model] automatic adoption started: '{key}' adopts {:?} (files present without markers; hashing, no download)",
+            specs.iter().map(|spec| spec.id).collect::<Vec<_>>()
+        ));
+        let handle = thread::spawn(move || {
+            let mut report = |snapshot: &ExternalDownloadProgress| {
+                // Latest wins, as for a download (see `start_download`).
+                let mut slot = match thread_progress.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *slot = Some(*snapshot);
+            };
+            let mut installed = |spec: &'static ExternalModelSpec| {
+                // Best effort: a dropped controller re-probes from disk next time.
+                if evt_tx.send(WorkerEvent::SpecInstalled { spec_id: spec.id }).is_err() {
+                    ms_log::runtime_log::log_info(format!("[ocr-model] '{}' adopted after its controller was dropped", spec.id));
+                }
+            };
+            let result = run_bundle_adopt(adopt, &thread_specs, &thread_cancel, &mut report, &mut installed);
+            match &result {
+                Ok(()) => ms_log::runtime_log::log_info(format!("[ocr-model] automatic adoption of '{thread_key}' finished")),
+                Err(err) => ms_log::runtime_log::log_warn(format!("[ocr-model] automatic adoption of '{thread_key}' ended: {err}")),
+            }
+            if evt_tx.send(WorkerEvent::AdoptFinished { key: thread_key.clone(), specs: thread_specs, result }).is_err() {
+                ms_log::runtime_log::log_info(format!("[ocr-model] adoption of '{thread_key}' ended after its controller was dropped"));
+            }
+        });
+        let latest = adopt_initial_progress(&specs);
+        self.download = Some(ActiveDownload { kind: JobKind::Adopt, specs, key, cancel, progress, latest, thread: Some(handle) });
     }
 
     /// The state of the spec with id `spec_id`: `Downloading` / `Verifying` while a running
@@ -632,11 +891,23 @@ impl Drop for OcrModelDownloadController {
     fn drop(&mut self) {
         if let Some(mut active) = self.download.take() {
             active.cancel.store(true, Ordering::Relaxed);
-            ms_log::runtime_log::log_info(format!(
-                "[ocr-model] download of '{}' interrupted: its controller was dropped (tab rebuild or exit); \
-                 the staged bytes stay on disk and the next probe offers a resume",
-                active.key
-            ));
+            let key = &active.key;
+            let message = match active.kind {
+                JobKind::Download => format!(
+                    "[ocr-model] download of '{key}' interrupted: its controller was dropped (tab rebuild or exit); \
+                     the staged bytes stay on disk and the next probe offers a resume"
+                ),
+                JobKind::Verify => format!(
+                    "[ocr-model] verify of '{key}' interrupted: its controller was dropped (tab rebuild or exit); \
+                     files and markers it already removed stay removed, the rest was not checked; the next probe shows the real state"
+                ),
+                JobKind::Adopt => format!(
+                    "[ocr-model] automatic adoption of '{key}' interrupted: its controller was dropped (tab rebuild or exit); \
+                     specs adopted before stay marked, the others stay unmarked and are not re-adopted in this process \
+                     (a Download keeps their matching files)"
+                ),
+            };
+            ms_log::runtime_log::log_info(message);
             // Detached on purpose, see the file header: never wait for a network read here.
             drop(active.thread.take());
         }
@@ -651,13 +922,15 @@ impl Drop for OcrModelDownloadController {
     }
 }
 
-/// Status worker: answers probes in order until `Stop` or the controller is gone.
-fn status_worker_loop(commands: &Receiver<StatusCommand>, events: &Sender<WorkerEvent>, probe: StatusProbe) {
+/// Status worker: answers probes in order until `Stop` or the controller is gone; a `Missing`
+/// answer also runs the stat-only `unmarked` probe (adoption candidate).
+fn status_worker_loop(commands: &Receiver<StatusCommand>, events: &Sender<WorkerEvent>, probe: StatusProbe, unmarked: UnmarkedProbe) {
     while let Ok(command) = commands.recv() {
         match command {
             StatusCommand::Probe(spec) => {
                 let status = probe(spec);
-                if events.send(WorkerEvent::Status { spec_id: spec.id, status }).is_err() {
+                let adoptable = status == ExternalModelStatus::Missing && unmarked(spec);
+                if events.send(WorkerEvent::Status { spec_id: spec.id, status, adoptable }).is_err() {
                     break;
                 }
             }
@@ -739,6 +1012,45 @@ fn run_bundle_verify(
     Ok(damaged)
 }
 
+/// The body of the adoption thread: adopts every spec of `specs` in order, mapping each
+/// spec's progress onto the whole list like a download; `installed` is told about every spec
+/// adopted. A refused spec does not stop the others (each is independent and nothing is
+/// deleted); a cancel stops at once. Blocking: the adoption thread only.
+///
+/// # Errors
+/// `Cancelled` when cancelled; otherwise the first spec's `ExternalModelError`.
+fn run_bundle_adopt(
+    adopt: AdoptJob,
+    specs: &[&'static ExternalModelSpec],
+    cancel: &AtomicBool,
+    report: &mut dyn FnMut(&ExternalDownloadProgress),
+    installed: &mut dyn FnMut(&'static ExternalModelSpec),
+) -> Result<(), ExternalModelError> {
+    let file_count = specs.iter().map(|spec| spec.files.len()).sum::<usize>();
+    let total_bytes = specs.iter().fold(0_u64, |total, spec| total.saturating_add(spec.total_bytes()));
+    let mut files_before = 0_usize;
+    let mut bytes_before = 0_u64;
+    let mut first_error = None;
+    for spec in specs {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ExternalModelError::Cancelled);
+        }
+        let mut forward =
+            |progress: &ExternalDownloadProgress| report(&bundle_progress(progress, files_before, file_count, bytes_before, total_bytes));
+        match adopt(spec, cancel, &mut forward) {
+            Ok(_dir) => installed(spec),
+            Err(ExternalModelError::Cancelled) => return Err(ExternalModelError::Cancelled),
+            Err(err) => {
+                ms_log::runtime_log::log_warn(format!("[ocr-model] adoption of '{}' refused: {err}", spec.id));
+                first_error.get_or_insert(err);
+            }
+        }
+        files_before = files_before.saturating_add(spec.files.len());
+        bytes_before = bytes_before.saturating_add(spec.total_bytes());
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 /// One spec's progress report mapped onto its bundle: the file index and byte counters
 /// continue after the `files_before` / `bytes_before` of the earlier specs, the totals are the
 /// bundle's.
@@ -772,6 +1084,12 @@ fn verify_initial_progress(specs: &[&'static ExternalModelSpec]) -> ExternalDown
         total_done: 0,
         total_bytes: specs.iter().fold(0_u64, |total, spec| total.saturating_add(spec.total_bytes())),
     }
+}
+
+/// The progress shown between the start and the first report of the adoption thread: the
+/// verify estimate over `specs`, in phase `Adopting`.
+fn adopt_initial_progress(specs: &[&'static ExternalModelSpec]) -> ExternalDownloadProgress {
+    ExternalDownloadProgress { phase: ExternalDownloadPhase::Adopting, ..verify_initial_progress(specs) }
 }
 
 /// The progress shown between the click and the first report of the download thread: the
@@ -1003,8 +1321,8 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 pub(crate) mod fakes {
     use super::{
-        ExternalDownloadProgress, ExternalModelError, ExternalModelSpec, ExternalModelStatus, HashMap, VerifyReport, initial_progress,
-        verify_initial_progress,
+        Adoption, ExternalDownloadProgress, ExternalModelError, ExternalModelSpec, ExternalModelStatus, HashMap, VerifyReport,
+        adopt_initial_progress, initial_progress, verify_initial_progress,
     };
     use ms_sysprobe::ai_models::external::{DirLayout, ExternalFile, ExternalSource};
     use std::path::PathBuf;
@@ -1161,6 +1479,69 @@ pub(crate) mod fakes {
         Err(ExternalModelError::Cancelled)
     }
 
+    /// Automatic adoption off: nothing is ever "present but unmarked".
+    pub(crate) const NO_ADOPTION: Adoption = Adoption { unmarked: never_unmarked, adopt: adoption_disabled };
+
+    pub(crate) fn never_unmarked(_spec: &'static ExternalModelSpec) -> bool {
+        false
+    }
+
+    pub(crate) fn always_unmarked(_spec: &'static ExternalModelSpec) -> bool {
+        true
+    }
+
+    /// The adoption body of [`NO_ADOPTION`]; unreachable while `never_unmarked` answers.
+    fn adoption_disabled(
+        _spec: &'static ExternalModelSpec,
+        _cancel: &AtomicBool,
+        _progress: &mut dyn FnMut(&ExternalDownloadProgress),
+    ) -> Result<PathBuf, ExternalModelError> {
+        Err(ExternalModelError::InvalidSpec("adoption is disabled in this test".to_owned()))
+    }
+
+    /// Reports the spec as fully hashed (phase `Adopting`), then succeeds.
+    pub(crate) fn ok_adopt(
+        spec: &'static ExternalModelSpec,
+        _cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&ExternalDownloadProgress),
+    ) -> Result<PathBuf, ExternalModelError> {
+        let mut report = adopt_initial_progress(&[spec]);
+        report.total_done = spec.total_bytes();
+        progress(&report);
+        Ok(PathBuf::from("unused"))
+    }
+
+    /// `THIRD_SPEC`'s file differs from its pin; every other spec adopts.
+    pub(crate) fn third_mismatches_adopt(
+        spec: &'static ExternalModelSpec,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&ExternalDownloadProgress),
+    ) -> Result<PathBuf, ExternalModelError> {
+        if spec.id == THIRD_SPEC.id {
+            return Err(ExternalModelError::HashMismatch { file: "c.bin", expected: "00", actual: "11".to_owned() });
+        }
+        ok_adopt(spec, cancel, progress)
+    }
+
+    /// Reports 7 bytes in phase `Adopting`, then runs until cancelled (10 s safety deadline).
+    pub(crate) fn adopt_waits_for_cancel(
+        spec: &'static ExternalModelSpec,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&ExternalDownloadProgress),
+    ) -> Result<PathBuf, ExternalModelError> {
+        let mut report = adopt_initial_progress(&[spec]);
+        report.total_done = 7;
+        progress(&report);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cancel.load(Ordering::Relaxed) {
+            if Instant::now() > deadline {
+                return Err(ExternalModelError::InvalidSpec("test timeout".to_owned()));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        Err(ExternalModelError::Cancelled)
+    }
+
     /// Fails `THIRD_SPEC`, succeeds for every other spec.
     pub(crate) fn third_fails(
         spec: &'static ExternalModelSpec,
@@ -1174,9 +1555,9 @@ pub(crate) mod fakes {
 #[cfg(test)]
 mod tests {
     use super::fakes::{
-        FAKE_SPEC, OTHER_SPEC, PARTIAL_BYTES, THIRD_SPEC, busy_failure, complete_download, damaged_verify, hash_failure,
-        installed_probe, intact_verify, missing_probe, ok_download, other_installed_probe, partial_probe, third_fails,
-        verify_waits_for_cancel, waits_for_cancel,
+        FAKE_SPEC, OTHER_SPEC, PARTIAL_BYTES, THIRD_SPEC, adopt_waits_for_cancel, always_unmarked, busy_failure, complete_download,
+        damaged_verify, hash_failure, installed_probe, intact_verify, missing_probe, ok_adopt, ok_download, other_installed_probe,
+        partial_probe, third_fails, third_mismatches_adopt, verify_waits_for_cancel, waits_for_cancel,
     };
     use super::*;
     use std::time::{Duration, Instant};
@@ -1508,6 +1889,183 @@ mod tests {
         cancel.store(true, Ordering::Relaxed);
         let result = run_bundle_verify(jobs, BUNDLE, &cancel, &mut |_| {}, &mut Vec::new());
         assert!(matches!(result, Err(ExternalModelError::Cancelled)), "{result:?}");
+    }
+
+    /// A fresh once-per-process adoption record, so parallel tests do not share one.
+    fn fresh_record() -> &'static Mutex<BTreeSet<&'static str>> {
+        Box::leak(Box::new(Mutex::new(BTreeSet::new())))
+    }
+
+    fn adopting(adopt: AdoptJob, status: StatusProbe, record: &'static Mutex<BTreeSet<&'static str>>) -> OcrModelDownloadController {
+        OcrModelDownloadController::with_parts(
+            Jobs { status, download: ok_download, verify: intact_verify },
+            Adoption { unmarked: always_unmarked, adopt },
+            record,
+        )
+    }
+
+    /// D9: a probed bundle whose specs are present but unmarked is adopted automatically and
+    /// reads installed; a later controller of the same process never adopts those specs again.
+    #[test]
+    fn present_unmarked_specs_are_adopted_automatically_once_per_process() {
+        let record = fresh_record();
+        let mut controller = adopting(ok_adopt, missing_probe, record);
+        controller.probe_unknown(BUNDLE);
+        poll_until(&mut controller, |c| !c.is_active());
+        let snapshot = controller.panel_snapshot(BUNDLE);
+        assert_eq!(snapshot.state, OcrModelDownloadState::Installed, "{snapshot:?}");
+        assert_eq!(snapshot.notice, None);
+
+        // A tab rebuild: the probe reads Missing again (fake), but the record forbids a second
+        // automatic adoption, so the state stays Missing with its Download button.
+        let mut rebuilt = adopting(ok_adopt, missing_probe, record);
+        rebuilt.probe_unknown(BUNDLE);
+        poll_until(&mut rebuilt, |c| !c.is_active());
+        assert_eq!(rebuilt.panel_snapshot(BUNDLE).state, OcrModelDownloadState::Missing);
+
+        // Only a `Missing` answer is a candidate: an installed spec never starts a job.
+        let mut installed = adopting(ok_adopt, installed_probe, fresh_record());
+        installed.probe_unknown(BUNDLE);
+        poll_until(&mut installed, |c| !c.is_active());
+        assert_eq!(installed.panel_snapshot(BUNDLE).state, OcrModelDownloadState::Installed);
+        // Disabled adoption (`with_jobs`): a missing bundle just reads Missing.
+        let mut disabled = OcrModelDownloadController::with_jobs(Jobs { status: missing_probe, download: ok_download, verify: intact_verify });
+        disabled.probe_unknown(BUNDLE);
+        poll_until(&mut disabled, |c| !c.is_active());
+        assert_eq!(disabled.panel_snapshot(BUNDLE).state, OcrModelDownloadState::Missing);
+    }
+
+    /// `running_job` names the kind of the one running job (what the FLUX.2 klein switch gate
+    /// reads) and returns `None` once it ended.
+    #[test]
+    fn running_job_names_the_kind_of_the_one_running_job() {
+        let jobs = Jobs { status: installed_probe, download: waits_for_cancel, verify: verify_waits_for_cancel };
+        let mut controller = OcrModelDownloadController::with_jobs(jobs);
+        assert_eq!(controller.running_job(), None);
+        controller.start_download(BUNDLE);
+        assert_eq!(controller.running_job(), Some(JobKind::Download));
+        controller.cancel();
+        poll_until(&mut controller, |c| !c.is_active());
+        assert_eq!(controller.running_job(), None);
+        controller.start_verify(BUNDLE);
+        assert_eq!(controller.running_job(), Some(JobKind::Verify));
+        controller.cancel();
+        poll_until(&mut controller, |c| !c.is_active());
+        assert_eq!(controller.running_job(), None);
+
+        let mut adoption = adopting(adopt_waits_for_cancel, missing_probe, fresh_record());
+        adoption.probe_unknown(BUNDLE);
+        poll_until(&mut adoption, |c| c.running_job().is_some());
+        assert_eq!(adoption.running_job(), Some(JobKind::Adopt));
+        adoption.cancel();
+        poll_until(&mut adoption, |c| !c.is_active());
+        assert_eq!(adoption.running_job(), None);
+    }
+
+    /// Whether `unmarked_after_reprobe` answers "present but unmarked"; only the test below
+    /// flips it.
+    static UNMARKED_NOW: AtomicBool = AtomicBool::new(false);
+
+    fn unmarked_after_reprobe(_spec: &'static ExternalModelSpec) -> bool {
+        UNMARKED_NOW.load(Ordering::SeqCst)
+    }
+
+    /// The per-frame `probe_unknown` re-registers nothing once a bundle is decided (no
+    /// allocation, no probe), yet a later status answer that makes a spec adoptable still
+    /// starts the automatic adoption the next time the bundle is shown; an explicit
+    /// `request_bundle_status` re-watches a decided bundle at once.
+    #[test]
+    fn a_decided_bundle_is_not_rewatched_per_frame_but_a_reprobe_can_still_adopt() {
+        UNMARKED_NOW.store(false, Ordering::SeqCst);
+        let mut controller = OcrModelDownloadController::with_parts(
+            Jobs { status: missing_probe, download: ok_download, verify: intact_verify },
+            Adoption { unmarked: unmarked_after_reprobe, adopt: ok_adopt },
+            fresh_record(),
+        );
+        controller.probe_unknown(BUNDLE);
+        poll_until(&mut controller, |c| !c.is_active() && c.adopt_watch.is_empty());
+        assert_eq!(controller.adopt_decided.len(), 1, "decided: nothing adoptable");
+        for _frame in 0..3 {
+            controller.probe_unknown(BUNDLE);
+            assert!(controller.adopt_watch.is_empty() && !controller.is_active(), "no re-registration, no probe");
+            assert!(!controller.poll());
+        }
+        assert_eq!(controller.adopt_decided.len(), 1);
+
+        // The explicit re-ask watches it again right away and decides it again.
+        controller.request_bundle_status(BUNDLE);
+        assert!(controller.adopt_decided.is_empty() && controller.adopt_watch.len() == 1);
+        poll_until(&mut controller, |c| !c.is_active() && c.adopt_watch.is_empty());
+        assert_eq!(controller.running_job(), None, "still nothing adoptable");
+
+        // A re-probe of one spec now finds it adoptable: its answer reopens the bundle, and the
+        // next frame's `probe_unknown` adopts it.
+        UNMARKED_NOW.store(true, Ordering::SeqCst);
+        controller.request_status(&FAKE_SPEC);
+        poll_until(&mut controller, |c| !c.is_active());
+        assert!(controller.adopt_decided.is_empty(), "a status answer reopens the bundles holding the spec");
+        controller.probe_unknown(BUNDLE);
+        poll_until(&mut controller, |c| !c.is_active() && c.adopt_watch.is_empty());
+        assert_eq!(controller.state_for(FAKE_SPEC.id), OcrModelDownloadState::Installed, "adopted after the re-probe");
+        assert_eq!(controller.state_for(THIRD_SPEC.id), OcrModelDownloadState::Missing, "its last answer was not adoptable");
+    }
+
+    /// A running adoption is the bundle's own `Verifying` job in phase `Adopting`, blocks other
+    /// bundles as an `Adopt` job, and a cancel leaves its notice without a restart.
+    #[test]
+    fn a_running_adoption_shows_progress_blocks_others_and_cancels_without_restart() {
+        let mut controller = adopting(adopt_waits_for_cancel, missing_probe, fresh_record());
+        controller.probe_unknown(BUNDLE);
+        poll_until(&mut controller, |c| {
+            matches!(c.panel_snapshot(BUNDLE).state, OcrModelDownloadState::Verifying(p) if p.total_done == 7 && p.phase == ExternalDownloadPhase::Adopting)
+        });
+        let other = controller.panel_snapshot(OTHER).other_download.expect("the adoption blocks other bundles");
+        assert_eq!(other.kind, JobKind::Adopt);
+        controller.start_download(OTHER);
+        assert!(!matches!(controller.state_for(OTHER_SPEC.id), OcrModelDownloadState::Downloading(_)));
+        controller.cancel();
+        poll_until(&mut controller, |c| !c.is_active());
+        let snapshot = controller.panel_snapshot(BUNDLE);
+        assert_eq!(snapshot.state, OcrModelDownloadState::Missing, "re-probed, not adopted again");
+        assert_eq!(snapshot.notice, Some(DownloadNotice::AdoptCancelled));
+        // The Download button stays the repair path and clears the notice.
+        controller.start_download(BUNDLE);
+        assert_eq!(controller.panel_snapshot(BUNDLE).notice, None);
+        poll_until(&mut controller, |c| !c.is_active());
+        assert_eq!(controller.panel_snapshot(BUNDLE).state, OcrModelDownloadState::Installed);
+    }
+
+    /// A mismatch leaves an `AdoptMismatch` notice naming the file over the re-probed state.
+    #[test]
+    fn an_adoption_mismatch_leaves_a_notice_over_the_reprobed_state() {
+        let mut controller = adopting(third_mismatches_adopt, missing_probe, fresh_record());
+        controller.probe_unknown(BUNDLE);
+        poll_until(&mut controller, |c| !c.is_active());
+        let snapshot = controller.panel_snapshot(BUNDLE);
+        assert_eq!(snapshot.notice, Some(DownloadNotice::AdoptMismatch { file: "c.bin" }), "{snapshot:?}");
+        assert_eq!(snapshot.state, OcrModelDownloadState::Missing);
+    }
+
+    /// The adoption thread continues past a refused spec (adopting the rest), reports the first
+    /// failure and maps progress onto the whole list; a cancel stops it.
+    #[test]
+    fn bundle_adoption_continues_past_a_mismatch_and_stops_on_cancel() {
+        let cancel = AtomicBool::new(false);
+        let mut installed = Vec::new();
+        let mut reports = Vec::new();
+        let specs: &[&'static ExternalModelSpec] = &[&FAKE_SPEC, &THIRD_SPEC, &OTHER_SPEC];
+        let result = run_bundle_adopt(third_mismatches_adopt, specs, &cancel, &mut |p| reports.push(*p), &mut |spec| installed.push(spec.id));
+        assert!(matches!(result, Err(ExternalModelError::HashMismatch { file: "c.bin", .. })), "{result:?}");
+        assert_eq!(installed, [FAKE_SPEC.id, OTHER_SPEC.id]);
+        let last = reports.last().copied().expect("progress was reported");
+        assert_eq!((last.file_index, last.file_count, last.total_bytes), (3, 5, 330));
+        assert!(reports.iter().all(|p| p.phase == ExternalDownloadPhase::Adopting));
+
+        cancel.store(true, Ordering::Relaxed);
+        installed.clear();
+        let result = run_bundle_adopt(ok_adopt, BUNDLE, &cancel, &mut |_| {}, &mut |spec| installed.push(spec.id));
+        assert!(matches!(result, Err(ExternalModelError::Cancelled)), "{result:?}");
+        assert!(installed.is_empty());
     }
 
     /// L1: no English diagnostic detail reaches the user-facing text.

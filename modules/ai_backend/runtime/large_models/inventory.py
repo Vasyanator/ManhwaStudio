@@ -2,7 +2,8 @@
 File: modules/ai_backend/runtime/large_models/inventory.py
 
 Purpose:
-What a component weighs, block by block, read from safetensors HEADERS only
+What a component weighs, block by block, read from checkpoint HEADERS only
+(safetensors or GGUF)
 (no tensor byte is read): which file tensors belong to which residency block,
 their device bytes after conversion, their file bytes for load-time
 forecasts, and the host transient of reading one of them (`load_host_bytes`).
@@ -17,9 +18,11 @@ Main responsibilities:
   (every component of a spec for one weight format).
 
 Notes:
-- The header parser and the per-tensor validation are
-  `runtime.safetensors_stream`'s (`read_safetensors_header_and_data_start`,
-  `parse_tensor_spans`); this module only groups.
+- The container dispatch, header parsers and per-tensor validation are
+  `runtime.tensor_container.read_container_layout`'s (safetensors or GGUF);
+  this module only groups. A block-quantized GGUF tensor is a `U8` span
+  (`TensorSpan.quant_type`) whose file bytes are its packed rows; its device
+  bytes are those bytes unless `ComponentSpec.device_itemsize` says otherwise.
 - Device bytes assume the spec's conversion preserves the element count of a
   file tensor (renames and splits do); a dtype change is declared through
   `ComponentSpec.device_itemsize`.
@@ -45,12 +48,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from ..safetensors_stream import (
-    SAFETENSORS_DTYPES_WITH_F8,
-    TensorSpan,
-    parse_tensor_spans,
-    read_safetensors_header_and_data_start,
-)
+from ..safetensors_stream import SAFETENSORS_DTYPES_WITH_F8, TensorSpan
+from ..tensor_container import read_container_layout
 from .spec import ComponentSpec, LargeModelSpec
 
 log = logging.getLogger(__name__)
@@ -187,7 +186,7 @@ def build_inventory(component: ComponentSpec, files: Sequence[Path], *, dtypes: 
 
     # Raises
     `ValueError` for an unreadable or malformed header (from
-    `safetensors_stream`), a state key produced by two file tensors, a file
+    `tensor_container`), a state key produced by two file tensors, a file
     tensor whose state keys fall into different blocks, a conversion that
     fails on `meta`, or a component with no tensor at all.
     """
@@ -200,8 +199,7 @@ def build_inventory(component: ComponentSpec, files: Sequence[Path], *, dtypes: 
     seen_state: dict[str, str] = {}
     fragmented = False
     for path in files:
-        header, _ = read_safetensors_header_and_data_start(path)
-        spans = parse_tensor_spans(header, source=path, dtypes=dtypes)
+        spans = read_container_layout(path, dtypes=dtypes).spans
         previous_block: object = object()
         closed_in_file: set[str] = set()
         for span in spans:

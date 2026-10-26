@@ -6,7 +6,9 @@ downloads itself, pinned by commit (Hugging Face) or by exact size + sha256 (pla
 opposed to the unpinned app-managed `Vasyanator2/ManhwaStudio_AI_Models` tree that
 `ai_models.rs` resolves. Today: Baberu OCR, the PaddleOCR-VL variants, EasyOCR (14 scripts,
 GitHub release zips), Surya detection + recognition (the Surya model host), the SDXL
-diffusers configs and the curated SDXL inpainting model. The Python backend never downloads
+diffusers configs, the curated SDXL inpainting model and the FLUX.2 klein 4B package (BFL bf16
+files + unsloth GGUF transformer and Qwen3-4B encoder quants; the 9B variant stays a backend
+download). The Python backend never downloads
 these; it receives the resolved directory or file paths from Rust and loads offline. Plus
 `hf_url.rs`, the URLs BOTH downloaders use; the HTTP stream they share is the `ms-download`
 crate.
@@ -15,7 +17,18 @@ crate.
 - `external_catalog.rs` is DATA: one `ExternalModelSpec` per model (`ExternalSource`:
   `HuggingFace { repo_id, revision }` or `Url { base_url }`; file allowlist with exact size +
   sha256; target directory relative to `side_models`; `DirLayout`), the typed
-  `PaddleVlVariant` selector, the Baberu layout helper `baberu_files` and `all_specs()`.
+  `PaddleVlVariant` selector, the Baberu layout helper `baberu_files`, the FLUX.2 klein
+  lookups and `all_specs()`.
+- FLUX.2 klein 4B: eleven `Shared` specs. Three BFL specs (`flux2_klein_4b_base` — licence,
+  index, scheduler, tokenizer, VAE, transformer + encoder configs; `…_transformer_bf16`;
+  `…_text_encoder_bf16`) publish into `FLUX.2-klein-4B/` at exactly the relative paths of
+  `ms_config::flux2_klein_*_dir` (and of the backend's former download, so an existing folder
+  is adoptable); the GGUF quants go to `FLUX.2-klein-4B/transformer_gguf/` and
+  `FLUX.2-klein-4B/text_encoder_gguf/`, one spec per `ms_config::Flux2WeightFormat`.
+  `flux2_klein_spec(variant, axis, format)` (one component), `flux2_klein_package_specs`
+  (base + transformer + encoder of a selection; empty for 9B) and `flux2_klein_weights_path`
+  (bf16 folder or GGUF file sent to the backend) are the only lookups; the format list itself
+  is `ms_config`'s, never repeated here.
 - `easyocr.rs` is the ONE owner of EasyOCR decisions: `normalize_easyocr_langs` (raw setting
   -> canonical codes sent to the backend), `easyocr_script_for` (mirror of easyocr 1.7.2
   `Reader.__init__`), `EasyOcrScript`, `easyocr_spec`. Every script spec lives in the ONE
@@ -23,8 +36,9 @@ crate.
   easyocr reads both from one `model_storage_directory`); files are `ZipMember`s of the
   release zips. Its tests compare the tables with `crates/ms-sysprobe/fixtures/easyocr_scripts.json`
   (generated from the installed library, choice cases verified against the real `Reader`).
-- `external.rs` is the PINNED downloader: the stat-only probe (`external_model_status`,
-  `installed_dir`) and the blocking downloader (`download_external_model`), whose core
+- `external.rs` is the PINNED downloader: the stat-only probes (`external_model_status`,
+  `installed_dir`, `unmarked_files_present`), the adoption of files present without a marker
+  (`adopt_external_model`) and the blocking downloader (`download_external_model`), whose core
   (`download_with`) takes an injected `RangeFetcher` and `RetryPolicy` (with an injected
   backoff sleep), so tests run without network and without real waiting. It owns the
   staging layout, markers and the zip-member flow; one file is fetched and published by
@@ -74,9 +88,10 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
 
 ## Files and submodules
 - `external.rs`: spec/source/layout/origin/status/progress/error types, probe, pinned
-  downloader, and the repair path `verify_external_model` (hash every file, delete
-  mismatching ones plus the markers of every spec listing them). Edit for staging layout,
-  marker format, zip-member flow or verification.
+  downloader, the repair path `verify_external_model` (hash every file, delete
+  mismatching ones plus the markers of every spec listing them) and adoption
+  (`unmarked_files_present` + `adopt_external_model`). Edit for staging layout, marker format,
+  zip-member flow, verification or adoption.
 - `easyocr.rs` + `easyocr/tests.rs`: EasyOCR language rule, scripts and specs; tests against
   the fixture.
 - `hf_url.rs`: resolve / `Url`-source URLs and their tests (encoding, endpoint override).
@@ -89,8 +104,8 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
 - `external/tests.rs`: downloader tests over an in-memory fetcher in a self-removing temp
   dir (including hand-built STORED zips for the member flow, shared directories and the
   legacy marker bytes), plus one opt-in `#[ignore]` real download (`MS_TEST_EXTERNAL_DOWNLOAD=1`).
-- `external_catalog.rs`: the pinned specs, `PaddleVlVariant`, `all_specs()`. Edit to add a
-  model or move a pin.
+- `external_catalog.rs`: the pinned specs, `PaddleVlVariant`, the FLUX.2 klein lookups,
+  `all_specs()`. Edit to add a model or move a pin.
 
 ## Contracts and invariants
 - The catalog (with `easyocr.rs` for EasyOCR) is the ONLY owner of source, revision, file
@@ -107,6 +122,18 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
   `verify_external_model` (worker thread, cancellable) is the only path that rehashes an
   installed model, and it hands repair back to a normal download by deleting the wrong
   files and the affected markers.
+- Adoption (the one owner: `adopt_external_model`): for files on disk with NO completion
+  marker at all (e.g. the FLUX.2 klein 4B folder the backend used to download). A marker of
+  another identity is an older install: never adopted (`unmarked_files_present` reads `false`,
+  the adoption refuses with `NotDownloaded`); its upgrade is the regular download, which
+  retires that marker and cleans stale files of an Exclusive directory. Worker thread only,
+  under the spec's busy guard, cancellable, progress phase `Adopting`; sizes are checked first
+  (stat), then every file is hashed against its pin; all match -> the marker is written through
+  `ms_atomic_file` exactly as a finished download writes it; any mismatch -> a typed error
+  (`NotDownloaded` / `SizeMismatch` / `HashMismatch`) and NOTHING is deleted or rewritten, so a
+  regular download then keeps the matching files (by hash) and fetches only the others. No
+  network: it takes no fetcher. When to adopt (once per process) is the download controller's
+  decision in `ms-tab-translation`.
 - `Url` sources never send the Hugging Face token; `total_bytes`, progress and `Partial`
   count network bytes (`ExternalFile::download_size`: the archive size for a zip member).
 - No implicit download: `installed_dir` only reports; `NotDownloaded` is the answer for a
@@ -148,6 +175,10 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
   total there. Pins come from `tools/model_pins/compute_pins.py`.
 - New EasyOCR version: regenerate the fixture from the installed library, re-pin the zips,
   update `easyocr.rs` until its tests pass.
+- New FLUX.2 klein weight format: add the variant to `ms_config::Flux2WeightFormat`, then a
+  spec per offering variant and axis here (the exhaustive `flux2_klein_4b_weights_spec` match
+  forces it) plus its row in `tools/model_pins/sources.json`; the catalog tests require every
+  offered format to resolve to exactly one spec.
 - Moving a pin: change revision and the changed file rows together; installs of the old pin
   then read `Missing` and a re-download keeps unchanged files.
 - Pinned-download behaviour (verification, marker, staging): `external.rs` +

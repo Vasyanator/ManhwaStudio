@@ -11,7 +11,7 @@ Key functions:
 - `require_params()` — the `params` object (`null` / absent = `{}`);
 - `progress_forwarder()` — the request's `ProgressEmitter` as a service
   `progress_callback` (`{phase, step, total, label}` plus the optional
-  `file_step` / `file_total` / `file_label` and `stage`; a dead peer never
+  `file_step` / `file_total` / `file_label` / `file_component` and `stage`; a dead peer never
   aborts the work, the first failure is logged once);
 - `read_hf_token()` — the `hf_token` field (absent = empty; never logged).
 """
@@ -70,6 +70,9 @@ def progress_forwarder(ctx: HandlerContext, method: str) -> "Any":
     frame; a consumer that does not know the three ignores them. `stage` is
     likewise optional: a stable machine id of the step (FLUX.3 klein's
     `region.progress_stages()`) the client localizes, omitted when `None`.
+    `file_component` (v21, optional) names WHICH component a load-phase byte
+    level reads (FLUX.2 klein: `"transformer"` / `"text_encoder"`; absent
+    means the transformer to the client), omitted when `None`.
     """
     emitter = getattr(ctx, PROGRESS_EMITTER_ATTR, None)
     failed = False
@@ -83,6 +86,7 @@ def progress_forwarder(ctx: HandlerContext, method: str) -> "Any":
         file_step: int | None = None,
         file_total: int | None = None,
         file_label: str | None = None,
+        file_component: str | None = None,
         stage: str | None = None,
     ) -> None:
         if emitter is None:
@@ -99,6 +103,8 @@ def progress_forwarder(ctx: HandlerContext, method: str) -> "Any":
             fields["file_total"] = int(file_total)
         if file_label is not None:
             fields["file_label"] = str(file_label)
+        if file_component is not None:
+            fields["file_component"] = str(file_component)
         if stage is not None:
             fields["stage"] = str(stage)
         nonlocal failed

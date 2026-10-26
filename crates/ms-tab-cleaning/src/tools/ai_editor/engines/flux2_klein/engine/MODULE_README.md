@@ -36,9 +36,12 @@ poll_x()   -> try_recv, apply the outcome, clear the Receiver
   inherent methods that keep the derived state honest, `impl AiEngine`, and the
   `same_region` / `same_region_size` helpers the region rules are written in. Edit it for
   the host contract, for what the engine remembers, and for when a query or a forecast is
-  re-armed.
-- `actions.rs`: the per-component load/unload actions, the Hugging Face token, the model
-  download and the derivation it applies when it finishes, the prompt translation, the
+  re-armed. It also drives the 4B catalog download (`downloads`, `poll_catalog_bundle`,
+  `poll_installed_formats`, `catalog_snapshot`, `apply_catalog_action`) and folds a
+  weight-format change (`fold_resources_and_formats`, `note_weight_formats_changed`).
+- `actions.rs`: the per-component load/unload actions, the Hugging Face token, the backend
+  model download of 9B (refused locally for a catalog variant, `refuse_backend_download`) and
+  the derivation it applies when it finishes, the prompt translation, the
   native file pickers, and the six `.prompt_cache.*` jobs. Edit it to add an operation or
   to change what one does with its answer.
 
@@ -57,7 +60,8 @@ poll_x()   -> try_recv, apply the outcome, clear the Receiver
   keeps the last answer as a STALE one while the next is asked) and `.prompt_cache.list` are
   re-armed by a flag (`resources.arm()` for the forecast), never issued per keystroke. Events
   that change the machine rather than the question (a finished run, a component action, a cap
-  write, a floor reset, a reconnect, a download) go through `invalidate_forecast`. The caps are
+  write, a floor reset, a reconnect, a download, a finished prompt-cache build, a CHANGED
+  prompt-cache listing) go through `invalidate_forecast`. The caps are
   sent by the controller's debounced `LimitsWriter`, drained from `poll` (`poll_side_jobs`).
 - **A failed settings write is not success**: the shared `SettingsSaver` (`saver`) drives the
   write; a failure restores `dirty`, shows `saver.error` and retries after `save_retry_delay`
@@ -79,6 +83,15 @@ poll_x()   -> try_recv, apply the outcome, clear the Receiver
   `.download.*` requests. `new(variant)` stamps it into the in-memory settings before the
   load worker starts, so everything derived from them describes the right checkpoint from
   the first frame; `Default` is `new(Klein9B)` and exists for the tests' sake.
+- **The catalog controller exists only for a catalog variant** (`new` creates it when
+  `Flux2Variant::downloads_from_catalog`), so 9B gets no extra status thread. It is polled from
+  `poll` every frame, never only from the panel, so adoption and a finished download land
+  with the panel closed. The installed-formats probe runs on an `ms_thread` worker (stat-only,
+  still disk I/O); its answer lives in `settings.installed_formats`, which a settings load
+  carries over because the file never holds it. Any running job of the controller (download,
+  verify, automatic adoption: `running_job`) keeps the engine picker closed through
+  `switch_block_reason`, like the backend download: the host polls only the selected engine,
+  so a job left behind by a switch would run unseen.
 - The frame rectangle, the painted mask, the marks and the pending result belong to the
   HOST and reach this type only through `AiEngine`. The marks arrive already packaged per
   `marks_support()`: a region-sized reference (sent as the run's extra reference image),

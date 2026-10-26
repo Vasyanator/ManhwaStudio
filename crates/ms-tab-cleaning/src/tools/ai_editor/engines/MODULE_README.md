@@ -27,7 +27,8 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
 ONE MODULE MAY CONTRIBUTE SEVERAL ENTRIES when the difference between them is a parameter and not
 an implementation. `flux2_klein/` contributes one per `config::Flux2Variant` — FLUX.2 klein 9B and
 FLUX.2 klein 4B — and the variant keys the engine id, the picker caption, the settings FILE, the
-model directory and the `variant` field the two `.download.*` methods carry. Duplicating the module
+model directory and the download owner (the backend's `.download.*` pair for 9B, the Rust model
+catalog for 4B). Duplicating the module
 for a second checkpoint is the wrong answer; parameterizing it is the pattern.
 
 THE OPPOSITE SHAPE IS ALSO CORRECT, and `lama/` and `sdxl/` are it: ONE picker entry offering four
@@ -433,6 +434,12 @@ functions with unit tests, not conditionals inside the drawing code.
     configuration the user switches back to, so writing over them would destroy it. The answered
     paths are kept only to LOG drift between the two halves. Derivation is what configures the
     engine, continuously rather than once at the end of a download.
+  - For a variant whose package is pinned in the Rust catalog (`downloads_from_catalog`: 4B),
+    the transformer and encoder paths also follow the persisted weight formats
+    (`transformer_format` / `text_encoder_format`, `ms_config::Flux2WeightFormat`) through
+    `external_catalog::flux2_klein_weights_path`: bf16 is the same folder as before, a GGUF
+    quant is the `.gguf` file under `transformer_gguf/` / `text_encoder_gguf/`. See
+    `flux2_klein/MODULE_README.md`.
   - The derived encoder is a SIBLING of the downloaded `tokenizer/` and `scheduler/` under the
     VARIANT's own root (`FLUX.2-klein-9B/` or `FLUX.2-klein-4B/`), which is what the backend needs: `component_search_roots` probes each
     supplied path AND ITS PARENT, so the repo root is reached from any of the three and both
@@ -443,9 +450,13 @@ functions with unit tests, not conditionals inside the drawing code.
     that HAS an uncensored encoder published for it (`supports_uncensored_encoder`, true for 9B
     only). `normalized()` forces the flag off for the other one, so the pairing the backend
     refuses cannot reach a path or the wire even from a hand-edited settings file.
-- FLUX.2 klein DOWNLOADS ITS OWN MODEL from Hugging Face, in the download mode of that switch:
+- FLUX.2 klein 9B DOWNLOADS ITS OWN MODEL from Hugging Face, in the download mode of that switch:
   `.download.check` (one-shot) and `.download.start` (streaming). The pinned wire contract is
-  `dev-docs/flux2_model_download.md`. What this side owns:
+  `dev-docs/flux2_model_download.md`. FLUX.2 klein 4B (`downloads_from_catalog`) does NOT use
+  that pair: its package and GGUF quants come from the app's pinned model catalog
+  (`ms_sysprobe::ai_models::external_catalog`, the catalog download controller), the backend
+  refuses `variant: "4b"` since protocol 21, and the engine refuses to send it locally. What this
+  side owns for 9B:
   - **The token is NOT this engine's.** It is the process-wide `crate::hf_token` global, kept in
     the OS secret store under `"ManhwaStudio Hugging Face"`, seeded at startup. This engine is its
     first UI surface, not its owner: the token is never a `Flux2KleinSettings` field, never reaches
@@ -464,8 +475,8 @@ functions with unit tests, not conditionals inside the drawing code.
     repoints `text_encoder_path` — but only when that path is empty or names the OTHER managed
     directory OF THE SAME VARIANT (`config::flux2_klein_text_encoder_dir`), so a hand-picked
     encoder, and the other engine's directory, both survive a flip.
-  - **The two `.download.*` methods carry a `variant`** (`"9b"`, the default when absent, or
-    `"4b"`), and `check` ECHOES it back — which is why the staleness rule is
+  - **The two `.download.*` methods carry a `variant`** (`"9b"`, also the default when absent;
+    `"4b"` is refused by the backend since protocol 21), and `check` ECHOES it back — which is why the staleness rule is
     `download_check_matches_selection` over the toggle AND the variant, so an answer about the
     other checkpoint stops being shown instead of pricing the wrong download. Every OTHER method
     is unchanged: they are already keyed by the three component paths, and the prompt-cache

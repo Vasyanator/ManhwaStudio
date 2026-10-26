@@ -16,6 +16,11 @@ Key items:
 - `external_model_status()` / `installed_dir()`: stat-only probes (no hashing, no network).
 - `verify_external_model()` + `VerifyReport`: the repair path — hash every file against its
   pin, delete mismatching ones and the markers of every spec listing them.
+- `unmarked_files_present()` + `adopt_external_model()`: ADOPTION of a model whose files are
+  already on disk with no completion marker at all (e.g. written by an older downloader; a
+  marker of another identity is an older install, upgraded only by a download):
+  a stat-only probe, then hashing every file against its pin and writing the marker. No
+  network, nothing deleted.
 - `download_external_model()`: blocking download with byte progress, cancel, resume,
   automatic retry of transient network failures, size + sha256 verification, atomic
   per-file publish and a completion marker.
@@ -264,6 +269,9 @@ pub enum ExternalDownloadPhase {
     /// Hashing bytes already on disk (an existing file or a resumed `.part` prefix) or
     /// extracting a zip member.
     Verifying,
+    /// Hashing a file that was found on disk without this spec's completion marker, to adopt
+    /// it ([`adopt_external_model`]); nothing is downloaded or deleted in this phase.
+    Adopting,
     /// A transient network failure interrupted the current file; the downloader waits
     /// before retry `attempt` of `max_attempts` (both 1-based counts of retries without
     /// progress). `delay_secs` is the remaining wait, rounded up; re-reported whenever it
@@ -389,6 +397,160 @@ pub fn installed_dir(side_models_root: &Path, spec: &ExternalModelSpec) -> Resul
         ExternalModelStatus::Installed => Ok(dir),
         ExternalModelStatus::Partial { .. } | ExternalModelStatus::Missing => Err(ExternalModelError::NotDownloaded { dir }),
     }
+}
+
+/// Whether `spec` looks ADOPTABLE: every one of its files is on disk at its exact pinned size
+/// and its completion marker file does NOT EXIST (proven absent). Typical cause: the files were
+/// written by an older downloader that kept no marker at all.
+///
+/// A marker of ANOTHER identity (an older pin of the same id) is never adoptable: it means an
+/// older version is installed, and the upgrade is the regular [`download_external_model`] path,
+/// which retires that marker and (Exclusive layout) removes the files only the old pin listed.
+/// An unreadable marker location (`try_exists` error) is not adoptable either.
+///
+/// Stat-only (no hashing, no network), like [`external_model_status`]; still filesystem I/O,
+/// so never on the GUI thread. `true` says nothing about the contents: only
+/// [`adopt_external_model`] hashes them.
+#[must_use]
+pub fn unmarked_files_present(side_models_root: &Path, spec: &ExternalModelSpec) -> bool {
+    if !matches!(spec.marker_path(side_models_root).try_exists(), Ok(false)) {
+        return false;
+    }
+    let dir = spec.local_dir(side_models_root);
+    spec.files.iter().all(|file| file_len(&join_relative(&dir, file.path)) == Some(file.size))
+}
+
+/// Adopts a model whose files are already present without ANY completion marker:
+/// hashes every file against its pin and, when ALL match, writes the completion marker
+/// (`ms_atomic_file`, like a finished download), so the model reads `Installed` without a
+/// single byte being downloaded. Returns the model directory.
+///
+/// Blocking, worker threads only: reads every byte of the model. Holds the spec's busy guard
+/// (the same one a download or verify takes), never touches the network, and never deletes or
+/// rewrites anything: a mismatch leaves every file (and any staging directory) as it is, and
+/// a later [`download_external_model`] then keeps the matching files and fetches only the
+/// others. A spec that already reads `Installed` returns at once without hashing.
+/// `progress` reports [`ExternalDownloadPhase::Adopting`] per read (in `download_size`
+/// units); `cancel` is polled before every read.
+///
+/// # Errors
+/// `InvalidSpec`; `Busy` (a download, verify or adoption of this spec is running);
+/// `NotDownloaded` (a file is absent, or a marker of another identity exists: an older version
+/// is installed and only a download upgrades it, see [`unmarked_files_present`]);
+/// `SizeMismatch` (a file has another size; `actual` is its length); `HashMismatch` (a file's
+/// sha256 differs; `actual` is the computed one); `Cancelled`; `Io` (the marker location
+/// cannot be checked, a read or the marker write failed); on wasm always `Unsupported`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn adopt_external_model(
+    side_models_root: &Path,
+    spec: &'static ExternalModelSpec,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(&ExternalDownloadProgress),
+) -> Result<PathBuf, ExternalModelError> {
+    validate_spec(spec)?;
+    // One guard for every job that reads or replaces this spec's files.
+    let _active = BusyGuard::try_acquire(spec.id).map_err(|_busy| ExternalModelError::Busy { id: spec.id })?; // RAII: held until return
+    let result = run_adoption(side_models_root, spec, cancel, progress);
+    match &result {
+        Ok(dir) => ms_log::runtime_log::log_info(format!(
+            "{LOG_TAG} adoption complete: id={} source={} files={} dir={}",
+            spec.id,
+            source_label(spec),
+            spec.files.len(),
+            dir.display()
+        )),
+        Err(ExternalModelError::Cancelled) => {
+            ms_log::runtime_log::log_info(format!("{LOG_TAG} adoption cancelled: id={} (nothing changed on disk)", spec.id));
+        }
+        Err(error) => ms_log::runtime_log::log_warn(format!(
+            "{LOG_TAG} adoption refused: id={} source={} error={error} (nothing deleted; a download repairs only the differing files)",
+            spec.id,
+            source_label(spec)
+        )),
+    }
+    result
+}
+
+/// Web build: there is no blocking file hashing here, so adoption is rejected explicitly.
+///
+/// # Errors
+/// Always `ExternalModelError::Unsupported`.
+#[cfg(target_arch = "wasm32")]
+pub fn adopt_external_model(
+    _side_models_root: &Path,
+    _spec: &'static ExternalModelSpec,
+    _cancel: &AtomicBool,
+    _progress: &mut dyn FnMut(&ExternalDownloadProgress),
+) -> Result<PathBuf, ExternalModelError> {
+    Err(ExternalModelError::Unsupported)
+}
+
+/// Body of [`adopt_external_model`] under the busy guard; logging stays with the caller.
+///
+/// A zip-member file is hashed without its member busy id: adoption deletes nothing, and a
+/// concurrent download of another spec publishes the shared member by atomic rename of a file
+/// verified against the same pin, so the bytes read here are always one complete file.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_adoption(
+    side_models_root: &Path,
+    spec: &'static ExternalModelSpec,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(&ExternalDownloadProgress),
+) -> Result<PathBuf, ExternalModelError> {
+    let dir = spec.local_dir(side_models_root);
+    if external_model_status(side_models_root, spec) == ExternalModelStatus::Installed {
+        return Ok(dir);
+    }
+    // Only a model with NO marker is adopted: a foreign marker is an older install, whose
+    // upgrade (marker retirement, stale-file cleanup) belongs to the download path.
+    let marker = spec.marker_path(side_models_root);
+    match marker.try_exists() {
+        Ok(false) => {}
+        Ok(true) => return Err(ExternalModelError::NotDownloaded { dir }),
+        Err(source) => return Err(ExternalModelError::Io { path: marker, source }),
+    }
+    ms_log::runtime_log::log_info(format!(
+        "{LOG_TAG} adoption start: id={} source={} files={} bytes={} dir={}",
+        spec.id,
+        source_label(spec),
+        spec.files.len(),
+        spec.files.iter().fold(0_u64, |total, file| total.saturating_add(file.size)),
+        dir.display()
+    ));
+    // Sizes first (stat-only), so a missing or truncated file is reported before hours of
+    // hashing the others.
+    for file in spec.files {
+        let path = join_relative(&dir, file.path);
+        match file_len(&path) {
+            None => return Err(ExternalModelError::NotDownloaded { dir }),
+            Some(len) if len != file.size => return Err(ExternalModelError::SizeMismatch { file: file.path, expected: file.size, actual: len }),
+            Some(_) => {}
+        }
+    }
+    let mut done_before = 0_u64;
+    for (index, file) in spec.files.iter().enumerate() {
+        let path = join_relative(&dir, file.path);
+        let mut emit = |file_done: u64| {
+            let file_done = file_done.min(file.download_size());
+            progress(&ExternalDownloadProgress {
+                file_index: index,
+                file_count: spec.files.len(),
+                file_path: file.path,
+                phase: ExternalDownloadPhase::Adopting,
+                file_done,
+                file_total: file.download_size(),
+                total_done: done_before.saturating_add(file_done),
+                total_bytes: spec.total_bytes(),
+            });
+        };
+        let actual = sha256_of_file(&path, cancel, &mut |hashed| emit(scale(hashed, file.size, file.download_size())))?;
+        if actual != file.sha256 {
+            return Err(ExternalModelError::HashMismatch { file: file.path, expected: file.sha256, actual });
+        }
+        done_before = done_before.saturating_add(file.download_size());
+    }
+    write_json_atomically(&spec.marker_path(side_models_root), &Marker::for_spec(spec))?;
+    Ok(dir)
 }
 
 /// Downloads (or resumes, or re-verifies) `spec` into `<side_models_root>/<spec.dir>` and
@@ -737,14 +899,24 @@ impl FileJob<'_> {
     }
 }
 
-/// Whether the whole of `path` hashes to `sha256` (lowercase hex); `on_hashed(bytes so far)`
-/// is called first with 0 and after every read of at most [`CHUNK`] bytes; `cancel` is
-/// polled before every read.
+/// Whether the whole of `path` hashes to `sha256` (lowercase hex); see [`sha256_of_file`]
+/// for progress and cancel.
 ///
 /// # Errors
 /// `Cancelled`, `Io`.
 #[cfg(not(target_arch = "wasm32"))]
 fn hash_matches(path: &Path, sha256: &str, cancel: &AtomicBool, on_hashed: &mut dyn FnMut(u64)) -> Result<bool, ExternalModelError> {
+    Ok(sha256_of_file(path, cancel, on_hashed)? == sha256)
+}
+
+/// Lowercase hex sha256 of the whole of `path`; `on_hashed(bytes so far)` is called first
+/// with 0 and after every read of at most [`CHUNK`] bytes; `cancel` is polled before every
+/// read.
+///
+/// # Errors
+/// `Cancelled`, `Io`.
+#[cfg(not(target_arch = "wasm32"))]
+fn sha256_of_file(path: &Path, cancel: &AtomicBool, on_hashed: &mut dyn FnMut(u64)) -> Result<String, ExternalModelError> {
     use sha2::Digest;
     use std::io::Read;
 
@@ -759,7 +931,7 @@ fn hash_matches(path: &Path, sha256: &str, cancel: &AtomicBool, on_hashed: &mut 
         }
         let read = handle.read(&mut buffer).map_err(|source| io_error(path, source))?;
         if read == 0 {
-            return Ok(hex_lower(&hasher.finalize()) == sha256);
+            return Ok(hex_lower(&hasher.finalize()));
         }
         hasher.update(&buffer[..read]);
         hashed = hashed.saturating_add(chunk_len(read));

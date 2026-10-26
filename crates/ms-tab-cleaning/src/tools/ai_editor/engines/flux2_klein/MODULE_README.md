@@ -40,7 +40,9 @@ it unconditionally would strand the user.
 
 Everything else, on screen and on the wire, is identical: every other method is keyed by
 the three component paths, and the prompt-cache family is fingerprinted backend-side from
-the encoder, so 4B gets its own family without a wire change.
+the encoder, so 4B gets its own family without a wire change. The one wire addition is 4B's
+own: its package comes from the Rust catalog, so in download mode it may run GGUF weights and
+sends the selected weight formats with their candidates (see "Contracts and invariants").
 
 Only ONE variant is resident at a time — the backend holds one pipeline and one text
 encoder, keyed by those paths — so selecting the other engine unloads this one. This side
@@ -113,13 +115,21 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
   `ui/MODULE_README.md`.
 - `decisions.rs`: the PURE decisions the panel renders — `flux2_readiness_line`,
   `flux2_prompt_cache_line`, `flux2_guidance_supported`, `flux2_run_block_reason`,
-  `region_block_reason` — with the line/tone types they answer in. Edit it to change what a
+  `region_block_reason`, the catalog bundle of the selection and its state
+  (`flux2_catalog_bundle`, `flux2_catalog_bundle_missing`, `flux2_catalog_job_running`), the
+  engine-picker block of a running catalog job (`flux2_catalog_switch_block_reason`) and the
+  weight-format row captions (`flux2_weight_format_label` / `_hint`) — with the line/tone types
+  they answer in. Edit it to change what a
   line or a refusal SAYS, or which control the backend's answer closes.
 - `settings.rs`: `Flux2KleinSettings`, its defaults, `normalized()`, `params()`, the
   dtype vocabulary, the two step ids (`step_choice` / `set_step_choice`), the one-time
   migration of the retired placement (`legacy_memory_steps`, the one owner of the placement ->
   step-pair table; an untouched default document goes to «Авто» / «Авто»),
-  `Flux2SourceMode`, the persisted `variant` and `effective_paths`, «Энкодер на CPU»
+  `Flux2SourceMode`, the persisted `variant` and `effective_paths`, the two weight formats
+  (`transformer_format` / `text_encoder_format`: `ms_config::Flux2WeightFormat` wire ids, absent
+  reads as `bf16`, unknown or not offered normalizes to `bf16`; `weight_format`,
+  `format_candidates`, the runtime-only `installed_formats` and its worker probe
+  `probe_flux2_installed_formats`), «Энкодер на CPU»
   (`encoder_on_cpu`, default on — also for a file without the field — and sent in every
   `params`, the forecast's included), «Постобработка» (`postprocess`: the shared
   `ms_region_postprocess::PostprocessSettings`, embedded `#[serde(flatten)]` so the file keeps
@@ -155,7 +165,9 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
   `apply_backend_flags` (writes `vae_tiling` only), `flux2_run_done_status`
   (a degraded run names its effective steps) and `flux2_picker_request` (the dialog request per
   picker purpose; the engine opens it through `ms_platform::file_dialog::request` and commits
-  the prompt-cache export's save target after the backend wrote it).
+  the prompt-cache export's save target after the backend wrote it; the weight-file filters are
+  per component — transformer safetensors or GGUF, VAE safetensors only, encoder FILE
+  (`TextEncoderFile`) GGUF only).
 - `wire.rs`: `Flux2RunInput` (the pixels of one run), `run_flux2_klein` (which builds the
   latent mask on the worker), the `.status` and
   `.component_action` calls (streaming through the shared `stream_call`) and their
@@ -175,6 +187,39 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
   `effective_paths` is the ONE answer to which three model paths a call uses. Both are
   variant-aware: the derived paths sit under the variant's own model directory, and a
   refused `variant`/`uncensored` pairing is normalized away before it can travel.
+- **Weight formats (protocol 21) exist only for a catalog variant in download mode**
+  (`weight_formats_in_effect`: `Flux2Variant::downloads_from_catalog`, i.e. 4B). There the
+  derived transformer / encoder paths come from `external_catalog::flux2_klein_weights_path` per
+  selected format — for bf16 the very folders the 9B rule derives, so an install made before the
+  formats existed stays valid — and `params` gain `transformer_format` / `transformer_formats` and
+  `text_encoder_format` / `text_encoder_formats` (`[{id, path}]`, best quality first: the formats
+  whose catalog files are installed plus the selected one, whose `path` equals the component's
+  `*_path`). Manual mode and 9B send none of the four (a picked `.gguf` path travels as-is and the
+  backend derives its format). "Installed" is runtime state carried IN the settings value
+  (`installed_formats`, `serde(skip)`) because every request builder receives that value and some
+  run on the GUI thread, which must not stat the disk; the engine fills it from
+  `probe_flux2_installed_formats` on a worker. Until it does, each list holds the selected format
+  alone.
+- **A GGUF encoder excludes fp8 (D8)**: while a GGUF encoder format is in effect `normalized()`
+  sends `text_encoder_fp8 = false`; the stored choice is kept. A manual-mode `.gguf` encoder with
+  fp8 is refused by the backend by name (Rust does not guess a format from a file name).
+- **4B never uses the backend download** (`download.rs`; `start_download*` refuse a catalog
+  variant locally): its package comes from the Rust catalog (`flux2_klein_package_specs`) and the
+  backend refuses `.download.*` with `variant = "4b"`. The engine owns an
+  `OcrModelDownloadController` for it (`downloads`, `None` for 9B) and drives it from `poll`
+  every frame (`poll_catalog_bundle`): it probes the bundle of the SELECTED formats
+  (`flux2_catalog_bundle`, empty outside download mode), which also triggers the one-time
+  automatic adoption of an unmarked existing download; the panel draws that bundle through the
+  shared `draw_ocr_model_download` only while its snapshot still describes the current selection.
+  The end of a controller job (download / verify / adoption) re-runs the installed-formats probe
+  and re-asks `.status`, the forecast and the prompt-cache listing. A changed format saves the
+  setting and re-arms the status, the forecast and the bundle probe
+  (`fold_resources_and_formats`). The readiness LINE says when the bundle is incomplete
+  (`Flux2ReadinessLine::BundleMissing`); the RUN gate stays the `.status` readiness.
+- **Format rows on both axes** («Память и скорость», 4B in download mode): the shared widget gets
+  `Some(&mut transformer_format)` (its rows and a format suggestion) and
+  `draw_encoder_formats` draws the encoder's rows under it; the forecast request keeps
+  `format: None`, so the backend plans the format the params select. 9B passes none.
 - **The memory steps are the user's and the wire always carries them** (`vram_step` /
   `ram_step` in every `params`; none of the retired placement fields ever does). A run never
   rewrites them: after a memory failure the backend degrades the run and learns a floor,
@@ -249,8 +294,14 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
   `config::Flux2Variant` in `crates/ms-config/src/lib.rs` — identity, paths and the capability
   gates are all in that one `impl` — and `variant_presentation.rs` here for its caption and
   repository id; `all_engines` then picks it up without a new module.
-- To change what differs between the checkpoints on screen, see `ui/install.rs` — both
-  differences are `if variant.…()` omissions there and nowhere else.
+- To change what differs between the checkpoints on screen, see `ui/install.rs` — the token row
+  and the uncensored toggle are `if variant.…()` omissions there; the catalog download block of
+  4B is `draw_catalog_download_block` (chosen by `weight_formats_in_effect` in `ui/mod.rs`), the
+  format rows of «Память и скорость» are `draw_memory_section`, the fp8 gate is `ui/advanced.rs`
+  and the manual encoder FILE button is offered where the variant has GGUF encoder formats.
+- To change when the catalog bundle is probed, re-probed or downloaded, see
+  `poll_catalog_bundle`, `note_weight_formats_changed` and `apply_catalog_action` in
+  `engine/mod.rs`.
 - To change what the readiness line, the prompt-cache line or a run refusal SAYS, see
   `decisions.rs`; to change what a `.status` answer MEANS, see `status.rs`; to change how
   either LOOKS, see `ui/`.

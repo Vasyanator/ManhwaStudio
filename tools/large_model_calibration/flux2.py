@@ -26,6 +26,11 @@ Notes:
 - `--max-seq` varies the encoder's padded length (the only `x` of the encode
   phase); `--with-reference` passes the region itself as the marks reference
   (its tokens join the denoise sequence).
+- The transformer's weight format is the one the service derives from the
+  file (`params.derived_format`: `bf16` for safetensors / a folder, `gguf` for
+  a GGUF file); the forecast and the run plan exactly that format
+  (`large_model.weight_format_of`), and the measured phases are keyed with its
+  compute path (`native` / `gguf`) by the `WorkCapture`.
 - torch is imported inside functions (a dry run imports none).
 """
 
@@ -61,7 +66,8 @@ ENCODERS = {"bf16": False, "fp8": True}
 @dataclass(frozen=True)
 class Flux2Combo:
     """One FLUX.2 point: region `size`, encoder weights (`encoder_fp8`), compute `dtype`,
-    prompt length `max_seq`, whether the marks reference is passed, and the step pair."""
+    prompt length `max_seq`, whether the marks reference is passed, the step pair, and the
+    transformer's weight format (`params.derived_format` of `--transformer-path`)."""
 
     size: tuple[int, int]
     encoder_fp8: bool
@@ -70,6 +76,7 @@ class Flux2Combo:
     with_reference: bool
     vram_step: VramStep
     ram_step: RamStep
+    transformer_format: str = "bf16"
 
     @property
     def steps(self) -> Steps:
@@ -85,7 +92,9 @@ class Flux2Combo:
     def grid_key(self) -> str:
         """Identifier minus the two steps (the cells of one grid share it)."""
         encoder = "fp8" if self.encoder_fp8 else "bf16"
-        return f"flux2__{self.dtype}__{self.size_label}__enc-{encoder}__seq-{self.max_seq}{'__ref' if self.with_reference else ''}"
+        # A bf16 transformer keeps the ids of earlier reports; any other format is named.
+        weights = "" if self.transformer_format == "bf16" else f"__fmt-{self.transformer_format}"
+        return f"flux2__{self.dtype}{weights}__{self.size_label}__enc-{encoder}__seq-{self.max_seq}{'__ref' if self.with_reference else ''}"
 
     @property
     def combo_id(self) -> str:
@@ -96,7 +105,7 @@ class Flux2Combo:
         """The report's descriptive fields of this combo."""
         return {
             "family": "flux2_klein",
-            "variant": "bf16",
+            "variant": self.transformer_format,
             "size": self.size_label,
             "case": "region_edit_ref" if self.with_reference else "region_edit",
             "encoder": "fp8" if self.encoder_fp8 else "bf16",
@@ -165,13 +174,16 @@ def _parse_ints(value: str, what: str) -> list[int]:
 
 
 def build_combos(args: argparse.Namespace) -> list[Flux2Combo]:
-    """Every combo, size-major, the step cells innermost; `ValueError` on bad options."""
+    """Every combo, size-major, the step cells innermost; `ValueError` on bad options (or an unreadable transformer file)."""
+    from modules.ai_backend.inpaint.flux2_klein.params import derived_format
+
+    transformer_format = derived_format(str(args.transformer_path))
     sizes = [size for size in parse_sizes(args.sizes, allow_auto=False) if size is not None]
     encoders = parse_list(args.encoders, ENCODERS, "--encoders")
     seqs = _parse_ints(args.max_seq, "--max-seq")
     references = parse_list(args.with_reference, {"no": False, "yes": True}, "--with-reference")
     cells = _cells(args)
-    return [Flux2Combo(size, fp8, args.dtype, seq, reference, cell.vram, cell.ram) for size in sizes for fp8 in encoders for seq in seqs for reference in references for cell in cells]
+    return [Flux2Combo(size, fp8, args.dtype, seq, reference, cell.vram, cell.ram, transformer_format) for size in sizes for fp8 in encoders for seq in seqs for reference in references for cell in cells]
 
 
 def _params(args: argparse.Namespace, combo: Flux2Combo, index: int) -> dict[str, Any]:
@@ -228,7 +240,7 @@ def forecast_flux2(service: Any, large_models: Any, params: dict[str, Any], comb
         normalized = normalize_flux2_klein_params(params)
         options, _device = service.large_model_inputs(params)
         shape = large_model.request_shape(combo.size[0], combo.size[1], with_reference=combo.with_reference, max_sequence_length=options.max_sequence_length, steps=options.steps)
-        report = large_models.profiles(service.large_model_name(params), options, shape, device=device, format=large_model.WEIGHT_FORMAT, steps=combo.steps)
+        report = large_models.profiles(service.large_model_name(params), options, shape, device=device, format=large_model.weight_format_of(options), steps=combo.steps)
         answer = selected_answer(report.selected, rss_before, combo.steps.label)
         estimate = memory.forecast_memory(normalized, combo.size[0], combo.size[1], with_reference=combo.with_reference, memory=hardware.memory_snapshot(device), steps=combo.steps, device=device)
     except Exception as exc:  # noqa: BLE001 - recorded beside the combo; the run reports the same failure

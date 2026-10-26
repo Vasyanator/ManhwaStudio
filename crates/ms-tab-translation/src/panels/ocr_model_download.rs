@@ -9,9 +9,10 @@ for its SDXL configs): install status, the outcome of the last unsuccessful down
 "Download (size)" / "Resume download" button, a "Verify files" button once the bundle is
 installed (hashes every file against its pin: the repair path for a damaged file the stat-only
 probe cannot see; it ends with an intact / N-files-removed notice), a progress bar with Cancel
-while a download or verify runs (its text also shows the automatic retry countdown after a
-network failure), and — while ANOTHER bundle's job runs — a line naming it with its progress
-over the disabled button.
+while a download, verify or automatic adoption (files found on disk without markers) runs
+(its text also shows the automatic retry countdown after a network failure, or that found
+files are being checked), the outcome of a refused or cancelled adoption, and — while ANOTHER
+bundle's job runs — a line naming it with its progress over the disabled button.
 It only draws and returns a `ModelDownloadAction`; the caller hands the action to
 `OcrModelDownloadController`.
 
@@ -34,9 +35,10 @@ use crate::ocr_model_download::{
 };
 use ms_sysprobe::ai_models::easyocr::{EasyOcrScript, easyocr_spec};
 use ms_sysprobe::ai_models::external::{ExternalDownloadPhase, ExternalDownloadProgress, ExternalModelSpec};
+use ms_config::{Flux2Variant, Flux2WeightAxis, Flux2WeightFormat};
 use ms_sysprobe::ai_models::external_catalog::{
-    BABERU_OCR, PaddleVlVariant, SDXL_CONFIG_BASE, SDXL_CONFIG_INPAINT, SDXL_INPAINT_FP16, SURYA_DETECTION_2025_05_07,
-    SURYA_RECOGNITION_2025_09_23,
+    BABERU_OCR, FLUX2_KLEIN_4B_BASE, PaddleVlVariant, SDXL_CONFIG_BASE, SDXL_CONFIG_INPAINT, SDXL_INPAINT_FP16,
+    SURYA_DETECTION_2025_05_07, SURYA_RECOGNITION_2025_09_23, flux2_klein_spec,
 };
 
 /// The user's request from the download block in this frame.
@@ -83,11 +85,15 @@ struct DownloadBlockView {
 
 /// Display name of an external model spec for user-facing text: the engine's product name
 /// for Baberu OCR, the localized variant label for a PaddleOCR-VL variant, "EasyOCR" with the
-/// recognizer file of its script, localized names for the Surya checkpoints and the SDXL
-/// downloads; the spec id for a spec this table does not know (logged once per call site
-/// would be noise: the id is the diagnostic itself).
+/// recognizer file of its script, localized names for the Surya checkpoints, the SDXL
+/// downloads and the FLUX.2 klein 4B package parts (a GGUF part names its quant token); the
+/// spec id for a spec this table does not know (logged once per call site would be noise: the
+/// id is the diagnostic itself).
 #[must_use]
 pub fn external_model_display_name(spec: &ExternalModelSpec) -> String {
+    if let Some(name) = flux2_klein_display_name(spec) {
+        return name;
+    }
     if spec.id == BABERU_OCR.id {
         // Product name, not translated (the engine selector shows the same literal).
         return "Baberu OCR".to_owned();
@@ -110,6 +116,30 @@ pub fn external_model_display_name(spec: &ExternalModelSpec) -> String {
     ms_i18n::resolve_key(key).to_string()
 }
 
+/// The display name of a FLUX.2 klein 4B package spec, `None` for any other spec. The
+/// weight specs are found through the catalog's own lookup over the offered formats, so a
+/// new format is named without touching this function.
+fn flux2_klein_display_name(spec: &ExternalModelSpec) -> Option<String> {
+    if spec.id == FLUX2_KLEIN_4B_BASE.id {
+        return Some(t!("translation.ocr_model.flux2_klein_4b_base_name").to_string());
+    }
+    let variant = Flux2Variant::Klein4B;
+    let (axis, format) = Flux2WeightAxis::all().into_iter().find_map(|axis| {
+        Flux2WeightFormat::offered_for(variant, axis)
+            .iter()
+            .find(|format| flux2_klein_spec(variant, axis, **format).is_some_and(|candidate| candidate.id == spec.id))
+            .map(|format| (axis, *format))
+    })?;
+    let name = match (axis, format.quant_token()) {
+        (Flux2WeightAxis::Transformer, None) => t!("translation.ocr_model.flux2_klein_4b_transformer_bf16_name").to_string(),
+        (Flux2WeightAxis::TextEncoder, None) => t!("translation.ocr_model.flux2_klein_4b_text_encoder_bf16_name").to_string(),
+        // The quant token (`Q8_0`, …) is a technical literal shown as is (i18n exclusion).
+        (Flux2WeightAxis::Transformer, Some(quant)) => tf!("translation.ocr_model.flux2_klein_4b_transformer_gguf_name", quant = quant),
+        (Flux2WeightAxis::TextEncoder, Some(quant)) => tf!("translation.ocr_model.flux2_klein_4b_text_encoder_gguf_name", quant = quant),
+    };
+    Some(name)
+}
+
 /// Display name of a bundle: its specs' names joined with " + ".
 fn bundle_display_name(specs: &[&'static ExternalModelSpec]) -> String {
     specs.iter().map(|spec| external_model_display_name(spec)).collect::<Vec<_>>().join(" + ")
@@ -123,6 +153,7 @@ fn other_download_line(other: &OtherDownload) -> String {
     match other.kind {
         JobKind::Download => tf!("translation.ocr_model.other_download_status", name = name, done = done, total = total),
         JobKind::Verify => tf!("translation.ocr_model.other_verify_status", name = name, done = done, total = total),
+        JobKind::Adopt => tf!("translation.ocr_model.other_adopt_status", name = name, done = done, total = total),
     }
 }
 
@@ -157,6 +188,17 @@ fn download_block_view(snapshot: &OcrModelPanelSnapshot) -> DownloadBlockView {
         }
         Some(DownloadNotice::VerifyCancelled) => {
             lines.push((StatusTone::Weak, t!("translation.ocr_model.verify_cancelled_status").to_string()));
+        }
+        // The adoption notices name the button the re-probed state offers: a download keeps
+        // every matching file and fetches only the rest.
+        Some(DownloadNotice::AdoptMismatch { file }) => {
+            let button = offered.clone().unwrap_or_else(|| download_button_label(snapshot.missing_bytes));
+            lines.push((StatusTone::Warning, tf!("translation.ocr_model.adopt_mismatch_status", file = file, button = button)));
+        }
+        Some(DownloadNotice::AdoptFailed(err)) => lines.push((StatusTone::Error, tf!("translation.ocr_model.adopt_failed_error", err = err))),
+        Some(DownloadNotice::AdoptCancelled) => {
+            let button = offered.clone().unwrap_or_else(|| download_button_label(snapshot.missing_bytes));
+            lines.push((StatusTone::Weak, tf!("translation.ocr_model.adopt_cancelled_status", button = button)));
         }
         None => {}
     }
@@ -231,7 +273,7 @@ fn progress_fraction(progress: &ExternalDownloadProgress) -> f32 {
 }
 
 /// Progress bar text: which file (1-based) and the byte counters while downloading, the
-/// file being hashed while verifying, the retry number and countdown (then "reconnecting")
+/// file being hashed while verifying or adopting found files, the retry number and countdown (then "reconnecting")
 /// while the downloader waits out a transient network failure.
 fn progress_text(progress: &ExternalDownloadProgress) -> String {
     match progress.phase {
@@ -243,6 +285,7 @@ fn progress_text(progress: &ExternalDownloadProgress) -> String {
             total = format_bytes(progress.total_bytes)
         ),
         ExternalDownloadPhase::Verifying => tf!("translation.ocr_model.verifying_status", file = progress.file_path),
+        ExternalDownloadPhase::Adopting => tf!("translation.ocr_model.adopting_status", file = progress.file_path),
         ExternalDownloadPhase::Retrying { attempt, max_attempts, delay_secs: 0 } => tf!(
             "translation.ocr_model.reconnecting_status",
             attempt = attempt,
@@ -512,9 +555,71 @@ mod tests {
             let spec = easyocr_spec(script);
             assert_eq!(external_model_display_name(spec), tf!("translation.ocr_model.easyocr_model_name", file = script.recognizer_file()));
         }
-        for spec in [&SURYA_DETECTION_2025_05_07, &SURYA_RECOGNITION_2025_09_23, &SDXL_CONFIG_BASE, &SDXL_CONFIG_INPAINT, &SDXL_INPAINT_FP16] {
+        for spec in ms_sysprobe::ai_models::external_catalog::all_specs() {
             assert_ne!(external_model_display_name(spec), spec.id, "{}", spec.id);
         }
+    }
+
+    /// The FLUX.2 klein 4B parts: one fixed name each for the base and the bf16 parts, and the
+    /// quant token substituted into the GGUF names, all distinct.
+    #[test]
+    fn flux2_klein_parts_have_distinct_names_with_their_quant() {
+        let _locale = crate::hold_locale_for_test();
+        let variant = Flux2Variant::Klein4B;
+        assert_eq!(external_model_display_name(&FLUX2_KLEIN_4B_BASE), t!("translation.ocr_model.flux2_klein_4b_base_name").to_string());
+        let mut names = vec![external_model_display_name(&FLUX2_KLEIN_4B_BASE)];
+        for axis in Flux2WeightAxis::all() {
+            for &format in Flux2WeightFormat::offered_for(variant, axis) {
+                let spec = flux2_klein_spec(variant, axis, format).expect("every offered 4B format has a spec");
+                let name = external_model_display_name(spec);
+                let expected = match (axis, format.quant_token()) {
+                    (Flux2WeightAxis::Transformer, None) => t!("translation.ocr_model.flux2_klein_4b_transformer_bf16_name").to_string(),
+                    (Flux2WeightAxis::TextEncoder, None) => t!("translation.ocr_model.flux2_klein_4b_text_encoder_bf16_name").to_string(),
+                    (Flux2WeightAxis::Transformer, Some(quant)) => tf!("translation.ocr_model.flux2_klein_4b_transformer_gguf_name", quant = quant),
+                    (Flux2WeightAxis::TextEncoder, Some(quant)) => tf!("translation.ocr_model.flux2_klein_4b_text_encoder_gguf_name", quant = quant),
+                };
+                assert_eq!(name, expected, "{}", spec.id);
+                if let Some(quant) = format.quant_token() {
+                    assert!(name.contains(quant), "{name}");
+                }
+                names.push(name);
+            }
+        }
+        let count = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), count, "names must be distinct: {names:?}");
+    }
+
+    /// Adoption: the progress text says found files are being checked; the notices name the
+    /// re-probed state's Download button; another bundle's adoption is named as such.
+    #[test]
+    fn adoption_progress_and_notices_are_shown() {
+        let _locale = crate::hold_locale_for_test();
+        let adopting = progress(ExternalDownloadPhase::Adopting, 5);
+        assert_eq!(progress_text(&adopting), tf!("translation.ocr_model.adopting_status", file = "onnx/decoder_prefill_int8.onnx"));
+        let running = download_block_view(&snapshot(OcrModelDownloadState::Verifying(adopting)));
+        assert_eq!(running.button.map(|button| button.action), Some(ModelDownloadAction::Cancel));
+        assert_eq!(running.progress.map(|(_, text)| text), Some(progress_text(&adopting)));
+
+        let mismatch = OcrModelPanelSnapshot { notice: Some(DownloadNotice::AdoptMismatch { file: "a.bin" }), ..snapshot(OcrModelDownloadState::Missing) };
+        let caption = offered_download_label(&mismatch).expect("missing offers a download");
+        let view = download_block_view(&mismatch);
+        assert_eq!(view.lines.last(), Some(&(StatusTone::Warning, tf!("translation.ocr_model.adopt_mismatch_status", file = "a.bin", button = caption.clone()))));
+        assert_eq!(view.button, download_button(caption.clone(), true));
+        let cancelled = OcrModelPanelSnapshot { notice: Some(DownloadNotice::AdoptCancelled), ..snapshot(OcrModelDownloadState::Missing) };
+        assert_eq!(download_block_view(&cancelled).lines.last(), Some(&(StatusTone::Weak, tf!("translation.ocr_model.adopt_cancelled_status", button = caption))));
+        let failed = OcrModelPanelSnapshot { notice: Some(DownloadNotice::AdoptFailed("boom".to_owned())), ..snapshot(OcrModelDownloadState::Missing) };
+        assert_eq!(download_block_view(&failed).lines.last(), Some(&(StatusTone::Error, tf!("translation.ocr_model.adopt_failed_error", err = "boom"))));
+        // Adoption notices go stale once the bundle reads installed (not verify notices).
+        assert!(!DownloadNotice::AdoptCancelled.is_verify());
+
+        let other = OtherDownload { specs: vec![&BABERU_OCR], kind: JobKind::Adopt, progress: adopting };
+        let name = external_model_display_name(&BABERU_OCR);
+        assert_eq!(
+            other_download_line(&other),
+            tf!("translation.ocr_model.other_adopt_status", name = name, done = format_bytes(5), total = format_bytes(BABERU_OCR.total_bytes()))
+        );
     }
 
     #[test]

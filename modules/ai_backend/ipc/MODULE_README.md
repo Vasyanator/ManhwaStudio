@@ -203,7 +203,7 @@ live in `handlers/MODULE_README.md`.
 - A `progress{id}` frame's field set is OPEN for additive optional fields, and the download's second
   level is the precedent: `inpaint.flux2_klein.download.start` adds `file_step` / `file_total` /
   `file_label` while `phase`/`step`/`total`/`label` keep their meaning, so a consumer that does not
-  know the new names stays correct. `inpaint.flux3_klein` adds a stable `stage` id the same way. An additive field must be OMITTED when absent, never sent as
+  know the new names stays correct. `inpaint.flux3_klein` adds a stable `stage` id the same way, and FLUX.2's load-phase byte level adds `file_component`. An additive field must be OMITTED when absent, never sent as
   `null`, and must never re-purpose one of the four existing names.
 - Do not add imports directly to `registry.py`. Add one line to `handlers/__init__.py` only.
 

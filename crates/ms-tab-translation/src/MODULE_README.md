@@ -46,6 +46,9 @@ Long work is delegated to focused controllers:
   `ms_sysprobe::ai_models::{external_catalog, easyocr}`). The tab polls it per frame; the OCR and
   text-detector panels draw its state through `panels/ocr_model_download.rs`. It is `pub`: the
   Cleaning tab reuses controller and block for its SDXL configs.
+  It also ADOPTS, automatically and once per process per spec, a spec whose files are already on
+  disk with no marker at all (hash + marker, no network, nothing deleted); a marker of another
+  identity is an older install and goes through the regular download.
 - `text_detector/` owns the text detector worker and returns page boxes plus editable binary
   masks. Detector modes (`TextDetectorRunMode`): `Classic` (local Otsu threshold + dilation +
   connected components), `PaddleOcr` (native ONNX or backend `textdetector.paddle.forward`),
@@ -494,15 +497,27 @@ is an author note addressed to the translator, not a replica.
   (stat-only per-spec status worker + at most one job thread — a download of a bundle's
   not-installed specs in order, or a verify (`start_verify`, `ms_sysprobe` `verify_external_model`
   per spec: damaged files and the markers sharing them are deleted, then the bundle and every
-  invalidated spec are re-probed and an intact / N-removed notice is left) — with progress over
-  the whole bundle coalesced in a mutex snapshot,
+  invalidated spec are re-probed and an intact / N-removed notice is left), or an automatic
+  ADOPTION (`Adoption` bodies: the status worker runs `unmarked_files_present` for every `Missing`
+  answer; a bundle registered by `probe_unknown` / `request_bundle_status` whose specs are all
+  probed starts one `adopt_external_model` job over its adoptable specs, shown as `Verifying` with
+  phase `Adopting`, `JobKind::Adopt` to other bundles; a refusal leaves `AdoptMismatch` /
+  `AdoptFailed` / `AdoptCancelled` and Download repairs only the differing files; the spec ids
+  tried are recorded process-wide in `AUTO_ADOPT_ATTEMPTED`, so a tab rebuild never re-hashes;
+  a decided bundle is not re-registered by the per-frame `probe_unknown` until a spec of it is
+  probed again or `request_bundle_status` re-asks it; `running_job` names the running job kind)
+  — with progress over the whole bundle coalesced in a mutex snapshot,
   injected worker bodies for tests; a running download is cancelled and DETACHED on drop, never
   joined on the GUI thread), `bundle_key`, `OcrModelDownloadState` + `DownloadNotice` +
   `OcrModelPanelSnapshot` (what the panel block draws: aggregated state, missing bytes),
   `offered_download_label` / `download_label_for_statuses` (the one owner of the visible download
   caption, also named by the gate errors), the `ExternalModelError` -> localized message mapping
   (no English detail reaches the user; the full `Display` is logged) and the localized byte
-  formatter. Test fakes (`fakes`) are shared with the tab's wiring tests.
+  formatter. Test fakes (`fakes`) are shared with the tab's wiring tests; `with_jobs` (tests)
+  disables adoption, `with_parts` injects adoption bodies and a fresh record.
+  Constraint: `OcrModelDownloadState` is matched exhaustively and `OcrModelPanelSnapshot` built by
+  literal in `ms-tab-cleaning` (SDXL), so a new job kind is expressed through `JobKind` and the
+  progress phase, not a new state variant or snapshot field.
 - `text_detector/`: `TranslationTextDetectorController` and batch worker (`mod.rs`), the
   model-based entry point and fallback policy (`pipeline.rs`), the backend forward runner
   (`backend.rs`), native Paddle routing and runner (`native.rs`, desktop only), local classic

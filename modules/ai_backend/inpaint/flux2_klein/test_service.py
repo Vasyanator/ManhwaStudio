@@ -25,7 +25,11 @@ Main responsibilities:
 - the single-file transformer's byte-level progress (second wire level);
 - the lock order of the two handles under the service lock (`LockOrderTests`):
   a run, an encoder «load» and a small-pool admission whose reclaim targets an
-  idle FLUX.2 handle never deadlock, and no reclaim reaches the service lock.
+  idle FLUX.2 handle never deadlock, and no reclaim reaches the service lock;
+- a GGUF transformer format (`GgufRunTests`): the run admits, keys and loads
+  the selected format's file, `status` finds that handle, and
+  `large_model_profiles` plans the request's format by default with one row
+  per candidate.
 
 Notes:
 Module attributes are patched on the module that defines them (`hardware`,
@@ -50,7 +54,7 @@ from modules.ai_backend.inpaint import region_imaging
 from modules.ai_backend.inpaint.flux2_klein import components, hardware, large_model
 from modules.ai_backend.runtime.model_manager import SmallModelManager
 
-from ._test_fixtures import _FakeEmbeds, _ManagedRunFixture, _TempTreeCase, _png_bytes
+from ._test_fixtures import _FakeEmbeds, _ManagedRunFixture, _TempTreeCase, _png_bytes, _write_bfl_gguf_transformer
 
 try:
     import torch
@@ -338,23 +342,77 @@ class VariantGuardTests(_RunCase):
         self.assertEqual(self.large.status(), [])
 
 
-class SingleFileByteProgressTests(_RunCase):
-    """A single-file transformer streams its bytes as the wire's SECOND progress level."""
+class ComponentByteProgressTests(_RunCase):
+    """Every component read from disk streams its bytes as the wire's SECOND progress level, on its own load step."""
 
-    def setUp(self) -> None:
-        super().setUp()
+    def _file_frames(self, step: int) -> list[tuple[str, int, int, str, dict[str, Any]]]:
+        return [frame for frame in self.frames if frame[4] and frame[1] == step]
+
+    def _assert_complete(self, frames: list[tuple[str, int, int, str, dict[str, Any]]], label: str) -> None:
+        self.assertTrue(frames)
+        self.assertTrue(all(frame[0] == "load" and frame[2] == svc.LOAD_PHASE_STEPS for frame in frames))
+        self.assertEqual({frame[4]["file_label"] for frame in frames}, {label})
+        component = svc.FILE_COMPONENT_TRANSFORMER if frames[0][1] == svc.LOAD_STEP_TRANSFORMER else svc.FILE_COMPONENT_TEXT_ENCODER
+        self.assertEqual({frame[4]["file_component"] for frame in frames}, {component})
+        self.assertGreater(frames[-1][4]["file_total"], 0)
+        self.assertEqual(frames[-1][4]["file_step"], frames[-1][4]["file_total"])
+
+    def test_a_single_file_transformer_is_named_by_its_file(self) -> None:
         single = self.root / "flux2-klein.safetensors"
         shutil.copyfile(self.root / "transformer" / "diffusion_pytorch_model.safetensors", single)
         self.paths["transformer_path"] = str(single)
-
-    def test_the_bytes_arrive_as_file_fields_on_the_transformer_step(self) -> None:
         self._run()
-        file_frames = [frame for frame in self.frames if frame[4]]
-        self.assertTrue(file_frames)
-        self.assertTrue(all(frame[1] == svc.LOAD_STEP_TRANSFORMER and frame[2] == svc.LOAD_PHASE_STEPS for frame in file_frames))
-        self.assertTrue(all(frame[4]["file_label"] == "flux2-klein.safetensors" for frame in file_frames))
-        last = file_frames[-1][4]
-        self.assertEqual(last["file_step"], last["file_total"])
+        self._assert_complete(self._file_frames(svc.LOAD_STEP_TRANSFORMER), "flux2-klein.safetensors")
+
+    def test_a_transformer_folder_is_named_by_its_folder(self) -> None:
+        self._run()
+        self._assert_complete(self._file_frames(svc.LOAD_STEP_TRANSFORMER), "transformer")
+
+    def test_the_text_encoder_streams_its_bytes_on_its_own_step(self) -> None:
+        self._run()
+        self._assert_complete(self._file_frames(svc.LOAD_STEP_TEXT_ENCODER), "text_encoder")
+        self.assertEqual({frame[1] for frame in self.frames if frame[4]}, {svc.LOAD_STEP_TRANSFORMER, svc.LOAD_STEP_TEXT_ENCODER}, "no other step carries file fields")
+        # Between the encoder's step frame and the encode step, carrying the step frame's own label.
+        steps = [frame[1] for frame in self.frames if frame[0] == "load"]
+        first = steps.index(svc.LOAD_STEP_TEXT_ENCODER)
+        self.assertLess(first, steps.index(svc.LOAD_STEP_ENCODE))
+        self.assertTrue(all(frame[3] == "Загрузка текстового энкодера" for frame in self._file_frames(svc.LOAD_STEP_TEXT_ENCODER)))
+
+    def test_a_cached_prompt_reads_no_encoder(self) -> None:
+        self._run(vram_step="phase", ram_step="run")
+        self.frames.clear()
+        self._run(vram_step="phase", ram_step="run")
+        self.assertEqual(self._file_frames(svc.LOAD_STEP_TEXT_ENCODER), [])
+
+    def test_the_encoder_load_action_and_the_cache_build_stream_it_too(self) -> None:
+        self.service.component_action(self.params(), component="text_encoder", action="load", progress_callback=self._progress)
+        self._assert_complete(self._file_frames(svc.LOAD_STEP_TEXT_ENCODER), "text_encoder")
+        self.service.unload()
+        self.frames.clear()
+        self.service.prompt_cache_build(self.params(prompt="a cat"), progress_callback=self._progress)
+        self._assert_complete(self._file_frames(svc.LOAD_STEP_TEXT_ENCODER), "text_encoder")
+
+    def test_an_encoder_read_inside_the_encode_phase_streams_on_the_current_step(self) -> None:
+        # The encoder handle is NOT loaded by the explicit `load` (as when the
+        # plan puts it on the DISK tier): the manager reads it inside
+        # `run_phase(encode)`, and the session's sink still streams it — on the
+        # step current at that moment, the encode step.
+        from modules.ai_backend.runtime.large_models.manager import Session
+
+        real_load = Session.load
+
+        def load(session: Any, *names: str, progress: Any = None) -> None:
+            if names == (large_model.TEXT_ENCODER,):
+                return
+            real_load(session, *names, progress=progress)
+
+        with patch.object(Session, "load", load):
+            self._run()
+        encoder_frames = [frame for frame in self.frames if frame[4].get("file_component") == svc.FILE_COMPONENT_TEXT_ENCODER]
+        self.assertTrue(encoder_frames, "the encoder was read inside the phase and reported")
+        self.assertEqual({(frame[0], frame[1], frame[3]) for frame in encoder_frames}, {("load", svc.LOAD_STEP_ENCODE, "Кодирование промпта")})
+        self.assertEqual(encoder_frames[-1][4]["file_step"], encoder_frames[-1][4]["file_total"])
+        self.assertTrue(self.pipeline_cls.encode_calls, "the prompt was really encoded")
 
     def test_the_step_level_is_not_disturbed(self) -> None:
         self._run()
@@ -444,7 +502,7 @@ class ComponentActionTests(_RunCase):
         out = self._action("transformer", "load", vram_step="max", ram_step="keep")
         self.assertTrue(out["performed"])
         self.assertEqual(out["components"]["vae"]["residency"], "gpu")
-        self.assertEqual([frame[1] for frame in self.frames], list(range(7)))
+        self.assertEqual([frame[1] for frame in self.frames if not frame[4]], list(range(7)))
 
     def test_parking_and_restoring_the_transformer(self) -> None:
         self._action("transformer", "load", vram_step="max", ram_step="keep")
@@ -713,16 +771,101 @@ class LargeModelProfilesTests(_RunCase):
         self.assertTrue(answer["selected"]["fits"])
         self.assertTrue(answer["encoder"]["fits"])
         self.assertIn("vram", answer)
+        self.assertEqual(encoder["format"], "bf16", "the encoder is planned in the request's format")
+        self.assertEqual([row["id"] for row in answer["encoder_formats"]], ["bf16"], "the encoder's own format rows")
+
+    def test_the_encoder_rows_list_every_candidate(self) -> None:
+        missing = str(self.root / "text_encoder_gguf" / "absent.gguf")
+        formats = [{"id": "bf16", "path": self.paths["text_encoder_path"]}, {"id": "q8_0", "path": missing}]
+        answer, calls = self._profiles(text_encoder_format="bf16", text_encoder_formats=formats)
+        rows = {row["id"]: row for row in answer["encoder_formats"]}
+        self.assertEqual(list(rows), ["bf16", "q8_0"])
+        self.assertTrue(rows["bf16"]["available"])
+        self.assertEqual((rows["q8_0"]["available"], rows["q8_0"]["reason"]), (False, "files_missing"))
 
     def test_the_float16_answer_names_its_registration(self) -> None:
         answer, calls = self._profiles(dtype="float16")
         self.assertEqual(answer["model"], "flux2_klein.float16")
         self.assertEqual(calls[0][0], "flux2_klein.float16")
 
-    def test_a_cached_prompt_plans_the_pipeline_alone(self) -> None:
-        self._run(prompt="a cat")
+    # The encoder rule, all four combinations: the encoder is left out ONLY when
+    # every prompt is cached AND its handle holds no byte.
+    def _cache_prompt(self) -> None:
+        normalized = svc.normalize_flux2_klein_params(self.params(prompt="a cat"))
+        self.service._prompt_cache[self.service._prompt_cache_key(normalized, "a cat")] = object()
+
+    def _make_encoder_resident(self) -> None:
+        self.service.component_action(self.params(), component="text_encoder", action="load")
+        self.assertTrue(any(sum(held) > 0 for key, held in self.held().items() if key.startswith("flux2_klein_text_encoder:")))
+
+    def _assert_encoder_counted(self, answer: dict[str, Any], calls: list[tuple[str, dict[str, Any]]]) -> None:
+        self.assertEqual([model for model, _kwargs in calls], ["flux2_klein", "flux2_klein_text_encoder", "flux2_klein"])
+        self.assertTrue(answer["encoder"]["fits"])
+        self.assertEqual([row["id"] for row in answer["encoder_formats"]], ["bf16"])
+
+    def test_an_uncached_prompt_without_a_resident_encoder_counts_it(self) -> None:
+        self._assert_encoder_counted(*self._profiles())
+
+    def test_an_uncached_prompt_with_a_resident_encoder_counts_it(self) -> None:
+        self._make_encoder_resident()
+        self._assert_encoder_counted(*self._profiles())
+
+    def test_a_cached_prompt_with_a_resident_encoder_still_counts_it(self) -> None:
+        self._cache_prompt()
+        self._make_encoder_resident()
+        self.assertTrue(self.service._prompt_cached(self.params(prompt="a cat")))
+        self._assert_encoder_counted(*self._profiles())
+
+    def test_a_cached_prompt_without_a_resident_encoder_plans_the_pipeline_alone(self) -> None:
+        self._cache_prompt()
         answer, calls = self._profiles()
         self.assertEqual([model for model, _kwargs in calls], ["flux2_klein"])
+        self.assertIsNone(answer["encoder"])
+        self.assertEqual(answer["encoder_formats"], [])
+
+    def test_a_run_that_dropped_the_encoder_leaves_it_out_and_one_that_kept_it_counts_it(self) -> None:
+        self._run(prompt="a cat", vram_step="phase", ram_step="run")
+        answer, calls = self._profiles()
+        self.assertIsNone(answer["encoder"], "cached and released: nothing to count")
+        self._run(prompt="a dog", vram_step="phase", ram_step="keep")
+        answer, calls = self._profiles()
+        self.assertTrue(self.service._prompt_cached(self.params(prompt="a cat")), "\"a cat\" is still cached")
+        self._assert_encoder_counted(answer, calls)
+
+    def test_both_forecasts_carry_the_baseline_their_host_peaks_include(self) -> None:
+        answer, _calls = self._profiles()
+        for name, forecast in (("selected", answer["selected"]["forecast"]), ("encoder", answer["encoder"]["forecast"])):
+            with self.subTest(name):
+                self.assertIsInstance(forecast["host_baseline"], int)
+                self.assertGreaterEqual(forecast["host_baseline"], 0)
+                self.assertLessEqual(forecast["host_baseline"], forecast["host_peak"])
+        self.assertEqual(answer["selected"]["forecast"]["host_baseline"], answer["encoder"]["forecast"]["host_baseline"], "one backend process, one baseline")
+        self._cache_prompt()
+        alone, _calls = self._profiles()
+        self.assertIn("host_baseline", alone["selected"]["forecast"], "the pipeline-alone answer carries it too")
+
+    def test_a_refused_encoder_keeps_the_baseline_on_both(self) -> None:
+        self.encoder_does_not_fit = True
+        answer, _calls = self._profiles()
+        self.assertIn("host_baseline", answer["selected"]["forecast"])
+        if answer["encoder"]["forecast"] is not None:
+            self.assertIn("host_baseline", answer["encoder"]["forecast"])
+
+    def test_the_profiles_never_wait_for_the_service_lock(self) -> None:
+        held, done = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            with self.service._lock:
+                held.set()
+                done.wait(5)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.addCleanup(done.set)
+        self.assertTrue(held.wait(5))
+        self._cache_prompt()
+        answer, calls = self._profiles()
         self.assertIsNone(answer["encoder"])
 
     def test_a_lower_vram_step_caps_the_encoder_at_the_higher_steps_combined_peak(self) -> None:
@@ -752,6 +895,54 @@ class LargeModelProfilesTests(_RunCase):
         self.assertFalse(answer["selected"]["fits"])
         self.assertEqual(answer["selected"]["reason"], answer["encoder"]["reason"])
         self.assertIsNone(answer["selected"]["vram"])
+
+
+def _has_gguf() -> bool:
+    try:
+        import gguf  # noqa: F401 - availability probe
+    except ImportError:
+        return False
+    return True
+
+
+@unittest.skipUnless(_has_gguf(), "needs the gguf package (fixture writer)")
+class GgufRunTests(_RunCase):
+    """A run, `status` and `large_model_profiles` on a GGUF transformer format (protocol 21)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.gguf = str(self.root / "transformer_gguf" / "klein-q8.gguf")
+        _write_bfl_gguf_transformer(self.root, Path(self.gguf))
+        self.formats = [{"id": "bf16", "path": self.paths["transformer_path"]}, {"id": "q8_0", "path": self.gguf}]
+        self.gguf_params = {"transformer_path": self.gguf, "transformer_format": "q8_0", "transformer_formats": self.formats}
+
+    def test_a_run_loads_the_selected_formats_file(self) -> None:
+        answer = self._run(vram_step="max", ram_step="keep", **self.gguf_params)
+        self.assertEqual(answer["region_size"], [128, 128])
+        keys = [key for key in self.held() if key.startswith("flux2_klein:")]
+        self.assertEqual(keys, [f"flux2_klein:bfloat16|{self.gguf}|{self.paths['vae_path']}|cuda:0"])
+        self.assertEqual(len(self.pipeline_cls.calls), 1, "the denoise ran on the GGUF handle")
+        status = self.large.status()
+        self.assertEqual({entry["format"] for entry in status if entry["key"].startswith("flux2_klein:")}, {"q8_0"})
+        components_out = self.service.status(self.params(**self.gguf_params, vram_step="max", ram_step="keep"))["components"]
+        self.assertEqual(components_out["transformer"]["residency"], "gpu", "status finds the GGUF handle by its file")
+        bf16_components = self.service.status(self.params(vram_step="max", ram_step="keep"))["components"]
+        self.assertEqual(bf16_components["transformer"]["residency"], "not_loaded", "the bf16 file is another handle")
+        handle = next(entry for entry in status if entry["key"].startswith("flux2_klein:"))
+        self.assertGreater(handle["device_bytes"], 0)
+
+    def test_profiles_plan_the_requested_format_with_a_row_per_candidate(self) -> None:
+        from modules.ai_backend.runtime.large_models.tiers import AUTO_STEPS
+
+        shape = large_model.request_shape(128, 128, with_reference=False, max_sequence_length=64, steps=1)
+        answer = self.service.large_model_profiles(self.params(prompt="a cat", **self.gguf_params), shape, format=None, steps=AUTO_STEPS)
+        self.assertEqual(answer["format"], "q8_0", "format=None plans the request's selection, not the best available")
+        rows = {row["id"]: row for row in answer["formats"]}
+        self.assertEqual(list(rows), ["bf16", "q8_0"])
+        self.assertEqual((rows["bf16"]["compute_path"], rows["q8_0"]["compute_path"]), ("native", "gguf"))
+        self.assertEqual((rows["bf16"]["quality_rank"], rows["q8_0"]["quality_rank"]), (2, 1))
+        other = self.service.large_model_profiles(self.params(prompt="a cat", **self.gguf_params), shape, format="bf16", steps=AUTO_STEPS)
+        self.assertEqual(other["format"], "bf16", "an explicit format is planned as asked")
 
 
 class LargeModelInputsTests(_TempTreeCase):

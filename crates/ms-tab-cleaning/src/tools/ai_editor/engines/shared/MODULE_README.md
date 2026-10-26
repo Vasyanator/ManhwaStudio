@@ -30,10 +30,15 @@ forecast / caps / learned-floor half of «Память и скорость» is 
 - `mod.rs`: the module root and the flat re-exports.
 - `stream_progress.rs`: `EngineProgress` (one per engine, claimed by GENERATION), `ProgressClaim`
   + `CallControl` (the sticky cancel handshake), `AbandonedJobs`,
-  `RateEstimator` (a five-second time window over the overall byte counter), `ProgressFrame` /
-  `parse_progress_frame` (the optional second level), `RunDegraded` / `parse_degraded`,
+  `RateEstimator` + `RateSource` (a time window over ONE byte counter: five seconds over a
+  download's overall counter, one second over the per-file counter of any other frame that
+  carries the byte fields, restarted per file
+  and component), `ProgressFrame` / `parse_progress_frame` (the optional second level with its
+  optional `file_component`, localized by `file_component_label`), `RunDegraded` / `parse_degraded`,
   `stream_call` + `map_call_error`, `spawn_backend_cancel`, and the rate / ETA formatters.
-- `stream_progress_ui.rs`: `draw_stream_progress` (the backend's `label` text) and
+- `stream_progress_ui.rs`: `draw_stream_progress` (the backend's `label` text; a load's file bar
+  names its component, and the speed line shows under the file bar of ANY frame that carries the byte
+  fields — download, load, encode or a denoise re-read) and
   `draw_stream_progress_staged` (a load / generate frame named by the engine's localization of
   its stable `stage` id, the `label` as fallback for an unknown id).
 - `hf_download.rs`: the per-repository verdicts (`HfDownloadState`, `HfDownloadLink`,

@@ -16,7 +16,8 @@ something the user did not ask for.
 
 Main responsibilities:
 - encoder identity (`text_encoder_fingerprint`, `local_encoder_identity`,
-  `encoder_family_name`);
+  `encoder_family_name`), for a folder or a GGUF file (whose identity and
+  family never coincide with a folder's);
 - the container format (`prompt_file_metadata`, `read_prompt_file_header`,
   `validate_prompt_file_metadata`, `write_prompt_file`, `read_prompt_file_tensor`);
 - library paths and listings (`prompt_cache_root`, `prompt_cache_family_dir`,
@@ -43,8 +44,10 @@ from ...runtime.paths import program_root
 from .components import (
     _MODEL_CONFIG_MARKER,
     component_dir_for_path,
+    is_gguf_file,
     read_safetensors_header,
     text_encoder_available,
+    text_encoder_config_dir,
 )
 from .params import _to_bool, _to_int, text_encoder_dtype_name
 
@@ -171,15 +174,23 @@ def text_encoder_fingerprint(path: str) -> str:
     in place gets what they asked for.
 
     `path` may be the encoder directory or a weights file inside it
-    (`component_dir_for_path`).
+    (`component_dir_for_path`), or a llama.cpp GGUF file: its identity is
+    `sha256(config bytes + "\\ngguf\\x00<file name>\\x00<size>")` over the
+    config found for it (`components.text_encoder_config_dir`), which a bf16
+    folder can never produce (the `gguf` marker), so a quantized encoder's
+    embeddings are never taken for bf16 ones or vice versa.
 
     # Raises
     `ValueError` when `path` does not resolve to a directory carrying a
-    `config.json` — an encoder that cannot be identified is one that cannot be
-    loaded either, so this is the same error the loader would raise later.
+    `config.json` (or a GGUF file without one found for it) — an encoder that
+    cannot be identified is one that cannot be loaded either, so this is the
+    same error the loader would raise later.
     """
     import hashlib
 
+    gguf_file = Path(path)
+    if is_gguf_file(gguf_file):
+        return _gguf_encoder_fingerprint(gguf_file)
     source = component_dir_for_path(Path(path))
     if not source.is_dir():
         raise ValueError(f"Путь текстового энкодера должен быть каталогом: {source}")
@@ -209,6 +220,28 @@ def text_encoder_fingerprint(path: str) -> str:
     return digest.hexdigest()
 
 
+def _gguf_encoder_fingerprint(gguf_file: Path) -> str:
+    """`text_encoder_fingerprint` of a GGUF encoder file (see there).
+
+    # Raises
+    `ValueError` when no `config.json` is found for the file or a file cannot
+    be read.
+    """
+    import hashlib
+
+    try:
+        config = text_encoder_config_dir(str(gguf_file)) / _MODEL_CONFIG_MARKER
+        config_bytes = config.read_bytes()
+        size = gguf_file.stat().st_size
+    except OSError as exc:
+        # `FileNotFoundError` (no config found) included: unidentifiable is unloadable.
+        raise ValueError(f"Не удалось опознать GGUF-энкодер {gguf_file.name}: {exc}") from exc
+    digest = hashlib.sha256()
+    digest.update(config_bytes)
+    digest.update(f"\ngguf\x00{gguf_file.name}\x00{size}".encode("utf-8"))
+    return digest.hexdigest()
+
+
 def prompt_file_metadata(
     normalized: dict[str, Any], text: str, encoder_id: str, family: str
 ) -> dict[str, str]:
@@ -235,6 +268,10 @@ def prompt_file_metadata(
         "max_sequence_length": str(int(normalized["max_sequence_length"])),
         "dtype": text_encoder_dtype_name(),
         "text_encoder_fp8": "true" if normalized["text_encoder_fp8"] else "false",
+        # Informational only, like the path below: compatibility is the
+        # fingerprint's, which already differs per format (a GGUF file's
+        # identity is not a folder's).
+        "text_encoder_format": str(normalized.get("text_encoder_format") or ""),
         "text_encoder_id": str(encoder_id),
         "text_encoder_family": str(family),
         # Informational only. It is where the encoder lived when the file was
@@ -569,8 +606,8 @@ def encoder_family_name(text_encoder_path: str, encoder_id: str) -> str:
     """Library subdirectory for one text encoder: `<readable name>-<short id>`.
 
     Two halves, each doing a job the other cannot. The readable half is the
-    encoder DIRECTORY's own name, so a user opening `prompt_cache/` sees which
-    model a folder belongs to. The hash half is the first
+    encoder DIRECTORY's own name (a GGUF encoder's file stem), so a user
+    opening `prompt_cache/` sees which model a folder belongs to. The hash half is the first
     `PROMPT_CACHE_FAMILY_HASH_CHARS` of `text_encoder_fingerprint`, so two
     different encoders that happen to live in identically named directories
     (`.../model/text_encoder` is the common case) cannot pour their entries into
@@ -582,9 +619,12 @@ def encoder_family_name(text_encoder_path: str, encoder_id: str) -> str:
     name sanitizes to nothing falls back to `encoder`; the hash still keeps the
     family unique.
     """
-    source = component_dir_for_path(Path(text_encoder_path))
+    gguf_file = Path(text_encoder_path)
+    # A GGUF encoder is named by its FILE (the quantization is in the name the
+    # user picked); its config folder is shared with the bf16 encoder.
+    source_name = gguf_file.stem if is_gguf_file(gguf_file) else component_dir_for_path(gguf_file).name
     try:
-        readable = sanitize_name_component(source.name, what="имя каталога энкодера")
+        readable = sanitize_name_component(source_name, what="имя каталога энкодера")
     except ValueError:
         # A directory name made entirely of separators or exotic characters is
         # still a legitimate encoder; only its readability is lost.

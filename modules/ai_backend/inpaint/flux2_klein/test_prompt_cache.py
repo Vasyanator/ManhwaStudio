@@ -38,7 +38,7 @@ from modules.ai_backend.inpaint import flux2_klein as svc
 from modules.ai_backend.inpaint.flux2_klein import hardware, prompt_cache
 from modules.ai_backend.runtime.model_manager import SmallModelManager
 
-from ._test_fixtures import _FakeEmbeds, _ManagedRunFixture, _TempTreeCase, _png_bytes
+from ._test_fixtures import TINY_GGUF_ENCODER_CONFIG, _FakeEmbeds, _ManagedRunFixture, _TempTreeCase, _png_bytes, _write_qwen3_gguf_encoder
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +155,44 @@ class EncoderFingerprintTests(_TempTreeCase):
         )
         theirs = svc.encoder_family_name(str(other), svc.text_encoder_fingerprint(str(other)))
         self.assertNotEqual(mine, theirs)
+
+
+@unittest.skipUnless(all(importlib.util.find_spec(name) is not None for name in ("gguf", "torch", "transformers", "accelerate")), "needs gguf, torch, transformers and accelerate")
+class GgufEncoderIdentityTests(_TempTreeCase):
+    """A GGUF encoder's identity and family never coincide with its bf16 counterpart's, and the in-memory key carries the format."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.root / "text_encoder" / "config.json").write_text(json.dumps(TINY_GGUF_ENCODER_CONFIG), encoding="utf-8")
+        self.q8 = self.root / "text_encoder_gguf" / "Qwen3-tiny-Q8_0.gguf"
+        _write_qwen3_gguf_encoder(self.q8)
+        self.q4 = self.root / "text_encoder_gguf" / "Qwen3-tiny-Q4_0.gguf"
+        _write_qwen3_gguf_encoder(self.q4, quant="Q4_0")
+
+    def test_fingerprint_and_family_differ_from_bf16_and_per_file(self) -> None:
+        folder = svc.text_encoder_fingerprint(self.paths["text_encoder_path"])
+        q8 = svc.text_encoder_fingerprint(str(self.q8))
+        q4 = svc.text_encoder_fingerprint(str(self.q4))
+        self.assertEqual(len({folder, q8, q4}), 3)
+        self.assertEqual(q8, svc.text_encoder_fingerprint(str(self.q8)), "stable")
+        family = svc.encoder_family_name(str(self.q8), q8)
+        self.assertEqual(family, f"Qwen3-tiny-Q8_0-{q8[: svc.PROMPT_CACHE_FAMILY_HASH_CHARS]}", "named by the file the user picked")
+        self.assertNotEqual(family, svc.encoder_family_name(self.paths["text_encoder_path"], folder))
+
+    def test_a_gguf_without_a_config_cannot_be_identified(self) -> None:
+        (self.root / "text_encoder" / "config.json").unlink()
+        with self.assertRaises(ValueError):
+            svc.text_encoder_fingerprint(str(self.q8))
+
+    def test_the_cache_key_and_the_file_carry_the_format(self) -> None:
+        service = svc.Flux2KleinInpaintService(SmallModelManager())
+        formats = [{"id": "bf16", "path": self.paths["text_encoder_path"]}, {"id": "q8_0", "path": str(self.q8)}]
+        bf16 = svc.normalize_flux2_klein_params(self.params(text_encoder_format="bf16", text_encoder_formats=formats))
+        q8 = svc.normalize_flux2_klein_params(self.params(text_encoder_path=str(self.q8), text_encoder_format="q8_0", text_encoder_formats=formats))
+        self.assertNotEqual(service._prompt_cache_key(bf16, "p"), service._prompt_cache_key(q8, "p"))
+        self.assertIn("q8_0", service._prompt_cache_key(q8, "p"))
+        metadata = prompt_cache.prompt_file_metadata(q8, "p", "id", "family")
+        self.assertEqual(metadata["text_encoder_format"], "q8_0")
 
 
 class PromptCacheLibraryTests(_TempTreeCase):

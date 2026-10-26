@@ -518,13 +518,22 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   `ms_sysprobe::ai_models` (engine: `ms-download`) before a backend feature initializes them; every
   download is explicit (never implicit on use), resumable and cancellable. The main model repo is
   unpinned (size + server identity, LFS sha256 when announced). Third-party models — Baberu OCR,
-  the PaddleOCR-VL variants, EasyOCR (one shared dir, detector stored once), Surya, the SDXL configs
-  and the one curated SDXL inpaint repo — come from the pinned external catalog
+  the PaddleOCR-VL variants, EasyOCR (one shared dir, detector stored once), Surya, the SDXL configs,
+  the one curated SDXL inpaint repo and FLUX.2 klein 4B (the BFL package plus the GGUF transformer
+  and Qwen3 encoder quants; existing unmarked files are adopted by hash, never re-downloaded)
+  — come from the pinned external catalog
   (`ai_models::external_catalog`: source, commit/URL, per-file size + sha256; regenerated with
   `tools/model_pins/`), the one owner of those facts. Rust sends the backend absolute paths and the
   backend loads them offline only (`local_files_only`, no library downloads); EasyOCR / Surya
-  library versions are pinned to match the catalog. The backend itself still downloads only FLUX,
-  watermark and Reline weights, through `engines/model_download.py` (same network rules).
+  library versions are pinned to match the catalog. The backend itself still downloads only FLUX
+  (FLUX.2 klein 9B, FLUX.3 klein, FLUX.1 Fill), watermark and Reline weights, through
+  `engines/model_download.py` (same network rules).
+- **GGUF weights.** FLUX.2 klein 4B's transformer and text encoder may be GGUF files (format ids
+  from `ms_config::Flux2WeightFormat`, opaque to the backend, which reads the quant from the file).
+  Every weight file goes through ONE container seam (`runtime/tensor_container`: safetensors or
+  GGUF, header `runtime/gguf_stream`); quantized tensors stay quantized in memory as uint8 rows and
+  are dequantized per forward (`runtime/gguf_layers`, diffusers' pure-torch kernels only), so the
+  large-model manager places, parks and streams them like any other weight.
 - **Downloaded code.** PaddleOCR-VL model code is vendored (`ocr/paddle_vl_vendor/`, no
   `trust_remote_code`). `modules/ai_backend/watermark/` is the only place that executes
   network-downloaded code (pinned commit, SHA-256 verified, hashed bytes are executed bytes).

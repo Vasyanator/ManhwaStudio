@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `20` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `21` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `crates/ms-backend-ipc/src/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -78,7 +78,7 @@ WebSocket is only a carrier.
 
 | Field             | Type   | Required on            | Meaning                                                                 |
 |-------------------|--------|------------------------|-------------------------------------------------------------------------|
-| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 20. Optional/ignored on others.  |
+| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 21. Optional/ignored on others.  |
 | `id`              | u64    | all framed messages    | Correlation id. `0` means a server-initiated frame (events, hello).     |
 | `kind`            | string | all                    | One of `hello`,`request`,`response`,`progress`,`event`,`cancel`,`error`.|
 | `method`          | string | `request`              | Method name, e.g. `ocr.manga`. See §5.                                  |
@@ -434,37 +434,43 @@ streams `phase:"download"`.
 | `inpaint.flux2_klein.prompt_cache.load`   | `params: object`, `name: string`                                         | none                   | `family`, `name`, `path`, `prompt`, `prompt_cached: true`, `max_sequence_length`, `dtype`, `created_at`, `encoder_verified: bool` | none | no | no |
 | `inpaint.flux2_klein.prompt_cache.export` | `params: object`, `name: string`, `path: string` (`*.msprompt`)          | none                   | `family`, `name`, `path`, `size_bytes`                                    | none       | no      | no     |
 | `inpaint.flux2_klein.prompt_cache.import` | `params: object`, `path: string` (`*.msprompt`), `name: string?`, `overwrite: bool=false` | none | `family`, `name`, `path`, `size_bytes`, `prompt`, `created_at`, `current_family`, `family_matches: bool` | none | no | no |
-| `inpaint.flux2_klein.download.check` | `hf_token: string` (may be empty), `uncensored: bool=false`, `variant: "9b"\|"4b"="9b"`  | none                   | `variant: string`, `repos: object` (repo id -> `{state, message}`), `plan: {total_bytes, missing_bytes, missing_files}\|null`, `plan_error: string` | none | no | no |
-| `inpaint.flux2_klein.download.start` | `hf_token: string` (may be empty for `4b`), `uncensored: bool=false`, `variant: "9b"\|"4b"="9b"` | none          | `paths: {transformer, text_encoder, vae}`, `downloaded_bytes: int`, `skipped_files: int` | none | **yes** | yes |
+| `inpaint.flux2_klein.download.check` | `hf_token: string` (may be empty), `uncensored: bool=false`, `variant: "9b"="9b"` (`"4b"` refused since v21) | none                   | `variant: string`, `repos: object` (repo id -> `{state, message}`), `plan: {total_bytes, missing_bytes, missing_files}\|null`, `plan_error: string` | none | no | no |
+| `inpaint.flux2_klein.download.start` | `hf_token: string`, `uncensored: bool=false`, `variant: "9b"="9b"` (`"4b"` refused since v21) | none          | `paths: {transformer, text_encoder, vae}`, `downloaded_bytes: int`, `skipped_files: int` | none | **yes** | yes |
 
 **Model download from Hugging Face** (`dev-docs/flux2_model_download.md` is the
 authoritative contract; `inpaint/flux2_download.py` implements it):
 
-**`variant` selects the model, and an absent field means `"9b"`.** That default
-is pinned so a client built before the field existed keeps downloading exactly
-what it used to. The two values differ in every way that matters:
+**The backend downloads FLUX.2 klein 9B only; an absent `variant` means `"9b"`.**
+That default is pinned so a client built before the field existed keeps
+downloading exactly what it used to:
 
 | `variant` | repository | gated | plan | uncensored encoder | destination |
 |---|---|---|---|---|---|
 | `"9b"` (default) | `black-forest-labs/FLUX.2-klein-9B` | yes (`gated: auto`) | ~34.7 GB | yes | `<side_models>/FLUX.2-klein-9B/` |
-| `"4b"` | `black-forest-labs/FLUX.2-klein-4B` | **no** (apache-2.0) | ~15.98 GB | **no** | `<side_models>/FLUX.2-klein-4B/` |
 
-Two request shapes are REFUSED with `status:"error"` rather than served with a
-substitute, on both methods and before any network call:
+**`"4b"` is refused since v21.** The FLUX.2 klein 4B package
+(`<side_models>/FLUX.2-klein-4B/`) and its GGUF quants are downloaded by the
+application itself from its pinned model catalog (Rust
+`ms_sysprobe::ai_models::external_catalog`, checksummed files), so each variant
+has exactly one download owner; the backend answers a `"4b"` request with a
+`status:"error"` whose message says so, on both methods, before any token check
+or network call.
+
+Two further request shapes are REFUSED with `status:"error"` rather than served
+with a substitute, on both methods and before any network call:
 
 - an unknown `variant` — never downgraded to `"9b"`, which would fetch tens of
   gigabytes the user did not ask for into a directory they did not name;
-- `variant:"4b"` together with `uncensored:true` — no such repository exists,
-  and handing back the official encoder under that button is a silent swap of
-  the weights the user asked for.
+- `uncensored:true` on a variant without an uncensored encoder (no current
+  variant lacks one) — handing back the official encoder under that button
+  would be a silent swap of the weights the user asked for.
 
 `hf_token` is a REQUEST FIELD of both methods. It never travels as an
 environment variable of the backend process, never sits inside `params`, and is
 never logged on either side; a message that must mention it says "the token" and
-nothing more. **A token is required only when the request touches a GATED
-repository**: an empty token on a `"4b"` request is a normal request that
-reaches the hub and answers `ok`, while `"9b"` (and any `uncensored:true`)
-short-circuits to `no_token` with no network call.
+nothing more. **Every repository the backend downloads from is gated**, so an
+empty token short-circuits to `no_token` (`.check`) or a refusal (`.start`) with
+no network call, and a present token is sent to every repository.
 
 `download.check` reports one entry per repository the variant and the
 `uncensored` toggle actually need — the variant's official one always, the
@@ -534,12 +540,12 @@ frames keep the four existing fields and ADD three optional ones:
   official `text_encoder/` or the uncensored `text_encoder_uncensored/`, never
   both, so a 9B plan is ~34.7 GB either way. Everything else comes from the
   official repository in both states, which is why both repositories are
-  access-checked whenever the toggle is on. The toggle exists for `"9b"` only;
-- **neither variant fetches the repository-root single-file transformer**
-  (`flux-2-klein-9b.safetensors` / `flux-2-klein-4b.safetensors`): it is the same
-  weights as the `transformer/` folder the plan already takes, so fetching it
-  would put a duplicate 7.75-18.16 GB copy on disk, and diffusers' single-file
-  loader silently discards the `device_map` this engine's layered offload needs;
+  access-checked whenever the toggle is on;
+- **the repository-root single-file transformer is never fetched**
+  (`flux-2-klein-9b.safetensors`): it is the same weights as the `transformer/`
+  folder the plan already takes, so fetching it would put a duplicate 18.16 GB
+  copy on disk, and diffusers' single-file loader silently discards the
+  `device_map` this engine's layered offload needs;
 - an INTERRUPTED file resumes rather than restarts: its partial bytes are parked
   beside the destination and continued with `Range: bytes=<n>-` on the next
   `download.start`, so a dropped connection at 8 of 9.8 GB does not cost those
@@ -576,7 +582,9 @@ accepted and then ignored),
 runs on the CPU from RAM at every VRAM step; §5.10 "Encoder on the CPU"),
 `whole_region: bool` (default `false`),
 `max_sequence_length` (64..512, default 512),
-`text_attention_in_mask: bool` (default `false`; see below).
+`text_attention_in_mask: bool` (default `false`; see below),
+`transformer_format` / `transformer_formats` and `text_encoder_format` /
+`text_encoder_formats` (v21; see "weight formats" below).
 Retired fields are refused BY NAME (a request error naming the field, the
 protocol that retired it and what replaced it), even with a `null` value: a
 stale client gets a clear error instead of a silently ignored choice. They are
@@ -586,6 +594,46 @@ the placement wire (v14) — `placement`, `profile`, `low_cpu_mem_usage`,
 `color_match`, `color_match_local_pct`, `color_match_scale_px`. Any other
 unknown key is ignored. This holds for every `inpaint.flux2_klein*` method that
 takes `params` and normalizes it.
+
+**FLUX.2 klein: weight formats and GGUF components** (v21). `transformer_path`
+and `text_encoder_path` may each name a `.gguf` file (the container is sniffed
+from the file's magic, never from the extension): the unsloth FLUX.2 klein 4B
+transformer quants and a Qwen3 4B GGUF text encoder. GGUF weights stay quantized
+in memory and are dequantized per forward. Per component, an optional selected
+format id and its candidates travel beside the path:
+
+- `transformer_format: string` and `transformer_formats: [{id: string, path:
+  string}]` (best first); `text_encoder_format` / `text_encoder_formats` likewise.
+  Ids match `^[a-z0-9_]{1,32}$` and are OPAQUE to the backend (the client's list,
+  e.g. `bf16`, `q8_0`, `q4_k_m`); a malformed id, a duplicate id, an empty list
+  or an entry that is not exactly `{id, path}` with a non-empty `path` is a
+  request error naming the field. A candidate's file need not exist: its row
+  then reports it unavailable.
+- When a `*_formats` list is present it MUST contain the selected id, and that
+  entry's `path` must equal the component's `*_path` exactly as strings;
+  otherwise a request error.
+- When absent, the backend derives the id from the container: `bf16` for a
+  safetensors file or a folder, `gguf` for a GGUF file, and there is one
+  candidate. A client that sends neither field behaves exactly as before v21.
+- The candidates become the `formats[]` rows of `large_models.profiles` (the
+  transformer's) and its additive `encoder_formats` (the encoder's); a GGUF row
+  reports `compute_path: "gguf"`. The selected format is the one the run uses;
+  the backend never switches to another candidate on its own.
+- `text_encoder_fp8: true` together with a GGUF text encoder is a request error
+  naming both fields (the two quantizations exclude each other; no fallback).
+- **Config, tokenizer and scheduler of a GGUF component.** A GGUF file carries
+  none of them. The component's `config.json` is probed beside the file (its
+  directory and that directory's parent, as for a folder), then in the INSTALLED
+  4B package `<side_models>/FLUX.2-klein-4B/` (`transformer/` or `text_encoder/`);
+  a candidate is accepted only when it matches the GGUF header (the package
+  fallback must declare every compared field and agree on all of them). While a
+  component is a GGUF file, that package root also joins the tokenizer /
+  scheduler search, LAST. A GGUF component with no matching config anywhere is a
+  request error naming the file and the directories probed. Safetensors and
+  folder paths never use the package fallback, so 9B and bf16 discovery is
+  unchanged.
+- The prompt cache keys a GGUF encoder by its own identity (a new encoder
+  family), so a bf16-encoded entry is never served to a GGUF encoder.
 
 **The mask is the LATENT mask; the answer is RAW** (v17). The mask segment is
 the painted mask already dilated by the client (L8, binarized by the backend,
@@ -731,6 +779,41 @@ through the SAME admission (reserves, limits, reclaim) that a generation does.
   lower «Видеопамять» step at or below a higher one for both handles together. A warm pipeline reports steps 0 and 9 only (plus
   7-8 when the prompt has to be encoded). The warm-up is a `load` step and never
   a `generate` one.
+- **Byte level of a component read** (any phase; normally `load`): while a
+  component is read from disk, the current frame (its `phase` / `step` /
+  `total` / `label`) is re-emitted with the optional
+  fields `file_step` (bytes read so far), `file_total` (bytes of the
+  whole component: every shard of a folder, or the one file), `file_label`
+  (the file's name for a single file / GGUF, the folder's name for a diffusers
+  / transformers folder) and `file_component` (`"transformer"` or
+  `"text_encoder"`: WHICH component is read; a client reads an absent field as
+  the transformer). `step`, `total` and `label` stay exactly those of the
+  step frame, so the overall bar does not move: a byte frame always carries
+  the CURRENT step frame. A load rides on its own step — the transformer's
+  bytes on step `1`, the text encoder's on step `7`. A read the backend makes
+  inside a later step (a component planned on the disk tier read when its
+  phase starts, a reload after an out-of-memory retry, weights brought back
+  from disk) rides on the step current at that moment: `8` («Кодирование
+  промпта») for the encoder, or a `phase:"generate"` frame (same `step` /
+  `total` / `label` as the last diffusion-step frame) for a read during the
+  denoise — the client shows a disk read there without moving either bar. The
+  VAE sends no byte frames. The read's last byte frame has `file_step ==
+  file_total`; frames come at most ~5 per second per read plus the final one
+  (not one per tensor), and a frame without the fields ends the byte level.
+  `file_total` counts THIS read: the whole component for a load, only the
+  weights brought back for a re-read. The encoder's byte frames normally come
+  after its step-7 frame and before step 8, in a
+  generation that encodes, in `prompt_cache.build` and in the encoder's
+  `component_action` `load`; a cached prompt reads no encoder and sends none.
+  The transformer's come after step 1 on a cold pipeline. Both since v21 (the
+  transformer's single-file bytes predate it).
+
+  ```json
+  { "v":1, "id":42, "kind":"progress", "phase":"load", "step":7, "total":9,
+    "label":"Загрузка текстового энкодера",
+    "file_step": 2147483648, "file_total": 8044936192, "file_label": "text_encoder",
+    "file_component": "text_encoder" }
+  ```
 - `phase:"generate"` — `step`/`total` are diffusion steps (`total` already
   accounts for the steps `strength` drops).
 - A progress frame that cannot be written (the client is gone) never stops the
@@ -827,7 +910,7 @@ generates.
   `tokenizer/` and `scheduler/` directories are pipeline components and are still
   required.
 - `large_models.profiles` answers `encoder: null` on such a machine (nothing will
-  be encoded), so the forecast is the pipeline's alone. It is advice; the
+  be encoded and nothing can be resident), so the forecast is the pipeline's alone. It is advice; the
   manager's admission of the run is the guard.
 
 **FLUX.2 klein: guidance and distilled checkpoints.** `.status` answers
@@ -907,6 +990,14 @@ region's size).
   (a `0/total` frame when the denoise begins). A degrade retry may repeat steps.
 - `phase:"download"` (download.start only) — the FLUX.2 two-level byte frames
   (`file_step` / `file_total` / `file_label`).
+- Disk reads (v21): every checkpoint read of the run adds a byte level to the
+  `phase:"load"` frame of the stage in force (same `step` / `total` / `label` /
+  `stage`; a reload during the denoise is a `load` frame of stage `denoise`):
+  `file_step` / `file_total` (bytes of this read of the component), `file_label`
+  (the file name; the folder name for a sharded component) and `file_component`
+  (`transformer` = DiT, `text_encoder` = Qwen3-VL encoder, `vae` = AE). Re-reads
+  of units brought back from disk are labelled the same. At most one frame per
+  0.2 s per read, plus one 100% frame.
 
 **Cancellation is mid-run**: the backend checks the request's `cancel` at every
 `stage` begin and after every denoise step and answers `Interrupted`; the weights
@@ -1158,10 +1249,27 @@ Notes:
   `bfloat16` and `flux2_klein.float16` for `float16`. The pickers are the
   PIPELINE's (transformer + VAE), planned with the text encoder's admission
   claimed (the encoder planned on what the pipeline leaves, under the same
-  device ceiling, as a run admits it); the answer adds `encoder: object|null` — the encoder's `selected`
-  (`null` when the prompt is cached or no encoder is installed) — and an encoder
+  device ceiling, as a run admits it); `selected` stays the PIPELINE's plan (the
+  encoder enters it only as a claim), so the run's total memory is `selected` +
+  `encoder`, summed by the client. The answer adds `encoder: object|null` — the
+  encoder's `selected`; since v21 `null` means "the encoder is not needed AND not
+  resident": every prompt the run needs (the prompt, plus `""` under
+  classifier-free guidance) is in the in-memory cache and the encoder handle of
+  these params holds no byte in RAM or VRAM, or no encoder is installed. A
+  resident encoder is counted even over a cached prompt (before v21 a cached
+  prompt alone made it `null`). Both `selected.forecast` and `encoder.forecast`
+  carry the additive `host_baseline: int` (v21; bytes): the backend's baseline
+  RSS that each `host_peak` already includes, so a client summing the two host
+  peaks subtracts it once (`host_peak` + `encoder.host_peak` - `host_baseline`). The residency is read without waiting for the
+  service lock, so the answer comes during a running generation — and an encoder
   that does not fit makes `selected.fits` `false` with the encoder's `reason` /
-  `shortest_resource`. The FLUX.2
+  `shortest_resource`. Since v21 the answer also carries the additive
+  `encoder_formats: object[]` — the encoder report's `formats[]` rows, one per
+  `text_encoder_formats` candidate (`[]` when `encoder` is `null`); the
+  `formats[]` rows are the `transformer_formats` candidates. A `format` absent or
+  `null` here plans the request's SELECTED transformer format
+  (`transformer_format`, or the derived one), not the best available one, so the
+  forecast describes the run the same params would start. The FLUX.2
   registrations are `flux2_klein`, `flux2_klein.float16` (pipelines) and
   `flux2_klein_text_encoder`, `flux2_klein_text_encoder.fp8` (encoders); a learned
   floor stored for a registration an earlier build had (the retired `….cpu`

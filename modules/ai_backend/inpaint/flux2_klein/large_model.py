@@ -17,7 +17,8 @@ Main responsibilities:
     decoder layers, one block per layer; phase `encode`), one spec per encoder
     precision (bf16, or weight-only fp8 done by the conversion:
     `encoder_model_name`), computing on the run device or the CPU as the plan
-    decides;
+    decides; its file is a safetensors folder or a llama.cpp GGUF (names
+    bridged by `encoder_gguf`, kept quantized like a GGUF transformer);
 - `PipelineOptions` / `EncoderOptions` (the manager's `options`), built from a
   normalized request by `pipeline_options` / `encoder_options`, and
   `request_shape`;
@@ -25,9 +26,20 @@ Main responsibilities:
   `FALLBACK_VAE_TILE_LOWERED`): tiled VAE decode where tiling engages for the
   region, then the VAE's tile lowered to `pipeline.EMERGENCY_TILE_LATENT_MIN_SIZE`
   latent cells;
+- the WEIGHT FORMATS of both handles (protocol 21): one `FormatInfo` per
+  candidate file of the request (`_pipeline_formats`, `_make_encoder_formats`),
+  the one resolver of "which format is this run" (`weight_format_of`) and of
+  "which file is that format" (`transformer_path_for`, `encoder_path_for`); a
+  GGUF transformer or encoder is built with `runtime.gguf_layers` modules where
+  its file is block-quantized (`_build_transformer_meta`,
+  `_make_build_encoder_meta`) and dequantized per forward; a GGUF encoder's
+  encode work is variant `ENCODE_VARIANT_GGUF` (never a borrowed bf16 cost);
+  weight-only fp8 and a GGUF encoder exclude each other (`encoder_options`);
 - `require_loadable` - the refusals a run must give BEFORE the manager reads a
   header (fp8_scaled checkpoint, missing transformer config, a VAE file without
-  its folder, a too-shallow encoder), with the wording the service always used;
+  its folder, a too-shallow encoder, a GGUF quantization the layers cannot
+  dequantize, a GGUF encoder that is not Qwen3 / lacks a consistent config /
+  comes with fp8), with the wording the service always used;
 - `register_specs` - registration of every FLUX.2 spec on a manager.
 
 Notes:
@@ -38,6 +50,15 @@ Notes:
   on the GPU when both fit, else on the CPU from RAM, `tiers.template_for`).
 - Why one spec per dtype / per encoder precision: `ComponentSpec.convert` sees
   only `(file_key, tensor)`, so the stored dtype is a property of the spec.
+- Weight formats are NOT separate specs: the manager hands every
+  `files` / `build_meta` / `key_of` call the format it plans, and the format
+  id selects the candidate file (`transformer_path_for`). The ids are opaque
+  (`params.WEIGHT_FORMAT_ID_PATTERN`); what a file holds is read from its
+  container (`runtime.tensor_container`), never inferred from the id. A
+  block-quantized GGUF tensor stays `uint8` rows end to end: the BFL
+  conversion only renames, splits rows (`torch.chunk(dim=0)` of a fused qkv)
+  or swaps row halves (`swap_scale_shift`), all valid on whole rows, and the
+  device size of a `U8` span is its file size (`_two_byte_float`).
 - Conversions are device-agnostic torch code (the DISK tier applies them to
   device views on every pass); torch / diffusers / transformers are imported
   lazily inside the functions.
@@ -71,8 +92,9 @@ from ...runtime.large_models.spec import (
     RequestShape,
     Role,
 )
-from . import attention, components, conversion
-from .params import REGION_SIZE_MULTIPLE, effective_steps, text_encoder_dtype_name
+from ...runtime.tensor_container import container_kind, read_container_layout
+from . import attention, components, conversion, encoder_gguf
+from .params import REGION_SIZE_MULTIPLE, SAFETENSORS_FORMAT, effective_steps, text_encoder_dtype_name
 from .pipeline import EMERGENCY_TILE_LATENT_MIN_SIZE
 
 log = logging.getLogger(__name__)
@@ -80,9 +102,25 @@ log = logging.getLogger(__name__)
 #: The calibration-table family of every FLUX.2 spec.
 FAMILY = "flux2_klein"
 
-#: The one weight format of a FLUX.2 checkpoint the manager plans (bf16 files;
-#: fp8_scaled checkpoints are refused by `require_loadable`).
-WEIGHT_FORMAT = "bf16"
+#: The text encoder's weight format when a request names none and its path is
+#: a safetensors folder (fp8 is a spec of its own, not a format). The selected
+#: format of a request is `EncoderOptions.text_encoder_format`
+#: (`weight_format_of`); a GGUF file without a named format is
+#: `params.GGUF_FORMAT`.
+ENCODER_WEIGHT_FORMAT = SAFETENSORS_FORMAT
+
+#: `PhaseWork.variant` of the encode phase: a safetensors encoder, or a GGUF
+#: encoder dequantized per forward (D7: its cost is never borrowed from the
+#: measured bf16 `encode text` entries, so its forecast is an estimate).
+ENCODE_VARIANT = "text"
+ENCODE_VARIANT_GGUF = "text_gguf"
+
+#: Calibration compute paths of a transformer format (`FormatInfo.compute_path`):
+#: plain matmuls over a safetensors checkpoint, or a GGUF file dequantized per
+#: forward. Deliberately not FLUX.3 nvfp4's `"dequant"`, whose measured cost
+#: entries must never be borrowed.
+COMPUTE_NATIVE = "native"
+COMPUTE_GGUF = "gguf"
 
 #: Component names (the manager's, the residency report's and the actions').
 TRANSFORMER = "transformer"
@@ -139,6 +177,9 @@ class PipelineOptions:
     tiling fallback; `vae_tile_lowered` is set by the lowered-threshold
     fallback only; `vae_tile_px` / `vae_scale` are the VAE's tiling threshold
     (output pixels) and pixels per latent cell from its `config.json`.
+    `transformer_format` is the selected weight format (its file is
+    `transformer_path`) and `transformer_alternatives` the request's candidate
+    `(id, path)` pairs, best first (`()`: the selected format alone).
     """
 
     transformer_path: str
@@ -152,6 +193,8 @@ class PipelineOptions:
     vae_tile_px: int
     vae_scale: int | None
     vae_tile_lowered: bool = False
+    transformer_format: str = SAFETENSORS_FORMAT
+    transformer_alternatives: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -160,13 +203,18 @@ class EncoderOptions:
 
     `on_cpu` is «Энкодер на CPU»: the encoder spec pins its one component to
     host execution (`LargeModelSpec.host_pin_of`), so the RAM step alone places
-    it and the residency key carries the pin.
+    it and the residency key carries the pin. `text_encoder_format` is the
+    selected weight format (its file is `text_encoder_path`) and
+    `text_encoder_alternatives` the request's candidate `(id, path)` pairs,
+    best first (`()`: the selected format alone).
     """
 
     text_encoder_path: str
     fp8: bool
     max_sequence_length: int
     on_cpu: bool = False
+    text_encoder_format: str = ENCODER_WEIGHT_FORMAT
+    text_encoder_alternatives: tuple[tuple[str, str], ...] = ()
 
 
 def vae_latent_scale(vae_path: str) -> int | None:
@@ -192,16 +240,91 @@ def pipeline_options(normalized: dict[str, Any], *, guidance: bool) -> PipelineO
         vae_tiling=bool(normalized["vae_tiling"]),
         vae_tile_px=components.vae_tile_threshold_pixels(normalized["vae_path"]),
         vae_scale=vae_latent_scale(normalized["vae_path"]),
+        transformer_format=normalized["transformer_format"],
+        transformer_alternatives=tuple(normalized["transformer_formats"]),
     )
 
 
+def weight_format_of(options: PipelineOptions | EncoderOptions) -> str:
+    """THE weight format a handle of `options` is planned, keyed and loaded in.
+
+    The pipeline: the request's `transformer_format`; the text encoder: the
+    request's `text_encoder_format`. Every `acquire` / `profiles` / forecast
+    of this package asks here, never spells a format itself.
+
+    # Raises
+    `TypeError` for any other options type.
+    """
+    if isinstance(options, PipelineOptions):
+        return options.transformer_format
+    if isinstance(options, EncoderOptions):
+        return options.text_encoder_format
+    raise TypeError(f"FLUX.2 klein: нет формата весов для опций {type(options).__name__}")
+
+
+def transformer_path_for(options: PipelineOptions, weight_format: str) -> str:
+    """The transformer file (or diffusers folder) of `weight_format` in `options`.
+
+    The candidate list first; the selected format is always its own
+    `transformer_path` (the request's contract, `params._weight_formats`).
+
+    # Raises
+    `ValueError` for a format the request did not offer.
+    """
+    for format_id, path in options.transformer_alternatives:
+        if format_id == weight_format:
+            return path
+    if weight_format == options.transformer_format:
+        return options.transformer_path
+    offered = [format_id for format_id, _ in options.transformer_alternatives] or [options.transformer_format]
+    raise ValueError(f"FLUX.2 klein: формата весов трансформера {weight_format!r} нет в запросе (есть: {', '.join(offered)})")
+
+
+def encoder_path_for(options: EncoderOptions, weight_format: str) -> str:
+    """The text-encoder folder or GGUF file of `weight_format` in `options` (as `transformer_path_for`).
+
+    # Raises
+    `ValueError` for a format the request did not offer.
+    """
+    for format_id, path in options.text_encoder_alternatives:
+        if format_id == weight_format:
+            return path
+    if weight_format == options.text_encoder_format:
+        return options.text_encoder_path
+    offered = [format_id for format_id, _ in options.text_encoder_alternatives] or [options.text_encoder_format]
+    raise ValueError(f"FLUX.2 klein: формата весов текстового энкодера {weight_format!r} нет в запросе (есть: {', '.join(offered)})")
+
+
 def encoder_options(normalized: dict[str, Any]) -> EncoderOptions:
-    """`EncoderOptions` of a normalized request."""
-    return EncoderOptions(
+    """`EncoderOptions` of a normalized request.
+
+    Every use of the encoder (run, profiles, forecast, actions) builds its
+    options here, so this is where the D8 rule holds: weight-only fp8 and a
+    GGUF encoder exclude each other (the GGUF weights are already quantized).
+
+    # Raises
+    `ValueError` naming `text_encoder_fp8` and `text_encoder_path` when
+    both ask for it — never a silent fallback to one of them.
+    """
+    options = EncoderOptions(
         text_encoder_path=normalized["text_encoder_path"],
         fp8=bool(normalized["text_encoder_fp8"]),
         max_sequence_length=int(normalized["max_sequence_length"]),
         on_cpu=bool(normalized["encoder_on_cpu"]),
+        text_encoder_format=normalized["text_encoder_format"],
+        text_encoder_alternatives=tuple(normalized["text_encoder_formats"]),
+    )
+    if options.fp8 and components.is_gguf_file(Path(options.text_encoder_path)):
+        raise ValueError(_fp8_gguf_message(options.text_encoder_path))
+    return options
+
+
+def _fp8_gguf_message(text_encoder_path: str) -> str:
+    """The D8 refusal: `text_encoder_fp8` together with a GGUF encoder file."""
+    return (
+        f"Параметр «fp8 для текстового энкодера» (text_encoder_fp8) нельзя сочетать с GGUF-энкодером "
+        f"(text_encoder_path: {Path(text_encoder_path).name}): веса GGUF уже квантованы. Отключите fp8 "
+        "или выберите текстовый энкодер bf16."
     )
 
 
@@ -255,8 +378,13 @@ def _decode_work(shape: RequestShape, options: PipelineOptions) -> PhaseWork:
 
 
 def _encode_work(shape: RequestShape, options: EncoderOptions) -> PhaseWork:
-    """One prompt at `max_sequence_length` tokens."""
-    return PhaseWork(tokens=options.max_sequence_length, variant="text")
+    """One prompt at `max_sequence_length` tokens; variant `ENCODE_VARIANT_GGUF` for a GGUF encoder (D7).
+
+    The work sees the options, not the planned format, so the variant follows
+    the SELECTED encoder file: an alternative format's row is planned with it.
+    """
+    gguf = components.is_gguf_file(Path(options.text_encoder_path))
+    return PhaseWork(tokens=options.max_sequence_length, variant=ENCODE_VARIANT_GGUF if gguf else ENCODE_VARIANT)
 
 
 # =====================================================================
@@ -291,7 +419,7 @@ def _shards(folder: Path) -> list[Path]:
 
 
 def transformer_files(path: str) -> list[Path]:
-    """The transformer's safetensors files: the single file, or every shard of a diffusers folder."""
+    """The transformer's checkpoint files: the single file (safetensors or GGUF), or every shard of a diffusers folder."""
     source = Path(path)
     return _shards(source) if source.is_dir() else [source]
 
@@ -302,8 +430,11 @@ def vae_files(path: str) -> list[Path]:
 
 
 def encoder_files(path: str) -> list[Path]:
-    """The text encoder's safetensors files (index weight map first, then the folder glob)."""
-    return _shards(components.component_dir_for_path(Path(path)))
+    """The text encoder's checkpoint files: a GGUF file itself, else the folder's safetensors (index weight map first, then the glob)."""
+    source = Path(path)
+    if components.is_gguf_file(source):
+        return [source]
+    return _shards(components.component_dir_for_path(source))
 
 
 def transformer_config_dir(path: str) -> Path:
@@ -326,7 +457,9 @@ def require_loadable(normalized: dict[str, Any], *, encoder: bool) -> None:
     """Refuse a request the manager could not load, BEFORE any header is inventoried, with the service's own wording.
 
     Checks the transformer (fp8_scaled refused, a `model.diffusion_model.`
-    prefixed file refused, a single file needs its config), the VAE (a folder with `config.json`; diffusers 0.39 has no
+    prefixed file refused, a single file needs its config; a GGUF file:
+    the same prefix and config rules plus `_require_dequantizable_gguf`), the
+    VAE (a folder with `config.json`; diffusers 0.39 has no
     single-file VAE loader) and, when `encoder`, that the encoder folder is a
     transformers folder deep enough for `ENCODER_KEEP_LAYERS`.
 
@@ -336,6 +469,10 @@ def require_loadable(normalized: dict[str, Any], *, encoder: bool) -> None:
     source = Path(normalized["transformer_path"])
     if source.is_dir():
         components._reject_fp8_scaled_directory(source)
+    elif container_kind(source) == "gguf":
+        layout = read_container_layout(source)
+        conversion.require_known_layout([span.name for span in layout.spans], source=source)
+        _require_dequantizable_gguf(layout.spans, source=source)
     else:
         header = components.read_safetensors_header(source)
         if components.is_fp8_scaled_checkpoint(header):
@@ -352,16 +489,89 @@ def require_loadable(normalized: dict[str, Any], *, encoder: bool) -> None:
         require_loadable_encoder(normalized)
 
 
-def require_loadable_encoder(normalized: dict[str, Any]) -> None:
-    """Refuse an encoder path that is not a transformers folder, or one shallower than `ENCODER_KEEP_LAYERS`.
+def _require_dequantizable_gguf(spans: Sequence[Any], *, source: Path, component: str = "Трансформер") -> None:
+    """Refuse a GGUF file holding a block-quantized type `runtime.gguf_layers` cannot dequantize.
+
+    `spans` are the file's `TensorSpan`s, `component` the capitalized
+    component name the message starts with. Every unsupported type is named
+    once, with its first tensor, so the user can pick another file. Imports
+    torch (through `gguf_layers`), so it runs only on a GGUF file.
 
     # Raises
-    `ValueError` naming the folder (and, for a shallow encoder, the counts).
+    `ValueError` naming the file, the types, a tensor of each and the
+    supported types.
     """
-    encoder_dir = components.component_dir_for_path(Path(normalized["text_encoder_path"]))
+    from ...runtime.gguf_layers import dequantizable_types, quant_type_name
+
+    supported = dequantizable_types()
+    refused: dict[int, str] = {}
+    for span in spans:
+        if span.quant_type is not None and span.quant_type not in supported:
+            refused.setdefault(span.quant_type, span.name)
+    if not refused:
+        return
+    named = ", ".join(f"{quant_type_name(quant_type)} (тензор {tensor})" for quant_type, tensor in refused.items())
+    allowed = ", ".join(sorted(quant_type_name(quant_type) for quant_type in supported))
+    log.error("FLUX.2 klein: GGUF %s (%s) содержит неподдерживаемые типы квантования: %s; поддерживаются: %s", source, component, named, allowed)
+    raise ValueError(
+        f"{component} {source.name}: тип квантования GGUF {named} не поддерживается — такие веса "
+        f"нечем распаковать. Поддерживаются: {allowed}. Возьмите файл с одним из этих типов."
+    )
+
+
+def require_loadable_encoder(normalized: dict[str, Any]) -> None:
+    """Refuse an encoder path that is not a transformers folder or a usable GGUF file, or one shallower than `ENCODER_KEEP_LAYERS`.
+
+    A GGUF file (`_require_loadable_gguf_encoder`) must not come with
+    `text_encoder_fp8` (D8), must be a `qwen3` GGUF deep enough, hold only
+    dequantizable types and Qwen3 tensor names, and have a consistent
+    `config.json` (beside it or in the installed 4B package).
+
+    # Raises
+    `ValueError` / `FileNotFoundError` naming the folder or file (and, for a
+    shallow encoder, the counts).
+    """
+    source = Path(normalized["text_encoder_path"])
+    if components.is_gguf_file(source):
+        _require_loadable_gguf_encoder(source, fp8=bool(normalized["text_encoder_fp8"]))
+        return
+    encoder_dir = components.component_dir_for_path(source)
     if not encoder_dir.is_dir():
         raise ValueError(f"Путь текстового энкодера должен быть каталогом в формате transformers: {encoder_dir}")
     components.text_encoder_truncation_kwargs(encoder_dir, components.ENCODER_KEEP_LAYERS)
+
+
+def _require_loadable_gguf_encoder(source: Path, *, fp8: bool) -> None:
+    """The GGUF branch of `require_loadable_encoder` (reads the header only).
+
+    # Raises
+    `ValueError` for fp8 together with GGUF (D8, naming both fields), a file
+    that is not a `qwen3` GGUF, one with fewer blocks than
+    `ENCODER_KEEP_LAYERS`, an undequantizable type, a foreign or missing
+    tensor; `FileNotFoundError` when no consistent `config.json` is found.
+    """
+    if fp8:
+        raise ValueError(_fp8_gguf_message(str(source)))
+    import gguf
+
+    layout = components.gguf_layout(source)
+    metadata = layout.gguf.metadata if layout.gguf is not None else {}
+    architecture = metadata.get(gguf.Keys.General.ARCHITECTURE)
+    if architecture != components.GGUF_ENCODER_ARCHITECTURE:
+        raise ValueError(
+            f"Текстовый энкодер {source.name}: это GGUF модели «{architecture}», а нужен Qwen3 "
+            f"(general.architecture = «{components.GGUF_ENCODER_ARCHITECTURE}») — возьмите GGUF текстового энкодера FLUX.2 klein."
+        )
+    keep = components.ENCODER_KEEP_LAYERS
+    blocks = components._config_int(metadata, gguf.Keys.LLM.BLOCK_COUNT.format(arch=components.GGUF_ENCODER_ARCHITECTURE))
+    if blocks is not None and blocks < keep:
+        raise ValueError(
+            f"Текстовый энкодер {source.name}: в файле {blocks} слоёв, а пайплайн читает скрытые состояния "
+            f"слоёв {', '.join(str(index) for index in components.TEXT_ENCODER_OUT_LAYER_INDICES)} и требует минимум {keep}."
+        )
+    _require_dequantizable_gguf(layout.spans, source=source, component="Текстовый энкодер")
+    encoder_gguf.require_known_encoder_names([span.name for span in layout.spans], keep, source=source)
+    components.text_encoder_truncation_kwargs(components.find_text_encoder_config_dir(source), keep)
 
 
 # =====================================================================
@@ -424,15 +634,51 @@ def _make_transformer_convert(dtype_name: str) -> Any:
     return convert
 
 
+def gguf_quant_types(path: str) -> dict[str, int]:
+    """`{diffusers state key: ggml type}` of every block-quantized tensor of a GGUF transformer (header only).
+
+    Each file tensor is mapped through `transformer_state_keys`, so a BFL
+    fused qkv gives its three row slices the type of the fused tensor; plain
+    (F32 / F16 / BF16) tensors are absent and stay ordinary weights.
+
+    # Raises
+    `ValueError` for an unreadable or malformed file.
+    """
+    return {
+        state_key: int(span.quant_type)
+        for span in read_container_layout(path).spans
+        if span.quant_type is not None
+        for state_key in transformer_state_keys(span.name)
+    }
+
+
 def _build_transformer_meta(options: PipelineOptions, weight_format: str) -> Any:
-    """`Flux2Transformer2DModel` from the checkpoint's own config, on `meta` (`guidance_embeds=False`: klein has none)."""
+    """`Flux2Transformer2DModel` from the checkpoint's own config, on `meta` (`guidance_embeds=False`: klein has none).
+
+    For a GGUF file of `weight_format`, every module whose weight the file
+    stores block-quantized is swapped for a `runtime.gguf_layers` module
+    (`uint8` rows, dequantized per forward into `options.dtype`) BEFORE the
+    loader fills it, so the stored layout derived on `meta` is the file's.
+
+    # Raises
+    `ValueError` / `FileNotFoundError` from the config probe, and `ValueError`
+    when a quantized tensor names no linear / embedding of the model
+    (`gguf_layers.swap_gguf_modules`).
+    """
     from accelerate import init_empty_weights
     from diffusers import Flux2Transformer2DModel
 
-    config = dict(Flux2Transformer2DModel.load_config(str(transformer_config_dir(options.transformer_path)), local_files_only=True))
+    path = transformer_path_for(options, weight_format)
+    config = dict(Flux2Transformer2DModel.load_config(str(transformer_config_dir(path)), local_files_only=True))
     config["guidance_embeds"] = False
     with init_empty_weights():
-        return Flux2Transformer2DModel.from_config(config)
+        model = Flux2Transformer2DModel.from_config(config)
+    if not Path(path).is_dir() and container_kind(path) == "gguf":
+        from ...runtime.gguf_layers import swap_gguf_modules
+
+        swapped = swap_gguf_modules(model, gguf_quant_types(path), compute_dtype=_torch_dtype(options.dtype))
+        log.info("FLUX.2 klein: трансформер %s (формат %s, конфиг %s) — %d слоёв GGUF, распаковка в %s при каждом проходе.", Path(path).name, weight_format, transformer_config_dir(path), swapped, options.dtype)
+    return model
 
 
 # =====================================================================
@@ -467,9 +713,20 @@ _FP8_MAX = 448.0
 
 
 def _encoder_state_key(file_key: str) -> str | None:
-    """The `Qwen3Model` state key of a checkpoint key (`model.` stripped), `None` for weights the truncated model lacks."""
+    """The `Qwen3Model` state key of a checkpoint key, `None` for weights the truncated model lacks.
+
+    Two disjoint name spaces: an HF key (`model.` stripped; `lm_head.*`
+    dropped) and a llama.cpp GGUF name (`encoder_gguf.encoder_state_key_of_gguf`).
+    The prefixed HF names are recognized first, so a safetensors encoder never
+    builds the GGUF name tables.
+
+    # Raises
+    `ValueError` for a GGUF name that is not a Qwen3 tensor.
+    """
     if file_key.startswith(components._ENCODER_LM_HEAD_PREFIX):
         return None
+    if not file_key.startswith(_ENCODER_PREFIX) and encoder_gguf.is_gguf_encoder_name(file_key):
+        return encoder_gguf.encoder_state_key_of_gguf(file_key, components.ENCODER_KEEP_LAYERS)
     key = file_key[len(_ENCODER_PREFIX):] if file_key.startswith(_ENCODER_PREFIX) else file_key
     match = _LAYER_RE.match(key)
     if match and int(match.group(1)) >= components.ENCODER_KEEP_LAYERS:
@@ -488,6 +745,10 @@ def _make_encoder_state_keys(fp8: bool) -> Any:
         if key is None:
             return ()
         if fp8 and _is_fp8_linear_weight(key):
+            # D8: `encoder_options` refuses fp8 with a GGUF file before any spec
+            # call; a GGUF linear reaching here would be quantized twice.
+            if not file_key.startswith(_ENCODER_PREFIX) and encoder_gguf.is_gguf_encoder_name(file_key):
+                raise ValueError(f"FLUX.2 klein: fp8 для текстового энкодера не применим к тензору GGUF «{file_key}»")
             stem = key[: -len(".weight")]
             return (f"{stem}.weight_fp8", f"{stem}.weight_scale")
         return (key,)
@@ -566,16 +827,28 @@ def _make_build_encoder_meta(fp8: bool) -> Any:
     def build(options: EncoderOptions, weight_format: str) -> Any:
         """`Qwen3Model` truncated to `ENCODER_KEEP_LAYERS`, on `meta` (non-persistent rotary buffers real); fp8 linears when asked.
 
+        For a GGUF file of `weight_format` the config is the one found for it
+        (`components.text_encoder_config_dir`) and every module the file stores
+        block-quantized (the linears and `embed_tokens`) is swapped for a
+        `runtime.gguf_layers` module (`uint8` rows, dequantized per forward
+        into `text_encoder_dtype_name()`) before the loader fills it.
+
         # Raises
         `ValueError` for an encoder shallower than the pipeline reads, or a
         config that does not say how deep it is (a whole-model load would
-        not match the truncated key set), or a torch without float8.
+        not match the truncated key set), a torch without float8, fp8 asked
+        for a GGUF file (D8), or a quantized tensor naming no linear /
+        embedding; `FileNotFoundError` for a GGUF file without a config.
         """
         import torch
         from accelerate import init_empty_weights
         from transformers import Qwen3Config, Qwen3Model
 
-        folder = components.component_dir_for_path(Path(options.text_encoder_path))
+        path = encoder_path_for(options, weight_format)
+        gguf = components.is_gguf_file(Path(path))
+        if fp8 and gguf:
+            raise ValueError(_fp8_gguf_message(path))
+        folder = components.text_encoder_config_dir(path)
         keep = components.ENCODER_KEEP_LAYERS
         kwargs = components.text_encoder_truncation_kwargs(folder, keep)
         config = Qwen3Config.from_pretrained(str(folder), local_files_only=True, **kwargs)
@@ -595,6 +868,12 @@ def _make_build_encoder_meta(fp8: bool) -> Any:
                     owner = layer.get_submodule(owner_path)
                     source = getattr(owner, leaf)
                     setattr(owner, leaf, fp8_linear(source.in_features, source.out_features, source.bias is not None, dtype))
+        if gguf:
+            from ...runtime.gguf_layers import swap_gguf_modules
+
+            quant_types = encoder_gguf.gguf_encoder_quant_types(components.gguf_layout(Path(path)).spans, keep)
+            swapped = swap_gguf_modules(model, quant_types, compute_dtype=dtype)
+            log.info("FLUX.2 klein: текстовый энкодер %s (формат %s, конфиг %s) — %d слоёв GGUF, распаковка в %s при каждом проходе.", Path(path).name, weight_format, folder, swapped, text_encoder_dtype_name())
         return model
 
     return build
@@ -603,19 +882,58 @@ def _make_build_encoder_meta(fp8: bool) -> Any:
 # =====================================================================
 #  Formats and keys
 # =====================================================================
+def _transformer_format_info(path: str, vae_present: bool, quality_rank: int) -> FormatInfo:
+    """One transformer format row: available when its file and the VAE exist; `dit_bytes` its file size; compute path by container.
+
+    A missing file's container is unknown: it reads as `COMPUTE_NATIVE` and is
+    never planned (the manager inventories available formats only).
+    """
+    source = Path(path)
+    present = vae_present and source.exists()
+    if not present:
+        return FormatInfo(False, "files_missing", 0, COMPUTE_NATIVE, quality_rank)
+    size = sum(file.stat().st_size for file in transformer_files(path) if file.is_file())
+    gguf = not source.is_dir() and container_kind(source) == "gguf"
+    return FormatInfo(True, None, size, COMPUTE_GGUF if gguf else COMPUTE_NATIVE, quality_rank)
+
+
 def _pipeline_formats(options: PipelineOptions) -> dict[str, FormatInfo]:
-    present = Path(options.transformer_path).exists() and Path(options.vae_path).exists()
-    size = sum(path.stat().st_size for path in transformer_files(options.transformer_path) if path.is_file()) if present else 0
-    return {WEIGHT_FORMAT: FormatInfo(present, None if present else "files_missing", size, "native", 1)}
+    """One row per candidate format of the request (`quality_rank` = count - index: best first), or the selected one alone."""
+    vae_present = Path(options.vae_path).exists()
+    candidates = options.transformer_alternatives or ((options.transformer_format, options.transformer_path),)
+    return {format_id: _transformer_format_info(path, vae_present, len(candidates) - index) for index, (format_id, path) in enumerate(candidates)}
 
 
-def _encoder_formats(options: EncoderOptions) -> dict[str, FormatInfo]:
-    present = bool(options.text_encoder_path) and Path(options.text_encoder_path).exists()
-    return {WEIGHT_FORMAT: FormatInfo(present, None if present else "files_missing", 0, "native", 1)}
+def _encoder_format_info(path: str, quality_rank: int) -> FormatInfo:
+    """One text-encoder format row: available when its folder / file exists; `dit_bytes` its weight files' size; compute path by container."""
+    source = Path(path)
+    if not path or not source.exists():
+        return FormatInfo(False, "files_missing", 0, COMPUTE_NATIVE, quality_rank)
+    size = sum(file.stat().st_size for file in encoder_files(path) if file.is_file())
+    gguf = components.is_gguf_file(source)
+    return FormatInfo(True, None, size, COMPUTE_GGUF if gguf else COMPUTE_NATIVE, quality_rank)
+
+
+def _make_encoder_formats(fp8: bool) -> Any:
+    """The `formats` callable of `encoder_spec(fp8)`: one row per candidate of the request, best first.
+
+    The fp8 spec offers only the candidates that are NOT GGUF files: fp8 is a
+    conversion of bf16 weights (D8). A missing candidate's container is
+    unknown and stays listed (unavailable).
+    """
+
+    def formats(options: EncoderOptions) -> dict[str, FormatInfo]:
+        candidates = options.text_encoder_alternatives or ((options.text_encoder_format, options.text_encoder_path),)
+        if fp8:
+            candidates = tuple((format_id, path) for format_id, path in candidates if not components.is_gguf_file(Path(path)))
+        return {format_id: _encoder_format_info(path, len(candidates) - index) for index, (format_id, path) in enumerate(candidates)}
+
+    return formats
 
 
 def _pipeline_key(options: PipelineOptions, weight_format: str, device: str) -> str:
-    return f"flux2_klein:{options.dtype}|{options.transformer_path}|{options.vae_path}|{device}"
+    """`flux2_klein:<dtype>|<the format's transformer file>|<vae>|<device>` (the selected format's file is `transformer_path`)."""
+    return f"flux2_klein:{options.dtype}|{transformer_path_for(options, weight_format)}|{options.vae_path}|{device}"
 
 
 def _encoder_host_pin(options: EncoderOptions) -> tuple[str, ...]:
@@ -624,8 +942,8 @@ def _encoder_host_pin(options: EncoderOptions) -> tuple[str, ...]:
 
 
 def _encoder_key(options: EncoderOptions, weight_format: str, device: str) -> str:
-    """`flux2_klein_text_encoder:<bf16|fp8>|<path>|<device>`."""
-    return f"flux2_klein_text_encoder:{'fp8' if options.fp8 else 'bf16'}|{options.text_encoder_path}|{device}"
+    """`flux2_klein_text_encoder:<bf16|fp8>|<the format's folder or file>|<device>` (the selected format's is `text_encoder_path`, so the bf16 key is unchanged)."""
+    return f"flux2_klein_text_encoder:{'fp8' if options.fp8 else 'bf16'}|{encoder_path_for(options, weight_format)}|{device}"
 
 
 # =====================================================================
@@ -639,7 +957,7 @@ def pipeline_spec(dtype: str) -> LargeModelSpec:
             ComponentSpec(
                 TRANSFORMER,
                 Role.DIT,
-                lambda options, weight_format: transformer_files(options.transformer_path),
+                lambda options, weight_format: transformer_files(transformer_path_for(options, weight_format)),
                 transformer_block_of,
                 state_keys_of=transformer_state_keys,
                 device_itemsize=_two_byte_float,
@@ -670,14 +988,20 @@ def pipeline_spec(dtype: str) -> LargeModelSpec:
 
 
 def encoder_spec(fp8: bool) -> LargeModelSpec:
-    """The text-encoder spec (`fp8`: weight-only fp8 linears, quantized tensor by tensor while loading); it computes on the run device or the CPU, as the plan decides."""
+    """The text-encoder spec (`fp8`: weight-only fp8 linears, quantized tensor by tensor while loading); it computes on the run device or the CPU, as the plan decides.
+
+    Its formats are the request's candidates (a safetensors folder or a GGUF
+    file each; the fp8 spec only the non-GGUF ones). A GGUF encoder stays
+    quantized in memory: `uint8` rows stored as read (`convert` casts floats
+    only), dequantized per forward.
+    """
     return LargeModelSpec(
         family=FAMILY,
         components=(
             ComponentSpec(
                 TEXT_ENCODER,
                 Role.ENCODER,
-                lambda options, weight_format: encoder_files(options.text_encoder_path),
+                lambda options, weight_format: encoder_files(encoder_path_for(options, weight_format)),
                 encoder_block_of,
                 state_keys_of=_make_encoder_state_keys(fp8),
                 device_itemsize=_make_encoder_itemsize(fp8),
@@ -687,7 +1011,7 @@ def encoder_spec(fp8: bool) -> LargeModelSpec:
             ),
         ),
         phases=(PhaseSpec(PHASE_ENCODE, frozenset({TEXT_ENCODER}), TEXT_ENCODER, _encode_work),),
-        formats=_encoder_formats,
+        formats=_make_encoder_formats(fp8),
         key_of=_encoder_key,
         host_pin_of=_encoder_host_pin,
     )

@@ -46,8 +46,9 @@ Coverage:
 - the two `inpaint.flux2_klein.download.*` methods: the token, the toggle and
   the `variant` travel as request fields — `variant` VERBATIM, because the
   vocabulary, the absent-field default and the cost of an unknown name are the
-  downloader's single answer — the `.check` reply echoes the variant back, a
-  token-less `4b` request is legal and reaches the downloader, a variant refusal
+  downloader's single answer — the `.check` reply echoes the variant back, the
+  retired `4b` (protocol 21: the application's catalog downloads it) is refused
+  by the real downloader before any network call, a variant refusal
   propagates unchanged, a non-string token is a request error, a NULL `plan`
   and its `plan_error` reach the client unchanged (a listing failure must never
   render as a completed installation), `.start`
@@ -977,7 +978,7 @@ def test_download_check_forwards_the_variant_verbatim(monkeypatch: Any) -> None:
     fake = _with_downloads(monkeypatch, _FakeDownloads())
     handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK)
 
-    for sent in ("4b", "9b", "  4B ", "nonsense", None):
+    for sent in ("9b", "  9B ", "nonsense", None):
         header, _blob = handler(
             _ctx(_FakeFlux2KleinService()),
             {"hf_token": "t", "variant": sent} if sent is not None else {"hf_token": "t"},
@@ -990,28 +991,33 @@ def test_download_check_forwards_the_variant_verbatim(monkeypatch: Any) -> None:
         assert "variant" in header
 
 
-def test_download_check_answers_a_tokenless_4b_request(monkeypatch: Any) -> None:
-    # The 4B repository is public: an empty token is a normal request there and
-    # must reach the downloader rather than being refused in this layer.
-    fake = _with_downloads(monkeypatch, _FakeDownloads())
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK)
+@pytest.mark.parametrize(
+    "method",
+    [METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK, METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START],
+)
+def test_the_retired_4b_variant_is_refused_by_the_real_downloader(method: str) -> None:
+    # Protocol 21: FLUX.2 klein 4B is downloaded by the application from its
+    # pinned model catalog, so the backend download refuses `variant: "4b"`.
+    # The REAL downloader module answers here (no fake): the refusal comes from
+    # `resolve_variant`, before any token check or network call, and reaches the
+    # client unchanged on both methods — with or without a token.
+    handler = get_handler(method)
 
-    header, _blob = handler(
-        _ctx(_FakeFlux2KleinService()), {"variant": "4b"}, b"", _no_cancel()
-    )
-
-    assert fake.checked == [("", False, "4b")]
-    assert header["variant"] == "4b"
+    for request in ({"variant": "4b"}, {"hf_token": "t", "variant": " 4B "}):
+        with pytest.raises(ValueError) as caught:
+            handler(_ctx(_FakeFlux2KleinService()), request, b"", _no_cancel())
+        assert "4B" in str(caught.value)
+        assert "приложением" in str(caught.value)
 
 
 def test_download_start_forwards_the_variant(monkeypatch: Any) -> None:
     fake = _with_downloads(monkeypatch, _FakeDownloads())
     handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START)
 
-    handler(_ctx(_FakeFlux2KleinService()), {"variant": "4b"}, b"", _no_cancel())
+    handler(_ctx(_FakeFlux2KleinService()), {"hf_token": "t", "variant": "9b"}, b"", _no_cancel())
     handler(_ctx(_FakeFlux2KleinService()), {"hf_token": "t"}, b"", _no_cancel())
 
-    assert fake.started == [("", False, "4b"), ("t", False, None)]
+    assert fake.started == [("t", False, "9b"), ("t", False, None)]
 
 
 @pytest.mark.parametrize(
@@ -1022,7 +1028,7 @@ def test_a_variant_refusal_reaches_the_client_unchanged(monkeypatch: Any, method
     # `resolve_variant` / `require_uncensored_supported` raise `ValueError` with
     # user-facing Russian text; both methods must let it through untouched
     # rather than turning it into a generic failure.
-    refusal = ValueError("Расцензуренный энкодер для 4B пока не поддерживается")
+    refusal = ValueError("Вариант модели FLUX.2 klein не поддерживается")
     fake = _with_downloads(monkeypatch, _FakeDownloads(fail=refusal))
 
     def explode(*_args: Any, **_kwargs: Any) -> Any:
@@ -1036,7 +1042,7 @@ def test_a_variant_refusal_reaches_the_client_unchanged(monkeypatch: Any, method
     with pytest.raises(ValueError) as caught:
         handler(
             _ctx(_FakeFlux2KleinService()),
-            {"hf_token": "t", "uncensored": True, "variant": "4b"},
+            {"hf_token": "t", "uncensored": True, "variant": "nonsense"},
             b"",
             _no_cancel(),
         )
@@ -1162,7 +1168,20 @@ def test_existing_four_argument_progress_callers_are_unchanged() -> None:
     assert frame_header["step"] == 2
     assert frame_header["total"] == 6
     assert frame_header["label"] == "Загрузка трансформера"
-    assert not {"file_step", "file_total", "file_label"} & set(frame_header)
+    assert not {"file_step", "file_total", "file_label", "file_component"} & set(frame_header)
+
+
+def test_the_forwarder_sends_the_component_of_a_load_byte_level() -> None:
+    from modules.ai_backend.ipc.handlers.streaming import progress_forwarder
+
+    emitter, disp = _emitter()
+    forward = progress_forwarder(_ctx(_FakeFlux2KleinService(), emitter=emitter), METHOD_INPAINT_FLUX2_KLEIN)
+    forward("load", 7, 9, "Загрузка текстового энкодера", file_step=5, file_total=10, file_label="text_encoder", file_component="text_encoder")
+
+    frame_header, _blob = disp.frames[0]
+    assert (frame_header["step"], frame_header["file_step"], frame_header["file_total"]) == (7, 5, 10)
+    assert frame_header["file_label"] == "text_encoder"
+    assert frame_header["file_component"] == "text_encoder"
 
 
 def test_both_download_methods_are_registered() -> None:

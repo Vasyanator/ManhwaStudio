@@ -408,6 +408,12 @@ pub struct Forecast {
     pub total_s: f64,
     pub calibrated: bool,
     pub device_calibrated: bool,
+    /// The baseline RSS `host_peak` includes (the backend process without this model's
+    /// weights; `service.py` `_reservation_of` reads the same figure back from the idle
+    /// phase). Optional and additive on the wire (`host_baseline`); `None` from a backend
+    /// that does not report it. Needed to ADD two forecasts' host peaks without counting
+    /// the process twice.
+    pub host_baseline: Option<u64>,
 }
 
 impl Forecast {
@@ -534,7 +540,7 @@ pub struct Suggestion {
 }
 
 /// The `large_models.profiles` answer (`ProfilesReport.to_dict()` plus FLUX.2's additive
-/// `encoder`).
+/// `encoder` and `encoder_formats`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LargeModelProfiles {
     /// The registration planned (e.g. `flux2_klein.float16` for a float16 request).
@@ -550,6 +556,9 @@ pub struct LargeModelProfiles {
     /// The text encoder's own plan (FLUX.2); `None` when it will not encode or the model has
     /// no encoder.
     pub encoder: Option<SelectedPlan>,
+    /// The text encoder's weight-format rows (FLUX.2, same row shape as `formats`), best
+    /// first; empty when the backend does not report them (older backends, FLUX.3).
+    pub encoder_formats: Vec<FormatRow>,
 }
 
 /// One loaded large-model handle (health `model_manager.large_models[]`).
@@ -696,6 +705,17 @@ pub fn parse_profiles(header: &Value) -> Result<LargeModelProfiles, LargeModelsE
         .enumerate()
         .map(|(index, row)| parse_format_row(&Obj::of(row, &format!("formats[{index}]"))?))
         .collect::<Result<Vec<_>, _>>()?;
+    // Additive key of the FLUX.2 adapter: absent or `null` (older backends, FLUX.3) reads as
+    // no rows; present, it is parsed as strictly as `formats`.
+    let encoder_formats = match root.opt("encoder_formats") {
+        None => Vec::new(),
+        Some(_) => root
+            .array("encoder_formats")?
+            .iter()
+            .enumerate()
+            .map(|(index, row)| parse_format_row(&Obj::of(row, &format!("encoder_formats[{index}]"))?))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     let suggestions = root
         .array("suggestions")?
         .iter()
@@ -714,6 +734,7 @@ pub fn parse_profiles(header: &Value) -> Result<LargeModelProfiles, LargeModelsE
         suggestions,
         // Additive key of the FLUX.2 adapter: absent for a model without a text encoder.
         encoder: root.opt_child("encoder")?.map(|encoder| parse_selected(&encoder)).transpose()?,
+        encoder_formats,
     })
 }
 
@@ -749,6 +770,7 @@ fn parse_forecast(obj: &Obj<'_>) -> Result<Forecast, LargeModelsError> {
         total_s: time.f64("total_s")?,
         calibrated: obj.bool("calibrated")?,
         device_calibrated: obj.bool("device_calibrated")?,
+        host_baseline: obj.opt_u64("host_baseline")?,
     })
 }
 
@@ -1429,6 +1451,19 @@ mod tests {
         let encoder = profiles.encoder.as_ref().expect("the fixture carries the encoder plan");
         assert!(encoder.fits);
         assert_eq!(encoder.vram, Some(VramStep::Phase));
+        assert_eq!(forecast.host_baseline, None, "the v13 fixture predates the optional baseline");
+    }
+
+    /// The optional `host_baseline` of a forecast is read when present; a malformed one is
+    /// malformed, never ignored.
+    #[test]
+    fn the_forecast_baseline_is_optional() {
+        let mut value = fixture();
+        value["selected"]["forecast"]["host_baseline"] = json!(1_610_612_736u64);
+        let profiles = parse_profiles(&value).expect("the fixture parses with a baseline");
+        assert_eq!(profiles.selected.forecast.as_ref().and_then(|forecast| forecast.host_baseline), Some(1_610_612_736));
+        value["selected"]["forecast"]["host_baseline"] = json!("lots");
+        assert!(matches!(parse_profiles(&value), Err(LargeModelsError::Malformed(_))));
     }
 
     /// An unknown step id is a malformed answer naming the field, never a silent fallback.
@@ -1471,6 +1506,37 @@ mod tests {
         let mut value = fixture();
         value["encoder"] = Value::Null;
         assert!(parse_profiles(&value).expect("encoder: null").encoder.is_none());
+    }
+
+    /// `encoder_formats` is additive: absent or `null` reads as no rows, present rows parse
+    /// like `formats`, and a malformed row is `Malformed` naming its index.
+    #[test]
+    fn encoder_formats_are_additive_and_strict() {
+        assert!(parse_profiles(&fixture()).expect("fixture").encoder_formats.is_empty(), "the v13 fixture has none");
+        let mut value = fixture();
+        value["encoder_formats"] = Value::Null;
+        assert!(parse_profiles(&value).expect("encoder_formats: null").encoder_formats.is_empty());
+
+        let mut value = fixture();
+        let row = value["formats"][0].clone();
+        let mut gguf = row.clone();
+        gguf["id"] = json!("q4_k_m");
+        gguf["fits_best"] = Value::Null;
+        value["encoder_formats"] = json!([row, gguf]);
+        let profiles = parse_profiles(&value).expect("encoder rows parse");
+        assert_eq!(profiles.encoder_formats.len(), 2);
+        assert_eq!(profiles.encoder_formats[0], profiles.formats[0], "same row shape as `formats`");
+        assert_eq!(profiles.encoder_formats[1].id, "q4_k_m");
+        assert_eq!(profiles.encoder_formats[1].fits_best, None);
+
+        value["encoder_formats"][1].as_object_mut().expect("object").remove("available");
+        match parse_profiles(&value) {
+            Err(LargeModelsError::Malformed(message)) => assert!(message.contains("encoder_formats[1].available"), "{message}"),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+        let mut value = fixture();
+        value["encoder_formats"] = json!({});
+        assert!(matches!(parse_profiles(&value), Err(LargeModelsError::Malformed(m)) if m.contains("encoder_formats")));
     }
 
     /// A refused selection carries its reason and resource as typed codes.

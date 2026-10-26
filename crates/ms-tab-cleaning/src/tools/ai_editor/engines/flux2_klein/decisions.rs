@@ -14,7 +14,14 @@ Main responsibilities:
 - decide whether the «Внимание только к маске» run option is live
   (`flux2_text_attention_block_reason`);
 - decide what the always-visible readiness line reports (`flux2_readiness_line`), with the
-  memory forecast folded in as `Flux2MemorySummary`;
+  memory forecast folded in as `Flux2MemorySummary` and a catalog bundle known to be
+  incomplete as its own line;
+- name the catalog package the current weight-format selection needs
+  (`flux2_catalog_bundle`, 4B in download mode only) and read the download controller's
+  bundle state (`flux2_catalog_bundle_missing`, `flux2_catalog_job_running`) and say why its
+  running job keeps the engine picker closed (`flux2_catalog_switch_block_reason`);
+- caption each weight-format row with its size and installed mark, and say what it costs
+  (`flux2_weight_format_label`, `flux2_weight_format_hint`);
 - name the first reason a run cannot start (`flux2_run_block_reason`);
 - validate a region SIZE against the model's hard limits (`region_block_reason`), the
   check the run gate and the worker share so the two cannot disagree.
@@ -25,6 +32,9 @@ Key structures:
 Key functions:
 - `flux2_prompt_cache_line()`, `flux2_guidance_supported()`, `flux2_readiness_line()`
 - `flux2_text_attention_block_reason()`
+- `flux2_catalog_bundle()`, `flux2_catalog_bundle_missing()`, `flux2_catalog_job_running()`,
+  `flux2_catalog_switch_block_reason()`
+- `flux2_weight_format_label()`, `flux2_weight_format_hint()`
 - `flux2_run_block_reason()`, `region_block_reason()`
 
 Notes:
@@ -124,7 +134,8 @@ pub(super) enum Flux2LineTone {
 /// The memory forecast as the readiness line carries it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Flux2MemorySummary {
-    /// The one-line forecast, already formatted by `large_model_resources::forecast_line`.
+    /// The one-line forecast of the whole run (text encoder included), already formatted by
+    /// `large_model_resources::forecast_line`.
     pub(super) line: String,
     /// The backend's own verdict. `false` turns the readiness line amber, because the
     /// spelled-out «не помещается» warning lives inside «Память и скорость» and that
@@ -144,6 +155,10 @@ pub(super) enum Flux2ReadinessLine {
     /// Components are missing; the string is the localized list, and «Установить» is
     /// offered beside the line because the fix is one click away.
     Missing { components: String },
+    /// `.status` names nothing missing (or has not answered), but the catalog package the
+    /// selected weight formats need is not fully downloaded (4B in download mode): the
+    /// download block in «Установка модели» is the fix, so «Установить» is offered too.
+    BundleMissing,
     /// No `.status` answer yet. Neutral and buttonless: nothing is wrong, nothing is known.
     Unknown,
 }
@@ -158,14 +173,14 @@ impl Flux2ReadinessLine {
                 Some(summary) if !summary.fits => Flux2LineTone::Warn,
                 Some(_) | None => Flux2LineTone::Ok,
             },
-            Self::Missing { .. } => Flux2LineTone::Warn,
+            Self::Missing { .. } | Self::BundleMissing => Flux2LineTone::Warn,
             Self::Unknown => Flux2LineTone::Neutral,
         }
     }
 
     /// Whether «Установить» is offered beside the line.
     pub(super) fn offers_install(&self) -> bool {
-        matches!(self, Self::Missing { .. })
+        matches!(self, Self::Missing { .. } | Self::BundleMissing)
     }
 
     /// The localized text of the line.
@@ -182,6 +197,7 @@ impl Flux2ReadinessLine {
                 "cleaning.tools.flux2_klein.model_missing_status",
                 components = components
             ),
+            Self::BundleMissing => t!("cleaning.tools.flux2_klein.bundle_missing_status").to_string(),
             Self::Unknown => {
                 t!("cleaning.tools.flux2_klein.model_readiness_unknown_status").to_string()
             }
@@ -194,17 +210,133 @@ impl Flux2ReadinessLine {
 /// `memory` is the forecast summary and is meaningful only for [`Flux2ModelReadiness::Ready`];
 /// it is IGNORED for the other two, because figures about a run that cannot start compete
 /// with the sentence that says why.
+///
+/// `bundle_missing` is whether the catalog package the selected weight formats need is known
+/// to be not fully downloaded ([`flux2_catalog_bundle_missing`]; always `false` outside a
+/// catalog variant's download mode). It turns a `Ready` or `Unknown` verdict into
+/// [`Flux2ReadinessLine::BundleMissing`]; a `Missing` verdict keeps its own line, because it
+/// names the components. It never gates a run: that stays the `.status` readiness.
 #[must_use]
 pub(super) fn flux2_readiness_line(
     readiness: Flux2ModelReadiness,
+    bundle_missing: bool,
     memory: Option<Flux2MemorySummary>,
 ) -> Flux2ReadinessLine {
     match readiness {
-        Flux2ModelReadiness::Ready => Flux2ReadinessLine::Ready { memory },
         Flux2ModelReadiness::Missing(missing) => Flux2ReadinessLine::Missing {
             components: missing.names(),
         },
+        Flux2ModelReadiness::Ready | Flux2ModelReadiness::Unknown if bundle_missing => Flux2ReadinessLine::BundleMissing,
+        Flux2ModelReadiness::Ready => Flux2ReadinessLine::Ready { memory },
         Flux2ModelReadiness::Unknown => Flux2ReadinessLine::Unknown,
+    }
+}
+
+/// The catalog package (`flux2_klein_package_specs`) the CURRENT selection needs: the base
+/// files, then the transformer spec, then the text-encoder spec of the selected formats.
+///
+/// Empty unless the weight formats are in effect
+/// ([`Flux2KleinSettings::weight_formats_in_effect`]: download mode of a variant that
+/// downloads from the catalog), so the 9B checkpoint and manual mode never draw or probe a
+/// catalog block. Pure: no disk access.
+#[must_use]
+pub(super) fn flux2_catalog_bundle(settings: &Flux2KleinSettings) -> Vec<&'static ExternalModelSpec> {
+    if !settings.weight_formats_in_effect() {
+        return Vec::new();
+    }
+    flux2_klein_package_specs(
+        settings.variant(),
+        settings.weight_format(Flux2WeightAxis::Transformer),
+        settings.weight_format(Flux2WeightAxis::TextEncoder),
+    )
+}
+
+/// The row (and closed-combo) caption of one weight format in «Веса трансформера» /
+/// «Веса текстового энкодера»: the format with the download size of its catalog spec, and a
+/// trailing ✓ when the last installed-formats probe found it installed.
+///
+/// The quant token is a technical identifier and stays literal
+/// (`Flux2WeightFormat::quant_token`, listed in `dev-docs/i18n_exclusions.md`); so is the ✓
+/// glyph, as in the FLUX Fill quant combo. A format without a catalog spec shows no size
+/// (never reached for an offered format: the catalog's tests pin one per offered format).
+#[must_use]
+pub(super) fn flux2_weight_format_label(
+    variant: Flux2Variant,
+    axis: Flux2WeightAxis,
+    format: Flux2WeightFormat,
+    installed: &Flux2InstalledFormats,
+) -> String {
+    let size = flux2_klein_spec(variant, axis, format).map(|spec| format_gib(spec.total_bytes())).unwrap_or_default();
+    let label = match format.quant_token() {
+        None => tf!("cleaning.tools.flux2_klein.format_bf16_label", size = size),
+        Some(quant) => tf!("cleaning.tools.flux2_klein.format_gguf_label", quant = quant, size = size),
+    };
+    if installed.contains(axis, format) {
+        format!("{label} ✓")
+    } else {
+        label
+    }
+}
+
+/// The hover of one weight-format row: what choosing it costs on THIS axis — a GGUF
+/// transformer makes every step slower, a GGUF encoder makes encoding slower and may shift
+/// quality at the smallest quants (and excludes fp8, D8).
+#[must_use]
+pub(super) fn flux2_weight_format_hint(axis: Flux2WeightAxis, format: Flux2WeightFormat) -> &'static str {
+    match (format.is_gguf(), axis) {
+        (false, Flux2WeightAxis::Transformer | Flux2WeightAxis::TextEncoder) => t!("cleaning.tools.flux2_klein.format_bf16_hint"),
+        (true, Flux2WeightAxis::Transformer) => t!("cleaning.tools.flux2_klein.format_gguf_transformer_hint"),
+        (true, Flux2WeightAxis::TextEncoder) => t!("cleaning.tools.flux2_klein.format_gguf_encoder_hint"),
+    }
+}
+
+/// Whether a catalog bundle's aggregated state says files are known to be absent: nothing
+/// usable, or an unfinished download. Every other state — not probed yet, probing, a job
+/// running, installed, a dead status worker — claims nothing.
+#[must_use]
+pub(super) fn flux2_catalog_bundle_missing(state: &OcrModelDownloadState) -> bool {
+    match state {
+        OcrModelDownloadState::Missing | OcrModelDownloadState::Partial { .. } => true,
+        OcrModelDownloadState::Unknown
+        | OcrModelDownloadState::Checking
+        | OcrModelDownloadState::Installed
+        | OcrModelDownloadState::Downloading(_)
+        | OcrModelDownloadState::Verifying(_)
+        | OcrModelDownloadState::Unavailable(_) => false,
+    }
+}
+
+/// Whether a controller job (download, verify or adoption) is running for ANY bundle, as one
+/// panel snapshot sees it: its own bundle's job, or another bundle's that blocks it. The
+/// falling edge of this is when files on disk may have changed, so the installed-formats
+/// probe, `.status` and the forecast are re-asked then.
+#[must_use]
+pub(super) fn flux2_catalog_job_running(snapshot: &OcrModelPanelSnapshot) -> bool {
+    snapshot.other_download.is_some()
+        || match snapshot.state {
+            OcrModelDownloadState::Downloading(_) | OcrModelDownloadState::Verifying(_) => true,
+            OcrModelDownloadState::Unknown
+            | OcrModelDownloadState::Checking
+            | OcrModelDownloadState::Missing
+            | OcrModelDownloadState::Partial { .. }
+            | OcrModelDownloadState::Installed
+            | OcrModelDownloadState::Unavailable(_) => false,
+        }
+}
+
+/// Why the engine picker must stay closed for a running catalog job of this engine's download
+/// controller ([`OcrModelDownloadController::running_job`]), or `None` when none runs.
+///
+/// Every kind blocks, for the same reason the backend download does: the host polls only the
+/// SELECTED engine, so a job left behind by a switch would run with no progress, no cancel
+/// and no repaint, and a download would share the disk with the other checkpoint's download.
+/// A download names itself; a verify and an automatic adoption both hash files on disk and
+/// share one message.
+#[must_use]
+pub(super) fn flux2_catalog_switch_block_reason(running_job: Option<JobKind>) -> Option<String> {
+    match running_job? {
+        JobKind::Download => Some(t!("cleaning.tools.flux2_klein.download.switch_blocked_download").to_string()),
+        JobKind::Verify | JobKind::Adopt => Some(t!("cleaning.tools.flux2_klein.download.switch_blocked_verify").to_string()),
     }
 }
 
@@ -614,7 +746,7 @@ mod tests {
             fits: true,
         };
 
-        let unknown = flux2_readiness_line(Flux2ModelReadiness::Unknown, Some(forecast.clone()));
+        let unknown = flux2_readiness_line(Flux2ModelReadiness::Unknown, false, Some(forecast.clone()));
         assert_eq!(unknown, Flux2ReadinessLine::Unknown);
         assert_eq!(unknown.tone(), Flux2LineTone::Neutral);
         assert!(
@@ -632,6 +764,7 @@ mod tests {
                 vae: true,
                 ..Flux2MissingComponents::default()
             }),
+            false,
             Some(forecast.clone()),
         );
         assert_eq!(missing.tone(), Flux2LineTone::Warn);
@@ -658,7 +791,7 @@ mod tests {
 
         // Ready with no answered forecast yet: the short line, and never a template with an
         // empty `{memory}` in it.
-        let bare = flux2_readiness_line(Flux2ModelReadiness::Ready, None);
+        let bare = flux2_readiness_line(Flux2ModelReadiness::Ready, false, None);
         assert_eq!(bare.tone(), Flux2LineTone::Ok);
         assert!(!bare.offers_install());
         assert_eq!(
@@ -666,7 +799,7 @@ mod tests {
             t!("cleaning.tools.flux2_klein.model_ready_status")
         );
 
-        let ready = flux2_readiness_line(Flux2ModelReadiness::Ready, Some(forecast));
+        let ready = flux2_readiness_line(Flux2ModelReadiness::Ready, false, Some(forecast.clone()));
         assert_eq!(ready.tone(), Flux2LineTone::Ok);
         assert_eq!(
             ready.text(),
@@ -682,6 +815,7 @@ mod tests {
         // tone of this line has to carry it.
         let tight = flux2_readiness_line(
             Flux2ModelReadiness::Ready,
+            false,
             Some(Flux2MemorySummary {
                 line: "VRAM 30.0".to_string(),
                 fits: false,
@@ -689,5 +823,118 @@ mod tests {
         );
         assert_eq!(tight.tone(), Flux2LineTone::Warn);
         assert!(!tight.offers_install(), "the model is installed; it is the memory that is short");
+    }
+
+    /// The catalog half of the readiness line: a bundle known to be incomplete turns a
+    /// `Ready` or `Unknown` verdict into its own amber line with «Установить»; a `Missing`
+    /// verdict keeps naming its components, and a complete bundle changes nothing.
+    #[test]
+    fn a_missing_catalog_bundle_takes_the_readiness_line_but_not_a_named_refusal() {
+        for readiness in [Flux2ModelReadiness::Ready, Flux2ModelReadiness::Unknown] {
+            let line = flux2_readiness_line(readiness, true, None);
+            assert_eq!(line, Flux2ReadinessLine::BundleMissing, "{readiness:?}");
+            assert_eq!(line.tone(), Flux2LineTone::Warn);
+            assert!(line.offers_install());
+            assert_eq!(line.text(), t!("cleaning.tools.flux2_klein.bundle_missing_status"));
+        }
+        let missing = Flux2ModelReadiness::Missing(Flux2MissingComponents { transformer: true, ..Flux2MissingComponents::default() });
+        assert!(matches!(flux2_readiness_line(missing, true, None), Flux2ReadinessLine::Missing { .. }));
+        assert_eq!(flux2_readiness_line(Flux2ModelReadiness::Ready, false, None), Flux2ReadinessLine::Ready { memory: None });
+    }
+
+    fn catalog_settings(variant: Flux2Variant, mode: Flux2SourceMode, transformer: Flux2WeightFormat, text_encoder: Flux2WeightFormat) -> Flux2KleinSettings {
+        Flux2KleinSettings {
+            variant: variant.wire().to_string(),
+            source_mode: mode.wire().to_string(),
+            transformer_format: transformer.wire().to_string(),
+            text_encoder_format: text_encoder.wire().to_string(),
+            ..Flux2KleinSettings::default()
+        }
+    }
+
+    /// The bundle follows BOTH selected formats (base, transformer, encoder, in that order),
+    /// and exists only for the catalog variant in download mode: the 9B checkpoint and manual
+    /// mode never draw or probe a catalog block.
+    #[test]
+    fn the_catalog_bundle_follows_the_selected_formats_and_only_in_download_mode() {
+        let variant = Flux2Variant::Klein4B;
+        for &transformer in Flux2WeightFormat::offered_for(variant, Flux2WeightAxis::Transformer) {
+            for &text_encoder in Flux2WeightFormat::offered_for(variant, Flux2WeightAxis::TextEncoder) {
+                let settings = catalog_settings(variant, Flux2SourceMode::Download, transformer, text_encoder);
+                let bundle: Vec<&str> = flux2_catalog_bundle(&settings).iter().map(|spec| spec.id).collect();
+                let expected: Vec<&str> = flux2_klein_package_specs(variant, transformer, text_encoder).iter().map(|spec| spec.id).collect();
+                assert_eq!(bundle, expected, "{transformer:?} / {text_encoder:?}");
+                assert_eq!(bundle.len(), 3, "base + transformer + encoder");
+                let transformer_spec = flux2_klein_spec(variant, Flux2WeightAxis::Transformer, transformer).expect("offered");
+                let encoder_spec = flux2_klein_spec(variant, Flux2WeightAxis::TextEncoder, text_encoder).expect("offered");
+                assert_eq!(bundle[1], transformer_spec.id);
+                assert_eq!(bundle[2], encoder_spec.id);
+            }
+        }
+        let manual = catalog_settings(variant, Flux2SourceMode::Manual, Flux2WeightFormat::Q80, Flux2WeightFormat::Q80);
+        assert!(flux2_catalog_bundle(&manual).is_empty(), "manual mode has no catalog block");
+        for mode in Flux2SourceMode::all() {
+            // A GGUF id in a 9B document is not offered there and reads as bf16 anyway.
+            let nine = catalog_settings(Flux2Variant::Klein9B, mode, Flux2WeightFormat::Q80, Flux2WeightFormat::Q4KM);
+            assert!(flux2_catalog_bundle(&nine).is_empty(), "9B keeps the backend download ({mode:?})");
+        }
+    }
+
+    /// Only a state that says files are absent counts as a missing bundle; a job runs exactly
+    /// while a download / verify of this bundle, or any job of another one, is in flight.
+    #[test]
+    fn the_bundle_states_that_claim_missing_files_and_a_running_job() {
+        assert!(flux2_catalog_bundle_missing(&OcrModelDownloadState::Missing));
+        assert!(flux2_catalog_bundle_missing(&OcrModelDownloadState::Partial { bytes_present: 1 }));
+        for state in [OcrModelDownloadState::Unknown, OcrModelDownloadState::Checking, OcrModelDownloadState::Installed, OcrModelDownloadState::Unavailable("x".to_string())] {
+            assert!(!flux2_catalog_bundle_missing(&state), "{state:?}");
+        }
+        let snapshot = |state: OcrModelDownloadState| OcrModelPanelSnapshot { bundle_key: String::new(), state, missing_bytes: 0, notice: None, other_download: None };
+        assert!(!flux2_catalog_job_running(&snapshot(OcrModelDownloadState::Installed)));
+        assert!(!flux2_catalog_job_running(&snapshot(OcrModelDownloadState::Missing)));
+    }
+
+    /// Every catalog job kind closes the engine picker: a download with the download message,
+    /// a verify and an automatic adoption with the file-check message; no job, no block.
+    #[test]
+    fn every_catalog_job_kind_blocks_the_engine_switch() {
+        assert_eq!(flux2_catalog_switch_block_reason(None), None);
+        assert_eq!(
+            flux2_catalog_switch_block_reason(Some(JobKind::Download)).as_deref(),
+            Some(t!("cleaning.tools.flux2_klein.download.switch_blocked_download"))
+        );
+        for kind in [JobKind::Verify, JobKind::Adopt] {
+            assert_eq!(
+                flux2_catalog_switch_block_reason(Some(kind)).as_deref(),
+                Some(t!("cleaning.tools.flux2_klein.download.switch_blocked_verify")),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// A format row names the format and its catalog download size, and carries ✓ exactly
+    /// when the installed-formats probe found it; every offered row of either axis has a size.
+    #[test]
+    fn a_format_row_names_its_size_and_whether_it_is_installed() {
+        let variant = Flux2Variant::Klein4B;
+        let mut installed = Flux2InstalledFormats::default();
+        installed.insert(Flux2WeightAxis::Transformer, Flux2WeightFormat::Q80);
+        for axis in Flux2WeightAxis::all() {
+            for &format in Flux2WeightFormat::offered_for(variant, axis) {
+                let spec = flux2_klein_spec(variant, axis, format).expect("every offered format has a spec");
+                let size = format_gib(spec.total_bytes());
+                let bare = match format.quant_token() {
+                    None => tf!("cleaning.tools.flux2_klein.format_bf16_label", size = size),
+                    Some(quant) => tf!("cleaning.tools.flux2_klein.format_gguf_label", quant = quant, size = size),
+                };
+                let expected = if axis == Flux2WeightAxis::Transformer && format == Flux2WeightFormat::Q80 { format!("{bare} ✓") } else { bare };
+                assert_eq!(flux2_weight_format_label(variant, axis, format, &installed), expected, "{axis:?} {format:?}");
+            }
+        }
+        // The two GGUF hovers differ per axis: the costs are not the same.
+        assert_ne!(
+            flux2_weight_format_hint(Flux2WeightAxis::Transformer, Flux2WeightFormat::Q4KM),
+            flux2_weight_format_hint(Flux2WeightAxis::TextEncoder, Flux2WeightFormat::Q4KM)
+        );
     }
 }

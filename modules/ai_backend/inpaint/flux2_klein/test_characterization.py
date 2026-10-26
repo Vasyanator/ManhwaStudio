@@ -403,8 +403,14 @@ class InpaintRunContract(_ManagedRunFixture):
         self.mask[48:80, 48:80] = 255
         self.calls = self.pipeline_cls.calls
         self.frames: list[tuple[Any, ...]] = []
+        self.file_frames: list[tuple[Any, ...]] = []
 
-    def _progress(self, phase: str, step: int, total: int, label: str, **_file_level: Any) -> None:
+    def _progress(self, phase: str, step: int, total: int, label: str, **file_level: Any) -> None:
+        # The byte level re-emits its step's frame with file fields: kept apart,
+        # so `frames` is the step level the order contract talks about.
+        if file_level:
+            self.file_frames.append((phase, step, total, label, file_level))
+            return
         self.frames.append((phase, step, total, label))
 
     def _run(self, **overrides: object) -> dict[str, Any]:
@@ -445,6 +451,24 @@ class InpaintRunContract(_ManagedRunFixture):
         self.assertTrue(all(total == 9 for phase, _s, total, _l in self.frames if phase == "load"))
         # A cold run reports every load step, in this order, exactly once.
         self.assertEqual(load, list(range(10)))
+
+    def test_byte_frames_ride_on_the_transformer_and_text_encoder_steps_only(self) -> None:
+        self._run(vram_step="max", ram_step="keep")
+        # `step` and `file_component` name the component being read (1 /
+        # "transformer", 7 / "text_encoder"); the label is the step frame's own, the file label the
+        # component's file or folder, and each read ends at its total.
+        by_step: dict[int, list[dict[str, Any]]] = {}
+        for phase, step, total, label, fields in self.file_frames:
+            self.assertEqual((phase, total), ("load", 9))
+            self.assertEqual(set(fields), {"file_step", "file_total", "file_label", "file_component"})
+            by_step.setdefault(step, []).append(fields)
+        self.assertEqual(sorted(by_step), [1, 7])
+        self.assertEqual({fields["file_label"] for fields in by_step[1]}, {"transformer"})
+        self.assertEqual({fields["file_label"] for fields in by_step[7]}, {"text_encoder"})
+        self.assertEqual({fields["file_component"] for fields in by_step[1]}, {"transformer"})
+        self.assertEqual({fields["file_component"] for fields in by_step[7]}, {"text_encoder"})
+        for fields in by_step.values():
+            self.assertEqual(fields[-1]["file_step"], fields[-1]["file_total"])
 
     def test_the_generate_frames_count_the_effective_steps(self) -> None:
         self._run(vram_step="max", ram_step="keep", steps=4, strength=1.0)

@@ -7,15 +7,18 @@ grouping and natural order, non-block weights, device itemsize conversion,
 dropped tensors, 1:N state keys, the `fragmented` flag (interleaved blocks,
 a block split across files), the load transient (`convert_bytes` from the
 conversion run on `meta`: casts and copies count, aliases and views do not),
-and every refusal.
+and every refusal; a GGUF file (`GgufInventoryTests`): quantized U8 rows and
+plain tensors sized by their byte spans, blocks contiguous.
 
 Notes:
 Header-only safetensors files in a temporary directory; nothing is read
-beyond the headers.
+beyond the headers. The GGUF case writes a tiny real file with
+`runtime._gguf_test_fixtures` and skips without the `gguf` package.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
@@ -192,6 +195,41 @@ class SpecValidationTests(unittest.TestCase):
 
     def test_natural_order(self) -> None:
         self.assertEqual(natural_block_order(["single.10", "single.2", "content.image.1", "content.image.0"]), ["content.image.0", "content.image.1", "single.2", "single.10"])
+
+
+@unittest.skipUnless(importlib.util.find_spec("gguf") is not None, "gguf is not installed")
+class GgufInventoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.root = Path(self._dir.name)
+
+    def test_a_gguf_component_is_sized_by_its_byte_spans(self) -> None:
+        from .. import _gguf_test_fixtures as fx
+
+        tensors = [
+            fx.make_tensor("embed.w", fx.Q.BF16, (4, 64), seed=1),
+            fx.make_tensor("blocks.0.a", fx.Q.Q4_K, (8, 256), seed=2),
+            fx.make_tensor("blocks.0.norm", fx.Q.F32, (32,), seed=3),
+            fx.make_tensor("blocks.1.a", fx.Q.Q8_0, (8, 64), seed=4),
+            fx.make_tensor("blocks.1.b", fx.Q.Q6_K, (2, 256), seed=5),
+        ]
+        path = fx.write_gguf(self.root / "m.gguf", tensors)
+        inventory = build_inventory(_component(), [path])
+        nbytes = {tensor.name: tensor.nbytes for tensor in tensors}
+        self.assertEqual(inventory.block_names, ("blocks.0", "blocks.1"))
+        self.assertFalse(inventory.fragmented)
+        for spans in inventory.blocks.values():
+            for entry in spans:
+                with self.subTest(entry.key):
+                    self.assertEqual(entry.device_bytes, nbytes[entry.key])
+                    self.assertEqual(entry.file_bytes, nbytes[entry.key])
+        self.assertEqual(inventory.bytes_by_block["blocks.1"], nbytes["blocks.1.a"] + nbytes["blocks.1.b"])
+        self.assertEqual(inventory.non_block_bytes, nbytes["embed.w"])
+        self.assertEqual(inventory.file_bytes_total, sum(nbytes.values()))
+        (quantized, norm) = inventory.blocks["blocks.0"]
+        self.assertEqual((quantized.span.dtype_token, quantized.span.quant_type), ("U8", int(fx.Q.Q4_K)))
+        self.assertIsNone(norm.span.quant_type)
 
 
 if __name__ == "__main__":

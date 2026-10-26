@@ -9,7 +9,9 @@ model-side switches that are not memory steps (precision, VAE tiling, fp8 encode
 Main responsibilities:
 - draw the section and report, through its `changed` flag, that a persisted value moved;
 - close the `guidance_scale` control, with the reason stated in the open, on a checkpoint
-  the backend reports as distilled.
+  the backend reports as distilled;
+- close the fp8-encoder switch, showing its effective value (off) and the reason, while a
+  GGUF text encoder format is in effect (D8; the stored choice is kept).
 
 Key functions:
 - `draw_advanced_section()`
@@ -145,13 +147,29 @@ pub(super) fn draw_advanced_section(
                 )
                 .on_hover_text(t!("cleaning.tools.flux2_klein.vae_tiling_hint"))
                 .changed();
-            *changed |= ui
-                .checkbox(
-                    &mut settings.text_encoder_fp8,
-                    t!("cleaning.tools.flux2_klein.text_encoder_fp8_label"),
+            // D8: fp8 quantization and a GGUF text encoder exclude each other (the GGUF file is
+            // already quantized, and the backend refuses the pair by name). While a GGUF
+            // encoder format is in effect the checkbox is closed and shows the EFFECTIVE value
+            // — off, which is what `normalized()` sends — while the stored choice is left
+            // untouched and comes back with a bf16 encoder. The reason is on hover AND in a
+            // line under it, as for `guidance_scale` above.
+            if settings.gguf_text_encoder_in_effect() {
+                let mut effective = false;
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut effective, t!("cleaning.tools.flux2_klein.text_encoder_fp8_label")),
                 )
-                .on_hover_text(t!("cleaning.tools.flux2_klein.text_encoder_fp8_hint"))
-                .changed();
+                .on_disabled_hover_text(t!("cleaning.tools.flux2_klein.text_encoder_fp8_gguf_disabled_hint"));
+                ui.small(t!("cleaning.tools.flux2_klein.text_encoder_fp8_gguf_disabled_hint"));
+            } else {
+                *changed |= ui
+                    .checkbox(
+                        &mut settings.text_encoder_fp8,
+                        t!("cleaning.tools.flux2_klein.text_encoder_fp8_label"),
+                    )
+                    .on_hover_text(t!("cleaning.tools.flux2_klein.text_encoder_fp8_hint"))
+                    .changed();
+            }
         },
     );
 }

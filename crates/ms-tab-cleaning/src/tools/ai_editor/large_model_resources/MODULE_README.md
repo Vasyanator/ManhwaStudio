@@ -16,6 +16,8 @@ engine owns one ResourcesController (ProfilesQuery + arming, LimitsWriter, reset
                                 Option<&mut encoder_on_cpu>, view)
   -> Vec<ResourcesAction>   -> controller.fold(actions, &mut choice, format) after the frame
 engine poll: controller.poll_side_jobs(now), controller.poll_query(region, gate, build)
+engine with several ENCODER formats also calls
+  draw_encoder_formats(ui, profiles, &mut encoder_format) -> Option<picked id>
 ```
 The wire types, labels and step vocabulary come from `ms_local_ai::large_models` (the one Rust
 client of `large_models.*`); the cap editor is `ms_widgets::ByteCapEdit`.
@@ -27,8 +29,10 @@ client of `large_models.*`); the cap editor is `ms_widgets::ByteCapEdit`.
   `poll_side_jobs` (cap writer + floor reset; a landed one invalidates the forecast), `view`,
   `fold` (step suggestions into the engine's pair, a format only where the engine has formats,
   a cap edit for its own axis, «Забыть»), `wants_repaint`. Its tests use an offline cap writer.
-- `mod.rs`: `ResourcesView` (+ `reborrow`), `ResourcesAction`, `draw_large_model_resources`, and the pure
-  line decisions `step_row_label`, `auto_item_label`, `forecast_line` with their tests plus the
+- `mod.rs`: `ResourcesView` (+ `reborrow`), `ResourcesAction`, `draw_large_model_resources`,
+  `draw_encoder_formats`, and the pure decisions `step_row_label`, `auto_item_label`,
+  `run_forecast`, `forecast_line`, `format_row_label` with their tests (plus a headless draw test of the
+  encoder rows' two-row rule) plus the
   catalog test over every `large_models.*` key (en and ru agree on placeholders; the Russian axis
   names are pinned verbatim).
 
@@ -38,12 +42,19 @@ client of `large_models.*`); the cap editor is `ms_widgets::ByteCapEdit`.
   The workers are the controller's, and none of them blocks the GUI thread.
 - **Step semantics are the backend's** (`runtime/large_models/tiers.py`). Nothing here decides
   whether a step fits; the rows say what the answer says. The forecast never blocks a run.
-- **Model-agnostic.** A model with one weight format passes `format: None` (FLUX.2); one with
-  several passes `Some(&mut format)` (FLUX.3 klein) and gets the format rows and the format suggestions. A model
+- **Model-agnostic.** A model with one weight format passes `format: None` (FLUX.2 klein 9B, and
+  4B while its weight formats are not in effect); one with several passes `Some(&mut format)`
+  (FLUX.3 klein; FLUX.2 klein 4B in download mode, its transformer format) and gets the format rows
+  and the format suggestions. A model
   with a separate text encoder passes `Some(&mut encoder_on_cpu)` and gets «Энкодер на CPU»
   (raises `EncoderOnCpuChanged`; the engine persists the flag and sends it as `encoder_on_cpu` in
   its run AND forecast `params`, honouring it is the backend's). With the flag on, the encoder's
-  forecast line names RAM only (`encoder_line`). No model name appears here.
+  forecast line names RAM only (`encoder_line`). A model whose text encoder has several weight
+  formats (`LargeModelProfiles::encoder_formats`, FLUX.2 klein 4B) draws them with
+  `draw_encoder_formats`, a separate call returning the picked id, so the widget's signature
+  and `ResourcesAction` stay the same for every engine; it draws only with two rows or more and
+  shares the row labels and visuals of the model's format rows (`draw_format_rows`). No model
+  name appears here.
 - **A stale answer is shown weak, not hidden**, so the panel does not flicker while the next one
   is asked; the busy spinner says a newer one is coming.
 - **A cap edit names its axis** (`LimitsEdited(Axis)`, `cap_changes_for`): the engine's
@@ -54,9 +65,15 @@ client of `large_models.*`); the cap editor is `ms_widgets::ByteCapEdit`.
   fold says so and draws no editor. A raise-limits suggestion opens the fold on the frame it is
   shown.
 - Stored widget state is namespaced by the caller's `id_salt` (both pickers and the fold).
-- `forecast_line` is the one formatter of a plan's forecast; an engine's readiness line prints
-  it too, so the two surfaces cannot read differently. `{total}` is a REPEATED run
-  (`Forecast::warm_total_s`), `{cold}` the first run end to end.
+- `forecast_line(&LargeModelProfiles)` is the one formatter of the run's forecast; an engine's
+  readiness line prints it too, so the two surfaces cannot read differently. `{total}` is a
+  REPEATED run (`Forecast::warm_total_s`), `{cold}` the first run end to end.
+- **The figure is the WHOLE run** (`run_forecast`): `selected.forecast` plus `encoder.forecast`
+  whenever the answer carries an encoder (the backend alone decides when the encoder counts).
+  Combined as the backend's admission combines them — the pipeline is planned with the
+  encoder's reservation claimed beside it: device peaks add, host peaks add with the shared
+  baseline RSS taken out once (`Forecast::host_baseline`; absent = counted twice, an
+  over-estimate), times add (encode, then denoise). The encoder line stays as the breakdown.
 
 ## Editing map
 - To change what a picker row or the forecast line SAYS: `step_row_label` / `forecast_line`

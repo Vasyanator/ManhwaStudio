@@ -25,7 +25,9 @@ The painted mask is NOT stored here — it belongs to the host's `MaskStack` and
 in `EngineRunRequest::masks`; the working mode is decided by the shared `mask_for_run`
 (`../shared/region_mask.rs`), because the backend refuses `whole_region = true` unless the
 mask really is uniformly 255. The model-path pickers ask for a directory PATH used in place (`PickDirectoryPath`) or
-an existing file; a platform without them answers the request with a typed error.
+an existing file; a platform without them answers the request with a typed error. The file
+filters are per component: transformer safetensors or GGUF, VAE safetensors only, text encoder
+GGUF only (`TextEncoderFile`; the bf16 encoder is a folder).
 */
 
 use super::*;
@@ -208,14 +210,24 @@ pub(super) fn flux2_run_done_status(degraded: Option<&RunDegraded>, oom_recovere
 // File pickers
 // ---------------------------------------------------------------------------------------
 
+/// Extensions the transformer FILE picker offers.
+const FLUX2_TRANSFORMER_FILE_EXTENSIONS: &[&str] = &["safetensors", "sft", "gguf"];
+/// Extensions the VAE FILE picker offers (no GGUF: the backend loads no GGUF VAE).
+const FLUX2_VAE_FILE_EXTENSIONS: &[&str] = &["safetensors", "sft"];
+/// Extensions the text-encoder FILE picker offers: GGUF only.
+const FLUX2_TEXT_ENCODER_FILE_EXTENSIONS: &[&str] = &["gguf"];
+
 /// What a running native file dialog is picking a path for.
 ///
-/// Five of the variants fill in a model path; the last two carry a prompt-cache entry in
+/// Six of the variants fill in a model path; the last two carry a prompt-cache entry in
 /// or out of the library and do NOT touch the settings — they start an IPC call instead
 /// (see [`Flux2KleinEngine::poll_picker`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Flux2PickerPurpose {
     TextEncoderDir,
+    /// A GGUF text encoder FILE in manual mode (the bf16 encoder is a folder,
+    /// `TextEncoderDir`); its tokenizer and config come from the 4B package around it.
+    TextEncoderFile,
     TransformerFile,
     TransformerDir,
     VaeFile,
@@ -231,13 +243,23 @@ pub(super) enum Flux2PickerPurpose {
 /// The model directories are used IN PLACE by the backend, so they are `PickDirectoryPath`
 /// requests, never copied-in folders; the prompt-cache export is a `SaveFile` whose target the
 /// engine commits once the backend has written it.
+///
+/// The weight-file filters follow what the backend can load per component: the transformer
+/// takes safetensors or GGUF, the VAE only safetensors (no GGUF VAE exists for FLUX.2), and a
+/// text-encoder FILE is only ever GGUF (a bf16 encoder is a sharded folder).
 pub(super) fn flux2_picker_request(purpose: Flux2PickerPurpose) -> FileDialogRequest {
     match purpose {
         Flux2PickerPurpose::TextEncoderDir | Flux2PickerPurpose::TransformerDir | Flux2PickerPurpose::VaeDir => {
             FileDialogRequest::new(DialogKind::PickDirectoryPath)
         }
-        Flux2PickerPurpose::TransformerFile | Flux2PickerPurpose::VaeFile => FileDialogRequest::new(DialogKind::OpenFile)
-            .filter(t!("cleaning.tools.flux2_klein.weights_files_filter"), &["safetensors", "sft", "gguf"]),
+        Flux2PickerPurpose::TransformerFile => {
+            FileDialogRequest::new(DialogKind::OpenFile).filter(t!("cleaning.tools.flux2_klein.weights_files_filter"), FLUX2_TRANSFORMER_FILE_EXTENSIONS)
+        }
+        Flux2PickerPurpose::VaeFile => {
+            FileDialogRequest::new(DialogKind::OpenFile).filter(t!("cleaning.tools.flux2_klein.weights_files_filter"), FLUX2_VAE_FILE_EXTENSIONS)
+        }
+        Flux2PickerPurpose::TextEncoderFile => FileDialogRequest::new(DialogKind::OpenFile)
+            .filter(t!("cleaning.tools.flux2_klein.weights_files_filter"), FLUX2_TEXT_ENCODER_FILE_EXTENSIONS),
         Flux2PickerPurpose::PromptCacheExport => FileDialogRequest::new(DialogKind::SaveFile)
             .title(t!("cleaning.tools.flux2_klein.prompt_cache_export_dialog_title"))
             .filter(t!("cleaning.tools.flux2_klein.prompt_cache_files_filter"), &[FLUX2_PROMPT_CACHE_EXTENSION])
@@ -307,6 +329,7 @@ mod tests {
     fn picker_requests_match_their_purpose() {
         let cases = [
             (Flux2PickerPurpose::TextEncoderDir, DialogKind::PickDirectoryPath),
+            (Flux2PickerPurpose::TextEncoderFile, DialogKind::OpenFile),
             (Flux2PickerPurpose::TransformerDir, DialogKind::PickDirectoryPath),
             (Flux2PickerPurpose::VaeDir, DialogKind::PickDirectoryPath),
             (Flux2PickerPurpose::TransformerFile, DialogKind::OpenFile),
@@ -317,5 +340,17 @@ mod tests {
         for (purpose, kind) in cases {
             assert_eq!(flux2_picker_request(purpose).kind(), kind, "{purpose:?}");
         }
+    }
+
+    /// The weight-file filters follow what the backend loads per component: the VAE never
+    /// offers GGUF, the transformer does, and an encoder FILE is GGUF only.
+    #[test]
+    fn weight_file_filters_match_each_component() {
+        let extensions = |purpose| -> Vec<String> {
+            flux2_picker_request(purpose).filters().iter().flat_map(|filter| filter.extensions().iter().cloned()).collect()
+        };
+        assert_eq!(extensions(Flux2PickerPurpose::TransformerFile), ["safetensors", "sft", "gguf"]);
+        assert_eq!(extensions(Flux2PickerPurpose::VaeFile), ["safetensors", "sft"]);
+        assert_eq!(extensions(Flux2PickerPurpose::TextEncoderFile), ["gguf"]);
     }
 }

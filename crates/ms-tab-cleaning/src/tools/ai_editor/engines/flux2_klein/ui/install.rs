@@ -11,18 +11,22 @@ Main responsibilities:
 - draw an editable model-path row with its browse buttons (`Flux2PathRow`,
   `draw_path_row`) and the read-only derived paths of the download mode
   (`draw_derived_paths`);
-- draw the download block — the heading and repository line, the token row
+- draw the CATALOG download block of a variant pinned in the Rust catalog (4B): the two
+  weight-format pickers and one pinned bundle download (`Flux2CatalogDownloadView`,
+  `draw_catalog_download_block`, over the shared `draw_ocr_model_download`);
+- draw the Hugging Face download block (9B) — the heading and repository line, the token row
   (`draw_flux2_token_row` over the shared `draw_hf_token_row`, unconditional for a gated
   repository and reopened on an ungated one whose check blamed the token), the encoder
   toggle, the derived paths, and the shared access-check / plan / download controls
   (`draw_hf_download_controls`) (`Flux2DownloadView`, `draw_download_block`).
 
 Key structures:
-- `Flux2DownloadView`, `Flux2PathRow`
+- `Flux2DownloadView`, `Flux2CatalogDownloadView`, `Flux2PathRow`
 
 Key functions:
 - `draw_source_mode_switch()`, `draw_path_row()`, `draw_derived_paths()`
 - `draw_download_block()`, `draw_flux2_token_row()`
+- `draw_catalog_download_block()`, `draw_weight_format_combo()`
 
 Notes:
 The HF token never reaches this file's own state: it lives in the process-wide `hf_token`
@@ -273,6 +277,98 @@ pub(super) fn draw_download_block(
     );
 }
 
+/// Everything the CATALOG download block reads (a variant whose package is pinned in the
+/// Rust catalog, i.e. 4B, in download mode).
+pub(super) struct Flux2CatalogDownloadView<'a> {
+    /// The controller's view of the bundle the selection needed when the frame began; `None`
+    /// before the engine has one. Drawn only while its `bundle_key` still matches.
+    pub(super) snapshot: Option<&'a OcrModelPanelSnapshot>,
+    /// The last `.status` answer, for the presence marks beside the derived paths.
+    pub(super) status: Option<&'a Flux2Status>,
+}
+
+/// Draws the catalog download block: «Веса трансформера» and «Веса текстового энкодера»
+/// (each a `WheelComboBox` of the offered formats with size and installed mark), the derived
+/// paths they lead to, and ONE pinned download block for the whole bundle
+/// (`draw_ocr_model_download`, the SDXL pattern: download / resume / verify / cancel, and the
+/// automatic adoption of an unmarked existing download shown as its check).
+///
+/// There is no token row and no backend download here: the repositories are open and the
+/// app fetches the pinned files itself. A changed format raises `changed` (the engine saves
+/// it and re-arms the status, the forecast and the bundle probe). `action` receives the
+/// block's click, applied by the engine to the CURRENT bundle; the block is skipped for the
+/// one frame in which the combos have just moved the bundle away from `view.snapshot`.
+pub(super) fn draw_catalog_download_block(
+    ui: &mut egui::Ui,
+    settings: &mut Flux2KleinSettings,
+    view: Flux2CatalogDownloadView<'_>,
+    changed: &mut bool,
+    action: &mut ModelDownloadAction,
+) {
+    ui.separator();
+    ui.label(t!("cleaning.tools.flux2_klein.download.heading"));
+    for axis in Flux2WeightAxis::all() {
+        draw_weight_format_combo(ui, settings, axis, changed);
+    }
+    // After the combos: the transformer and encoder paths follow the formats.
+    draw_derived_paths(ui, settings, view.status);
+    let current = bundle_key(&flux2_catalog_bundle(settings));
+    if let Some(snapshot) = view.snapshot.filter(|snapshot| snapshot.bundle_key == current) {
+        let clicked = draw_ocr_model_download(ui, snapshot);
+        if clicked != ModelDownloadAction::None {
+            *action = clicked;
+        }
+    }
+}
+
+/// Draws one weight-format picker: its caption (hover: what the axis choice means) and a
+/// `WheelComboBox` of the formats the variant offers on `axis`, each captioned by
+/// [`flux2_weight_format_label`] and hovered by [`flux2_weight_format_hint`]. A pick is
+/// written into the axis's persisted wire id and raises `changed`.
+///
+/// The combo's `Id` comes from a fixed `id_salt` per axis, never from the localized caption
+/// (`egui-docs/05-ids-and-i18n.md` §2); a `WheelComboBox` rather than `egui::ComboBox`
+/// (`egui-docs/04-widgets.md` §0.2).
+fn draw_weight_format_combo(ui: &mut egui::Ui, settings: &mut Flux2KleinSettings, axis: Flux2WeightAxis, changed: &mut bool) {
+    let variant = settings.variant();
+    let selected = settings.weight_format(axis);
+    let (label, hint, id_salt) = match axis {
+        Flux2WeightAxis::Transformer => (
+            t!("cleaning.tools.flux2_klein.transformer_format_label"),
+            t!("cleaning.tools.flux2_klein.transformer_format_hint"),
+            "cleaning_flux2_klein_transformer_format",
+        ),
+        Flux2WeightAxis::TextEncoder => (
+            t!("cleaning.tools.flux2_klein.text_encoder_format_label"),
+            t!("cleaning.tools.flux2_klein.text_encoder_format_hint"),
+            "cleaning_flux2_klein_text_encoder_format",
+        ),
+    };
+    let installed = &settings.installed_formats;
+    let mut picked = selected;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(label).on_hover_text(hint);
+        WheelComboBox::from_id_salt(id_salt)
+            .selected_text(flux2_weight_format_label(variant, axis, selected, installed))
+            .show_ui(ui, |ui| {
+                for &format in Flux2WeightFormat::offered_for(variant, axis) {
+                    ui.selectable_value(&mut picked, format, flux2_weight_format_label(variant, axis, format, installed))
+                        .on_hover_text(flux2_weight_format_hint(axis, format));
+                }
+            })
+            .response
+            .on_hover_text(hint);
+    });
+    if picked != selected {
+        let stored = match axis {
+            Flux2WeightAxis::Transformer => &mut settings.transformer_format,
+            Flux2WeightAxis::TextEncoder => &mut settings.text_encoder_format,
+        };
+        *stored = picked.wire().to_string();
+        *changed = true;
+    }
+}
+
 /// Draws the Hugging Face token row of this block through the shared `draw_hf_token_row`.
 ///
 /// Split out because it has TWO callers with different conditions — a gated repository,
@@ -442,6 +538,57 @@ mod tests {
                 entry("cleaning.tools.flux2_klein.title"),
                 entry("cleaning.tools.flux2_klein.title_4b"),
                 "locale `{tag}`: the two FLUX.2 klein engines share a picker caption"
+            );
+        }
+    }
+
+    /// The catalog half of the block (4B): the two pickers, the row captions and hovers, the
+    /// readiness line of an incomplete bundle and the fp8 checkbox a GGUF encoder closes. The
+    /// two catalogs maintained by hand (`en`, the reference, and `ru`) must carry them; `es` /
+    /// `fr` / `pt` fall back to `en`.
+    #[test]
+    fn the_reference_catalogs_carry_the_weight_format_keys() {
+        let plain = [
+            "cleaning.tools.flux2_klein.transformer_format_label",
+            "cleaning.tools.flux2_klein.transformer_format_hint",
+            "cleaning.tools.flux2_klein.text_encoder_format_label",
+            "cleaning.tools.flux2_klein.text_encoder_format_hint",
+            "cleaning.tools.flux2_klein.format_bf16_hint",
+            "cleaning.tools.flux2_klein.format_gguf_transformer_hint",
+            "cleaning.tools.flux2_klein.format_gguf_encoder_hint",
+            "cleaning.tools.flux2_klein.text_encoder_fp8_gguf_disabled_hint",
+            "cleaning.tools.flux2_klein.bundle_missing_status",
+        ];
+        // A format row is only a choice while it names the format and its size.
+        let interpolated: [(&str, &[&str]); 2] = [
+            ("cleaning.tools.flux2_klein.format_bf16_label", &["{size}"]),
+            ("cleaning.tools.flux2_klein.format_gguf_label", &["{quant}", "{size}"]),
+        ];
+        for (tag, source) in ms_i18n::embedded_locales().iter().filter(|(tag, _)| matches!(*tag, "en" | "ru")) {
+            let catalog: Value = serde_json::from_str(source)
+                .unwrap_or_else(|error| panic!("locale `{tag}` is not valid JSON: {error}"));
+            let entry = |key: &str| -> String {
+                catalog
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("locale `{tag}` lacks the key `{key}`"))
+                    .to_owned()
+            };
+            for key in plain {
+                assert!(!entry(key).trim().is_empty(), "locale `{tag}`: `{key}` is empty");
+            }
+            for (key, placeholders) in interpolated {
+                let text = entry(key);
+                for placeholder in placeholders {
+                    assert!(text.contains(placeholder), "locale `{tag}`: `{key}` must carry `{placeholder}`, `{text}` does not");
+                }
+            }
+            // The two pickers sit one under the other: identical captions would hide which
+            // component a choice is for.
+            assert_ne!(
+                entry("cleaning.tools.flux2_klein.transformer_format_label"),
+                entry("cleaning.tools.flux2_klein.text_encoder_format_label"),
+                "locale `{tag}`: the two weight-format pickers share a caption"
             );
         }
     }

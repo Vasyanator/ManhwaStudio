@@ -3,19 +3,22 @@ File: modules/ai_backend/runtime/large_models/loader.py
 
 Purpose:
 The torch-facing base of the mechanics layer: load one component of a large
-model straight from its safetensors files into the tiers a `ComponentPlan`
-names (device, host or left on `meta`), bind its residency units to the module
-tensors they own, and the device-operations seam (`Transport`) every move and
-residency hook goes through.
+model straight from its checkpoint files (safetensors or GGUF) into the tiers
+a `ComponentPlan` names (device, host or left on `meta`), bind its residency
+units to the module tensors they own, and the device-operations seam
+(`Transport`) every move and residency hook goes through.
 
 Main responsibilities:
 - `load_component` - build the component on `meta` (`ComponentSpec.build_meta`)
   and fill it through `runtime.safetensors_stream.fill_module_from_safetensors`
-  (THE one filler) with per-key `targets` derived from the plan; register every
-  unit in the handle's `Ledger`; `HostWatch` checked before the first read and
+  (THE one filler; it opens each file through `runtime.tensor_container`)
+  with per-key `targets` derived from the plan; register every unit in the
+  handle's `Ledger`; `HostWatch` checked before the first read and
   at every file tensor, load transient included;
 - `load_units` - re-read some DISK/DROPPED units of a loaded component onto
   its device (a phase transition bringing a dropped block back);
+- disk-read progress of a component (`LoadProgress`, `LoadProgressSink`,
+  `component_read_progress`): what a session's load-progress sink receives;
 - `LoadedComponent` with its unit binding (`TensorSlot`, `set_unit_to_meta`)
   and the packed layout of a unit (`packed_layout`, `packed_view`,
   `PACK_ALIGN`), shared by parked host buffers and device slots;
@@ -60,15 +63,17 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol
 
 from ..memory_budget import HostWatch
 from ..safetensors_stream import (
     LEAVE_ON_META,
+    PROGRESS_MIN_INTERVAL_SECONDS,
     SAFETENSORS_DTYPES_WITH_F8,
     ByteProgressCb,
     FillReport,
@@ -361,6 +366,52 @@ def inventory_units(inventory: ComponentInventory) -> dict[UnitRef, tuple[BlockS
     return units
 
 
+# =====================================================================
+#  Disk-read progress of one component
+# =====================================================================
+@dataclass(frozen=True)
+class LoadProgress:
+    """One disk-read progress frame of one component of a large model.
+
+    `component` is the `ComponentSpec.name`; `file` the checkpoint file the
+    bytes were last read from (`None` only for the empty frame of a read that
+    reads nothing); `files` every file of the component, in read order (a
+    single-file component or a sharded folder: the caller picks the label);
+    `done_bytes` / `total_bytes` count file bytes of THIS read only: a whole
+    component for a fresh load (`reread=False`), only the DISK / DROPPED units
+    a transition brings back for a re-read (`reread=True`). `done_bytes` never
+    decreases within one read and its last frame has `done_bytes ==
+    total_bytes`.
+    """
+
+    component: str
+    file: Path | None
+    files: tuple[Path, ...]
+    done_bytes: int
+    total_bytes: int
+    reread: bool
+
+
+#: A session's load-progress sink (`Session.set_load_progress`): called on the
+#: thread that drives the session, synchronously inside the read loop.
+LoadProgressSink = Callable[[LoadProgress], None]
+
+
+def component_read_progress(inventory: ComponentInventory, sink: LoadProgressSink, *, reread: bool) -> ByteProgressCb:
+    """A filler `ByteProgressCb` that turns `(done, total, last_key)` into `LoadProgress` frames of `inventory`'s component.
+
+    The file of a frame is the one that holds `last_key` (the tensor being
+    read). Rate limiting stays with the filler's `ByteProgress`; this adds none.
+    """
+    file_of_key = {span.key: span.file for spans in inventory_units(inventory).values() for span in spans}
+    files = tuple(inventory.files)
+
+    def report(done: int, total: int, last_key: str) -> None:
+        sink(LoadProgress(component=inventory.name, file=file_of_key.get(last_key), files=files, done_bytes=done, total_bytes=total, reread=reread))
+
+    return report
+
+
 @dataclass(eq=False)
 class LoadedComponent:
     """One component of a large model, loaded into a module, with its units bound.
@@ -527,6 +578,7 @@ def _fill(
     progress: ByteProgressCb | None,
     owner: str,
     device_is_host: bool = False,
+    progress_interval_seconds: float = PROGRESS_MIN_INTERVAL_SECONDS,
 ) -> FillReport:
     """One filler call writing every read entry into its unit's place.
 
@@ -541,7 +593,8 @@ def _fill(
     to be allocated before the next check: this tensor's conversion outputs, or
     the largest transient of the reads still to come less this tensor's read
     buffer (freed by then). The guard therefore never asks for more than the
-    forecast's `host weights + load transient`.
+    forecast's `host weights + load transient`. `progress` /
+    `progress_interval_seconds` go to the filler unchanged.
     """
     import torch
 
@@ -618,6 +671,7 @@ def _fill(
         write=write,
         dtypes=SAFETENSORS_DTYPES_WITH_F8,
         progress=progress,
+        progress_interval_seconds=progress_interval_seconds,
         log_summary=False,
         owner=owner,
         logger=log,
@@ -710,8 +764,12 @@ def load_component(
     )
 
 
-def load_units(component: LoadedComponent, refs: Sequence[UnitRef], *, watch: HostWatch | None = None, progress: ByteProgressCb | None = None) -> FillReport:
+def load_units(component: LoadedComponent, refs: Sequence[UnitRef], *, watch: HostWatch | None = None, progress: ByteProgressCb | None = None, progress_interval_seconds: float = PROGRESS_MIN_INTERVAL_SECONDS) -> FillReport:
     """Read the DISK / DROPPED units `refs` of `component` from its files onto its device (watched as in `load_component`).
+
+    `progress` gets the filler's byte frames of these units only, at most every
+    `progress_interval_seconds` plus the final one (`0.0`: every read chunk,
+    for a caller that aggregates several calls and throttles itself).
 
     At most `ledger.max_in_flight` units per call (each is in flight until the
     fill finished); a block-wise move passes one. Each unit's ledger entry
@@ -737,7 +795,7 @@ def load_units(component: LoadedComponent, refs: Sequence[UnitRef], *, watch: Ho
         for ref in refs:
             ledger.begin_copy(ref, Tier.DEVICE)
             started_refs.append(ref)
-        report = _fill(component.name, component.spec, component.inventory, component.module, component.units, device=torch.device(component.device), tiers=tiers, wanted=frozenset(refs), host_buffers=component.host_buffers, watch=watch, progress=progress, owner=f"large model component «{component.name}»", device_is_host=component.device_is_host)
+        report = _fill(component.name, component.spec, component.inventory, component.module, component.units, device=torch.device(component.device), tiers=tiers, wanted=frozenset(refs), host_buffers=component.host_buffers, watch=watch, progress=progress, owner=f"large model component «{component.name}»", device_is_host=component.device_is_host, progress_interval_seconds=progress_interval_seconds)
     except BaseException:
         log.error("large model component «%s»: re-reading %d unit(s) from disk failed; they stay on disk", component.name, len(refs))
         for ref in started_refs:

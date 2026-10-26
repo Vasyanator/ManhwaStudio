@@ -5,17 +5,18 @@ Purpose:
 The streaming progress protocol of the FLUX.2 klein service: the `phase:"load"`
 step numbering every loader and the service itself report against, the callback
 type they are handed, and the small adapters that turn a `(step, label)` report —
-or a byte count inside one such step — into the `progress_callback` the IPC layer
-expects.
+or the large-model manager's disk-read frames — into the `progress_callback`
+the IPC layer expects.
 
 Key declarations:
 - LOAD_STEP_* / LOAD_PHASE_STEPS - the load-phase step numbers and their total.
-- ProgressCb - the `(phase, step, total, label)` callback type, plus the three
+- ProgressCb - the `(phase, step, total, label)` callback type, plus the four
   OPTIONAL keyword-only fields that carry the second, byte level.
-- FileProgressCb - the `(done_bytes, total_bytes)` callback a loader is handed.
+- FILE_COMPONENT_* - the `file_component` values naming the component read.
 - _progress_reporter() - binds a phase and a total onto a `ProgressCb`.
-- _file_progress_reporter() - binds ONE step frame so a loader can report bytes
-  inside it without moving `step` / `total`.
+- LoadFrames - the request's `ProgressCb` plus the manager's load-progress
+  sink: re-emits the current step frame with the byte level of a component
+  read, without moving `step` / `total`.
 
 Notes:
 This module deliberately depends on nothing else in the package: the step
@@ -25,6 +26,7 @@ client, so they must not drag a loader import behind them.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Callable, Protocol
 
 #: `phase:"load"` progress step numbers, in the order a run actually performs
@@ -47,12 +49,20 @@ LOAD_STEP_ENCODER_DONE = 9
 #: Total number of `phase:"load"` progress steps, i.e. the last step number above.
 LOAD_PHASE_STEPS = LOAD_STEP_ENCODER_DONE
 
+#: `file_component` values of a load-phase byte level (v21): which component is
+#: being read. A wire contract with the Rust client, which reads an absent field
+#: as the transformer (frames of older backends).
+FILE_COMPONENT_TRANSFORMER = "transformer"
+FILE_COMPONENT_TEXT_ENCODER = "text_encoder"
+
+
 class ProgressCb(Protocol):
     """Progress callback: `(phase, step, total, label)`, phase in {"load","generate"}.
 
-    The three keyword-only fields are the SECOND, optional level of the same
+    The keyword-only fields are the SECOND, optional level of the same
     frame — the byte counters of the file currently being read
-    (`file_step`/`file_total`/`file_label` on the wire). They are additive:
+    (`file_step`/`file_total`/`file_label` on the wire) and the component it
+    belongs to (`file_component`, `FILE_COMPONENT_*`). They are additive:
     `step`/`total` keep meaning the overall step level, a field left `None` is
     omitted from the frame entirely, and a caller that passes only the four
     positional arguments emits exactly the frame this protocol always described.
@@ -60,8 +70,8 @@ class ProgressCb(Protocol):
     it and clears it again on the next frame that does not.
 
     An implementation may accept the four positional arguments only: nothing in
-    this package requires the second level, and both reporters below swallow the
-    `TypeError` such a callback raises (see `_file_progress_reporter`).
+    this package requires the second level, and `_progress_reporter` and
+    `LoadFrames.sink` swallow the `TypeError` such a callback raises.
     """
 
     def __call__(
@@ -74,13 +84,8 @@ class ProgressCb(Protocol):
         file_step: int | None = None,
         file_total: int | None = None,
         file_label: str | None = None,
+        file_component: str | None = None,
     ) -> None: ...
-
-
-#: Byte-level progress callback handed to a component loader: `(done_bytes,
-#: total_bytes)`. It carries no name — the file it describes is bound when the
-#: reporter is built, because the file does not change during one load.
-FileProgressCb = Callable[[int, int], None]
 
 
 def _progress_reporter(
@@ -99,47 +104,94 @@ def _progress_reporter(
     return report
 
 
-def _file_progress_reporter(
-    callback: ProgressCb | None,
-    phase: str,
-    total: int,
-    step: int,
-    label: str,
-    file_label: str,
-) -> FileProgressCb:
-    """Bind ONE step frame so a loader can report BYTES inside it.
+class ReadEvent(Protocol):
+    """The fields of the manager's `LoadProgress` frame this module reads (`runtime.large_models.loader`)."""
 
-    The returned `report(done_bytes, total_bytes)` re-emits the very frame the
-    step-level reporter emitted — same `phase`, `step`, `total` and `label` — and
-    only ADDS the three optional file fields. That is what keeps the overall bar
-    parked on this step while the second bar fills: the byte level must never
-    move `step`/`total`, which are a wire contract shared with the Rust client
-    (`LOAD_STEP_*`).
+    @property
+    def component(self) -> str: ...
 
-    `file_label` names the FILE being read (a checkpoint name), not the tensor
-    inside it: the client renders it as «<label> — <done> из <total> ГиБ», and a
-    tensor key would flicker on every frame while saying nothing the user can
-    act on.
+    @property
+    def done_bytes(self) -> int: ...
 
-    Like `_progress_reporter`, the result never raises: a dead IPC peer, or a
-    callback that only accepts the four positional arguments, must not kill a
-    load that is otherwise succeeding.
+    @property
+    def total_bytes(self) -> int: ...
+
+
+class LoadFrames:
+    """A request's `ProgressCb` that also turns the manager's disk-read frames into the wire's SECOND (byte) level.
+
+    Every step-level frame (a call without file fields: a `load` step or a
+    `generate` step) passes straight through and is remembered. `sink` is the
+    `Session.set_load_progress` sink of every session of the request: a read
+    of a component named in `files` re-emits the LAST step-level frame — same
+    `phase`, `step`, `total`, `label` — with only `file_step` / `file_total`
+    (bytes of this read) / `file_label` / `file_component` added. So the byte
+    level never moves `step` / `total` (`LOAD_STEP_*`, a contract with the
+    Rust client): a read during the load phase rides on the load step that
+    announced it (`LOAD_STEP_TRANSFORMER`, `LOAD_STEP_TEXT_ENCODER`), and a
+    re-read inside a phase (a DISK-tier component brought back, a degrade
+    retry's reload) rides on the current step of that phase, a `generate`
+    frame during the denoise.
+
+    `files`: `{manager component name: (file_component, file_label)}`;
+    `file_label` names the file (single file, GGUF) or the folder of a
+    sharded component — never a tensor key, which would flicker on every frame.
+    Components absent from it (the VAE: tens of MB) send no byte frames.
+
+    `__call__` propagates what the wrapped callback raises (a raising
+    `generate` callback aborts the run, as it always did); `sink` never raises,
+    so a dead peer cannot kill a read that is otherwise succeeding.
     """
 
-    def report(done_bytes: int, total_bytes: int) -> None:
-        if callback is None:
-            return
-        try:
-            callback(
-                phase,
-                int(step),
-                int(total),
-                str(label),
-                file_step=int(done_bytes),
-                file_total=int(total_bytes),
-                file_label=str(file_label),
-            )
-        except Exception:  # noqa: BLE001 - a dead or older peer must not kill the load
-            pass
+    def __init__(self, callback: ProgressCb, files: Mapping[str, tuple[str, str]]) -> None:
+        self._callback = callback
+        self._files = dict(files)
+        self._last: tuple[str, int, int, str] | None = None
 
-    return report
+    def __call__(
+        self,
+        phase: str,
+        step: int,
+        total: int,
+        label: str,
+        *,
+        file_step: int | None = None,
+        file_total: int | None = None,
+        file_label: str | None = None,
+        file_component: str | None = None,
+    ) -> None:
+        file_level = {
+            key: value
+            for key, value in (("file_step", file_step), ("file_total", file_total), ("file_label", file_label), ("file_component", file_component))
+            if value is not None
+        }
+        if not file_level:
+            self._last = (phase, int(step), int(total), str(label))
+        self._callback(phase, step, total, label, **file_level)
+
+    def sink(self, event: ReadEvent) -> None:
+        """`Session.set_load_progress` sink: one byte frame on the current step.
+
+        Nothing is sent before the first step frame, for a component absent
+        from `files`, or for the empty frame of a read that reads nothing
+        (`total_bytes == 0`: a bar over zero bytes says nothing).
+        """
+        named = self._files.get(event.component)
+        last = self._last
+        if named is None or last is None or event.total_bytes <= 0:
+            return
+        file_component, file_label = named
+        phase, step, total, label = last
+        try:
+            self._callback(
+                phase,
+                step,
+                total,
+                label,
+                file_step=int(event.done_bytes),
+                file_total=int(event.total_bytes),
+                file_label=file_label,
+                file_component=file_component,
+            )
+        except Exception:  # noqa: BLE001 - a dead or older peer must not kill the read
+            pass

@@ -19,6 +19,12 @@ Main responsibilities:
 - the transformer config contract (`find_transformer_config_dir`,
   `validate_transformer_config_dir`, `_missing_transformer_config_message`);
 - text-encoder availability (`text_encoder_available`, `require_text_encoder`);
+- the config of a GGUF component (`find_text_encoder_config_dir`,
+  `text_encoder_config_dir`, the GGUF branch of `find_transformer_config_dir`):
+  probed beside the file, then in the installed 4B package
+  (`installed_4b_package_root`, `FLUX2_KLEIN_4B_DIR_NAME`), each candidate
+  checked against the file's header (`_search_gguf_config`); the package root
+  also joins the tokenizer / scheduler search for a GGUF component;
 - the encoder<->transformer width contract (`TEXT_ENCODER_OUT_LAYER_INDICES`,
   `TEXT_ENCODER_OUT_LAYERS`, `transformer_config_dir`,
   `require_encoder_transformer_compatible`) — the one check that tells a 9B
@@ -43,26 +49,52 @@ Notes:
   through this module object, so every consumer outside this file must reach
   them as `components._weight_bytes(...)` / through this module rather than by
   importing the name - one patch must reach every caller.
-- No torch import: this module answers questions about the filesystem only.
+- No torch import: this module answers questions about the filesystem only
+  (GGUF headers through the torch-free `runtime.tensor_container`; the `gguf`
+  package's key and tensor names are imported lazily).
+- `installed_4b_package_root` is replaced by the test suite through this
+  module object (no test may see the machine's real `side_models/`).
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
+import re
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ...runtime.encoder_truncation import keep_layers_for_hidden_states
+from ...runtime.paths import side_models_root
 from ...runtime.safetensors_stream import (  # noqa: F401 - re-bound for the package's callers
     MAX_SAFETENSORS_HEADER_BYTES,
     read_safetensors_header,
     read_safetensors_header_and_data_start,
 )
+from ...runtime.tensor_container import ContainerLayout, container_kind, read_container_layout
 from ...runtime.torch_support import is_torch_available
 from .params import MAX_REGION_PIXELS
 
 log = logging.getLogger(__name__)
+
+#: Directory under `side_models/` that holds the installed FLUX.2 klein 4B
+#: package (the Rust catalog downloads it there: `ms_config::Flux2Variant::Klein4B`'s
+#: `dir_name`). A GGUF component kept OUTSIDE that package borrows its config,
+#: tokenizer and scheduler from it (`installed_4b_package_root`).
+FLUX2_KLEIN_4B_DIR_NAME = "FLUX.2-klein-4B"
+
+#: Subdirectory of a klein package holding the text encoder's `config.json`.
+_TEXT_ENCODER_SUBDIR = "text_encoder"
+
+#: `architectures` a text-encoder `config.json` found for a GGUF encoder must declare.
+_TEXT_ENCODER_ARCHITECTURES = ["Qwen3ForCausalLM"]
+
+#: `general.architecture` of a llama.cpp GGUF of the Qwen3 text encoder.
+GGUF_ENCODER_ARCHITECTURE = "qwen3"
+
 
 #: Subdirectory names searched for the two components the user does not supply.
 _TOKENIZER_SUBDIR = "tokenizer"
@@ -148,7 +180,7 @@ VAE_TILE_THRESHOLD_FALLBACK_PIXELS = MAX_REGION_PIXELS
 # =====================================================================
 #  Component discovery (tokenizer / scheduler / transformer config)
 # =====================================================================
-def component_search_roots(normalized_or_paths: dict[str, Any]) -> list[Path]:
+def component_search_roots(normalized_or_paths: Mapping[str, Any], *, package_fallback: bool = True) -> list[Path]:
     """Directories searched for the components the user does not supply.
 
     Order (first match wins): the text-encoder directory and its parent, then the
@@ -156,6 +188,13 @@ def component_search_roots(normalized_or_paths: dict[str, Any]) -> list[Path]:
     A klein checkout keeps `text_encoder/`, `tokenizer/`, `scheduler/`, `vae/` and
     `transformer/` side by side, so the parent of any supplied path is usually
     the repository root.
+
+    When `package_fallback` and the text encoder or the transformer is a GGUF
+    file (kept anywhere, e.g. a user's own model folder), the installed 4B
+    package root (`installed_4b_package_root`) is appended LAST: a GGUF file
+    carries no tokenizer or scheduler, and the 4B package is the model those
+    files were made from. Safetensors / folder paths never get it, so 9B and
+    bf16 discovery is unchanged.
     """
     roots: list[Path] = []
     for key in ("text_encoder_path", "transformer_path", "vae_path"):
@@ -167,7 +206,57 @@ def component_search_roots(normalized_or_paths: dict[str, Any]) -> list[Path]:
         for root in (base, base.parent):
             if root not in roots:
                 roots.append(root)
+    if package_fallback and _has_gguf_component(normalized_or_paths):
+        package = installed_4b_package_root()
+        if package not in roots:
+            log.debug("FLUX.2 klein: GGUF-компонент — в поиск токенизатора и планировщика добавлен пакет %s", package)
+            roots.append(package)
     return roots
+
+
+def _has_gguf_component(paths: Mapping[str, Any]) -> bool:
+    """Whether the text encoder or the transformer path names a GGUF file."""
+    return any(is_gguf_file(Path(raw)) for raw in (str(paths.get(key) or "").strip() for key in ("text_encoder_path", "transformer_path")) if raw)
+
+
+def installed_4b_package_root() -> Path:
+    """`<side_models>/FLUX.2-klein-4B`: the installed 4B package (it may not exist).
+
+    Replaced by the test suite through this module object, so every caller
+    looks it up here at call time.
+    """
+    return side_models_root() / FLUX2_KLEIN_4B_DIR_NAME
+
+
+def is_gguf_file(path: Path) -> bool:
+    """Whether `path` is an existing file with the GGUF magic.
+
+    Discovery helpers ask this and must not fail on a path they merely
+    inspect: an unreadable file is logged and answered `False`, and the loader
+    that later opens it gives the real diagnosis.
+    """
+    try:
+        return path.is_file() and container_kind(path) == "gguf"
+    except (OSError, ValueError) as exc:
+        log.debug("FLUX.2 klein: не удалось проверить контейнер %s (%s)", path, exc)
+        return False
+
+
+@functools.lru_cache(maxsize=8)
+def _cached_layout(path: str, size: int, mtime_ns: int) -> ContainerLayout:
+    """`read_container_layout`, cached per path, size and mtime (the config probes re-read a header several times per run)."""
+    return read_container_layout(path)
+
+
+def gguf_layout(path: Path) -> ContainerLayout:
+    """The parsed header of the GGUF file `path` (no tensor byte read), cached while the file is unchanged.
+
+    # Raises
+    `OSError` when the file cannot be stat'ed; `ValueError` for a malformed
+    header (`runtime.tensor_container`).
+    """
+    stat = path.stat()
+    return _cached_layout(str(path), int(stat.st_size), int(stat.st_mtime_ns))
 
 
 def component_probe_order(roots: list[Path], subdir: str) -> list[Path]:
@@ -298,10 +387,229 @@ def find_transformer_config_dir(source: Path) -> Path | None:
     `None` when there is none: the caller must refuse the load, because the
     parameters that config carries cannot be recovered from the weights (see
     `_missing_transformer_config_message`).
+
+    A GGUF `source` goes through `_search_gguf_config` instead: the same probes
+    plus the installed 4B package's `transformer/`, each candidate checked
+    against the file's header (`_gguf_transformer_mismatch`).
     """
+    if is_gguf_file(source):
+        return _search_gguf_config(source, _TRANSFORMER_SUBDIR, _gguf_transformer_mismatch).found
     return discover_component_dir(
         transformer_config_roots(source), _TRANSFORMER_SUBDIR, (_MODEL_CONFIG_MARKER,)
     )
+
+
+# =====================================================================
+#  Config discovery for a GGUF component
+# =====================================================================
+@dataclass(frozen=True)
+class GgufConfigSearch:
+    """The outcome of a config probe for a GGUF file.
+
+    `found` is the accepted config directory (`None`: none fits); `probed` every
+    directory looked at, in order; `rejected` the `(directory, reason)` of each
+    `config.json` that exists but contradicts the file (or is unreadable).
+    """
+
+    found: Path | None
+    probed: tuple[Path, ...]
+    rejected: tuple[tuple[Path, str], ...]
+
+
+#: `mismatch(config, layout, strict) -> reason | None` of one component kind.
+_Mismatch = Callable[[Mapping[str, Any], ContainerLayout, bool], "str | None"]
+
+
+def gguf_config_candidates(source: Path, subdir: str) -> list[tuple[Path, bool]]:
+    """`(directory, is_package_fallback)` probed for the config of the GGUF file `source`, in order.
+
+    The file's directory and its parent (`<root>/<subdir>`, then `<root>`,
+    as `component_probe_order`), then the installed 4B package's
+    `<subdir>` (`installed_4b_package_root`), unless already probed. Pure path
+    arithmetic.
+    """
+    order = [(candidate, False) for candidate in component_probe_order(transformer_config_roots(source), subdir)]
+    fallback = installed_4b_package_root() / subdir
+    if all(candidate != fallback for candidate, _ in order):
+        order.append((fallback, True))
+    return order
+
+
+def _compare_declared(pairs: Sequence[tuple[str, int | None, int | None, bool]], strict: bool) -> str | None:
+    """First contradiction among `(what, file value, config value, required)` pairs, or `None`.
+
+    A pair with an undeclared side is skipped, except a `required` pair under
+    `strict` (the package fallback must PROVE it is the file's model).
+    """
+    for what, in_file, in_config, required in pairs:
+        if in_file is None or in_config is None:
+            if strict and required:
+                side = "в файле" if in_file is None else "в config.json"
+                return f"{what}: не объявлено {side}"
+            continue
+        if in_file != in_config:
+            return f"{what}: в файле {in_file}, в config.json {in_config}"
+    return None
+
+
+def _search_gguf_config(source: Path, subdir: str, mismatch: _Mismatch) -> GgufConfigSearch:
+    """Probe `gguf_config_candidates` for the first `config.json` consistent with the GGUF header of `source`.
+
+    A candidate beside the file is accepted when nothing it declares
+    contradicts the header; the package fallback only when every required
+    field is declared on both sides and equal (`strict`). The accepted
+    directory is logged at DEBUG (the module builds log it at INFO); a
+    rejected one at INFO with its reason.
+
+    # Raises
+    `OSError` / `ValueError` when the GGUF header itself cannot be read.
+    """
+    layout = gguf_layout(source)
+    probed: list[Path] = []
+    rejected: list[tuple[Path, str]] = []
+    for candidate, strict in gguf_config_candidates(source, subdir):
+        probed.append(candidate)
+        config_path = candidate / _MODEL_CONFIG_MARKER
+        try:
+            present = config_path.is_file()
+        except OSError as exc:
+            log.debug("FLUX.2 klein: не удалось проверить %s (%s)", config_path, exc)
+            continue
+        if not present:
+            continue
+        data = _read_json_object(config_path)
+        reason = "config.json не читается как JSON-объект" if data is None else mismatch(data, layout, strict)
+        if reason is not None:
+            log.info("FLUX.2 klein: конфиг %s не подходит к GGUF %s: %s", config_path, source.name, reason)
+            rejected.append((candidate, reason))
+            continue
+        origin = " (из установленного пакета FLUX.2 klein 4B)" if strict else ""
+        # DEBUG: the probe runs several times per request (guards, refusals,
+        # identity); the module build logs the config it really uses at INFO.
+        log.debug("FLUX.2 klein: для GGUF %s взят конфиг %s%s", source.name, config_path, origin)
+        return GgufConfigSearch(candidate, tuple(probed), tuple(rejected))
+    return GgufConfigSearch(None, tuple(probed), tuple(rejected))
+
+
+def _missing_gguf_config_message(source: Path, component: str, search: GgufConfigSearch, expected_subdir: str) -> str:
+    """The refusal for a GGUF file no `config.json` fits: what was probed, what was rejected and why, the way out."""
+    rejected = "".join(f"\n  {directory}: {reason}" for directory, reason in search.rejected)
+    rejected_text = f"\nОтклонены (не совпадают с заголовком файла):{rejected}" if search.rejected else ""
+    return (
+        f"Не найден config.json {component} для GGUF-файла {source.name}: GGUF не содержит "
+        "конфигурации модели, а подобрать её по весам нельзя.\n"
+        "Что сделать: установите пакет FLUX.2 klein 4B («Установка модели»), либо положите "
+        f"config.json {component} ОТ ЭТОЙ ЖЕ модели как «{source.parent / expected_subdir / _MODEL_CONFIG_MARKER}».\n"
+        f"Просмотрены каталоги: {', '.join(str(path) for path in search.probed)}"
+        f"{rejected_text}"
+    )
+
+
+_DOUBLE_BLOCK_RE = re.compile(r"^(?:double_blocks|transformer_blocks)\.(\d+)\.")
+_SINGLE_BLOCK_RE = re.compile(r"^(?:single_blocks|single_transformer_blocks)\.(\d+)\.")
+#: The image / text embedders in the BFL and the diffusers layout (`(out = inner width, in)`).
+_IMAGE_EMBEDDERS = ("img_in.weight", "x_embedder.weight")
+_TEXT_EMBEDDERS = ("txt_in.weight", "context_embedder.weight")
+
+
+def _block_count(names: Sequence[str], pattern: re.Pattern[str]) -> int | None:
+    indices = {int(match.group(1)) for name in names if (match := pattern.match(name)) is not None}
+    return max(indices) + 1 if indices else None
+
+
+def _gguf_transformer_mismatch(config: Mapping[str, Any], layout: ContainerLayout, strict: bool) -> str | None:
+    """Why a transformer `config.json` does not describe the GGUF `layout` (`None`: it does).
+
+    Compared: the class name, the double / single block counts and the inner
+    width (required under `strict`), and the latent / text input widths when
+    the embedder is a plain tensor (a quantized row hides its input width).
+    """
+    class_name = config.get("_class_name")
+    if isinstance(class_name, str) and class_name != _TRANSFORMER_CONFIG_CLASS_NAME:
+        return f"конфиг класса «{class_name}», а не «{_TRANSFORMER_CONFIG_CLASS_NAME}»"
+    names = [span.name for span in layout.spans]
+    spans = {span.name: span for span in layout.spans}
+    image = next((spans[name] for name in _IMAGE_EMBEDDERS if name in spans), None)
+    text = next((spans[name] for name in _TEXT_EMBEDDERS if name in spans), None)
+    heads = _config_int(config, "num_attention_heads")
+    head_dim = _config_int(config, "attention_head_dim")
+    width = heads * head_dim if heads is not None and head_dim is not None else None
+    pairs = (
+        ("двойных блоков", _block_count(names, _DOUBLE_BLOCK_RE), _config_int(config, "num_layers"), True),
+        ("одиночных блоков", _block_count(names, _SINGLE_BLOCK_RE), _config_int(config, "num_single_layers"), True),
+        ("ширина модели", image.shape[0] if image is not None else None, width, True),
+        ("входные каналы", image.shape[1] if image is not None and image.quant_type is None and len(image.shape) == 2 else None, _config_int(config, "in_channels"), False),
+        ("ширина текста", text.shape[1] if text is not None and text.quant_type is None and len(text.shape) == 2 else None, _config_int(config, "joint_attention_dim"), False),
+    )
+    return _compare_declared(pairs, strict)
+
+
+def _gguf_encoder_mismatch(config: Mapping[str, Any], layout: ContainerLayout, strict: bool) -> str | None:
+    """Why a text-encoder `config.json` does not describe the Qwen3 GGUF `layout` (`None`: it does).
+
+    The config must declare `architectures == ["Qwen3ForCausalLM"]`; the
+    file's `general.architecture` must be `qwen3`; then the GGUF hyper
+    parameters (`qwen3.block_count`, `.embedding_length`, the head counts:
+    required under `strict`; `.feed_forward_length`, `.attention.key_length`,
+    the embedding rows) are compared with the config's.
+    """
+    architectures = config.get("architectures")
+    if architectures != _TEXT_ENCODER_ARCHITECTURES:
+        return f"architectures = {architectures!r}, нужен {_TEXT_ENCODER_ARCHITECTURES!r}"
+    # The key and tensor names are the `gguf` package's own (the header was
+    # parsed with it already, so the import costs nothing new).
+    import gguf
+
+    metadata = layout.gguf.metadata if layout.gguf is not None else {}
+    arch = metadata.get(gguf.Keys.General.ARCHITECTURE)
+    if arch != GGUF_ENCODER_ARCHITECTURE:
+        return f"файл объявляет архитектуру {arch!r}, а не {GGUF_ENCODER_ARCHITECTURE!r}"
+
+    def key(template: str) -> str:
+        return template.format(arch=GGUF_ENCODER_ARCHITECTURE)
+
+    embedding_name = f"{gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.TOKEN_EMBD]}.weight"
+    embedding = next((span for span in layout.spans if span.name == embedding_name), None)
+    pairs = (
+        ("слоёв", _config_int(metadata, key(gguf.Keys.LLM.BLOCK_COUNT)), _config_int(config, "num_hidden_layers"), True),
+        ("ширина", _config_int(metadata, key(gguf.Keys.LLM.EMBEDDING_LENGTH)), _config_int(config, "hidden_size"), True),
+        ("голов внимания", _config_int(metadata, key(gguf.Keys.Attention.HEAD_COUNT)), _config_int(config, "num_attention_heads"), True),
+        ("голов ключей", _config_int(metadata, key(gguf.Keys.Attention.HEAD_COUNT_KV)), _config_int(config, "num_key_value_heads"), True),
+        ("ширина MLP", _config_int(metadata, key(gguf.Keys.LLM.FEED_FORWARD_LENGTH)), _config_int(config, "intermediate_size"), False),
+        ("размер головы", _config_int(metadata, key(gguf.Keys.Attention.KEY_LENGTH)), _config_int(config, "head_dim"), False),
+        ("размер словаря", embedding.shape[0] if embedding is not None else None, _config_int(config, "vocab_size"), False),
+    )
+    return _compare_declared(pairs, strict)
+
+
+def find_text_encoder_config_dir(gguf_file: Path) -> Path:
+    """The directory of the Qwen3 `config.json` that describes the GGUF text encoder `gguf_file`.
+
+    Probes `<dir>/text_encoder`, `<dir>`, `<parent>/text_encoder`, `<parent>`
+    of the file, then the installed 4B package's `text_encoder/`, accepting the
+    first config consistent with the file's header (`_gguf_encoder_mismatch`).
+
+    # Raises
+    `FileNotFoundError` naming every probed and rejected directory and the way
+    out when none fits; `OSError` / `ValueError` when the header is unreadable.
+    """
+    search = _search_gguf_config(gguf_file, _TEXT_ENCODER_SUBDIR, _gguf_encoder_mismatch)
+    if search.found is None:
+        raise FileNotFoundError(_missing_gguf_config_message(gguf_file, "текстового энкодера", search, _TEXT_ENCODER_SUBDIR))
+    return search.found
+
+
+def text_encoder_config_dir(text_encoder_path: str) -> Path:
+    """The directory holding the text encoder's `config.json`: a GGUF file's found config (`find_text_encoder_config_dir`), else the folder (`component_dir_for_path`).
+
+    # Raises
+    As `find_text_encoder_config_dir` for a GGUF file; never for a folder (the
+    folder is returned unchanged and its caller diagnoses it).
+    """
+    source = Path(text_encoder_path)
+    if is_gguf_file(source):
+        return find_text_encoder_config_dir(source)
+    return component_dir_for_path(source)
 
 
 def validate_transformer_config_dir(config_dir: Path) -> None:
@@ -343,7 +651,13 @@ def _missing_transformer_config_message(source: Path) -> str:
     derivable from the weights, and a wrong value for any of them produces a
     model whose tensor shapes are IDENTICAL — nothing would catch it before the
     user got quietly wrong images.
+
+    A GGUF `source` gets `_missing_gguf_config_message` (the package fallback
+    and every rejected config are part of the story).
     """
+    if is_gguf_file(source):
+        search = _search_gguf_config(source, _TRANSFORMER_SUBDIR, _gguf_transformer_mismatch)
+        return _missing_gguf_config_message(source, "трансформера", search, _TRANSFORMER_SUBDIR)
     searched = ", ".join(
         str(candidate)
         for candidate in component_probe_order(transformer_config_roots(source), _TRANSFORMER_SUBDIR)
@@ -471,7 +785,7 @@ def _read_json_object(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _config_int(data: dict[str, Any] | None, key: str) -> int | None:
+def _config_int(data: Mapping[str, Any] | None, key: str) -> int | None:
     """A positive integer field of a model config, or `None` when it is absent.
 
     `bool` is rejected explicitly because it is a subclass of `int` and a `true`
@@ -540,7 +854,14 @@ def require_encoder_transformer_compatible(paths: dict[str, Any]) -> None:
     if config_dir is None:
         return
     transformer_config = config_dir / _MODEL_CONFIG_MARKER
-    encoder_config = component_dir_for_path(Path(encoder_raw)) / _MODEL_CONFIG_MARKER
+    try:
+        encoder_config = text_encoder_config_dir(encoder_raw) / _MODEL_CONFIG_MARKER
+    except (OSError, ValueError) as exc:
+        # A GGUF encoder whose config cannot be found or whose header cannot be
+        # read: a different fault, refused with its own wording by
+        # `large_model.require_loadable_encoder`.
+        log.debug("FLUX.2 klein: совместимость энкодера и трансформера не проверена — конфиг энкодера %s не найден (%s)", encoder_raw, exc)
+        return
 
     joint = _config_int(_read_json_object(transformer_config), "joint_attention_dim")
     hidden = _config_int(_read_json_object(encoder_config), "hidden_size")
@@ -614,9 +935,12 @@ def model_index_search_roots(paths: dict[str, Any]) -> list[Path]:
     key, so letting the encoder's root decide would let two requests that share
     a pipeline key disagree about `is_distilled`. Nothing is lost in the shipped layout: a
     klein checkout keeps `model_index.json` in the root that is the parent of
-    both `transformer/` and `vae/`.
+    both `transformer/` and `vae/`. The installed-package fallback of a GGUF
+    file is excluded for the same reason: klein 4B and klein base 4B share every
+    shape, so a borrowed manifest could declare a distillation the file does
+    not have.
     """
-    return component_search_roots({key: paths.get(key) for key in ("transformer_path", "vae_path")})
+    return component_search_roots({key: paths.get(key) for key in ("transformer_path", "vae_path")}, package_fallback=False)
 
 
 def checkpoint_is_distilled(paths: dict[str, Any]) -> bool | None:

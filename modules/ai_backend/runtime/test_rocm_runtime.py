@@ -8,7 +8,8 @@ without overriding explicit user values, and that it forces
 `expandable_segments:False` into the allocator-config variable Torch will
 ACTUALLY read - overriding an explicit user value there, since that one is a
 correctness hazard rather than a preference - unless
-`MS_ALLOW_EXPANDABLE_SEGMENTS` opts out.
+`MS_ALLOW_EXPANDABLE_SEGMENTS` opts out - and that it removes a truthy
+`DIFFUSERS_GGUF_CUDA_KERNELS` on ROCm only.
 
 Notes:
 - A fake `torch` module is injected into `sys.modules` so the tests do not need
@@ -51,6 +52,7 @@ _MIOPEN_ENV_KEYS = (
     "PYTORCH_HIP_ALLOC_CONF",
     "PYTORCH_ALLOC_CONF",
     "MS_ALLOW_EXPANDABLE_SEGMENTS",
+    "DIFFUSERS_GGUF_CUDA_KERNELS",
 )
 
 
@@ -226,6 +228,35 @@ class RocmRuntimeTests(_RocmRuntimeCase):
         self._configure_rocm()
         for key in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
             self.assertNotIn(key, os.environ)
+
+
+class GgufCudaKernelsGuardTests(_RocmRuntimeCase):
+    """diffusers' GGUF CUDA kernels must never be enabled on a ROCm build."""
+
+    def test_a_truthy_flag_is_removed_with_a_warning(self) -> None:
+        for value in ("1", "true", "YES"):
+            with self.subTest(value=value):
+                os.environ["DIFFUSERS_GGUF_CUDA_KERNELS"] = value
+                with self.assertLogs("modules.ai_backend.runtime.rocm_runtime", "WARNING") as caught:
+                    self._configure_rocm()
+                self.assertNotIn("DIFFUSERS_GGUF_CUDA_KERNELS", os.environ)
+                self.assertIn("DIFFUSERS_GGUF_CUDA_KERNELS", "\n".join(caught.output))
+
+    def test_a_value_diffusers_reads_as_off_is_left_alone(self) -> None:
+        # diffusers compares without stripping, so " 1" already means off.
+        for value in ("false", "0", " 1", ""):
+            with self.subTest(value=value):
+                os.environ["DIFFUSERS_GGUF_CUDA_KERNELS"] = value
+                self._configure_rocm()
+                self.assertEqual(os.environ["DIFFUSERS_GGUF_CUDA_KERNELS"], value)
+
+    def test_a_cuda_build_keeps_the_flag(self) -> None:
+        # On NVIDIA the kernels are the user's legitimate choice.
+        os.environ["DIFFUSERS_GGUF_CUDA_KERNELS"] = "1"
+        sys.modules["torch"] = _make_fake_torch(hip_version=None)
+        rocm_runtime = _load_rocm_runtime()
+        self.assertFalse(rocm_runtime.configure_rocm_runtime())
+        self.assertEqual(os.environ["DIFFUSERS_GGUF_CUDA_KERNELS"], "1")
 
 
 class ErrorTextGateTests(_RocmRuntimeCase):

@@ -53,6 +53,9 @@ Contracts (measured defaults, see the package MODULE_README):
 Notes:
 - torch is imported lazily. Reads use `os.preadv` where the OS has it
   (Linux, macOS), else seek + readinto on a private unbuffered handle.
+- A DISK block's absolute offsets are its spans plus the file's data start,
+  taken from `runtime.tensor_container.read_container_layout` (safetensors or
+  GGUF); a quantized GGUF block streams as its uint8 rows like any other.
 """
 
 from __future__ import annotations
@@ -67,7 +70,8 @@ from pathlib import Path
 from typing import Any
 
 from ..memory_budget import HostWatch
-from ..safetensors_stream import read_safetensors_header_and_data_start
+from ..safetensors_stream import SAFETENSORS_DTYPES_WITH_F8
+from ..tensor_container import read_container_layout
 from .ledger import UnitRef, debug_enabled
 from .loader import PACK_ALIGN, LoadedComponent, Stream, TensorSlot, Transport, packed_layout, packed_view
 from .tiers import ComponentPlan, Tier
@@ -316,7 +320,8 @@ class HookSet:
             if ledger.tier(ref) is Tier.DISK:
                 for entry in component.unit_spans[ref]:
                     if entry.file not in data_start:
-                        data_start[entry.file] = read_safetensors_header_and_data_start(entry.file)[1]
+                        # The container's own data start (safetensors or GGUF), same table as the inventory.
+                        data_start[entry.file] = read_container_layout(entry.file, dtypes=SAFETENSORS_DTYPES_WITH_F8).data_start
         slot_bytes = staging_bytes = 0
         for ref in hooked:
             entries = component.units[ref]

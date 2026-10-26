@@ -37,6 +37,11 @@ ms-native-runtime` line (`ARCHITECTURE.md` §2).
   contract test). A question's `ProfilesRequest::references` (`[w, h]` of every reference image,
   FLUX.3 klein: the region first) travel as `shape.references` only when non-empty, so a model
   without references (FLUX.2) sends the shape it always did; they are part of `ProfilesKey`.
+  The answer's FLUX.2-only additive keys `encoder` (the text encoder's plan) and
+  `encoder_formats` (its weight-format rows, the `formats` row shape) read as `None` / empty
+  when absent or `null`, and are parsed strictly when present. A forecast's optional
+  `host_baseline` (the baseline RSS its `host_peak` includes) reads as `None` when absent; it
+  lets a consumer add two forecasts' host peaks without counting the process twice.
 - `local_ai.rs`: `LocalAiAvailability` (may this process use the Python backend / native ONNX:
   `--no-ai` switches both off, the platform capability table decides independently, a platform
   reason wins; built once at startup), `LocalAiOff` / `LocalRuntime` / `LocalAiOffReason` (typed

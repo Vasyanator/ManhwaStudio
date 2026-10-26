@@ -123,6 +123,12 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   reclaim: `runtime/residency/`), large-model placement / forecast / degrade
   (`runtime/large_models/`: a model service declares specs and phases, never moves a weight),
   checkpoint -> meta-module filling (`runtime.safetensors_stream.fill_module_from_safetensors`),
+  weight-container dispatch (`runtime/tensor_container`; GGUF header parsing `runtime/gguf_stream`),
+  GGUF dequantizing layers (`runtime/gguf_layers`; never set `DIFFUSERS_GGUF_CUDA_KERNELS`, ROCm
+  reports a CUDA-like capability), the FLUX.2 weight-format list (`ms_config::Flux2WeightFormat`;
+  Python lists no quants), llama.cpp <-> HF Qwen3 tensor names (the `gguf` package's own map via
+  `flux2_klein/encoder_gguf.py`), adoption of present-but-unmarked catalog files
+  (`ms_sysprobe::ai_models::external::adopt_external_model`),
   OS integration records — record names (`ms_os_integration::identity`), expected registry
   values (`ms_os_integration::windows::values`) and the "Open with" ownership rule
   (`open_with_command_targets_install`); no other crate spells a record name or builds its values;

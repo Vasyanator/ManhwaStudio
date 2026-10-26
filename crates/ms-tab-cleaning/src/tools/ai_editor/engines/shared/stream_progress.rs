@@ -13,8 +13,9 @@ Main responsibilities:
 - own `EngineProgress` and the `Mutex` discipline around it (`lock_progress`,
   `begin_progress_generation`, `retire_progress_generation`, `update_progress`,
   `publish_progress_frame`);
-- keep a bounded sliding window of transfer samples and derive speed and ETA from it
-  (`RateEstimator`, `transfer_status`);
+- keep a bounded sliding window of byte samples — a download's overall counter, or the
+  per-file counter of a load reading a model file from disk — and derive speed and ETA from
+  it (`RateEstimator`, `RateSource`, `transfer_status`);
 - parse a streamed progress frame (`parse_progress_frame`) and what a large-model run's
   answer says about a degraded run (`parse_degraded`);
 - run one streaming backend call whose id a cancel can reach (`stream_call`), and ask the
@@ -25,8 +26,8 @@ Main responsibilities:
 - format the rate and duration strings the bar shows (bytes: `large_models::format_gib`).
 
 Key structures:
-- `EngineProgress`, `ProgressClaim`, `CallControl`, `AbandonedJobs`, `RateEstimator`, `FileProgress`,
-  `ProgressFrame`, `RunDegraded`
+- `EngineProgress`, `ProgressClaim`, `CallControl`, `AbandonedJobs`, `RateEstimator`, `RateSource`,
+  `FileProgress`, `ProgressFrame`, `RunDegraded`
 
 Key functions:
 - `begin_progress_generation()`, `retire_progress_generation()`, `update_progress()`,
@@ -34,7 +35,7 @@ Key functions:
 - `progress_fraction()`, `progress_fractions()`, `transfer_status()`
 - `parse_progress_frame()`, `parse_degraded()`, `stream_call()`, `map_call_error()`,
   `spawn_backend_cancel()`
-- `format_mib_per_second()`, `format_eta()`
+- `format_mib_per_second()`, `format_eta()`, `file_component_label()`
 
 Notes:
 The GENERATION is the invariant: a frame whose generation no longer matches the live one
@@ -75,13 +76,16 @@ pub(in crate::tools::ai_editor::engines) struct EngineProgress {
     /// the engine localizes; `None` for a backend that sends none (FLUX.2), whose `label` is
     /// then the only text there is.
     pub(in crate::tools::ai_editor::engines) stage: Option<String>,
-    /// The file a model download is transferring right now, `None` for every
-    /// operation and every phase that has no second level. See [`FileProgress`].
+    /// The file a model download is transferring or a load is reading right now, `None` for
+    /// every operation and every phase that has no second level. See [`FileProgress`].
     pub(in crate::tools::ai_editor::engines) file: Option<FileProgress>,
-    /// Transfer rate over the OVERALL counter, fed only by `download` frames. Reset by
-    /// [`begin_progress_generation`], so a new operation never inherits the previous
-    /// transfer's speed.
+    /// Transfer rate of the counter `rate_source` names: the OVERALL counter of `download`
+    /// frames, or the per-file counter of `load` frames that read a file from disk. Reset by
+    /// [`begin_progress_generation`] and whenever the source changes, so a new operation (or
+    /// the next file) never inherits the previous transfer's speed.
     pub(in crate::tools::ai_editor::engines) rate: RateEstimator,
+    /// What `rate` measures; `None` until a frame with a byte counter arrived.
+    pub(in crate::tools::ai_editor::engines) rate_source: Option<RateSource>,
     /// The cancellation control of the operation that owns `generation` (`None` before the
     /// first claim). Deliberately NOT a display field written through [`update_progress`]:
     /// the worker holds its own clone through [`ProgressClaim`], so an id it publishes AFTER a
@@ -249,25 +253,99 @@ pub(in crate::tools::ai_editor::engines) const RATE_WINDOW: Duration = Duration:
 /// is worse than no estimate. Nothing is shown until the window spans this much real time.
 pub(in crate::tools::ai_editor::engines) const RATE_MIN_SPAN: Duration = Duration::from_millis(1500);
 
-/// Rolling transfer-rate estimator over the OVERALL byte counter.
+/// Wall-clock span the DISK-READ rate (a model load's per-file counter) averages over.
 ///
-/// Fed from `step`/`total` and never from the per-file counters: the per-file counter resets
-/// at every file boundary, which on a 35 GB plan would make the rate jump to nonsense
-/// several times per gigabyte.
+/// Shorter than [`RATE_WINDOW`]: a load reads a component in seconds to a minute, so a
+/// five-second average would trail the real speed for most of it, while one second at the
+/// backend's ~5 frames per second still averages several chunks and does not jump.
+pub(in crate::tools::ai_editor::engines) const DISK_READ_RATE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Shortest span the disk-read window must cover before a rate is shown (see
+/// [`RATE_MIN_SPAN`]): one full window, so the first number is already a one-second average.
+pub(in crate::tools::ai_editor::engines) const DISK_READ_RATE_MIN_SPAN: Duration = Duration::from_secs(1);
+
+/// The byte counter a [`RateEstimator`] measures.
+///
+/// A download is measured over its OVERALL counter (`step`); any other frame that carries a
+/// file level (a load, the encode phase, a denoise re-reading disk-tier blocks) over the
+/// counter of the ONE file it is reading (`file_step`), because its `step` is a component or
+/// step index, not bytes. The per-file counter restarts at every file, so a file read is keyed by the
+/// file's component and label and a new key starts a new window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::tools::ai_editor::engines) enum RateSource {
+    /// `download` frames: the overall byte counter across the whole plan.
+    Download,
+    /// Non-download frames with a file level (a load, the encode phase, a denoise re-read):
+    /// the bytes read of this one file.
+    FileRead {
+        /// The frame's `file_component` (`None` = the legacy transformer-only frames).
+        component: Option<String>,
+        /// The frame's `file_label`.
+        label: String,
+    },
+}
+
+impl RateSource {
+    /// The counter `frame` contributes to a rate, or `None` for a frame without bytes
+    /// (a generation's steps without a file level, a load step between files).
+    #[must_use]
+    pub(in crate::tools::ai_editor::engines) fn of(frame: &ProgressFrame) -> Option<(Self, u64)> {
+        match (frame.phase.as_str(), frame.file.as_ref()) {
+            ("download", _) => Some((Self::Download, frame.step)),
+            // Any other phase with a file level is reading a model file from disk: a load step,
+            // the encode phase reading the encoder, or a denoise re-reading disk-tier blocks.
+            (_, Some(file)) => Some((Self::FileRead { component: file.component.clone(), label: file.label.clone() }, file.step)),
+            (_, None) => None,
+        }
+    }
+
+    /// A fresh estimator with this source's window.
+    fn estimator(&self) -> RateEstimator {
+        match self {
+            Self::Download => RateEstimator::default(),
+            Self::FileRead { .. } => RateEstimator::with_window(DISK_READ_RATE_WINDOW, DISK_READ_RATE_MIN_SPAN),
+        }
+    }
+}
+
+/// Rolling transfer-rate estimator over ONE monotonically growing byte counter.
+///
+/// A download feeds the OVERALL counter and never its per-file counters: the per-file counter
+/// resets at every file boundary, which on a 35 GB plan would make the rate jump to nonsense
+/// several times per gigabyte. A load feeds the per-file counter of the file it reads, with a
+/// new estimator per file ([`RateSource`]).
 ///
 /// The rate is the total byte delta across the retained window divided by the wall time it
-/// spans — a moving average over [`RATE_WINDOW`]. An exponential average was the
-/// alternative and was rejected: its smoothing factor only means something relative to a
-/// fixed sample interval, and this stream's interval is set by whichever of the backend's
-/// two throttles binds, which changes with the line speed.
-#[derive(Debug, Clone, Default)]
+/// spans — a moving average over `window` ([`RATE_WINDOW`] for a download,
+/// [`DISK_READ_RATE_WINDOW`] for a load). An exponential average was the alternative and was
+/// rejected: its smoothing factor only means something relative to a fixed sample interval,
+/// and this stream's interval is set by whichever of the backend's two throttles binds, which
+/// changes with the line speed.
+#[derive(Debug, Clone)]
 pub(in crate::tools::ai_editor::engines) struct RateEstimator {
-    /// `(observed_at, overall step)`, oldest first. Bounded by the window, so at ten frames
+    /// `(observed_at, counter)`, oldest first. Bounded by the window, so at ten frames
     /// per second it holds about fifty entries.
     pub(in crate::tools::ai_editor::engines) samples: VecDeque<(Instant, u64)>,
+    /// The span averaged over.
+    window: Duration,
+    /// The shortest span that yields a rate at all.
+    min_span: Duration,
+}
+
+impl Default for RateEstimator {
+    /// The download estimator: [`RATE_WINDOW`] and [`RATE_MIN_SPAN`].
+    fn default() -> Self {
+        Self::with_window(RATE_WINDOW, RATE_MIN_SPAN)
+    }
 }
 
 impl RateEstimator {
+    /// An empty estimator averaging over `window`, silent until `min_span` is covered.
+    #[must_use]
+    pub(in crate::tools::ai_editor::engines) fn with_window(window: Duration, min_span: Duration) -> Self {
+        Self { samples: VecDeque::new(), window, min_span }
+    }
+
     /// Records one overall-byte observation.
     ///
     /// A BACKWARDS step discards the whole window and starts a new one from this sample.
@@ -287,7 +365,7 @@ impl RateEstimator {
             && self
                 .samples
                 .get(1)
-                .is_some_and(|&(t, _)| now.duration_since(t) > RATE_WINDOW)
+                .is_some_and(|&(t, _)| now.duration_since(t) > self.window)
         {
             self.samples.pop_front();
         }
@@ -297,13 +375,14 @@ impl RateEstimator {
     /// enough history for the number to mean anything.
     ///
     /// `None` covers every degenerate case rather than reporting a number: fewer than two
-    /// samples, a window shorter than [`RATE_MIN_SPAN`], and a window in which the
+    /// samples, a window shorter than its minimum span ([`RATE_MIN_SPAN`] for a download), and
+    /// a window in which the
     /// byte counter did not move.
     pub(in crate::tools::ai_editor::engines) fn bytes_per_second(&self) -> Option<f64> {
         let (first_at, first_step) = *self.samples.front()?;
         let (last_at, last_step) = *self.samples.back()?;
         let span = last_at.duration_since(first_at);
-        if self.samples.len() < 2 || span < RATE_MIN_SPAN {
+        if self.samples.len() < 2 || span < self.min_span {
             return None;
         }
         // The backwards case is already handled by `observe`, so this cannot underflow; the
@@ -335,8 +414,9 @@ impl RateEstimator {
     }
 }
 
-/// The SECOND progress level: the single file a model download is transferring, while
-/// `step`/`total` stay the overall byte count across the whole plan.
+/// The SECOND progress level: the single file a model download is transferring (while
+/// `step`/`total` stay the overall byte count across the whole plan), or the single file a
+/// model LOAD is reading from disk (while `step`/`total` count the load's components).
 ///
 /// Optional on the wire (`dev-docs/flux2_model_download.md` §4) and therefore optional
 /// here: a preparation frame carries no file at all, and rendering it as a bar stuck at
@@ -350,6 +430,24 @@ pub(in crate::tools::ai_editor::engines) struct FileProgress {
     pub(in crate::tools::ai_editor::engines) total: u64,
     /// The file's own name, as the backend spelled it.
     pub(in crate::tools::ai_editor::engines) label: String,
+    /// The optional `file_component`: which model component a READ is reading this file for
+    /// (a wire id: `transformer` / `text_encoder` / `vae`, [`file_component_label`]). `None`
+    /// when the frame does not say — a download, or a backend whose load frames describe
+    /// the transformer alone.
+    pub(in crate::tools::ai_editor::engines) component: Option<String>,
+}
+
+/// The localized name of a file read's `file_component` id, `None` for an id this build
+/// does not know (the bar then names the file alone). An ABSENT component on a read frame
+/// is the transformer: the backends that predate the field sent file frames for it only.
+#[must_use]
+pub(in crate::tools::ai_editor::engines) fn file_component_label(component: Option<&str>) -> Option<String> {
+    match component {
+        None | Some("transformer") => Some(t!("cleaning.tools.engine_progress.component_transformer_label").to_string()),
+        Some("text_encoder") => Some(t!("cleaning.tools.engine_progress.component_text_encoder_label").to_string()),
+        Some("vae") => Some(t!("cleaning.tools.engine_progress.component_vae_label").to_string()),
+        Some(_) => None,
+    }
 }
 
 /// A large-model run the backend finished on a MORE ECONOMICAL step pair than planned,
@@ -397,12 +495,25 @@ pub(in crate::tools::ai_editor::engines) fn format_eta(remaining: Duration) -> S
 /// `None` when there is no rate yet — the line is then absent entirely rather than showing a
 /// placeholder, because "no estimate" is the honest state at the start of every transfer.
 /// Pure, so the "not enough history" rule can be tested without a `Ui`.
+///
+/// Shown only while the CURRENT frame still feeds the measured counter: a download frame for
+/// a download's rate, a frame of any other phase reading the same file for a file read's
+/// rate — so a step between two files, or a generate frame without a file level, never shows
+/// the last file's speed.
 pub(in crate::tools::ai_editor::engines) fn transfer_status(progress: &EngineProgress) -> Option<String> {
+    let (step, total) = match progress.rate_source.as_ref()? {
+        RateSource::Download if progress.phase == "download" => (progress.step, progress.total),
+        RateSource::FileRead { component, label } if progress.phase != "download" => {
+            let file = progress.file.as_ref().filter(|file| file.component == *component && file.label == *label)?;
+            (file.step, file.total)
+        }
+        RateSource::Download | RateSource::FileRead { .. } => return None,
+    };
     let rate = progress.rate.bytes_per_second()?;
     let speed = tf!("cleaning.tools.engine_progress.speed_status", speed = format_mib_per_second(rate));
     // The estimate is optional even when the speed is known: a plan whose total is not known
     // yet, or one already finished, has no remaining time to report.
-    match progress.rate.remaining(progress.step, progress.total) {
+    match progress.rate.remaining(step, total) {
         Some(remaining) => Some(tf!(
             "cleaning.tools.engine_progress.speed_and_eta_status",
             speed = speed,
@@ -443,6 +554,7 @@ pub(in crate::tools::ai_editor::engines) fn begin_progress_generation(progress: 
     // inherit the file the previous download was transferring, nor its measured speed.
     guard.file = None;
     guard.rate = RateEstimator::default();
+    guard.rate_source = None;
     let canceller = guard.canceller.clone().unwrap_or_else(|| Arc::new(spawn_backend_cancel) as Canceller);
     let control = Arc::new(CallControl::new(canceller));
     guard.control = Some(Arc::clone(&control));
@@ -485,7 +597,9 @@ pub(in crate::tools::ai_editor::engines) fn update_progress(
 /// Every streaming operation of an engine publishes its frames the same way, second
 /// level included, so a field added to the wire reaches every bar through one place
 /// instead of copies that drift. A frame carrying no `file` CLEARS the second level
-/// rather than leaving the previous file on screen.
+/// rather than leaving the previous file on screen. A frame with a byte counter
+/// ([`RateSource::of`]) feeds the rate; a counter of ANOTHER source (the next file, or a
+/// download after a load) starts a fresh estimator first.
 pub(in crate::tools::ai_editor::engines) fn publish_progress_frame(
     progress: &Mutex<EngineProgress>,
     generation: u64,
@@ -493,11 +607,7 @@ pub(in crate::tools::ai_editor::engines) fn publish_progress_frame(
 ) {
     let now = Instant::now();
     update_progress(progress, generation, |state| {
-        // Only a download's counters are BYTES. A generation's `step` is a step index, so
-        // feeding it here would produce a "speed" in bytes per second from step counts.
-        if frame.phase == "download" {
-            state.rate.observe(now, frame.step);
-        }
+        observe_rate(state, &frame, now);
         state.phase = frame.phase;
         state.step = frame.step;
         state.total = frame.total;
@@ -505,6 +615,21 @@ pub(in crate::tools::ai_editor::engines) fn publish_progress_frame(
         state.stage = frame.stage;
         state.file = frame.file;
     });
+}
+
+/// Feeds `frame`'s byte counter, if it has one, into the rate of `state`.
+///
+/// Only BYTES are fed: a generation's `step` is a step index and a load's `step` a component
+/// index, so feeding either would produce a "speed" in bytes per second from step counts.
+fn observe_rate(state: &mut EngineProgress, frame: &ProgressFrame, now: Instant) {
+    let Some((source, counter)) = RateSource::of(frame) else {
+        return;
+    };
+    if state.rate_source.as_ref() != Some(&source) {
+        state.rate = source.estimator();
+        state.rate_source = Some(source);
+    }
+    state.rate.observe(now, counter);
 }
 
 /// Asks the backend to stop request `id`, on a worker thread.
@@ -600,7 +725,8 @@ pub(in crate::tools::ai_editor::engines) struct ProgressFrame {
 ///
 /// Every field is optional and degrades rather than failing: an absent `phase` reads as
 /// `generate` (what a generation sends most of the time), absent counters as `0`, and an
-/// absent `file_step`/`file_total` pair as "this frame describes no single file". A frame
+/// absent `file_step`/`file_total` pair as "this frame describes no single file", an absent
+/// `file_component` as "no component named" ([`file_component_label`]). A frame
 /// that carries EITHER of the two is taken as describing one, because a backend that
 /// reports a byte count without a size still has a file in flight to name.
 pub(in crate::tools::ai_editor::engines) fn parse_progress_frame(header: &Value) -> ProgressFrame {
@@ -615,6 +741,8 @@ pub(in crate::tools::ai_editor::engines) fn parse_progress_frame(header: &Value)
             step: file_step.unwrap_or(0),
             total: file_total.unwrap_or(0),
             label: str_field("file_label").unwrap_or_default().to_string(),
+            // Optional: a blank id is none, exactly like `stage`.
+            component: str_field("file_component").filter(|component| !component.trim().is_empty()).map(str::to_string),
         })
     };
     ProgressFrame {
@@ -754,6 +882,7 @@ mod tests {
                 step: 3_221_225_472,
                 total: 9_800_000_000,
                 label: "model-00001-of-00002.safetensors".to_string(),
+                component: None,
             })
         );
         publish_frame_into(&mut progress, transferring);
@@ -797,14 +926,16 @@ mod tests {
     // Transfer rate and remaining time
     // -----------------------------------------------------------------------------------
 
-    /// Feeds a scripted frame sequence into a progress state exactly as
+    /// Feeds a scripted DOWNLOAD frame sequence into a progress state exactly as
     /// [`publish_progress_frame`] does, at `origin + offset`.
     ///
     /// `Instant` cannot be constructed at an arbitrary value, but the estimator only ever
     /// looks at DIFFERENCES, so offsets from one origin script it deterministically.
     fn feed_download(progress: &mut EngineProgress, origin: Instant, samples: &[(u64, u64)]) {
         for &(millis, step) in samples {
-            progress.rate.observe(origin + Duration::from_millis(millis), step);
+            let frame = ProgressFrame { phase: "download".to_string(), step, total: progress.total, ..ProgressFrame::default() };
+            observe_rate(progress, &frame, origin + Duration::from_millis(millis));
+            progress.phase = frame.phase;
             progress.step = step;
         }
     }
@@ -1016,7 +1147,8 @@ mod tests {
             // Fed through the estimator the same way `publish_progress_frame` does, with a
             // scripted clock instead of the wall clock.
             let mut guard = lock_progress(&progress);
-            guard.rate.observe(origin + Duration::from_millis(millis), frame.step);
+            observe_rate(&mut guard, &frame, origin + Duration::from_millis(millis));
+            guard.phase = frame.phase;
             guard.step = frame.step;
             guard.total = frame.total;
             guard.file = frame.file;
@@ -1066,6 +1198,116 @@ mod tests {
         // renderer returns before reaching it.
         retire_progress_generation(&progress, "test");
         assert!(!lock_progress(&progress).active);
+    }
+
+    /// Feeds one scripted LOAD frame reading `label` (for `component`) at `origin + millis`,
+    /// exactly as [`publish_progress_frame`] applies it.
+    fn feed_load(progress: &mut EngineProgress, origin: Instant, millis: u64, component: Option<&str>, label: &str, file_step: u64, file_total: u64) {
+        let mut header = json!({ "phase": "load", "step": 2, "total": 5, "label": "loading", "file_step": file_step, "file_total": file_total, "file_label": label });
+        if let Some(component) = component {
+            header.as_object_mut().expect("object").insert("file_component".to_string(), json!(component));
+        }
+        let frame = parse_progress_frame(&header);
+        observe_rate(progress, &frame, origin + Duration::from_millis(millis));
+        progress.phase = frame.phase;
+        progress.step = frame.step;
+        progress.total = frame.total;
+        progress.file = frame.file;
+    }
+
+    /// A load's per-file byte counter drives a ONE-second disk-read rate (a load's `step` is a
+    /// component index and never feeds it); jittery chunk frames average out instead of
+    /// jumping; the next file or another component starts a fresh window; a load frame
+    /// between files shows no speed.
+    #[test]
+    fn a_load_reads_its_speed_from_the_file_counter_and_restarts_per_file() {
+        let origin = Instant::now();
+        let mut progress = EngineProgress::default();
+        // Five frames a second at an AVERAGE of 100 MiB/s, alternating 60 / 140 MiB chunks.
+        let mut read = 0;
+        for index in 0..=10u64 {
+            feed_load(&mut progress, origin, index * 200, None, "flux-2-klein-9b.safetensors", read, 2048 * MIB);
+            read += if index % 2 == 0 { 12 * MIB } else { 28 * MIB };
+        }
+        assert_eq!(progress.rate_source, Some(RateSource::FileRead { component: None, label: "flux-2-klein-9b.safetensors".to_string() }));
+        let rate = progress.rate.bytes_per_second().expect("two seconds of reads give a rate");
+        let expected = 100.0 * MIB as f64;
+        // The one-second window spans five or six alternating chunks, so the reading stays
+        // within a fifth of the average rather than swinging between 60 and 140.
+        assert!((rate - expected).abs() < expected * 0.2, "expected ~{expected} B/s, got {rate}");
+        assert!(transfer_status(&progress).is_some(), "a load reading a file shows its speed");
+
+        // The text encoder's file: a new source, so a new (empty) window, then its own rate.
+        feed_load(&mut progress, origin, 2400, Some("text_encoder"), "qwen3-8b.gguf", 0, 1024 * MIB);
+        assert_eq!(progress.rate.bytes_per_second(), None, "the previous file's samples are gone");
+        assert_eq!(transfer_status(&progress), None);
+        feed_load(&mut progress, origin, 3400, Some("text_encoder"), "qwen3-8b.gguf", 50 * MIB, 1024 * MIB);
+        let rate = progress.rate.bytes_per_second().expect("one second of the encoder file");
+        assert!((rate - 50.0 * MIB as f64).abs() < 1.0, "got {rate}");
+
+        // A load step without a file level shows no speed (the rate is kept for the file).
+        let between = parse_progress_frame(&json!({ "phase": "load", "step": 3, "total": 5, "label": "vae" }));
+        observe_rate(&mut progress, &between, origin + Duration::from_millis(3600));
+        progress.phase = between.phase;
+        progress.file = between.file;
+        assert_eq!(transfer_status(&progress), None);
+
+        // A generation's step counts never feed it either.
+        let generate = parse_progress_frame(&json!({ "phase": "generate", "step": 4, "total": 4 }));
+        assert_eq!(RateSource::of(&generate), None);
+    }
+
+    /// A frame of ANY phase that carries the byte fields reads a file (the encode phase, a
+    /// denoise re-reading disk-tier blocks): the second bar and the speed follow it, the
+    /// overall generate counter stays the step counter, and the next frame without the
+    /// byte fields hides both.
+    #[test]
+    fn a_generate_frame_with_the_byte_fields_shows_the_file_read() {
+        let progress = Arc::new(Mutex::new(EngineProgress::default()));
+        let generation = begin_progress_generation(&progress).generation;
+        let origin = Instant::now();
+        for (millis, read) in [(0u64, 0u64), (500, 40 * MIB), (1000, 80 * MIB)] {
+            let frame = parse_progress_frame(&json!({
+                "phase": "generate", "step": 3, "total": 8, "label": "denoise",
+                "file_step": read, "file_total": 400 * MIB, "file_label": "flux-2-klein-9b.safetensors", "file_component": "transformer"
+            }));
+            let mut guard = lock_progress(&progress);
+            assert_eq!(guard.generation, generation);
+            observe_rate(&mut guard, &frame, origin + Duration::from_millis(millis));
+            publish_frame_into(&mut guard, frame);
+        }
+        {
+            let guard = lock_progress(&progress);
+            let (overall, file) = progress_fractions(&guard);
+            assert!((overall - 3.0 / 8.0).abs() < 1e-6, "the generate bar keeps its step counter");
+            assert!((file.expect("a file bar") - 0.2).abs() < 1e-6);
+            let rate = guard.rate.bytes_per_second().expect("one second of re-reads");
+            assert!((rate - 80.0 * MIB as f64).abs() < 1.0, "got {rate}");
+            assert!(transfer_status(&guard).is_some(), "a generate frame reading a file shows its speed");
+        }
+        // The next denoise step without the byte fields: no file bar, no speed line.
+        publish_progress_frame(&progress, generation, parse_progress_frame(&json!({ "phase": "generate", "step": 4, "total": 8 })));
+        let guard = lock_progress(&progress);
+        assert_eq!(progress_fractions(&guard).1, None);
+        assert_eq!(transfer_status(&guard), None);
+    }
+
+    /// `file_component` is optional: absent or blank is none, which a load names as the
+    /// transformer; a known id is localized and an unknown one names nothing.
+    #[test]
+    fn the_file_component_is_optional_and_localized() {
+        let _locale = ms_config::locale_store::GLOBAL_LOCALE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let en = ms_i18n::LocaleTag::parse("en").expect("en tag is valid");
+        ms_i18n::set_locale(&en).expect("en catalog installs");
+        let file = |header: Value| parse_progress_frame(&header).file.expect("a file level");
+        assert_eq!(file(json!({ "phase": "load", "file_step": 1, "file_label": "a" })).component, None);
+        assert_eq!(file(json!({ "phase": "load", "file_step": 1, "file_component": " " })).component, None);
+        assert_eq!(file(json!({ "phase": "load", "file_step": 1, "file_component": "text_encoder" })).component.as_deref(), Some("text_encoder"));
+        assert_eq!(file_component_label(None).as_deref(), Some("Transformer"));
+        assert_eq!(file_component_label(Some("transformer")).as_deref(), Some("Transformer"));
+        assert_eq!(file_component_label(Some("text_encoder")).as_deref(), Some("Text encoder"));
+        assert_eq!(file_component_label(Some("vae")).as_deref(), Some("VAE"));
+        assert_eq!(file_component_label(Some("warp_core")), None);
     }
 
     /// The optional `stage` id travels from the frame into the shared state and is cleared by

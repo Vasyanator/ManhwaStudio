@@ -86,14 +86,15 @@ Every service follows the same shape and is safe to copy from when adding anothe
   manifest over `hf_gated_download`. Stateless, imported lazily by the handler. Tests:
   `test_flux3_download.py`.
 - `hf_gated_download.py`: the model-agnostic half of a backend-side Hugging Face download
-  (`DownloadTarget` = label + `RepoSpec`s + `ManifestEntry` prefixes + root): plan resolution,
-  the per-repository access check (`STATE_*`), the per-repository token rule, the publish gates,
+  (`DownloadTarget` = label + `RepoSpec`s + `ManifestEntry` prefixes + root) for GATED repositories
+  only: plan resolution, the per-repository access check (`STATE_*`), the token rule (an empty
+  token is refused before any network call; a token is sent to every repository), the publish gates,
   free space, throttled two-level progress and the resumable transfer over
   `../engines/model_download.py`. Used by `flux2_download.py` and `flux3_download.py`.
 - `flux2_download.py`: acquisition of the klein weights from Hugging Face
-  (`inpaint.flux2_klein.download.check` / `.start`), for either VARIANT (`ModelVariant`: `9b`
-  gated, `4b` public): the variant table, the encoder toggle and the manifest, mapped onto
-  `hf_gated_download`. NOT a service and deliberately so: it holds no
+  (`inpaint.flux2_klein.download.check` / `.start`) for the `9b` VARIANT (`ModelVariant`, gated;
+  `4b` is refused, `RETIRED_VARIANTS`: the app's Rust model catalog downloads it): the variant
+  table, the encoder toggle and the manifest, mapped onto `hf_gated_download`. NOT a service and deliberately so: it holds no
   resident model, takes no lease and has no `AppState` field — it is a module of functions the
   handler imports lazily. See the FLUX.2 klein download section.
 - `region_imaging.py`: the region editors' wire codecs (FLUX.2 klein, FLUX.3 klein): strict L8 mask
@@ -345,9 +346,15 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   fills it per its plan: device units on the device, parked units in packed host buffers, disk units
   not at all; the host peak is one tensor. diffusers' `from_single_file` / `from_pretrained` are not
   used any more (the old streaming loader and its eligibility rule are gone). The BFL -> diffusers
-  key rule is `conversion.py` (diffusers' own per-key converter), applied per tensor. A single-file
-  transformer reports its bytes as the wire's SECOND progress level (`file_step` / `file_total` /
-  `file_label` = the FILE name) inside `LOAD_STEP_TRANSFORMER`; a folder reports steps only.
+  key rule is `conversion.py` (diffusers' own per-key converter), applied per tensor. Every
+  component read from disk reports its bytes as the wire's SECOND progress level (`file_step` /
+  `file_total` = the whole component, `file_label` = the file name, or the folder name for a
+  diffusers / transformers folder, `file_component` = `progress.FILE_COMPONENT_*`) on the CURRENT
+  step frame: a load rides on its own step (the transformer on `LOAD_STEP_TRANSFORMER`, the text
+  encoder — run, cache build, «load» action — on `LOAD_STEP_TEXT_ENCODER`); a read the manager
+  makes inside a phase (a DISK-tier component, a degrade retry's reload, a re-read of DISK /
+  DROPPED units) rides on the step current then — the encode step, or a `generate` frame during
+  the denoise. The VAE reports no bytes.
 - **The text encoder and the transformer must be the SAME variant, and that is checked before any
   weight is read** (`require_encoder_transformer_compatible`, `components.py`). The pipeline
   concatenates the encoder's hidden states at layers `(9, 18, 27)`
@@ -374,8 +381,23 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   DISCOVERED next to those paths (`component_search_roots` / `discover_component_dir`). A component
   that is not found raises an error naming what to put where — there is deliberately no built-in
   scheduler config, because an invented one produces plausible-looking garbage. Putting those files
-  on disk in the first place is `flux2_download.py`'s job, and the two never meet: the downloader
-  knows nothing about the pipeline and the service knows nothing about Hugging Face.
+  on disk in the first place is the downloaders' job — `flux2_download.py` for 9B only; the 4B
+  package and its GGUF quants come from the app's Rust model catalog — and the two never meet: the
+  downloader knows nothing about the pipeline and the service knows nothing about Hugging Face.
+- **The transformer and the text encoder may each be a GGUF file** (protocol 21; the unsloth
+  FLUX.2 klein 4B quants and a Qwen3 4B GGUF encoder; `flux2_klein/encoder_gguf.py` bridges the
+  llama.cpp tensor names to HF Qwen3, the GGUF weights stay quantized in memory and are dequantized
+  per forward by `runtime.gguf_layers`). A GGUF file carries no `config.json`, tokenizer or
+  scheduler: its config is probed beside the file first, then in the INSTALLED 4B package
+  (`components.installed_4b_package_root`, `<side_models>/FLUX.2-klein-4B/`), and a candidate is
+  accepted only when its config matches the file's header (the package fallback must declare every
+  compared field and agree on all of them); the 4B package root also joins the tokenizer /
+  scheduler search, but only while a component is a GGUF file, so 9B and bf16 discovery is
+  unchanged. A GGUF component outside the package with no matching config is refused by name.
+  `text_encoder_fp8: true` with a GGUF encoder is refused naming both fields. The per-component
+  weight FORMATS (`transformer_format(s)` / `text_encoder_format(s)`, `[{id, path}]` candidates the
+  client sends) give one format row each; `large_models.profiles` answers the encoder's rows as the
+  additive `encoder_formats` beside the pipeline's `formats`. Detail: `flux2_klein/MODULE_README.md`.
 - **A weights FILE may stand in for its component folder** (`component_dir_for_path`). Neither
   `AutoencoderKLFlux2` nor the Qwen3 encoder has a single-file loader in diffusers 0.39, and a user
   picking a model naturally selects `diffusion_pytorch_model.safetensors` rather than the directory
@@ -479,6 +501,11 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
     - **The forecast follows.** With no encoder installed `forecast_memory` zeroes the `encode`
       and `encode_standalone` phases (neither can run there), and `large_model_profiles` answers
       `encoder: null`, so the forecast and the guard get a lower number from the same planner.
+    - **When the forecast counts the encoder** has one owner, `service._encoder_need`
+      (`EncoderNeed.counted`): it is left out ONLY when it is not resident (its handle holds no
+      byte) AND every prompt the run needs is cached; a resident encoder is counted over a cached
+      prompt too. The run asks the same helper (`EncoderNeed.encodes`) whether it plans the
+      encoder's combined ceiling. Neither reading waits for the service lock.
   - **Layout:** `<program root>/prompt_cache/<encoder family>/<name>.msprompt`, the root taken
     from `runtime.paths.program_root()`. The family level exists because an embedding is only
     valid for the encoder that produced it; two encoders must never share a listing. A family
@@ -544,9 +571,11 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   `large_model_profiles(params, shape, format=, steps=)`, which the handler prefers: the pipeline
   planned alone, the encoder planned with that plan's reservation claimed, then the pipeline
   planned again with the encoder's reservation claimed (`LargeModelManager.profiles(claimed_device_bytes=,
-  claimed_host_bytes=)`); the answer is that report plus `encoder` (the encoder's `selected`, `null`
-  when the prompt is cached or no encoder is installed), and an encoder that does not fit refuses
-  `selected`. The reservation of a plan is its device peak and its host peak above the baseline
+  claimed_host_bytes=)`); the answer is that report (`selected` = the PIPELINE's plan, the encoder
+  only claimed in it; the client sums `selected` + `encoder`, minus the one `forecast.host_baseline`
+  both carry, `service._with_host_baseline`) plus `encoder` (the encoder's
+  `selected`, `null` when the encoder is not needed AND not resident, `EncoderNeed.counted`), and an
+  encoder that does not fit refuses `selected`. The reservation of a plan is its device peak and its host peak above the baseline
   RSS (`service._reservation_of`). `memory.forecast_memory` is the same two-handle admission as
   one forecast dict (pipeline first, encoder on what is left, under the combined ceiling); its
   consumers are the calibration tool (`tools/large_model_calibration/flux2.py`) and the golden
@@ -579,8 +608,8 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   `lm_head` and deeper layers never built nor read); its checkpoint keys lose their `model.`
   prefix in the spec.
 - **Models on disk (local check, 2026-10-16):** the klein 9B checkpoint (`flux-2-klein-9b`) and the
-  uncensored 9B encoder; no 4B checkpoint, so the 4B path is exercised by the tiny real models of
-  the tests only. One spec family serves both variants (block and layer counts come from the files).
+  uncensored 9B encoder; the 4B path is exercised by the tiny real models of the tests (and by the
+  opt-in real GGUF header tests when their env vars name files). One spec family serves both variants (block and layer counts come from the files).
 - **`is_distilled` is READ FROM THE CHECKPOINT, and it decides whether guidance can happen at all.**
   `components.checkpoint_is_distilled` answers a TRI-STATE from the `model_index.json` beside the
   weights — `True` / `False` as declared, `None` when there is no manifest, it cannot be read, or it
@@ -656,41 +685,39 @@ client-facing half. What this module owns:
 
 ### FLUX.2 klein: model download (`flux2_download.py` over `hf_gated_download.py`)
 The FLUX.2 module owns only the variant table, the encoder toggle and the manifest; every generic
-rule below (per-repository token, prefix plan, state taxonomy, publish gates, throttle, free
-space, transfer) is `hf_gated_download.py`'s and applies to the FLUX.3 download as well.
+rule below (token gate, prefix plan, state taxonomy, publish gates, throttle, free space, transfer)
+is `hf_gated_download.py`'s and applies to the FLUX.3 download as well.
 The wire contract is `dev-docs/flux2_model_download.md`; `ipc/PROTOCOL.md` carries the frame shapes.
 Everything lands in `<side_models>/<variant directory>/` — `transformer/`, ONE of `text_encoder/`
 or `text_encoder_uncensored/`, `tokenizer/`, `vae/`, `scheduler/scheduler_config.json`,
 `model_index.json`, `LICENSE.md` — which is exactly the layout `component_search_roots` /
 `discover_component_dir` already expect, so a finished download leaves a configured engine.
 
-- **Two VARIANTS, one manifest.** `ModelVariant` / `VARIANTS` is a frozen data table: wire key,
-  repository id, destination directory, the uncensored repository (or `None`), and whether the
-  repository is gated. `9b` (`FLUX.2-klein-9B`, gated, ~34.7 GB, has an uncensored encoder) is the
-  DEFAULT the wire contract pins for a request with no `variant` field; `4b`
-  (`FLUX.2-klein-4B`, public/apache-2.0, ~15.98 GB) has none. The two repositories share the
-  identical folder layout, so a variant carries NO manifest of its own — `manifest_entries`
-  derives the rules from `variant.repo` and the two cannot drift apart file by file. `variant`
-  is a REQUIRED keyword on `model_root`, `component_paths`, `required_repos`, `manifest_entries`
+- **One downloadable VARIANT; 4B has a different owner.** `ModelVariant` / `VARIANTS` is a frozen
+  data table: wire key, repository id, destination directory and the uncensored repository (or
+  `None`); every repository is gated. Its one row, `9b` (`FLUX.2-klein-9B`, gated,
+  ~34.7 GB, has an uncensored encoder), is also the DEFAULT the wire contract pins for a request
+  with no `variant` field. `4b` is a `RETIRED_VARIANTS` name: the FLUX.2 klein 4B package
+  (`side_models/FLUX.2-klein-4B/`) is downloaded by the application's pinned model catalog
+  (Rust `ms_sysprobe::ai_models::external_catalog`), so each variant has exactly ONE download
+  owner and this module never writes into the 4B folder. A variant carries NO manifest of its own
+  — `manifest_entries` derives the rules from `variant.repo`. `variant` is a REQUIRED keyword on `model_root`, `component_paths`, `required_repos`, `manifest_entries`
   and `resolve_plan`: a caller that forgot it would silently write one variant's weights into the
   other's directory. Only `check_access` and `download` default it, because that default IS the
   contract, and they take the RAW wire value (`resolve_variant`) so the vocabulary lives in one
   place instead of in the IPC layer as well.
-- **Two shapes are refused, never substituted.** An unknown `variant` (`resolve_variant`) and
-  `4b` + `uncensored` (`require_uncensored_supported`), both before any network call. Downgrading
-  either would fetch weights the user did not ask for under the button they pressed.
-- **The token gate follows the REPOSITORY, not the feature** (`token_required`). `no_token` is
-  answered only when the request touches a gated repository — 9B, or any uncensored encoder. A
-  `4b` request with an empty token goes to the hub, passes `auth_check` anonymously and answers
-  `ok` with a real plan; `HfApi` is given `token or None` so an empty string never reaches it.
-- **A token that IS supplied is SENT to gated repositories only** (`repo_token`, `PUBLIC_REPOS`
-  derived from the variant table). The decision is per REPOSITORY and is applied at all three
-  network sites — `probe_repo_access`, `repo_listing` and `_fetch_one`'s two attempts — so a plan
-  mixing a gated and a public repository stays correct file by file. `token_required` answers a
-  different question (may the request short-circuit to `no_token`) and does not gate the wire.
-  Without this, a stale 9B token forwarded to the PUBLIC 4B repository made the hub answer 401,
-  `classify_repo_error` reported `invalid_token`, no plan was built and the download button stayed
-  disabled — with no token editor on the 4B panel to recover from.
+- **Three shapes are refused, never substituted.** An unknown `variant` and a retired one (`4b`,
+  with the user-facing reason from `RETIRED_VARIANTS`) in `resolve_variant`, and the uncensored
+  toggle on a variant without an uncensored encoder (`require_uncensored_supported`; no table row
+  lacks one today), all before any network call. Downgrading any of them would fetch weights the
+  user did not ask for under the button they pressed.
+- **Every repository is gated, so every request needs a token.** `hf_gated_download` serves
+  gated repositories only (9B and its uncensored encoder; FLUX.3): an empty token is `no_token`
+  (`.check`) or the target's `no_token_message` (`.start`) before any network call, and a present
+  token is sent at all three network sites — `probe_repo_access`, `repo_listing` and
+  `_fetch_one`'s two attempts. `HfApi` is given `token or None` so an empty string never reaches it.
+  A public repository is not a case the machinery handles: a model that needs one gets its own
+  rule (the public 4B package went to the Rust catalog instead).
 - **The manifest is PREFIXES resolved against the live listing, never hard-coded shard names**
   (`shared_manifest(variant)` + one encoder rule -> `resolve_plan`). A prefix that resolves to no
   file is a `RuntimeError` naming the prefix and the repository: a repo that was re-sharded must
@@ -707,8 +734,7 @@ or `text_encoder_uncensored/`, `tokenizer/`, `vae/`, `scheduler/scheduler_config
   there, and nothing here deletes the unselected one — 16 GB the user paid to download does not
   vanish because a checkbox moved.
 - **Three files are excluded and each exclusion is load-bearing.** The root single-file
-  transformer — 18.157 GB `flux-2-klein-9b.safetensors`, 7.751 GB `flux-2-klein-4b.safetensors`,
-  whichever variant is selected — is the SAME transformer as `transformer/`, and a single file goes
+  transformer — 18.157 GB `flux-2-klein-9b.safetensors` — is the SAME transformer as `transformer/`, and a single file goes
   through `from_single_file`, which in diffusers 0.39 accepts `device_map` and silently discards it —
   the layered offload this engine depends on would be lost. The four `*.gguf` of the uncensored repo
   are llama.cpp format and the `transformers` loader cannot read them. `*.jpg` / `README.md` /
@@ -842,8 +868,10 @@ no network wait, no inference. Everything is a strict no-op off ROCm.
   refusals — see `flux2_klein/large_model.py` (BFL keys: `flux2_klein/conversion.py`). How a
   component is READ (tensor by tensor) is `../runtime/large_models/loader.py` over
   `../runtime/safetensors_stream.py`; the fp8-scaled refusal stays in `flux2_klein/`. The
-  byte-level progress of a single-file transformer is `progress._file_progress_reporter`, wired in
-  `service._load_pipeline_locked`; it must never move `LOAD_STEP_*` / `LOAD_PHASE_STEPS`.
+  byte-level progress of a component read is `progress.LoadFrames`, built per request by
+  `service._load_frames` and registered as the load-progress sink of every session
+  (`service._acquire`, `Session.set_load_progress`); it must never move `LOAD_STEP_*` /
+  `LOAD_PHASE_STEPS`.
 - To change FLUX.2 klein params, region limits, the retired-field refusals or the step pair of a
   request, see `flux2_klein/` (`params.normalize_flux2_klein_params`, `params.RETIRED_FIELDS`,
   `params.validate_region_size`, `memory.requested_steps`, `memory.forecast_memory`); the
@@ -868,16 +896,15 @@ no network wait, no inference. Everything is a strict no-op off ROCm.
   `ipc/PROTOCOL.md §5.4`.
 - To add or change a downloadable MODEL VARIANT, see `ModelVariant` / `VARIANTS` /
   `DEFAULT_VARIANT` in `flux2_download.py`, and `resolve_variant` /
-  `require_uncensored_supported` / `token_required` / `repo_token` for the wire vocabulary, the two
-  refusals and the two token rules. A new variant is one table row; it gets a manifest for free
-  because `shared_manifest` derives it from `variant.repo`, and `PUBLIC_REPOS` picks its
-  gatedness up from the same row. Keep the wire values in step with
+  `require_uncensored_supported` for the wire vocabulary and the two refusals. A new variant is one table row; it gets a manifest for free
+  because `shared_manifest` derives it from `variant.repo`. A variant whose download moved to the
+  Rust catalog leaves `VARIANTS` and gets a `RETIRED_VARIANTS` entry, never a second owner. Keep the wire values in step with
   `dev-docs/flux2_model_download.md` §1a and `ipc/PROTOCOL.md`.
 - To change WHICH files the FLUX.2 klein download fetches, see `shared_manifest` /
   `official_encoder_manifest` / `uncensored_encoder_manifest` in `flux2_download.py`
   (`EXCLUDED_SUFFIXES` / `EXCLUDED_NAMES` are `hf_gated_download.py`'s) — never a hard-coded
   shard name. An entry added to
-  `shared_manifest` is fetched in BOTH toggle states and by BOTH variants; the two encoder
+  `shared_manifest` is fetched in BOTH toggle states; the two encoder
   tuples stay mutually exclusive. To change the access states, see `hf_gated_download.classify_repo_error`
   (status before type); to change the frame shape or the throttle, its `_chunk_reporter` /
   `ProgressThrottle`; to change where it all lands, `model_root` / `component_paths`; to change how

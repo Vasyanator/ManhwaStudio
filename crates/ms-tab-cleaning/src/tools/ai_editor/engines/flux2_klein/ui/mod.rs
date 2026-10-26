@@ -16,7 +16,10 @@ Main responsibilities:
 - draw the two PINNED parts the host places outside the panel's scroll: the progress with
   the run status (`draw_flux2_progress_section`, top) and the per-run option
   «Внимание только к маске» (`draw_flux2_run_options`, bottom);
-- delegate each block to the submodule that owns it.
+- delegate each block to the submodule that owns it;
+- in «Память и скорость», hand the shared widget the transformer format and draw the
+  encoder's format rows under it (`draw_encoder_formats`) while the weight formats are in
+  effect (4B in download mode); 9B passes none.
 
 Key structures:
 - `Flux2PanelCtx`
@@ -26,7 +29,8 @@ Key functions:
 - `draw_flux2_progress_section()`, `draw_flux2_run_options()`: the pinned parts
 
 Submodules:
-- `install.rs`: the source-mode switch, the model paths and the whole download block.
+- `install.rs`: the source-mode switch, the model paths and the whole download block (the
+  Hugging Face one of 9B, the catalog one with the two weight-format pickers of 4B).
 - `components.rs`: the merged component list (the memory steps are the shared
   `ai_editor::large_model_resources` widget, drawn by `draw_memory_section`).
 - `advanced.rs`: «Для экспертов».
@@ -196,6 +200,14 @@ pub(super) struct Flux2PanelCtx<'a> {
     pub(super) hf_token_action: &'a mut Option<HfTokenAction>,
     /// The one download control the user pressed this frame, if any.
     pub(super) download_action: &'a mut Option<HfDownloadAction>,
+    /// The catalog download block's state for the bundle the selection needed when the frame
+    /// began (4B in download mode, [`Flux2KleinEngine::catalog_snapshot`]); `None` otherwise.
+    pub(super) catalog_snapshot: Option<&'a OcrModelPanelSnapshot>,
+    /// The catalog bundle is known to be incomplete: the readiness line says so
+    /// ([`flux2_readiness_line`]). Always `false` for 9B and in manual mode.
+    pub(super) bundle_missing: bool,
+    /// The catalog download block's click this frame (download / verify / cancel).
+    pub(super) catalog_action: &'a mut ModelDownloadAction,
 }
 
 impl Flux2PanelCtx<'_> {
@@ -688,11 +700,11 @@ impl Flux2PanelCtx<'_> {
         // actionable half.
         let memory = match readiness {
             Flux2ModelReadiness::Ready => self.resources.profiles.and_then(|profiles| {
-                forecast_line(&profiles.selected).map(|line| Flux2MemorySummary { line, fits: profiles.selected.fits })
+                forecast_line(profiles).map(|line| Flux2MemorySummary { line, fits: profiles.selected.fits })
             }),
             Flux2ModelReadiness::Missing(_) | Flux2ModelReadiness::Unknown => None,
         };
-        let line = flux2_readiness_line(readiness, memory);
+        let line = flux2_readiness_line(readiness, self.bundle_missing, memory);
         let text = line.text();
         let mut install_requested = false;
         ui.horizontal_wrapped(|ui| {
@@ -777,6 +789,8 @@ impl Flux2PanelCtx<'_> {
         let download_check_busy = self.download_check_busy;
         let download_busy = self.download_busy;
         let download_status = self.download_status;
+        let catalog_snapshot = self.catalog_snapshot;
+        let catalog_action = &mut *self.catalog_action;
 
         ui.separator();
         let section_id = ui.make_persistent_id("cleaning_flux2_klein_install_section");
@@ -825,17 +839,29 @@ impl Flux2PanelCtx<'_> {
                 draw_source_mode_switch(ui, settings, changed);
                 match settings.source_mode() {
                     Flux2SourceMode::Manual => {
+                        // A GGUF text encoder is a single FILE, so a variant that offers GGUF
+                        // encoder formats (4B) gets a file button beside the folder one; the
+                        // 9B row keeps its folder button alone.
+                        let mut encoder_buttons = Vec::with_capacity(2);
+                        if Flux2WeightFormat::offered_for(variant, Flux2WeightAxis::TextEncoder).iter().any(|format| format.is_gguf()) {
+                            encoder_buttons.push((
+                                "📄",
+                                t!("cleaning.tools.flux2_klein.browse_file_tooltip"),
+                                Flux2PickerPurpose::TextEncoderFile,
+                            ));
+                        }
+                        encoder_buttons.push((
+                            "📁",
+                            t!("cleaning.tools.flux2_klein.browse_folder_tooltip"),
+                            Flux2PickerPurpose::TextEncoderDir,
+                        ));
                         draw_path_row(
                             ui,
                             &Flux2PathRow {
                                 label: t!("cleaning.tools.flux2_klein.text_encoder_path_label"),
                                 hint: t!("cleaning.tools.flux2_klein.text_encoder_path_hint"),
                                 id_salt: "cleaning_flux2_klein_text_encoder_path",
-                                buttons: &[(
-                                    "📁",
-                                    t!("cleaning.tools.flux2_klein.browse_folder_tooltip"),
-                                    Flux2PickerPurpose::TextEncoderDir,
-                                )],
+                                buttons: &encoder_buttons,
                             },
                             &mut settings.text_encoder_path,
                             changed,
@@ -888,6 +914,15 @@ impl Flux2PanelCtx<'_> {
                             picker_requested,
                         );
                     }
+                    // A catalog variant (4B) downloads through the app itself: the two weight
+                    // formats and one pinned bundle, no token and no backend download.
+                    Flux2SourceMode::Download if settings.weight_formats_in_effect() => draw_catalog_download_block(
+                        ui,
+                        settings,
+                        Flux2CatalogDownloadView { snapshot: catalog_snapshot, status },
+                        changed,
+                        catalog_action,
+                    ),
                     // The three manual rows are NOT drawn here: in this mode the paths are
                     // derived, and an editable field whose value nothing reads is a lie.
                     // The derived destinations are shown read-only inside the block.
@@ -946,6 +981,12 @@ impl Flux2PanelCtx<'_> {
     /// Closed by default: the steps are chosen once per machine and the forecast they produce
     /// is already on the readiness line above. The widget writes the step pair into a copy
     /// that is stored back here, and every other action travels to the engine.
+    ///
+    /// While the weight formats are in effect (4B in download mode) the widget also gets the
+    /// transformer format (its format rows; a picked row is written into the setting) and the
+    /// encoder's format rows are drawn right under it (`draw_encoder_formats`); a pick on
+    /// either raises `settings_changed`, which saves it and re-arms the status, the forecast
+    /// and the bundle probe.
     pub(super) fn draw_memory_section(&mut self, ui: &mut egui::Ui) {
         let settings = &mut *self.settings;
         let changed = &mut *self.settings_changed;
@@ -958,12 +999,17 @@ impl Flux2PanelCtx<'_> {
             false,
             |ui| {
                 let mut choice = settings.step_choice();
+                // Weight formats exist only while they are in effect (4B in download mode):
+                // then the transformer's format rows come from the widget and the encoder's
+                // right under it; elsewhere FLUX.2 has one format and draws no rows.
+                let formats = settings.weight_formats_in_effect();
+                // Copied out before `reborrow` hands the view to the widget.
+                let profiles = resources.profiles;
                 let actions = draw_large_model_resources(
                     ui,
                     "cleaning_flux2_klein_resources",
                     &mut choice,
-                    // One weight format: no format rows.
-                    None,
+                    formats.then_some(&mut settings.transformer_format),
                     Some(&mut settings.encoder_on_cpu),
                     resources.reborrow(),
                 );
@@ -971,6 +1017,14 @@ impl Flux2PanelCtx<'_> {
                     *changed |= settings.set_step_choice(choice);
                 }
                 actions_out.extend(actions);
+                if formats
+                    && let Some(profiles) = profiles
+                    && draw_encoder_formats(ui, profiles, &mut settings.text_encoder_format).is_some()
+                {
+                    // The row already wrote its id into the setting; the engine saves it and
+                    // re-arms the status, the forecast and the bundle probe.
+                    *changed = true;
+                }
             },
         );
     }

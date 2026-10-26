@@ -19,13 +19,13 @@ in `cost_tables.detect_device_class`, in `inventory`'s `meta` conversion and ins
 mechanics' functions):
 ```
 spec                      (stdlib)
-inventory, tiers          (-> spec; inventory -> ..safetensors_stream)
+inventory, tiers          (-> spec; inventory -> ..tensor_container, ..safetensors_stream)
 cost_tables               (-> ..torch_support, ..memory_probe lazily)
 forecast                  (-> tiers, inventory, cost_tables)
 planner                   (-> forecast, tiers, ..memory_budget)
 ledger                    (-> tiers; stdlib)                       mechanics
 loader                    (-> ledger, inventory, ..safetensors_stream, ..memory_budget)
-hooks, moves              (-> loader, ledger; moves -> ..rocm_mmap_transfer in debug mode)
+hooks, moves              (-> loader, ledger; hooks -> ..tensor_container; moves -> ..rocm_mmap_transfer in debug mode)
 degrade                   (-> planner, moves, tiers, ..memory_budget)              manager layer
 manager                   (-> every module above, ..residency, ..memory_budget)
 ```
@@ -45,7 +45,8 @@ buffer each, DISK/DROPPED left on `meta`) and registers every unit in the handle
 runs a phase whose compute component has HOST/DISK blocks, and is removed before the next move.
 `Ledger.holdings()` is what the handle reports up to the residency arbiter.
 Data flow of one planning call: the model package resolves its files per weight format ->
-`inventory.build_inventories` (safetensors headers only) -> `planner.plan(spec, inventories,
+`inventory.build_inventories` (checkpoint headers only, safetensors or GGUF through
+`..tensor_container`) -> `planner.plan(spec, inventories,
 format=, formats=, steps=, limits=, budgets=, shape=, tables=, floor=)`. The planner plans the
 STEP GRID of the format lazily: each concrete pair (a cell) expands its `tiers.template_for`
 template over the spec's components, tries the template's alternatives in preference order,
@@ -91,7 +92,8 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
 - `inventory.py`: `build_inventory` / `build_inventories` -> `ComponentInventory` (blocks in
   residency order, non-block weights, device and file bytes, largest tensor/block, `fragmented`,
   the load transient `load_host_bytes` from `BlockSpan.convert_bytes`: the spec's conversion run
-  on `meta`, outputs that alias the read buffer cost nothing).
+  on `meta`, outputs that alias the read buffer cost nothing). Files of either container: a
+  block-quantized GGUF tensor is a `U8` span (`TensorSpan.quant_type`) sized by its bytes.
 - `tiers.py`: `Tier`, `VramStep` / `VRAM_ORDER`, `RamStep` / `RAM_ORDER`, `Steps` (`AUTO_STEPS`,
   `STEP_WALK`), `StepFloor`, `Limits` (hard caps only), the plan types (`ComponentPlan`,
   `PhasePlan`, `Transition`, `ResidencyPlan`, `derive_transitions`) and the templates
@@ -113,11 +115,13 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
   `release` / `move_without_copy`, staging, `holdings()`, `assert_single_copy()`), the debug
   cross-check (`MS_LARGE_MODELS_DEBUG=1`, `arm_cross_check` / `cross_check`).
 - `loader.py`: `load_component`, `load_units`, `LoadedComponent` (unit binding `TensorSlot`,
-  `host_buffers`), `packed_layout` / `packed_view`, and the device seam `Transport` /
+  `host_buffers`), `packed_layout` / `packed_view`, the disk-read progress frame `LoadProgress` /
+  `LoadProgressSink` / `component_read_progress`, and the device seam `Transport` /
   `TorchTransport` / `Stream` / `TorchLedgerProbe`.
 - `hooks.py`: `apply_block_residency` -> `HookSet` (pre/post forward hooks, device slots, the DISK
   reader thread, `HookStats`), `BlockStreamError`.
-- `moves.py`: `transfer_block_wise` -> `TransferReport`, `park`, `restore`, `drop`, `DeviceShort`.
+- `moves.py`: `transfer_block_wise` -> `TransferReport`, `park`, `restore`, `drop`, `DeviceShort`;
+  optional `read_progress` for the DISK / DROPPED units a transfer re-reads.
 - `degrade.py`: `classify_failure` -> `RunFailure` (`FailureKind`), `Ladder` (rungs `RungKind`:
   `RECLAIM`, `TIGHTER_DEVICE`, `FALLBACK`, `NEXT_VRAM_STEP`, `NEXT_RAM_STEP`; `Replan`, `Rung`,
   `MAX_RETRIES`), learned floors per axis (`FloorKey` with its `host_pin`, `FloorEntry`,
@@ -140,7 +144,14 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
   real arbiter and small pool, fake probes over the fake transports' byte pools): the manager
   contracts below.
 - `test_inventory.py` (also the spec validation), `test_tiers.py`, `test_cost_tables.py`,
-  `test_forecast.py`, `test_planner.py`: the contracts below.
+  `test_forecast.py`, `test_planner.py`: the contracts below. `test_inventory.py` and
+  `test_hooks.py` also cover a GGUF file (written with `.._gguf_test_fixtures`; skipped without
+  the `gguf` package).
+- `test_gguf_residency.py`: GGUF weights through every tier — a toy with a `GgufEmbedding` and 4
+  blocks of `GgufLinear` over a real tiny GGUF: loader DEVICE / HOST packed / DISK, hooks streaming
+  from the GGUF data start, park / restore, and a manager acquire -> load -> run_phase -> finish
+  under RAM KEEP. Output equals the reference exactly, single copy holds, `quant_type` and the
+  uint8 weight survive every step (skipped without torch / `gguf`).
 
 ## Contracts and invariants
 - **No host OOM (the budget's contract, owned by `../memory_budget.py`).** A plan's host growth
@@ -261,6 +272,15 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
   moves a unit toward the device (a unit whose between-runs tier is more resident than where it
   is stays there; an absent component stays absent): an early failure costs no disk read.
   `Session.settle()` is the explicit reconcile to `plan.idle` with loads (a safe point).
+- **Disk-read progress has one session-level sink.** `Session.set_load_progress(sink)` receives
+  every checkpoint read of a step as `loader.LoadProgress` frames (component, file being read,
+  the component's files, done / total file bytes of THIS read, `reread`): a fresh load (`load`,
+  a transition, a phase entry, the reload after a degrade retry, `settle`) is one stream over the
+  whole component; the DISK / DROPPED units a step brings back are one stream per component and
+  step (`reread=True`, aggregated in `moves` and throttled there once). Frames come synchronously
+  on the session's thread, at most every 0.2 s per stream (`safetensors_stream`) plus one 100%
+  frame. Hook streaming inside a phase and `finish` report nothing. An explicit
+  `Session.load(progress=)` replaces the sink for that call's fresh loads.
 - **Placements** (`ComponentPlacement`, `LargeModelManager.placements(key)`, `status()`
   `components`) are read from the handle's ledger only: no probe, never waits for a session.
 - **Run reservation.** A session holds one reservation = remaining forecast peak - bytes the
@@ -301,7 +321,7 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
 - To support a new model, write its `LargeModelSpec` in the model package; nothing here changes.
 - To change how memory is probed or the reserves, edit `../memory_budget.py`, not this package.
 - To change the admission (planner inputs, Q-P1, the reservation), the session steps (incl.
-  `finish` / `settle`), the placements or the pool offers, edit `manager.py`; the rung order, what
+  `finish` / `settle`), the load-progress sink, the placements or the pool offers, edit `manager.py`; the rung order, what
   counts as a memory failure or the floors, `degrade.py`; a model-specific rung is a
   `spec.Fallback` in the model package.
 - To change how a component is loaded per tier, edit `loader.py`; how a juggled block reaches the

@@ -13,8 +13,8 @@ It serves BOTH model variants (klein 9B and klein 4B) and carries no variant fie
 driven by the three user-supplied paths (block and layer counts are read from the files). The one
 place the variants are told apart is `components.require_encoder_transformer_compatible`, which
 refuses a MIXED pair before any weight is read — see the FLUX.2 klein sections of
-`../MODULE_README.md`. Only the 9B checkpoint is on this machine (2026-10-16); the 4B path is
-exercised by the tiny real models of the tests.
+`../MODULE_README.md`. The tiny real models of the tests exercise both; real 4B GGUF files are
+checked by the opt-in `test_real_gguf_header.py` / `test_real_gguf_encoder_header.py`.
 
 **This file documents the LAYOUT only.** The domain contracts — mask semantics, run order, the
 request's step pair and the refused placement wire, the decode fallbacks, per-component residency,
@@ -26,16 +26,20 @@ Strict one-directional layering. A module may import from any module ABOVE it in
 `../../runtime/`, never from a module below it:
 
 ```
-params, progress, conversion            (no intra-package dependencies; params -> runtime tiers)
+params, progress, conversion,           (no intra-package dependencies; params -> runtime tiers,
+encoder_gguf                                 runtime.tensor_container; encoder_gguf -> gguf,
+                                             transformers, accelerate lazily)
 attention                               (-> params)
 components                              (-> params, runtime.torch_support, runtime.safetensors_stream,
-                                             runtime.encoder_truncation)
+                                             runtime.encoder_truncation, runtime.tensor_container,
+                                             runtime.paths)
 hardware                                (-> runtime.torch_support, runtime.memory_probe,
                                              runtime.torch_device)
 prompt_cache                            (-> components, params, runtime.paths)
 pipeline                                (-> components)
-large_model                             (-> attention, components, conversion, params, pipeline,
-                                             runtime.large_models)
+large_model                             (-> attention, components, conversion, encoder_gguf, params, pipeline,
+                                             runtime.large_models, runtime.tensor_container;
+                                             runtime.gguf_layers lazily)
 memory                                  (-> attention, components, hardware, large_model,
                                              runtime.large_models, runtime.memory_budget)
 service                                 (-> all of the above, runtime.large_models, runtime.residency,
@@ -59,26 +63,35 @@ object itself.
 
 ## Files and submodules
 - `__init__.py`: the package docstring and the re-export block (plus the package-level `log`).
-- `params.py`: `normalize_flux2_klein_params` (including the optional `vram_step` / `ram_step`
-  and the by-name refusal of every retired field, `RETIRED_FIELDS`: the placement wire and the
-  region post-processing fields),
+- `params.py`: `normalize_flux2_klein_params` (including the optional `vram_step` / `ram_step`,
+  the weight-format fields `transformer_format` / `transformer_formats` with `derived_format`
+  and the generic `_weight_formats`, and the by-name refusal of every retired field,
+  `RETIRED_FIELDS`: the placement wire and the region post-processing fields),
   `_whole_region_overrides`, `validate_region_size`, `effective_steps`,
   `_lenient_paths`, `encoder_on_cpu` (the «Энкодер на CPU» flag and its default, also read
   leniently by `status`), `text_encoder_dtype_name` and the coercion helpers.
 - `progress.py`: the `phase:"load"` step numbering (`LOAD_STEP_*`, `LOAD_PHASE_STEPS`), the
-  `ProgressCb` protocol with its three OPTIONAL file fields, `_progress_reporter` and
-  `_file_progress_reporter`. A wire contract shared with the Rust client; imports nothing from the
+  `ProgressCb` protocol with its OPTIONAL file fields, `FILE_COMPONENT_*`, `_progress_reporter` and
+  `LoadFrames` (the request's callback plus the manager's load-progress sink: a component read
+  re-emits the CURRENT step frame with the byte level). A wire contract shared with the Rust client; imports nothing from the
   package.
+- `encoder_gguf.py`: the llama.cpp GGUF <-> HF Qwen3 name bridge of the text encoder
+  (`encoder_state_key_of_gguf`, `is_gguf_encoder_name`, `require_known_encoder_names`,
+  `gguf_encoder_quant_types`): the `gguf` package's QWEN3 map inverted over the real `Qwen3Model`
+  key set, no hand-written table, no Q/K row permutation.
 - `conversion.py`: the per-key BFL / diffusers layout rule of the transformer checkpoint
   (`is_bfl_key`), diffusers' own per-key converter on one tensor (`convert_bfl_tensor`), the
   `model.diffusion_model.` prefix refusal.
 - `components.py`: the five components AS FILES ON DISK — search roots and probe order, tokenizer
   and scheduler discovery, header reading, the fp8-scaled refusal, the transformer-config contract,
-  text-encoder availability, the encoder<->transformer width contract, the encoder truncation
+  the config of a GGUF component (beside it, else the installed 4B package, checked against the
+  file's header: `_search_gguf_config`, `find_text_encoder_config_dir`), text-encoder availability, the encoder<->transformer width contract, the encoder truncation
   (`ENCODER_KEEP_LAYERS`, `text_encoder_truncation_kwargs`), `checkpoint_is_distilled`, the disk
   sizes `status` reports, the VAE tiling threshold and the `components` map of `status`.
 - `large_model.py`: the `LargeModelSpec`s (`pipeline_spec(dtype)`, `encoder_spec(fp8)`,
-  `register_specs`), their options (`PipelineOptions`, `EncoderOptions`, `request_shape`), the key
+  `register_specs`), their options (`PipelineOptions`, `EncoderOptions`, `request_shape`), the
+  transformer's weight formats (`weight_format_of`, `transformer_path_for`, `_pipeline_formats`,
+  `gguf_quant_types`, the GGUF module swap in `_build_transformer_meta`), the key
   mapping and block structure (`transformer_state_keys`, `transformer_block_of`,
   `transformer_block_order`, the encoder's truncation / `model.` prefix / fp8 split), each phase's
   work, the decode fallbacks (`FALLBACK_VAE_TILING`, `FALLBACK_VAE_TILE_LOWERED`), the
@@ -100,7 +113,11 @@ object itself.
   vocabulary / action matrix (`residency_of`, `_component_actions`).
 - `service.py`: `Flux2KleinInpaintService` — the service lock, the prompt cache, the tokenizer /
   scheduler caches, the manager sessions of a run and of every action (acquired under the lock, pipeline
-  before encoder; `LockOrderTests`), `large_model_profiles` (the `large_models.profiles` adapter:
+  before encoder; `LockOrderTests`), `_encoder_need` / `EncoderNeed` (the one decision whether a
+  request encodes and whether its forecast counts the encoder: not counted only when not resident
+  AND fully cached), `_load_frames` (the request's `LoadFrames`; `_acquire` registers its sink on every session, so
+  every checkpoint read of a session reports its bytes),
+  `large_model_profiles` (the `large_models.profiles` adapter:
   pipeline pickers with the encoder's claim; `large_model_name` / `large_model_inputs` its
   single-handle fallback), `set_phase_observer` (the calibration hook) and
   `_effective_guidance_scale`.
@@ -109,10 +126,17 @@ object itself.
 - `_test_fixtures.py`: shared test fixtures — the model tree (header-only weights, or tiny REAL
   models with `real_weights=True`), `_TempTreeCase`, `_FakeEmbeds`, and `_ManagedRunFixture` (a
   service over a REAL manager on the CPU; only the pipeline call, the tokenizer, the budget probes
-  and the transport's device are faked).
+  and the transport's device are faked), and the GGUF writers (`_write_tiny_gguf`,
+  `_write_bfl_gguf_transformer`: the tiny real transformer as a BFL-layout GGUF plus the
+  diffusers state dict it must load as).
 - `test_*.py`: one per module; `test_characterization.py` holds the CONTRACT tests of the wire (and
   the GOLDEN forecast), `test_runtime_extraction.py` pins what FLUX.2 keeps seeing of names
-  that live in `../../runtime/`. Torch / diffusers / transformers tests skip without them; no GPU,
+  that live in `../../runtime/`, `test_real_gguf_header.py` is the opt-in check of real 4B GGUF
+  transformer files (skips unless `side_models/FLUX.2-klein-4B/transformer_gguf/*.gguf` exists or
+  `MS_FLUX2_KLEIN_GGUF_FILES` names files), `test_real_gguf_encoder_header.py` the same for Qwen3
+  GGUF encoders (`text_encoder_gguf/*.gguf` or `MS_FLUX2_KLEIN_GGUF_ENCODER_FILES`; a Q8_0 file is
+  also checked row by row against the package's bf16 encoder), `test_encoder_gguf.py` the name
+  bridge and the tiny real Qwen3 GGUF through the manager. Torch / diffusers / transformers tests skip without them; no GPU,
   no network. Run them with `python -m pytest modules/ai_backend/inpaint/ -q` from the repo root.
 
 ## Memory behaviour under the manager
@@ -128,6 +152,64 @@ object itself.
 
 ## Contracts and invariants
 
+### Transformer weight formats (protocol 21)
+- The request selects ONE transformer format (`transformer_format`, its file is always
+  `transformer_path`) and may list candidates (`transformer_formats`, `[{id, path}]`, best
+  first). Ids are opaque (`^[a-z0-9_]{1,32}$`): the Rust format list owns their names, this
+  package lists no quantization. Absent fields: the id is derived from the CONTAINER
+  (`params.derived_format`: `bf16` for safetensors / a folder, `gguf` for a GGUF file), never
+  from a file name.
+- `large_model.weight_format_of(options)` is the ONE answer to "which format is this handle":
+  every `acquire`, `profiles` (a `None` format plans the request's selection), forecast and the
+  calibration tool ask it. The encoder's formats: next section.
+- One `FormatInfo` row per candidate (`quality_rank = count - index`; available = its file and
+  the VAE exist; `dit_bytes` the file size; compute path `native` / `gguf` by container). The
+  `gguf` compute path is measured by no calibration table, so a GGUF forecast is an estimate.
+- The pipeline's residency key names the FORMAT'S FILE (`transformer_path_for`), never the id:
+  the bf16 key is the pre-format key, and two formats are two handles.
+- A GGUF transformer stays quantized in memory: `_build_transformer_meta` swaps every module
+  the file stores block-quantized for a `runtime.gguf_layers.GgufLinear` (a BFL fused qkv gives
+  its three row slices the fused tensor's type), the loader fills its `uint8` rows, and each
+  forward dequantizes into the request's `dtype`. The BFL conversion stays diffusers' own and
+  is valid on quantized bytes because it only renames, splits whole rows (qkv `chunk(dim=0)`)
+  or swaps row halves (`swap_scale_shift`). Plain GGUF tensors (F32 / F16 / BF16) are ordinary
+  weights.
+- `require_loadable` refuses, before any admission, a GGUF transformer with a
+  `model.diffusion_model.` prefix, a block type `gguf_layers` cannot dequantize (named with a
+  tensor and the supported list), or no `transformer/config.json` found next to it (a file in
+  `<package>/transformer_gguf/` finds `<package>/transformer/config.json`).
+
+### Text-encoder weight formats and the GGUF encoder (protocol 21)
+- The encoder has the transformer's contract: `text_encoder_format` (its file is always
+  `text_encoder_path`) and optional `text_encoder_formats` candidates; absent, the id is derived from
+  the container (`params.derived_encoder_format`: an absent or missing encoder derives `bf16`, since
+  nothing is loaded from it). `weight_format_of` answers for both handles; one `FormatInfo` row per
+  candidate (`dit_bytes` the weight files' size, compute path `native` / `gguf`), the residency key
+  names the format's file (`encoder_path_for`: the bf16 key is unchanged).
+- A GGUF encoder stays quantized in memory: `_make_build_encoder_meta` swaps every block-quantized
+  module (the linears and `embed_tokens`, a `GgufEmbedding` that dequantizes only looked-up rows)
+  before the loader fills it; the norms are F32 in the file and cast to the encoder dtype. Blocks
+  `>= ENCODER_KEEP_LAYERS` and the tied `output.weight` map to nothing and are never read.
+- The encode phase of a GGUF encoder is variant `ENCODE_VARIANT_GGUF` (`text_gguf`, D7), so no
+  measured bf16 `encode text` entry is borrowed: its forecast is an estimate. `PhaseSpec.work` sees
+  the options only, so the variant follows the SELECTED encoder file — an alternative format's row
+  is planned with it.
+- Weight-only fp8 and a GGUF encoder exclude each other (D8): `large_model.encoder_options` (every
+  encoder use) and `require_loadable_encoder` refuse `text_encoder_fp8` with a GGUF file naming both
+  fields; the fp8 spec lists no GGUF candidate. No silent fallback.
+- Config of a GGUF file (encoder and transformer alike): probed `<dir>/<subdir>`, `<dir>`,
+  `<parent>/<subdir>`, `<parent>`, then the installed 4B package's `<subdir>`
+  (`components.installed_4b_package_root`, `<side_models>/FLUX.2-klein-4B`). A candidate is accepted
+  only when it does not contradict the GGUF header (encoder: `architectures == ["Qwen3ForCausalLM"]`,
+  `general.architecture == "qwen3"`, layer / width / head counts; transformer: class name, double /
+  single block counts, inner width); the package fallback must declare every required field. No fit
+  is a Russian refusal listing what was probed and rejected. The package root also joins the
+  tokenizer / scheduler search when a component is GGUF, never the `model_index.json` search
+  (klein 4B and klein base 4B share every shape).
+- Prompt cache: a GGUF encoder's fingerprint is `sha256(config bytes + "\ngguf\x00<name>\x00<size>")`
+  and its family is named by the file's stem, so a Q4 cache is never served for bf16; the in-memory
+  key carries the format; `.msprompt` metadata records `text_encoder_format` for display only.
+
 ### Monkeypatched symbols must be reached through their defining module
 The test suite replaces module-level attributes to keep the GPU, the filesystem and the memory
 snapshot out of the way. One `patch.object` reaches every caller only if every caller looks the name
@@ -137,7 +219,7 @@ up on the module that defines it:
 |---|---|
 | `memory_snapshot`, `_clear_torch_cache`, `_resolve_selected_backend_device` | `hardware` |
 | `_tables_for` (the forecast's cost tables) | `memory` |
-| `_weight_bytes` (the disk size `status` reports) | `components` |
+| `_weight_bytes` (the disk size `status` reports), `installed_4b_package_root` | `components` |
 | `program_root`, `write_prompt_file` | `prompt_cache` |
 | `build_text_attention_mask` | `attention` |
 | `is_torch_available` | `components` AND `hardware` — TWO bindings, see below |
@@ -187,11 +269,14 @@ which is what makes `assertLogs(svc.log)` capture records of the submodules.
 - To change the step keys of an answer, the combined VRAM-axis rule or the two-handle forecast,
   see `memory.py`.
 - To change what the manager knows of a component — files, keys, blocks, dtype, fp8, a phase's
-  work, a decode fallback, a pre-admission refusal — see `large_model.py`; the BFL key rule is
+  work, a decode fallback, a pre-admission refusal, the transformer's formats — see
+  `large_model.py`; the weight-format wire fields are `params._weight_formats`; the BFL key rule is
   `conversion.py`. The steps, the forecast, the planner, the loader and the ladder are
   `../../runtime/large_models/` (model-agnostic: never special-case FLUX.2 there).
-- To change where a component is looked for on disk, what a checkpoint may contain, the variant
-  rule, how deep the text encoder is, what the checkpoint declares about guidance distillation, or
+- To change the llama.cpp <-> HF names of the Qwen3 encoder, see `encoder_gguf.py`; the encoder's
+  formats, GGUF build and the D8 rule, `large_model.py`.
+- To change where a component (or a GGUF file's config) is looked for on disk, what a checkpoint
+  may contain, the variant rule, how deep the text encoder is, what the checkpoint declares about guidance distillation, or
   the VAE's tiling threshold, see `components.py`.
 - To change what happens to `guidance_scale` on a distilled checkpoint, see
   `service._effective_guidance_scale` — and nowhere else.
@@ -209,8 +294,7 @@ which is what makes `assertLogs(svc.log)` capture records of the submodules.
   dtype/padding/size, see `attention.py` — and keep `text_attention_mask_bytes` the ONE formula
   the spec's denoise work and the allocation use. After a diffusers upgrade,
   `RealTransformerLayoutTests` is what proves the layout still holds.
-- To change what the progress bar shows while the transformer is read, see
-  `progress._file_progress_reporter` and its one caller, `service._load_pipeline_locked`; the step
-  numbers must not move.
+- To change what the progress bar shows while a component is read, see `progress.LoadFrames` and
+  `service._load_frames` (which components report, their labels); the step numbers must not move.
 - To add a declaration that other modules or the tests must see, add it to the matching module AND
   to the re-export block of `__init__.py`.

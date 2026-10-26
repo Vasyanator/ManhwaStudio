@@ -42,6 +42,11 @@ Contracts:
 - Sources are only the mechanics' own anonymous host tensors, never a
   file-mapped tensor (the ROCm amdkfd stall); the debug mode asserts it.
 - A component with live residency hooks is refused (`RuntimeError`).
+- Disk re-reads report progress only when the caller passes `read_progress`:
+  one `LoadProgress` stream (`reread=True`) per component over ALL of its
+  DISK / DROPPED incoming units of the transfer, rate-limited once here
+  (`ByteProgress`, the filler itself reports every chunk to it), ending with
+  one frame at 100% after that component's last unit was read.
 
 Notes:
 - torch is imported lazily through the loader / transport.
@@ -56,8 +61,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..memory_budget import HostMemoryShort, HostWatch
+from ..safetensors_stream import ByteProgress, ByteProgressCb
 from .ledger import Ledger, UnitRef, debug_enabled
-from .loader import LoadedComponent, TorchLedgerProbe, TorchTransport, Transport, load_units, packed_layout, packed_view, set_unit_to_meta
+from .loader import LoadedComponent, LoadProgressSink, TorchLedgerProbe, TorchTransport, Transport, component_read_progress, load_units, packed_layout, packed_view, set_unit_to_meta
 from .tiers import Tier
 
 log = logging.getLogger(__name__)
@@ -112,13 +118,47 @@ def _ledgers(moves: Sequence[Move]) -> list[Ledger]:
     return seen
 
 
+class _RereadProgress:
+    """The disk re-reads of one transfer, one rate-limited `LoadProgress` stream per component.
+
+    Built before anything moves from the incoming units still in DISK /
+    DROPPED: a component's total is the file bytes of exactly those units
+    (what `load_units` will read for them).
+    """
+
+    def __init__(self, incoming: Sequence[Move], sink: LoadProgressSink, owner: str) -> None:
+        totals: dict[LoadedComponent, int] = {}
+        for component, ref in incoming:
+            if component.ledger.tier(ref) in (Tier.DISK, Tier.DROPPED):
+                totals[component] = totals.get(component, 0) + sum(span.file_bytes for span in component.unit_spans[ref])
+        self._streams = {component: ByteProgress(component_read_progress(component.inventory, sink, reread=True), total, owner=owner, logger=log) for component, total in totals.items()}
+        self._totals = totals
+
+    def callback_for(self, component: LoadedComponent) -> ByteProgressCb | None:
+        """The per-`load_units` callback feeding `component`'s stream with byte deltas; `None` when it re-reads nothing."""
+        stream = self._streams.get(component)
+        if stream is None:
+            return None
+        total = self._totals[component]
+        last = 0
+
+        def report(done: int, _unit_total: int, key: str) -> None:
+            nonlocal last
+            delta = done - last
+            last = done
+            stream.advance(delta, key, final=stream.done_bytes + delta >= total)
+
+        return report
+
+
 class _Mover:
     """State of one `transfer_block_wise` call."""
 
-    def __init__(self, moves: Sequence[Move], transport: Transport, watch: HostWatch | None, owner: str) -> None:
+    def __init__(self, moves: Sequence[Move], transport: Transport, watch: HostWatch | None, owner: str, reread: _RereadProgress | None = None) -> None:
         self.transport = transport
         self.watch = watch
         self.owner = owner
+        self.reread = reread
         self.ledgers = _ledgers(moves)
         self.debug = debug_enabled()
         if self.debug and isinstance(transport, TorchTransport):
@@ -204,7 +244,9 @@ class _Mover:
             self._free_host(component, ref)
             ledger.commit(ref)
         else:
-            load_units(component, [ref], watch=self.watch)
+            progress = None if self.reread is None else self.reread.callback_for(component)
+            # Interval 0: the per-component stream above throttles once.
+            load_units(component, [ref], watch=self.watch, progress=progress, progress_interval_seconds=0.0)
             for entry in component.units[ref]:
                 self.transport.track_device(entry.get())
         self.after_unit(component, ref)
@@ -233,6 +275,7 @@ def transfer_block_wise(
     watch: HostWatch | None = None,
     device_limit: int | None = None,
     owner: str = "large models",
+    read_progress: LoadProgressSink | None = None,
 ) -> TransferReport:
     """Move `outgoing` DEVICE units to `outgoing_to` and bring `incoming` units onto the device, interleaved.
 
@@ -241,6 +284,8 @@ def transfer_block_wise(
     `incoming` units may be in `HOST`, `DISK` or `DROPPED` (the latter two are
     re-read from their files). `device_limit` (bytes, same measure as
     `Transport.device_reserved`) is the ceiling the device may never exceed.
+    `read_progress` receives the disk re-reads (module contracts), on the
+    calling thread; a HOST -> device restore reads no file and reports nothing.
 
     # Raises
     `ValueError` for a unit in the wrong tier or an invalid `outgoing_to`;
@@ -262,7 +307,8 @@ def transfer_block_wise(
         raise ValueError(f"transfer_block_wise: уходящие блоки не на устройстве {wrong_out[:3]}, приходящие уже на устройстве {wrong_in[:3]}")
 
     started = time.monotonic()
-    mover = _Mover([*outgoing, *incoming], transport, watch, owner)
+    reread = None if read_progress is None else _RereadProgress(incoming, read_progress, owner)
+    mover = _Mover([*outgoing, *incoming], transport, watch, owner, reread)
     report = TransferReport()
     start = mover.measure()
     out_bytes = sum(component.unit_bytes[ref] for component, ref in outgoing)
@@ -322,10 +368,10 @@ def park(component: LoadedComponent, *, to: Tier = Tier.HOST, transport: Transpo
     return transfer_block_wise(outgoing, [], outgoing_to=to, transport=transport, watch=watch, owner=owner)
 
 
-def restore(component: LoadedComponent, *, transport: Transport, watch: HostWatch | None = None, device_limit: int | None = None, owner: str = "large models") -> TransferReport:
-    """Bring every off-device unit of `component` back onto its device (non-block weights first)."""
+def restore(component: LoadedComponent, *, transport: Transport, watch: HostWatch | None = None, device_limit: int | None = None, owner: str = "large models", read_progress: LoadProgressSink | None = None) -> TransferReport:
+    """Bring every off-device unit of `component` back onto its device (non-block weights first); `read_progress` as in `transfer_block_wise`."""
     incoming = [(component, ref) for ref in component.refs(tiers=(Tier.HOST, Tier.DISK, Tier.DROPPED))]
-    return transfer_block_wise([], incoming, outgoing_to=Tier.DROPPED, transport=transport, watch=watch, device_limit=device_limit, owner=owner)
+    return transfer_block_wise([], incoming, outgoing_to=Tier.DROPPED, transport=transport, watch=watch, device_limit=device_limit, owner=owner, read_progress=read_progress)
 
 
 def drop(component: LoadedComponent, *, transport: Transport) -> int:

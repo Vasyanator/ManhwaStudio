@@ -65,7 +65,11 @@ and is reported (`settings.vram_cap`, per step `non_torch_end`).
   cell forecast is the service's own estimate (`memory.forecast_memory`). It sends
   `encoder_on_cpu: false` unless `--encoder-on-cpu` (the wire default is on; the measured grid
   lets the steps place the encoder). The FLUX.3 driver builds `Flux3Options`, whose
-  `encoder_on_cpu` defaults to off.
+  `encoder_on_cpu` defaults to off. The transformer's weight format is the one the service derives
+  from `--transformer-path` (`params.derived_format`: `bf16` for safetensors / a folder, `gguf`
+  for a GGUF file); the measured phases are keyed with its compute path (`native` / `gguf`), the
+  report's `variant` is that format and a non-bf16 grid key gains `__fmt-<id>` (bf16 keeps the ids
+  of earlier reports).
 - `report.py`: `report.json` / `report.csv` (rewritten after every combo), the step grids and the
   per-axis monotonic check, the summary.
 - `device_memory.py`: the `--vram-cap-gib` cap and the device baseline (amdgpu sysfs, or

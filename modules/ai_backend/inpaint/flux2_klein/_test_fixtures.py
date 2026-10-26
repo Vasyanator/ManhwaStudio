@@ -17,11 +17,23 @@ Key declarations:
 - `TINY_TRANSFORMER_CONFIG` / `TINY_VAE_CONFIG` / `TINY_ENCODER_CONFIG` - the tiny
   real models (the encoder has exactly `ENCODER_KEEP_LAYERS` layers and a width
   that matches the transformer, so the variant guard passes).
+- `_write_tiny_gguf` - a minimal GGUF transformer file (header-readable, BFL
+  names) for the format / params / refusal tests;
+  `TINY_GGUF_ENCODER_CONFIG` / `_write_qwen3_gguf_encoder` - a tiny REAL
+  Qwen3 encoder written as a llama.cpp GGUF (quantized linears and
+  embedding, F32 norms, `qwen3.*` metadata) plus its truncated reference
+  state;
+  `_write_bfl_gguf_transformer` - the tiny REAL transformer re-written as a
+  GGUF in the BFL layout (fused qkv, swapped final adaLN, block-quantized
+  linears) plus the diffusers state dict it must load as.
 - `DEFAULT_MODEL_INDEX` - the `model_index.json` the tree carries by default, kept
   faithful to the shipped klein 4B one (`is_distilled: true`). Pass another dict,
   or `None` for no manifest at all, to build an undeclared checkpoint.
 - `_TempTreeCase` - a `TestCase` with a complete model tree in a temp directory
-  (`real_weights = True` in a subclass for the tiny real models).
+  (`real_weights = True` in a subclass for the tiny real models); it points
+  `components.installed_4b_package_root` at an absent `self.installed_package`
+  under that directory, so the GGUF package fallback never sees the machine's
+  real `side_models/`.
 - `_FakeEmbeds` - a prompt-embedding stand-in for the library tests.
 - `_ManagedRunFixture` (+ `_RoomyProbes`, `_FakeRunPipeline`, `_ImageProcessor`,
   `_flat_tables`) - real manager, arbiter, small pool, torch and model classes;
@@ -48,7 +60,7 @@ import numpy as np
 from PIL import Image
 
 from modules.ai_backend.inpaint import flux2_klein as svc
-from modules.ai_backend.inpaint.flux2_klein import hardware
+from modules.ai_backend.inpaint.flux2_klein import components, hardware
 from modules.ai_backend.runtime.model_manager import SmallModelManager
 
 
@@ -234,6 +246,207 @@ def _write_real_weights(root: Path) -> None:
     (root / "text_encoder" / "config.json").write_text(json.dumps(TINY_ENCODER_CONFIG), encoding="utf-8")
 
 
+def _write_tiny_gguf(path: Path, *, quant: str = "Q8_0") -> Path:
+    """A minimal GGUF transformer file at `path` (parents created): a block-quantized BFL qkv in `quant`, a BF16 embedder, an F32 norm.
+
+    Header-readable only (no model matches it); needs the `gguf` package.
+    """
+    from modules.ai_backend.runtime._gguf_test_fixtures import Q, make_tensor, write_gguf
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tensors = [
+        make_tensor("img_in.weight", Q.BF16, (32, 8), seed=1),
+        make_tensor("double_blocks.0.img_attn.qkv.weight", Q[quant], (96, 256 if quant.endswith("_K") else 32), seed=2),
+        make_tensor("double_blocks.0.img_attn.norm.query_norm.scale", Q.F32, (16,), seed=3),
+    ]
+    return write_gguf(path, tensors)
+
+
+#: diffusers -> BFL renames of the tiny transformer (the inverse of the
+#: converter's renames; the fused qkv and the final adaLN are built apart).
+_DIFFUSERS_TO_BFL = (
+    ("time_guidance_embed.timestep_embedder.linear_1.", "time_in.in_layer."),
+    ("time_guidance_embed.timestep_embedder.linear_2.", "time_in.out_layer."),
+    ("double_stream_modulation_img.linear.", "double_stream_modulation_img.lin."),
+    ("double_stream_modulation_txt.linear.", "double_stream_modulation_txt.lin."),
+    ("single_stream_modulation.linear.", "single_stream_modulation.lin."),
+    ("x_embedder.", "img_in."),
+    ("context_embedder.", "txt_in."),
+    ("proj_out.", "final_layer.linear."),
+)
+_DOUBLE_TO_BFL = {
+    "attn.norm_q.weight": "img_attn.norm.query_norm.scale",
+    "attn.norm_k.weight": "img_attn.norm.key_norm.scale",
+    "attn.norm_added_q.weight": "txt_attn.norm.query_norm.scale",
+    "attn.norm_added_k.weight": "txt_attn.norm.key_norm.scale",
+    "attn.to_out.0.weight": "img_attn.proj.weight",
+    "attn.to_add_out.weight": "txt_attn.proj.weight",
+    "ff.linear_in.weight": "img_mlp.0.weight",
+    "ff.linear_out.weight": "img_mlp.2.weight",
+    "ff_context.linear_in.weight": "txt_mlp.0.weight",
+    "ff_context.linear_out.weight": "txt_mlp.2.weight",
+}
+_SINGLE_TO_BFL = {
+    "attn.to_qkv_mlp_proj.weight": "linear1.weight",
+    "attn.to_out.weight": "linear2.weight",
+    "attn.norm_q.weight": "norm.query_norm.scale",
+    "attn.norm_k.weight": "norm.key_norm.scale",
+}
+
+
+def _bfl_tensors_of(diffusers_state: dict[str, object]) -> dict[str, object]:
+    """The BFL-layout tensors of a diffusers FLUX.2 state dict (test inverse of diffusers' converter, torch tensors in, torch tensors out)."""
+    import torch
+
+    out: dict[str, object] = {}
+    fused: dict[str, list[object]] = {}
+    for key, value in diffusers_state.items():
+        parts = key.split(".")
+        if parts[0] == "transformer_blocks":
+            index, inner = parts[1], ".".join(parts[2:])
+            for stream, names in (("img_attn", ("attn.to_q.weight", "attn.to_k.weight", "attn.to_v.weight")), ("txt_attn", ("attn.add_q_proj.weight", "attn.add_k_proj.weight", "attn.add_v_proj.weight"))):
+                if inner in names:
+                    fused.setdefault(f"double_blocks.{index}.{stream}.qkv.weight", [None, None, None])[names.index(inner)] = value
+                    break
+            else:
+                out[f"double_blocks.{index}.{_DOUBLE_TO_BFL[inner]}"] = value
+        elif parts[0] == "single_transformer_blocks":
+            out[f"single_blocks.{parts[1]}.{_SINGLE_TO_BFL['.'.join(parts[2:])]}"] = value
+        elif key == "norm_out.linear.weight":
+            # BFL keeps (shift, scale); diffusers (scale, shift): the swap is its own inverse.
+            scale, shift = value.chunk(2, dim=0)  # type: ignore[attr-defined]
+            out["final_layer.adaLN_modulation.1.weight"] = torch.cat([shift, scale], dim=0)
+        else:
+            renamed = next((new + key[len(old):] for old, new in _DIFFUSERS_TO_BFL if key.startswith(old)), None)
+            if renamed is None:
+                raise KeyError(f"no BFL name for {key}")
+            out[renamed] = value
+    for name, (q, k, v) in fused.items():
+        out[name] = torch.cat([q, k, v], dim=0)  # type: ignore[list-item]
+    return out
+
+
+def _write_bfl_gguf_transformer(root: Path, path: Path, *, quant: str = "Q8_0") -> dict[str, object]:
+    """Re-write the tree's tiny REAL transformer (`_write_real_weights`) as a BFL-layout GGUF at `path`; return the diffusers state dict it must load as.
+
+    Every 2-D weight whose row is whole blocks of `quant` (block 32: Q8_0 /
+    Q4_0 / Q5_0) is quantized from its bf16 values — the fused qkv and the
+    swapped final adaLN included — the other 2-D weights stay BF16 and the
+    norm scales F32. The returned reference (bf16, diffusers keys) is the
+    file's values dequantized by `runtime.gguf_layers.dequantize`, then put
+    through diffusers' own converter on FLOAT tensors: a loader that splits
+    and swaps the quantized ROWS must reproduce it bit for bit.
+    """
+    import numpy as np
+    import torch
+    from gguf import quants
+
+    from modules.ai_backend.runtime._gguf_test_fixtures import FixtureTensor, Q, write_gguf
+    from modules.ai_backend.runtime.gguf_layers import dequantize
+    from modules.ai_backend.runtime.safetensors_stream import StreamingSafetensorsReader
+
+    from . import conversion
+
+    source = root / "transformer" / "diffusion_pytorch_model.safetensors"
+    with StreamingSafetensorsReader(source) as reader:
+        diffusers_state = {span.name: reader.read_tensor(span).clone() for span in reader.spans}
+    qtype = Q[quant]
+    fixtures: list[FixtureTensor] = []
+    reference: dict[str, object] = {}
+    for name, value in _bfl_tensors_of(diffusers_state).items():
+        if value.dim() == 1:  # type: ignore[attr-defined]
+            values = value.float().numpy()  # type: ignore[attr-defined]
+            fixtures.append(FixtureTensor(name=name, qtype=Q.F32, shape=tuple(values.shape), raw=np.ascontiguousarray(values)))
+            restored = torch.from_numpy(values.copy()).to(torch.bfloat16)
+        elif value.shape[-1] % 32 == 0:  # type: ignore[attr-defined]
+            raw = np.ascontiguousarray(quants.quantize(value.float().numpy(), qtype))  # type: ignore[attr-defined]
+            fixtures.append(FixtureTensor(name=name, qtype=qtype, shape=tuple(value.shape), raw=raw))  # type: ignore[attr-defined]
+            restored = dequantize(torch.from_numpy(raw.copy()), int(qtype), row_elements=int(value.shape[-1])).to(torch.bfloat16)  # type: ignore[attr-defined]
+        else:
+            raw = np.ascontiguousarray(value.contiguous().view(torch.uint8).numpy())  # type: ignore[attr-defined]
+            fixtures.append(FixtureTensor(name=name, qtype=Q.BF16, shape=tuple(value.shape), raw=raw))  # type: ignore[attr-defined]
+            restored = value.to(torch.bfloat16)  # type: ignore[attr-defined]
+        reference.update(conversion.convert_bfl_tensor(name, restored))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_gguf(path, fixtures)
+    return reference
+
+
+#: A tiny real Qwen3 encoder that a GGUF can hold block-quantized: every row is
+#: whole Q8_0 blocks (32), 30 layers so the truncation to `ENCODER_KEEP_LAYERS`
+#: (28) has blocks to skip. Its width does not match the tiny transformer, so it
+#: is for the encoder's own tests, not for a whole run.
+TINY_GGUF_ENCODER_CONFIG: dict[str, object] = {
+    "architectures": ["Qwen3ForCausalLM"],
+    "model_type": "qwen3",
+    "hidden_size": 64,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "head_dim": 32,
+    "intermediate_size": 64,
+    "num_hidden_layers": 30,
+    "vocab_size": 128,
+    "tie_word_embeddings": True,
+}
+
+
+def _write_qwen3_gguf_encoder(path: Path, *, quant: str = "Q8_0", config: dict[str, object] | None = None, metadata: dict[str, object] | None = None) -> dict[str, object]:
+    """Write a tiny REAL Qwen3 encoder (`config`, default `TINY_GGUF_ENCODER_CONFIG`) as a llama.cpp GGUF at `path`; return its truncated reference state.
+
+    Names are llama.cpp's (the `gguf` package's QWEN3 map applied FORWARD to
+    the HF names, `model.` prefixed), with no Q/K row permutation (llama.cpp
+    has none for qwen3). The linears and `token_embd` are quantized in
+    `quant`, the norms stay F32; the metadata carries the `qwen3.*` hyper
+    parameters (`metadata` overrides / adds keys). The returned reference is
+    `{Qwen3Model state key: bf16 tensor}` for the first
+    `ENCODER_KEEP_LAYERS` layers: the file's values dequantized by
+    `runtime.gguf_layers.dequantize`, what a loader must reproduce.
+    """
+    import gguf
+    import numpy as np
+    import torch
+    from gguf import quants
+    from transformers import Qwen3Config, Qwen3Model
+
+    from modules.ai_backend.runtime._gguf_test_fixtures import FixtureTensor, Q, write_gguf
+    from modules.ai_backend.runtime.gguf_layers import dequantize
+
+    config = dict(config or TINY_GGUF_ENCODER_CONFIG)
+    torch.manual_seed(1)
+    model = Qwen3Model(Qwen3Config(**{key: value for key, value in config.items() if key not in ("architectures", "model_type")}))
+    layers = int(config["num_hidden_layers"])
+    name_map = gguf.get_tensor_name_map(gguf.MODEL_ARCH.QWEN3, layers)
+    qtype = Q[quant]
+    fixtures: list[FixtureTensor] = []
+    reference: dict[str, object] = {}
+    keep = svc.ENCODER_KEEP_LAYERS
+    for key, value in model.state_dict().items():
+        name = name_map.get_name(f"model.{key}", try_suffixes=(".weight", ".bias"))
+        assert name is not None, key
+        if value.dim() == 1:
+            values = value.float().numpy()
+            fixtures.append(FixtureTensor(name=name, qtype=Q.F32, shape=tuple(values.shape), raw=np.ascontiguousarray(values)))
+            restored = torch.from_numpy(values.copy()).to(torch.bfloat16)
+        else:
+            raw = np.ascontiguousarray(quants.quantize(value.float().numpy(), qtype))
+            fixtures.append(FixtureTensor(name=name, qtype=qtype, shape=tuple(value.shape), raw=raw))
+            restored = dequantize(torch.from_numpy(raw.copy()), int(qtype), row_elements=int(value.shape[-1])).to(torch.bfloat16)
+        if not (key.startswith("layers.") and int(key.split(".")[1]) >= keep):
+            reference[key] = restored
+    header = {
+        "qwen3.block_count": layers,
+        "qwen3.embedding_length": int(config["hidden_size"]),
+        "qwen3.feed_forward_length": int(config["intermediate_size"]),
+        "qwen3.attention.head_count": int(config["num_attention_heads"]),
+        "qwen3.attention.head_count_kv": int(config["num_key_value_heads"]),
+        "qwen3.attention.key_length": int(config["head_dim"]),
+    }
+    header.update(metadata or {})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_gguf(path, fixtures, architecture="qwen3", metadata=header)
+    return reference
+
+
 def _write_safetensors(path: Path, header: dict[str, object]) -> None:
     """Write a safetensors container carrying only `header` (no tensor bytes)."""
     payload = json.dumps(header).encode("utf-8")
@@ -263,6 +476,12 @@ class _TempTreeCase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
+        # The installed 4B package a GGUF component falls back to: absent unless
+        # a test creates it, so no test sees the real `side_models/` of the machine.
+        self.installed_package = self.root / "_installed" / components.FLUX2_KLEIN_4B_DIR_NAME
+        package_patch = patch.object(components, "installed_4b_package_root", lambda: self.installed_package)
+        package_patch.start()
+        self.addCleanup(package_patch.stop)
         self.paths = _make_model_tree(
             self.root,
             single_file_transformer=self.single_file_transformer,

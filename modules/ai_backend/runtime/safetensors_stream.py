@@ -2,11 +2,11 @@
 File: modules/ai_backend/runtime/safetensors_stream.py
 
 Purpose:
-Model-agnostic safetensors container I/O: parse the JSON header, validate every
-tensor entry against a dtype table, and read a checkpoint ONE TENSOR AT A TIME
-with plain `read()` calls, so a loader's host-memory peak is the largest tensor
-instead of the whole file. Also the rate-limited byte-level progress reporter
-such a loader drives.
+Model-agnostic checkpoint I/O: parse the safetensors JSON header, validate every
+tensor entry against a dtype table, and read a checkpoint (safetensors, or GGUF
+through the spans `gguf_stream` parses) ONE TENSOR AT A TIME with plain `read()`
+calls, so a loader's host-memory peak is the largest tensor instead of the whole
+file. Also the rate-limited byte-level progress reporter such a loader drives.
 
 Main responsibilities:
 - the one header parser (`read_safetensors_header_and_data_start`, with the
@@ -14,10 +14,17 @@ Main responsibilities:
   (`MAX_SAFETENSORS_HEADER_BYTES`);
 - the per-tensor contract (`TensorSpan`, `parse_tensor_spans`): mappable dtype,
   sane shape and offsets, length == shape x itemsize, no overlap, file order;
-- the reader (`StreamingSafetensorsReader`);
+  `TensorSpan.quant_type` marks a block-quantized GGUF tensor (uint8 rows);
+- the one span-layout rule of both containers (`check_span_layout`: file
+  order, no overlap, inside the file);
+- the container-agnostic reader (`StreamingTensorReader`) and its safetensors
+  subclass (`StreamingSafetensorsReader`); which one a file gets is decided
+  only by `tensor_container`;
 - byte-level progress (`ByteProgress`, `ByteProgressCb`,
-  `PROGRESS_MIN_INTERVAL_SECONDS`);
-- filling a module built on `meta` from one or more checkpoint files, one
+  `PROGRESS_MIN_INTERVAL_SECONDS`) and the bounded read chunk that feeds it
+  inside one tensor (`READ_CHUNK_BYTES`);
+- filling a module built on `meta` from one or more checkpoint files
+  (safetensors or GGUF, via `tensor_container.open_tensor_reader`), one
   tensor at a time — THE one direct-to-device filler of the backend
   (`fill_module_from_safetensors`, `FillReport`, `MissingWeightsError`):
   1:1 (`key_map` + `cast`) or 1:N (`convert`, optionally `expected_keys_of`)
@@ -42,7 +49,8 @@ Notes:
   exactly one live tensor.
 - torch is imported lazily inside `read_tensor` and
   `fill_module_from_safetensors`; everything else is stdlib, so header parsing
-  and validation work without torch.
+  and validation work without torch. `tensor_container` is imported lazily by
+  the filler (it imports this module).
 """
 
 from __future__ import annotations
@@ -157,12 +165,18 @@ _METADATA_KEY = "__metadata__"
 
 @dataclass(frozen=True)
 class TensorSpan:
-    """Where one tensor lives in a safetensors file, and what it is.
+    """Where one tensor lives in a checkpoint file (safetensors or GGUF), and what it is.
 
-    `start`/`end` are the header's own `data_offsets`, i.e. RELATIVE to the data
-    section (`StreamingSafetensorsReader.data_start`), never absolute. `nbytes`
+    `start`/`end` are RELATIVE to the file's data section
+    (`StreamingTensorReader.data_start`), never absolute: the header's own
+    `data_offsets` for safetensors, the tensor-info offset for GGUF. `nbytes`
     is `end - start` and has already been checked against `shape` and the dtype's
     element size, so a reader may trust it.
+
+    `quant_type` is the ggml block type id of a block-quantized GGUF tensor and
+    `None` for every plain tensor. Such a span is `dtype_token="U8"` with shape
+    `(*rows, bytes_per_row)` (`gguf_stream` module notes): its bytes travel as
+    opaque uint8 rows, and only a consumer that knows the type dequantizes them.
     """
 
     name: str
@@ -171,6 +185,7 @@ class TensorSpan:
     shape: tuple[int, ...]
     start: int
     end: int
+    quant_type: int | None = None
 
     @property
     def nbytes(self) -> int:
@@ -281,10 +296,36 @@ def parse_tensor_spans(
             )
         )
 
-    spans.sort(key=lambda span: span.start)
+    return check_span_layout(spans, source=source)
+
+
+def check_span_layout(
+    spans: Iterable[TensorSpan],
+    *,
+    source: Path,
+    data_start: int = 0,
+    file_size: int | None = None,
+    container: str = "safetensors",
+) -> list[TensorSpan]:
+    """The one span-layout rule of both containers: sort by `start`, refuse overlaps and spans past the file.
+
+    Returns the spans IN FILE ORDER (sorted by `start`; see
+    `parse_tensor_spans` for why file order matters). Two spans sharing a byte
+    are refused (the one malformed layout that loads silently wrong weights
+    instead of failing); gaps are allowed (alignment padding). With
+    `file_size`, every `data_start + end` must lie inside the file, so a
+    reader built on the result can fail only on I/O; `None` skips that check
+    (a header checked without its file). `container` names the format in the
+    truncation message.
+
+    # Raises
+    `ValueError` naming the file and, for an overlap, BOTH tensors and their
+    byte ranges; for a truncated file, the tensor and both sizes.
+    """
+    ordered = sorted(spans, key=lambda span: span.start)
     # Pairwise once the spans are ordered: with `start` ascending, an overlap can
     # only be with the immediate predecessor, so one pass is enough.
-    for previous, current in zip(spans, spans[1:]):
+    for previous, current in zip(ordered, ordered[1:]):
         if current.start < previous.end:
             raise ValueError(
                 f"Перекрывающиеся тензоры в {source}: «{previous.name}» занимает байты "
@@ -292,50 +333,74 @@ def parse_tensor_spans(
                 f"{current.start}..{current.end}. Такой файл повреждён: один и тот же "
                 "участок данных прочитался бы как два разных веса."
             )
-    return spans
+    if file_size is not None:
+        for span in ordered:
+            if data_start + span.end > file_size:
+                raise ValueError(
+                    f"Обрезанный {container} {source}: тензор «{span.name}» объявлен до байта "
+                    f"{data_start + span.end}, а файл занимает {file_size} B"
+                )
+    return ordered
 
 
-class StreamingSafetensorsReader:
-    """Reads a safetensors file tensor by tensor with ordinary `read()` calls.
+def file_size_of(path: Path) -> int:
+    """`st_size` of `path` as a refusal-style `ValueError` on an OS error."""
+    try:
+        return int(path.stat().st_size)
+    except OSError as exc:
+        raise ValueError(f"Не удалось получить размер {path}: {exc}") from exc
 
-    Construction parses and fully validates the header (`parse_tensor_spans`) and
-    checks every declared span against the file's real size, so `read_tensor` can
-    fail only on I/O. Reads must happen inside the context manager; the file
-    handle is unbuffered, because every read is already one whole tensor.
+
+class StreamingTensorReader:
+    """Reads a checkpoint file tensor by tensor with ordinary `read()` calls (container-agnostic).
+
+    Built from already parsed `spans` (relative to `data_start`) of the file at
+    `path` whose size is `file_size`; construction re-applies
+    `check_span_layout` (file order, no overlap, inside the file), so
+    `read_tensor` can fail only on I/O. Reads must happen inside the context
+    manager; the file handle is unbuffered, because every read is already one
+    whole tensor. `tensor_container.open_tensor_reader` picks the container;
+    `StreamingSafetensorsReader` is the safetensors subclass. `container`
+    (default: the class's `container`) names the format in the truncation
+    message.
 
     Each returned tensor VIEWS its own freshly allocated `bytearray`, so exactly
     one tensor is alive in anonymous memory at a time — that is the whole point
-    of this class, and it is why `safetensors.safe_open` is not used (its pages
-    are released only when the handle closes, so the peak still reaches the whole
-    checkpoint).
-
-    `dtypes` is the dtype table the header is validated against (see
-    `parse_tensor_spans`); the default is `SAFETENSORS_DTYPES`.
+    of this class, and it is why `safetensors.safe_open` (and `mmap` for GGUF)
+    is not used: mapped pages are released only when the handle closes, so the
+    peak still reaches the whole checkpoint. A block-quantized GGUF span comes
+    back as its uint8 rows (`TensorSpan.quant_type`). A tensor is read in
+    chunks of at most `READ_CHUNK_BYTES` straight into its own buffer, so a
+    byte-progress caller hears from a single large tensor several times.
 
     # Raises
-    `ValueError` (construction) when the header is malformed, a dtype is not in
-    `dtypes`, or a span runs past the end of the file.
+    `ValueError` (construction) for overlapping spans or a span past the end
+    of the file.
     """
 
+    #: Container name used in the truncation message.
+    container = "файл весов"
+
     def __init__(
-        self, path: Path | str, *, dtypes: Mapping[str, tuple[str, int]] = SAFETENSORS_DTYPES
+        self,
+        path: Path | str,
+        spans: Sequence[TensorSpan],
+        data_start: int,
+        file_size: int,
+        *,
+        container: str | None = None,
     ) -> None:
         self.path = Path(path)
-        self.header, self.data_start = read_safetensors_header_and_data_start(self.path)
-        try:
-            self.file_size = int(self.path.stat().st_size)
-        except OSError as exc:
-            raise ValueError(f"Не удалось получить размер {self.path}: {exc}") from exc
-        self.spans = parse_tensor_spans(self.header, source=self.path, dtypes=dtypes)
-        for span in self.spans:
-            if self.data_start + span.end > self.file_size:
-                raise ValueError(
-                    f"Обрезанный safetensors {self.path}: тензор «{span.name}» объявлен до байта "
-                    f"{self.data_start + span.end}, а файл занимает {self.file_size} B"
-                )
+        self.data_start = int(data_start)
+        self.file_size = int(file_size)
+        if container is not None:
+            self.container = container
+        self.spans = check_span_layout(
+            spans, source=self.path, data_start=self.data_start, file_size=self.file_size, container=self.container
+        )
         self._handle: Any = None
 
-    def __enter__(self) -> StreamingSafetensorsReader:
+    def __enter__(self) -> StreamingTensorReader:
         self._handle = self.path.open("rb", buffering=0)
         return self
 
@@ -357,11 +422,22 @@ class StreamingSafetensorsReader:
         """Tensor names ordered by their offset in the file. See `parse_tensor_spans`."""
         return [span.name for span in self.spans]
 
-    def read_tensor(self, span: TensorSpan) -> Any:
+    def read_tensor(
+        self,
+        span: TensorSpan,
+        *,
+        on_bytes: Callable[[int], None] | None = None,
+        chunk_bytes: int | None = None,
+    ) -> Any:
         """Read one tensor's bytes and wrap them, without a copy, in a `torch.Tensor`.
 
         The result owns a `bytearray` of exactly `span.nbytes`; nothing else of
-        the file stays in anonymous memory.
+        the file stays in anonymous memory. The bytes are read with `readinto`
+        on slices of that one buffer, at most `chunk_bytes` (default
+        `READ_CHUNK_BYTES`) per call, and `on_bytes(n)` is called after every
+        successful `readinto` with the `n` bytes it delivered, so the calls sum
+        to `span.nbytes` on success. `on_bytes` runs on the calling thread;
+        whatever it raises propagates.
 
         # Raises
         `RuntimeError` when called outside the context manager; `ValueError` when
@@ -371,8 +447,11 @@ class StreamingSafetensorsReader:
 
         if self._handle is None:
             raise RuntimeError(
-                f"StreamingSafetensorsReader({self.path}) используется вне контекстного менеджера"
+                f"{type(self).__name__}({self.path}) используется вне контекстного менеджера"
             )
+        chunk = READ_CHUNK_BYTES if chunk_bytes is None else int(chunk_bytes)
+        if chunk <= 0:
+            raise ValueError(f"read_tensor: размер порции чтения должен быть положительным, получено {chunk}")
         length = span.nbytes
         buffer = bytearray(length)
         view = memoryview(buffer)
@@ -380,18 +459,45 @@ class StreamingSafetensorsReader:
             self._handle.seek(self.data_start + span.start)
             read = 0
             while read < length:
-                got = self._handle.readinto(view[read:])
+                # A bounded slice of the destination buffer: no second
+                # full-size copy, and the caller hears progress per chunk.
+                got = self._handle.readinto(view[read : min(length, read + chunk)])
                 if not got:
                     raise ValueError(
                         f"Файл {self.path} оборвался на тензоре «{span.name}»: прочитано "
                         f"{read} B из {length} B"
                     )
                 read += got
+                if on_bytes is not None:
+                    on_bytes(got)
         except OSError as exc:
             raise ValueError(f"Ошибка чтения тензора «{span.name}» из {self.path}: {exc}") from exc
         tensor = torch.frombuffer(buffer, dtype=getattr(torch, span.torch_dtype_name))
         return tensor.reshape(span.shape)
 
+
+class StreamingSafetensorsReader(StreamingTensorReader):
+    """The safetensors `StreamingTensorReader`: parses and validates the header itself.
+
+    Construction parses the header (`read_safetensors_header_and_data_start`,
+    kept as `header`), validates every entry against `dtypes`
+    (`parse_tensor_spans`; default `SAFETENSORS_DTYPES`) and checks every span
+    against the file's real size.
+
+    # Raises
+    `ValueError` (construction) when the header is malformed, a dtype is not in
+    `dtypes`, or a span runs past the end of the file.
+    """
+
+    container = "safetensors"
+
+    def __init__(
+        self, path: Path | str, *, dtypes: Mapping[str, tuple[str, int]] = SAFETENSORS_DTYPES
+    ) -> None:
+        source = Path(path)
+        self.header, data_start = read_safetensors_header_and_data_start(source)
+        spans = parse_tensor_spans(self.header, source=source, dtypes=dtypes)
+        super().__init__(source, spans, data_start, file_size_of(source))
 
 
 # =====================================================================
@@ -400,19 +506,30 @@ class StreamingSafetensorsReader:
 #: Byte-level progress callback: `(done_bytes, total_bytes, last_key)`.
 ByteProgressCb = Callable[[int, int, str], None]
 
-#: Smallest gap between two progress reports. A diffusion checkpoint holds
-#: thousands of tensors and reporting each one would be thousands of frames per
-#: load.
-PROGRESS_MIN_INTERVAL_SECONDS = 2.0
+#: Smallest gap between two progress reports: five frames per second. A
+#: diffusion checkpoint holds thousands of tensors and reporting each one would
+#: be thousands of frames per load, while the UI computes the read speed from
+#: the byte deltas of consecutive frames, so they must come at a steady pace.
+#: Used only by checkpoint LOADS; downloads pace their own frames.
+PROGRESS_MIN_INTERVAL_SECONDS = 0.2
+
+#: Largest single `readinto` of `StreamingTensorReader.read_tensor`. Must stay
+#: well below what the slowest supported disk reads in
+#: `PROGRESS_MIN_INTERVAL_SECONDS` (~150 MB/s HDD -> ~30 MB): with one read per
+#: tensor a 0.5-1.2 GB embedding tensor would freeze the bar for seconds.
+READ_CHUNK_BYTES = 16 * 1024**2
 
 
 class ByteProgress:
     """Rate-limits a `ByteProgressCb` and never lets it break the load.
 
-    `advance` is called once per tensor; it reports at most every
-    `interval_seconds`, plus unconditionally when `final=True`, so the bar always
-    ends at 100%. A callback that raises is logged at debug and swallowed — a
-    dead IPC peer must not kill a load that is otherwise succeeding.
+    `advance` is called per read chunk (or per tensor); it reports at most every
+    `interval_seconds` (the first report one interval after construction), plus
+    unconditionally when `final=True`, so the bar always ends at 100%. A final
+    `advance` that adds no bytes since the last report is skipped when that
+    report already carried the same count (no duplicate last frame). A callback
+    that raises is logged at debug and swallowed — a dead IPC peer must not kill
+    a load that is otherwise succeeding.
 
     `owner` is the service name that prefixes that debug record, and `logger` is
     the logger it goes to, so the record keeps the caller's wording and lands in
@@ -438,6 +555,8 @@ class ByteProgress:
         self._clock = clock
         self._done = 0
         self._last_report = clock()
+        # `done` of the last report, `None` before the first one.
+        self._reported_done: int | None = None
 
     @property
     def done_bytes(self) -> int:
@@ -449,10 +568,13 @@ class ByteProgress:
         self._done += int(nbytes)
         if self._callback is None:
             return
+        if final and self._reported_done == self._done:
+            return
         now = self._clock()
         if not final and now - self._last_report < self._interval:
             return
         self._last_report = now
+        self._reported_done = self._done
         try:
             self._callback(self._done, self._total, key)
         except Exception as exc:  # noqa: BLE001 - a dead peer must not kill the load
@@ -581,7 +703,9 @@ def fill_module_from_safetensors(
     - `module` was built on the `meta` device; its NON-persistent buffers (they
       are not in any checkpoint) are already real tensors.
     - `files` are read in the given order, each in file order, ONE tensor at a
-      time (`StreamingSafetensorsReader`): when a file tensor is read, no
+      time (`tensor_container.open_tensor_reader`: safetensors or GGUF; a
+      block-quantized GGUF tensor arrives as its uint8 rows, see
+      `TensorSpan.quant_type`): when a file tensor is read, no
       earlier one is still referenced by the filler, so the host peak is one
       source tensor plus whatever it converts into.
     - Key conversion, exactly one of two forms:
@@ -608,10 +732,13 @@ def fill_module_from_safetensors(
     - A CUDA/HIP device is synchronized after every file tensor, as measured
       for FLUX.2 klein: without it the host buffers of queued copies pile up on
       HIP. A CPU target has nothing to synchronize.
-    - `progress` gets `(done_bytes, total_bytes, last_key)` once per read file
-      tensor at most every `progress_interval_seconds`, always on the last one,
-      through `ByteProgress(owner=owner, logger=logger)`; the total counts only
-      the tensors that will be read (one `(0, 0, "")` report when none is).
+    - `progress` gets `(done_bytes, total_bytes, last_key)` as bytes arrive
+      (per `READ_CHUNK_BYTES` chunk inside a tensor, `last_key` = the tensor
+      being read) at most every `progress_interval_seconds`, and always once
+      at 100% after the last tensor was written, through
+      `ByteProgress(owner=owner, logger=logger)`, on the calling thread; the
+      total counts only the tensors that will be read (one `(0, 0, "")`
+      report when none is).
     - `log_summary=False` drops the start / finish INFO records for a caller
       that logs its own.
 
@@ -638,7 +765,8 @@ def fill_module_from_safetensors(
     parameter or buffer still on `meta` after the fill that `targets` did not
     leave there. An expected persistent key left unfilled is
     `MissingWeightsError` (a `ValueError`). I/O errors surface as `ValueError`
-    from the reader; whatever `write` raises propagates unchanged.
+    from the reader; whatever `write` raises propagates unchanged. A GGUF file
+    without the `gguf` package installed is a `RuntimeError`.
     """
     import torch
 
@@ -651,7 +779,10 @@ def fill_module_from_safetensors(
 
     started = time.monotonic()
     target = torch.device(device)
-    readers = [StreamingSafetensorsReader(path, dtypes=dtypes) for path in files]
+    # Lazy: `tensor_container` imports this module (the dispatch sits above both containers).
+    from .tensor_container import open_tensor_reader
+
+    readers = [open_tensor_reader(path, dtypes=dtypes) for path in files]
     expected_shapes = {key: tuple(value.shape) for key, value in module.state_dict().items()}
 
     def place_of(state_key: str) -> Any:
@@ -672,7 +803,7 @@ def fill_module_from_safetensors(
 
     # Plan the whole fill from the headers: which spans are read, and refuse a
     # wrong key set before the first read whenever the keys are known there.
-    plan: list[tuple[StreamingSafetensorsReader, list[tuple[TensorSpan, list[str] | None]]]] = []
+    plan: list[tuple[StreamingTensorReader, list[tuple[TensorSpan, list[str] | None]]]] = []
     state = _FillState(provider={}, meta_keys=set())
     unexpected: list[str] = []
     duplicates: list[str] = []
@@ -737,14 +868,14 @@ def fill_module_from_safetensors(
             target,
         )
 
-    def consume(reader: StreamingSafetensorsReader, span: TensorSpan, declared: list[str] | None) -> None:
+    def consume(reader: StreamingTensorReader, span: TensorSpan, declared: list[str] | None) -> None:
         """Read, convert, check, write and synchronize ONE file tensor.
 
         A function of its own so that every reference to the source tensor and
         to what it converted into (loop variables included) dies on return,
         before the next read: that is what keeps the host peak at one tensor.
         """
-        tensor = reader.read_tensor(span)
+        tensor = reader.read_tensor(span, on_bytes=lambda nbytes: reporter.advance(nbytes, span.name))
         if convert is not None:
             pairs = list(convert(span.name, tensor))
         else:
@@ -808,7 +939,10 @@ def fill_module_from_safetensors(
                 consume(reader, span, declared)
                 index += 1
                 last_key = span.name
-                reporter.advance(span.nbytes, span.name, final=index == read_count)
+                if index == read_count:
+                    # The bytes were counted per chunk while reading; this is
+                    # the guaranteed 100% frame, after the last write.
+                    reporter.advance(0, span.name, final=True)
     if read_count == 0:
         reporter.advance(0, last_key, final=True)
 

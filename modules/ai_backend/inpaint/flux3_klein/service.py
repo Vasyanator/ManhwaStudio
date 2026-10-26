@@ -14,7 +14,8 @@ Main responsibilities:
   the weight format is the user's and never changes), the load scope (DiT, AE)
   and the run scope (encode, reference AE encode, flow-map denoise, decode) as
   manager steps (`Session.load` / `transition` / `run_phase`), each bracketed
-  by its observer `Phase`;
+  by its observer `Phase`; an optional disk-read sink (`load_progress`)
+  becomes the session's `set_load_progress` for the run;
 - `health` / `unload` - the service contract every backend service has
   (`inpaint/MODULE_README.md`, health snapshot); where each component is comes
   from the manager's ledger (`LargeModelManager.placements`), never from the
@@ -57,6 +58,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from ...runtime.health_snapshot import HealthSnapshot
 from ...runtime.large_models.degrade import classify_failure
+from ...runtime.large_models.loader import LoadProgressSink
 from ...runtime.large_models.manager import ComponentPlacement, LargeModelError, LargeModelManager, LargeModelRunFailed, PhaseContext, Session
 from ...runtime.large_models.spec import ExecDevice, RequestShape
 from ...runtime.large_models.tiers import ComponentPlan, Steps, Tier
@@ -397,6 +399,7 @@ class Flux3KleinService:
         *,
         observer: PhaseObserver | None = None,
         step_callback: StepCallback | None = None,
+        load_progress: LoadProgressSink | None = None,
     ) -> Flux3Result:
         """Generate one image for `request` with the package and run options `options`.
 
@@ -404,6 +407,14 @@ class Flux3KleinService:
         repeat steps when the manager retries the denoise on a gentler plan.
         Exceptions of `observer` and `step_callback` propagate (raise
         `Flux3Canceled` to cancel: see the class).
+
+        `load_progress` becomes the session's disk-read sink
+        (`Session.set_load_progress`) for the whole run: every checkpoint read
+        — a fresh load of the DiT / AE / encoder, a reload after a degrade
+        retry, a DISK / DROPPED re-read (`reread=True`) — arrives as
+        `loader.LoadProgress` frames on this thread, inside the observer phase
+        whose step performs the read. Rate limiting is the manager's; a sink
+        that raises is logged and ignored, so it cannot cancel a read.
 
         Before the admission (refusals here cost no load): the package files and
         `config.json`, `normalize_request`, the VL_REFS-needs-references rule,
@@ -458,6 +469,8 @@ class Flux3KleinService:
                 fp8_applied=plan.model_options.fp8_compute if options.variant is WeightFormat.FP8R else None,
                 compute_path=large_model.compute_path(options.variant, plan.model_options.fp8_compute),
             )
+            # Registered before the first step, so the load scope's reads are seen too.
+            session.set_load_progress(load_progress)
             try:
                 load_failed = True
                 self._load_locked(session, plan, observer)

@@ -31,7 +31,7 @@ pub(super) enum Flux3LineTone {
 /// The memory forecast as the readiness line carries it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Flux3MemorySummary {
-    /// The one-line forecast (`large_model_resources::forecast_line`).
+    /// The one-line forecast of the whole run (`large_model_resources::forecast_line`).
     pub(super) line: String,
     /// The backend's verdict; `false` turns the line amber.
     pub(super) fits: bool,

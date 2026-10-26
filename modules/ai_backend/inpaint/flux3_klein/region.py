@@ -14,6 +14,8 @@ Key functions:
 - `edit_region_bytes(service, image_png, mask_png, reference_pngs, params, *,
   progress_callback, should_cancel)` -> the answer dict (module notes);
 - `progress_stages()` — the stable `stage` ids of the progress frames, in run order.
+- `file_component_id()` / `file_label()` — the `file_component` id and the
+  `file_label` of one disk-read frame.
 
 Progress frames (`progress_callback(phase, step, total, label, *, stage=)`):
 `phase:"load"` for every step but the denoise — `stage` = `"prepare"` (step 0)
@@ -21,6 +23,18 @@ or the observer `Phase` value, `step` = its position in `progress_stages()`,
 `total` = the last position; `phase:"generate"` for the denoise, `step` /
 `total` = flow-map steps, `stage` = `"denoise"`. `label` is Russian log text;
 the client localizes `stage`.
+
+Disk-read frames (the second, byte level): every checkpoint read of the run
+(the manager's `LoadProgress`, through `service.generate(load_progress=)`)
+re-emits the `phase:"load"` frame of the stage in force — same `step`,
+`total`, `label`, `stage` — plus `file_step` / `file_total` (bytes of THIS
+read of the component), `file_label` (the file name; the folder name for a
+sharded component such as the encoder) and `file_component` (`transformer` =
+the DiT, `text_encoder` = the Qwen3-VL encoder, `vae` = the AE). A re-read of
+units brought back from disk reads the same way (the bar of that component).
+A read during the denoise stage (a reload after a degrade retry) is a `load`
+frame of the `denoise` stage. Cadence is the manager's (<= 1 frame per 0.2 s
+per stream plus one 100% frame); nothing here throttles or adds frames.
 
 Cancellation: `should_cancel()` is checked at every observer phase begin and
 after every denoise step; a raised `service.Flux3Canceled` ends the run (the
@@ -41,18 +55,33 @@ from __future__ import annotations
 import logging
 import secrets
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..region_imaging import decode_image_rgb, decode_mask, encode_png_rgb, require_solid_mask
+from .large_model import COMPONENT_AE, COMPONENT_DIT, COMPONENT_ENCODER
 from .params import Flux3Request
 from .phases import Phase
 from .service import Flux3Canceled, Flux3KleinService
 from .wire import MAX_EXTRA_REFERENCES, normalize_flux3_params, validate_region_size
 
+if TYPE_CHECKING:
+    from ...runtime.large_models.loader import LoadProgress
+
 log = logging.getLogger(__name__)
 
-#: `progress_callback(phase, step, total, label, *, stage=None)`.
+#: `progress_callback(phase, step, total, label, *, stage=None, file_step=None,
+#: file_total=None, file_label=None, file_component=None)` (the IPC layer's
+#: `streaming.progress_forwarder`); the four `file_*` fields come only with a
+#: disk-read frame.
 ProgressCallback = Callable[..., None]
+
+#: The wire `file_component` id of each spec component (the ids the shared
+#: Rust progress bar names; an id it does not know shows the file name alone).
+_FILE_COMPONENTS: Mapping[str, str] = {
+    COMPONENT_DIT: "transformer",
+    COMPONENT_ENCODER: "text_encoder",
+    COMPONENT_AE: "vae",
+}
 
 #: The first progress stage, before the service is called.
 STAGE_PREPARE = "prepare"
@@ -77,6 +106,28 @@ _LABELS: Mapping[str, str] = {
 def progress_stages() -> tuple[str, ...]:
     """Every `stage` id of the progress frames, in run order: `prepare`, then the observer `Phase` values."""
     return (STAGE_PREPARE, *(phase.value for phase in Phase))
+
+
+def file_component_id(component: str) -> str:
+    """The wire `file_component` id of spec component `component`; an unknown component passes through unchanged."""
+    return _FILE_COMPONENTS.get(component, component)
+
+
+def file_label(progress: LoadProgress) -> str:
+    """The `file_label` of one disk-read frame: what the user recognises as the component's checkpoint.
+
+    A single-file component (the DiT, the AE) is named by its file; a
+    component of several files in one folder (the sharded encoder) by that
+    folder, because the byte counters span every file of the read and a
+    per-shard name would change mid-bar. Several folders: the file being read.
+    """
+    files = progress.files
+    if len(files) == 1:
+        return files[0].name
+    folders = {path.parent for path in files}
+    if len(folders) == 1:
+        return next(iter(folders)).name
+    return progress.file.name if progress.file is not None else ""
 
 
 def _decode_references(reference_pngs: Sequence[bytes]) -> list[Any]:
@@ -142,9 +193,30 @@ def edit_region_bytes(
     stages = progress_stages()
     last = len(stages) - 1
 
+    # The stage in force: a disk-read frame belongs to the observer phase whose step reads.
+    current_stage = STAGE_PREPARE
+
     def report(phase: str, step: int, total: int, stage: str) -> None:
         if progress_callback is not None:
             progress_callback(phase, step, total, _LABELS[stage], stage=stage)
+
+    def on_read(progress: LoadProgress) -> None:
+        # Called synchronously on this thread by the session (the observer's thread
+        # too), so `current_stage` is the phase that performs this read.
+        if progress_callback is None:
+            return
+        stage = current_stage
+        progress_callback(
+            "load",
+            stages.index(stage),
+            last,
+            _LABELS[stage],
+            stage=stage,
+            file_step=int(progress.done_bytes),
+            file_total=int(progress.total_bytes),
+            file_label=file_label(progress),
+            file_component=file_component_id(progress.component),
+        )
 
     def check_cancel() -> None:
         if should_cancel is not None and should_cancel():
@@ -154,9 +226,11 @@ def edit_region_bytes(
     report("load", 0, last, STAGE_PREPARE)
 
     def observer(phase: Phase, event: str, info: Mapping[str, Any]) -> None:
+        nonlocal current_stage
         if event != "begin":
             return
         check_cancel()
+        current_stage = phase.value
         if phase is Phase.DENOISE:
             report("generate", 0, int(info["steps"]), phase.value)
         else:
@@ -168,7 +242,7 @@ def edit_region_bytes(
 
     request = Flux3Request(caption=wire.prompt, references=(Image.fromarray(region_rgb, "RGB"), *references), width=width, height=height, seed=seed, steps=wire.steps)
     log.info("FLUX.3 klein: правка области %dx%d, %d доп. референсов, сид %d, %s", width, height, len(references), seed, "вся область" if wire.whole_region else "по маске")
-    result = service.generate(request, wire.options, observer=observer, step_callback=on_step)
+    result = service.generate(request, wire.options, observer=observer, step_callback=on_step, load_progress=on_read if progress_callback is not None else None)
     generated = np.ascontiguousarray(np.asarray(result.image.convert("RGB"), dtype=np.uint8))
     if generated.shape[:2] != (height, width):
         raise ValueError(f"FLUX.3 klein вернул изображение {generated.shape[1]}x{generated.shape[0]} вместо области {width}x{height}")

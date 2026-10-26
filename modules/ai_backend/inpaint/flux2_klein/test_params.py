@@ -12,16 +12,23 @@ Main responsibilities:
   `text_attention_in_mask` that `whole_region` forces off;
 - verify a region that the pipeline would silently resize or crop is refused
   with concrete numbers instead;
-- verify `effective_steps` matches what the pipeline will actually run.
+- verify `effective_steps` matches what the pipeline will actually run;
+- verify the weight-format fields of protocol 21 (`transformer_format`,
+  `transformer_formats`, and the encoder's `text_encoder_format` /
+  `text_encoder_formats`): the derived id per container (an absent encoder
+  derives `bf16`), the opaque-id shape, the candidate list's contract and
+  every refusal naming its field.
 """
 
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from modules.ai_backend.inpaint import flux2_klein as svc
+from modules.ai_backend.inpaint.flux2_klein import params as params_module
 
-from ._test_fixtures import _TempTreeCase
+from ._test_fixtures import _TempTreeCase, _write_tiny_gguf
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +115,10 @@ class NormalizeParamsTests(_TempTreeCase):
                 "text_encoder_path",
                 "transformer_path",
                 "vae_path",
+                "transformer_format",
+                "transformer_formats",
+                "text_encoder_format",
+                "text_encoder_formats",
                 "prompt",
                 "steps",
                 "guidance_scale",
@@ -167,6 +178,123 @@ class NormalizeParamsTests(_TempTreeCase):
     def test_seed_is_kept_and_null_means_random(self) -> None:
         self.assertEqual(svc.normalize_flux2_klein_params(self.params(seed=7))["seed"], 7)
         self.assertIsNone(svc.normalize_flux2_klein_params(self.params(seed=None))["seed"])
+
+
+def _has_gguf() -> bool:
+    try:
+        import gguf  # noqa: F401 - availability probe
+    except ImportError:
+        return False
+    return True
+
+
+@unittest.skipUnless(_has_gguf(), "needs the gguf package (fixture writer)")
+class WeightFormatParamsTests(_TempTreeCase):
+    """The protocol-21 weight-format fields of the transformer (D5 matrix)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.gguf = str(_write_tiny_gguf(self.root / "transformer_gguf" / "klein-q8.gguf"))
+
+    def _normalized(self, **overrides: object) -> dict[str, object]:
+        return svc.normalize_flux2_klein_params(self.params(**overrides))
+
+    def test_absent_fields_derive_the_id_from_the_container(self) -> None:
+        folder = self._normalized()
+        self.assertEqual((folder["transformer_format"], folder["transformer_formats"]), ("bf16", ()))
+        gguf = self._normalized(transformer_path=self.gguf)
+        self.assertEqual((gguf["transformer_format"], gguf["transformer_formats"]), ("gguf", ()))
+        single = self.root / "single.safetensors"
+        single.write_bytes((Path(self.paths["transformer_path"]) / "diffusion_pytorch_model.safetensors").read_bytes())
+        self.assertEqual(self._normalized(transformer_path=str(single))["transformer_format"], "bf16")
+        self.assertEqual(self._normalized(transformer_format=None)["transformer_format"], "bf16", "null reads as absent")
+
+    def test_a_named_format_is_opaque(self) -> None:
+        out = self._normalized(transformer_path=self.gguf, transformer_format="q8_0")
+        self.assertEqual((out["transformer_format"], out["transformer_formats"]), ("q8_0", ()))
+        # Nothing checks the id against the container: the client owns the names.
+        self.assertEqual(self._normalized(transformer_format="anything_1")["transformer_format"], "anything_1")
+
+    def test_a_candidate_list_is_kept_in_order_as_pairs(self) -> None:
+        formats = [{"id": "bf16", "path": self.paths["transformer_path"]}, {"id": "q8_0", "path": self.gguf}, {"id": "q4_k_m", "path": str(self.root / "missing.gguf")}]
+        out = self._normalized(transformer_path=self.gguf, transformer_format="q8_0", transformer_formats=formats)
+        self.assertEqual(out["transformer_format"], "q8_0")
+        self.assertEqual(out["transformer_formats"], (("bf16", self.paths["transformer_path"]), ("q8_0", self.gguf), ("q4_k_m", str(self.root / "missing.gguf"))))
+        derived = self._normalized(transformer_formats=[{"id": "bf16", "path": self.paths["transformer_path"]}])
+        self.assertEqual(derived["transformer_format"], "bf16", "an absent id is derived, then looked up")
+
+    def test_bad_ids_are_refused_by_field(self) -> None:
+        for bad in ("Q8_0", "", "q8-0", "x" * 33, 8, True, ["q8_0"]):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "transformer_format"):
+                self._normalized(transformer_format=bad)
+
+    def test_bad_lists_are_refused_by_field(self) -> None:
+        good = {"id": "bf16", "path": self.paths["transformer_path"]}
+        for bad, field in (
+            ([], "transformer_formats"),
+            ({"id": "bf16"}, "transformer_formats"),
+            ("bf16", "transformer_formats"),
+            ([good, "q8_0"], r"transformer_formats\[1\]"),
+            ([good, {"id": "q8_0"}], r"transformer_formats\[1\]"),
+            ([good, {"id": "q8_0", "path": self.gguf, "size": 1}], r"transformer_formats\[1\]"),
+            ([good, {"id": "Q8", "path": self.gguf}], r"transformer_formats\[1\]\.id"),
+            ([good, {"id": "q8_0", "path": ""}], r"transformer_formats\[1\]\.path"),
+            ([good, {"id": "q8_0", "path": 5}], r"transformer_formats\[1\]\.path"),
+            ([good, dict(good)], "дважды"),
+        ):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, field):
+                self._normalized(transformer_formats=bad)
+
+    def test_the_list_must_carry_the_selected_file(self) -> None:
+        with self.assertRaisesRegex(ValueError, "transformer_format"):
+            self._normalized(transformer_format="q8_0", transformer_formats=[{"id": "bf16", "path": self.paths["transformer_path"]}])
+        # The selected id with another path: the list may not redirect the request.
+        with self.assertRaisesRegex(ValueError, "transformer_path"):
+            self._normalized(transformer_format="bf16", transformer_formats=[{"id": "bf16", "path": self.gguf}])
+        with self.assertRaisesRegex(ValueError, "transformer_path"):
+            self._normalized(transformer_format="bf16", transformer_formats=[{"id": "bf16", "path": self.paths["transformer_path"] + "/"}])
+
+    def test_derived_format_reads_the_container_not_the_name(self) -> None:
+        disguised = self.root / "weights.safetensors"
+        disguised.write_bytes(Path(self.gguf).read_bytes())
+        self.assertEqual(params_module.derived_format(str(disguised)), "gguf")
+        self.assertEqual(params_module.derived_format(self.paths["transformer_path"]), "bf16")
+        with self.assertRaises(ValueError):
+            params_module.derived_format(str(self.root / "absent.gguf"))
+
+
+class EncoderWeightFormatParamsTests(_TempTreeCase):
+    """The protocol-21 weight-format fields of the text encoder: the transformer's contract, on an optional path."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Any GGUF container derives `gguf`; the encoder's own content is not read here.
+        self.gguf = str(_write_tiny_gguf(self.root / "text_encoder_gguf" / "qwen3-q8.gguf"))
+
+    def _normalized(self, **overrides: object) -> dict[str, object]:
+        return svc.normalize_flux2_klein_params(self.params(**overrides))
+
+    def test_absent_fields_derive_the_id_from_the_container(self) -> None:
+        folder = self._normalized()
+        self.assertEqual((folder["text_encoder_format"], folder["text_encoder_formats"]), ("bf16", ()))
+        self.assertEqual(self._normalized(text_encoder_path=self.gguf)["text_encoder_format"], "gguf")
+
+    def test_an_absent_encoder_derives_bf16_and_is_not_an_error(self) -> None:
+        for path in ("", str(self.root / "elsewhere" / "qwen3.gguf")):
+            with self.subTest(path=path):
+                out = self._normalized(text_encoder_path=path)
+                self.assertEqual((out["text_encoder_format"], out["text_encoder_formats"]), ("bf16", ()))
+
+    def test_a_candidate_list_follows_the_transformer_contract(self) -> None:
+        formats = [{"id": "bf16", "path": self.paths["text_encoder_path"]}, {"id": "q8_0", "path": self.gguf}]
+        out = self._normalized(text_encoder_path=self.gguf, text_encoder_format="q8_0", text_encoder_formats=formats)
+        self.assertEqual((out["text_encoder_format"], out["text_encoder_formats"]), ("q8_0", (("bf16", self.paths["text_encoder_path"]), ("q8_0", self.gguf))))
+        with self.assertRaisesRegex(ValueError, "text_encoder_path"):
+            self._normalized(text_encoder_format="q8_0", text_encoder_formats=formats)
+        with self.assertRaisesRegex(ValueError, "text_encoder_format"):
+            self._normalized(text_encoder_format="Q8")
+        with self.assertRaisesRegex(ValueError, r"text_encoder_formats\[1\]\.path"):
+            self._normalized(text_encoder_formats=[formats[0], {"id": "q8_0", "path": ""}])
 
 
 # ---------------------------------------------------------------------------

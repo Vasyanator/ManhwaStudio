@@ -5,16 +5,21 @@ Purpose:
 Unit tests for `runtime/safetensors_stream.py`: the header parser's ceiling and
 truncation refusals, the per-tensor contract under the default and a custom
 dtype table, file order and the overlap refusal, the reader's end-of-file check,
-`ByteProgress` (rate limit, final report, caller-owned wording and logger), the
+`ByteProgress` (rate limit on an injected clock, the 0.2 s interval, final
+report without a duplicate frame, caller-owned wording and logger), chunked
+tensor reads (bounded `readinto`, per-chunk byte reports), the
 opt-in 8-bit float table (bit-exact fp8 round trip) and
 `fill_module_from_safetensors` (1:1 key map + cast, 1:N convert with and
 without header-declared keys, per-key `targets` incl. leaving keys on `meta`,
 the `write` seam, per-tensor progress, the one-tensor host peak, argument
-validation, and every refusal).
+validation, and every refusal), plus the filler on a GGUF file
+(`GgufFillTests`: quantized uint8 rows and plain tensors, 1:1 and 1:N with
+declared keys, file order and one source tensor alive at a time).
 
 Notes:
-Torch-free except `ReadTensorTests`, `F8RoundTripTests` and `FillModuleTests`,
-which need real torch on the CPU and skip themselves without it. Every file is written into a
+Torch-free except `ReadTensorTests`, `F8RoundTripTests`, `FillModuleTests` and
+`GgufFillTests`, which need real torch on the CPU and skip themselves without
+it (`GgufFillTests` also needs the `gguf` package). Every file is written into a
 temporary directory removed by the test.
 """
 
@@ -28,6 +33,7 @@ import tempfile
 import unittest
 import weakref
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from . import safetensors_stream as ss
@@ -192,6 +198,30 @@ class ReadTensorTests(_TempCase):
         self.assertTrue(torch.equal(values[0], torch.tensor([1.5, -2.0])))
         self.assertTrue(torch.equal(values[1], torch.tensor([3.25])))
 
+    def test_read_tensor_reads_a_big_tensor_in_bounded_chunks(self) -> None:
+        import torch
+
+        values = [float(v) for v in range(25)]
+        path = self.root / "big.safetensors"
+        _write_raw(path, {"w": _entry("F32", [25], 0, 100)}, _f32_bytes(values))
+        reader = ss.StreamingSafetensorsReader(path)
+        chunks: list[int] = []
+        with reader:
+            (span,) = reader.spans
+            value = reader.read_tensor(span, on_bytes=chunks.append, chunk_bytes=32)
+        # Every readinto is bounded by the chunk; together they are the whole span.
+        self.assertGreaterEqual(len(chunks), 4)
+        self.assertTrue(all(0 < chunk <= 32 for chunk in chunks))
+        self.assertEqual(sum(chunks), 100)
+        self.assertTrue(torch.equal(value, torch.tensor(values)))
+
+    def test_read_tensor_refuses_a_non_positive_chunk(self) -> None:
+        path = self.root / "real.safetensors"
+        _write_raw(path, {"w": _entry("F32", [1], 0, 4)}, b"\0" * 4)
+        reader = ss.StreamingSafetensorsReader(path)
+        with reader, self.assertRaises(ValueError):
+            reader.read_tensor(reader.spans[0], chunk_bytes=0)
+
     def test_read_tensor_outside_the_context_manager_is_refused(self) -> None:
         path = self.root / "real.safetensors"
         _write_raw(path, {"w": _entry("F32", [1], 0, 4)}, b"\0" * 4)
@@ -215,11 +245,11 @@ class ByteProgressTests(unittest.TestCase):
         )
 
     def test_reports_are_rate_limited_and_the_last_one_always_fires(self) -> None:
-        reporter = self._reporter(self._progress)
+        reporter = self._reporter(self._progress, interval_seconds=2.0)
         reporter.advance(10, "a")
         self.now += 1.0
         reporter.advance(10, "b")
-        self.now += ss.PROGRESS_MIN_INTERVAL_SECONDS
+        self.now += 2.0
         reporter.advance(5, "c")
         reporter.advance(5, "d", final=True)
         self.assertEqual(self.seen, [(25, 30, "c"), (30, 30, "d")])
@@ -238,6 +268,30 @@ class ByteProgressTests(unittest.TestCase):
         )
         self.assertEqual(captured.records[0].name, self.logger.name)
         self.assertEqual(reporter.done_bytes, 30)
+
+    def test_the_interval_is_five_frames_per_second(self) -> None:
+        self.assertEqual(ss.PROGRESS_MIN_INTERVAL_SECONDS, 0.2)
+
+    def test_the_interval_is_honoured_on_the_injected_clock(self) -> None:
+        # Binary-exact steps, so the float clock hits the interval exactly.
+        reporter = self._reporter(self._progress, interval_seconds=0.25)
+        for key in "abcdef":
+            # One 1 B chunk every 0.125 s: a report on every second one.
+            self.now += 0.125
+            reporter.advance(1, key)
+        self.assertEqual(self.seen, [(2, 30, "b"), (4, 30, "d"), (6, 30, "f")])
+
+    def test_a_final_with_nothing_new_since_the_last_report_is_not_repeated(self) -> None:
+        reporter = self._reporter(self._progress, interval_seconds=0.0)
+        reporter.advance(30, "a")
+        reporter.advance(0, "a", final=True)
+        self.assertEqual(self.seen, [(30, 30, "a")])
+        # A final after bytes the throttle swallowed still reports them.
+        self.seen.clear()
+        throttled = self._reporter(self._progress)
+        throttled.advance(30, "b")
+        throttled.advance(0, "b", final=True)
+        self.assertEqual(self.seen, [(30, 30, "b")])
 
     def test_no_callback_still_counts(self) -> None:
         reporter = self._reporter(None)
@@ -574,9 +628,9 @@ class FillModuleConvertTests(FillModuleTests):
         reads: list[str] = []
         original = ss.StreamingSafetensorsReader.read_tensor
 
-        def read(reader: ss.StreamingSafetensorsReader, span: ss.TensorSpan) -> object:
+        def read(reader: ss.StreamingSafetensorsReader, span: ss.TensorSpan, **kwargs: Any) -> object:
             reads.append(span.name)
-            return original(reader, span)
+            return original(reader, span, **kwargs)
 
         path = self.root / "partial.safetensors"
         _write_f32_file(path, {"stat": ([2], self.stat)})
@@ -638,6 +692,41 @@ class FillModuleConvertTests(FillModuleTests):
         )
         self.assertEqual(seen, [(24, 44, "proj.weight"), (36, 44, "proj.bias"), (44, 44, "stat")])
 
+    def test_a_big_tensor_reports_per_chunk_and_ends_once_at_the_file_bytes(self) -> None:
+        import torch
+
+        seen: list[tuple[int, int, str]] = []
+        path = self._complete_file()
+        with patch.object(ss, "READ_CHUNK_BYTES", 8):
+            report = self._fill([path], progress=lambda d, t, k: seen.append((d, t, k)), progress_interval_seconds=0.0)
+        # proj.weight (24 B) in three 8 B chunks, proj.bias (12 B) in 8 + 4, stat (8 B) in one.
+        self.assertEqual(
+            seen,
+            [
+                (8, 44, "proj.weight"), (16, 44, "proj.weight"), (24, 44, "proj.weight"),
+                (32, 44, "proj.bias"), (36, 44, "proj.bias"), (44, 44, "stat"),
+            ],
+        )
+        self.assertEqual(report.bytes_read, 44)
+        self.assertTrue(torch.equal(self.module.proj.weight, torch.tensor(self.weight).reshape(3, 2)))
+
+    def test_the_final_report_comes_after_the_last_write_even_when_throttled(self) -> None:
+        seen: list[tuple[int, int, str]] = []
+        written: list[str] = []
+
+        def write(writes: list[ss.TensorWrite]) -> None:
+            for key, value, _ in writes:
+                written.append(key)
+                ss._set_module_tensor(self.module, key, value.clone())
+
+        def progress(done: int, total: int, key: str) -> None:
+            seen.append((done, total, key))
+            self.assertEqual(len(written), 3)
+
+        # A huge interval: only the guaranteed final frame fires, after every write.
+        self._fill([self._complete_file()], write=write, progress=progress, progress_interval_seconds=3600.0)
+        self.assertEqual(seen, [(44, 44, "stat")])
+
     def test_no_earlier_source_tensor_is_alive_at_the_next_read(self) -> None:
         import torch
 
@@ -645,9 +734,9 @@ class FillModuleConvertTests(FillModuleTests):
         sources: list[weakref.ref] = []
         original = ss.StreamingSafetensorsReader.read_tensor
 
-        def read(reader: ss.StreamingSafetensorsReader, span: ss.TensorSpan) -> object:
+        def read(reader: ss.StreamingSafetensorsReader, span: ss.TensorSpan, **kwargs: Any) -> object:
             live.append(sum(1 for ref in sources if ref() is not None))
-            tensor = original(reader, span)
+            tensor = original(reader, span, **kwargs)
             sources.append(weakref.ref(tensor))
             return tensor
 
@@ -678,6 +767,106 @@ class FillModuleConvertTests(FillModuleTests):
             with self.subTest(label):
                 with self.assertRaises(TypeError):
                     self._fill([self._complete_file()], **kwargs)
+
+
+_HAS_GGUF = importlib.util.find_spec("gguf") is not None
+
+
+@unittest.skipUnless(_HAS_TORCH and _HAS_GGUF, "torch or gguf is not installed")
+class GgufFillTests(_TempCase):
+    """`fill_module_from_safetensors` over a GGUF file: the filler opens it through `tensor_container`."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        import torch
+
+        from . import _gguf_test_fixtures as fx
+
+        Q = fx.Q
+        self.qkv = fx.make_tensor("blk.0.qkv.weight", Q.Q8_0, (6, 64), seed=1)
+        self.proj = fx.make_tensor("blk.0.proj.weight", Q.Q4_K, (2, 256), seed=2)
+        self.norm = fx.make_tensor("blk.0.norm.weight", Q.F32, (64,), seed=3)
+        self.bias = fx.make_tensor("blk.0.proj.bias", Q.F16, (2,), seed=4)
+        self.path = fx.write_gguf(self.root / "tiny.gguf", [self.qkv, self.proj, self.norm, self.bias])
+        self.logger = logging.getLogger("test.runtime.safetensors_stream.gguf_fill")
+        qkv_rows, proj_rows = self.qkv.raw.shape, self.proj.raw.shape
+
+        class Block(torch.nn.Module):
+            def __init__(self, split: bool) -> None:
+                super().__init__()
+                if split:
+                    for part in ("q", "k", "v"):
+                        self.register_buffer(f"{part}_weight", torch.zeros(qkv_rows[0] // 3, qkv_rows[1], dtype=torch.uint8))
+                else:
+                    self.register_buffer("qkv_weight", torch.zeros(qkv_rows, dtype=torch.uint8))
+                self.register_buffer("proj_weight", torch.zeros(proj_rows, dtype=torch.uint8))
+                self.norm = torch.nn.Parameter(torch.zeros(64))
+                self.bias = torch.nn.Parameter(torch.zeros(2, dtype=torch.float16))
+
+        self.block_class = Block
+
+    def _meta(self, *, split: bool) -> Any:
+        import torch
+
+        with torch.device("meta"):
+            return self.block_class(split)
+
+    def _assert_bytes(self, value: Any, expected: Any) -> None:
+        import numpy as np
+        import torch
+
+        self.assertTrue(np.array_equal(value.contiguous().view(torch.uint8).numpy().reshape(-1), expected.reshape(-1).view(np.uint8)))
+
+    def test_one_to_one_keeps_quantized_rows_as_uint8(self) -> None:
+        import torch
+
+        names = {"blk.0.qkv.weight": "qkv_weight", "blk.0.proj.weight": "proj_weight", "blk.0.norm.weight": "norm", "blk.0.proj.bias": "bias"}
+        module = self._meta(split=False)
+        report = ss.fill_module_from_safetensors(module, [self.path], device="cpu", key_map=names.get, owner="Tiny", logger=self.logger)
+        self.assertEqual(report.loaded, 4)
+        self.assertEqual(report.bytes_read, sum(t.nbytes for t in (self.qkv, self.proj, self.norm, self.bias)))
+        self.assertEqual(module.qkv_weight.dtype, torch.uint8)
+        self._assert_bytes(module.qkv_weight, self.qkv.raw)
+        self._assert_bytes(module.proj_weight, self.proj.raw)
+        self.assertTrue(torch.equal(module.norm, torch.from_numpy(self.norm.reference())))
+        self.assertEqual(module.bias.dtype, torch.float16)
+        self._assert_bytes(module.bias, self.bias.raw)
+
+    def test_one_to_many_splits_rows_in_file_order_one_tensor_at_a_time(self) -> None:
+        reads: list[str] = []
+        live: list[int] = []
+        sources: list[weakref.ref] = []
+        original = ss.StreamingTensorReader.read_tensor
+
+        def read(reader: ss.StreamingTensorReader, span: ss.TensorSpan, **kwargs: Any) -> object:
+            reads.append(span.name)
+            live.append(sum(1 for ref in sources if ref() is not None))
+            tensor = original(reader, span, **kwargs)
+            sources.append(weakref.ref(tensor))
+            return tensor
+
+        renamed = {"blk.0.proj.weight": "proj_weight", "blk.0.norm.weight": "norm", "blk.0.proj.bias": "bias"}
+
+        def declared(key: str) -> list[str]:
+            return ["q_weight", "k_weight", "v_weight"] if key == "blk.0.qkv.weight" else [renamed[key]]
+
+        def convert(key: str, tensor: Any) -> list[tuple[str, Any]]:
+            if key == "blk.0.qkv.weight":
+                # Whole quantized rows split along the output axis, cloned so the module owns its bytes.
+                return [(name, part.clone()) for name, part in zip(declared(key), tensor.chunk(3, dim=0))]
+            return [(renamed[key], tensor.clone())]
+
+        module = self._meta(split=True)
+        with patch.object(ss.StreamingTensorReader, "read_tensor", read):
+            report = ss.fill_module_from_safetensors(module, [self.path], device="cpu", convert=convert, expected_keys_of=declared, owner="Tiny", logger=self.logger)
+        self.assertEqual(report.loaded, 6)
+        # File order is the writer's order; no earlier source is alive at the next read.
+        self.assertEqual(reads, ["blk.0.qkv.weight", "blk.0.proj.weight", "blk.0.norm.weight", "blk.0.proj.bias"])
+        self.assertEqual(live, [0, 0, 0, 0])
+        rows = self.qkv.raw.shape[0] // 3
+        for index, name in enumerate(("q_weight", "k_weight", "v_weight")):
+            self._assert_bytes(getattr(module, name), self.qkv.raw[index * rows : (index + 1) * rows])
+
 
 if __name__ == "__main__":
     unittest.main()

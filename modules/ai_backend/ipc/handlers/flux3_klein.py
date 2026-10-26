@@ -19,7 +19,9 @@ client post-processes it, protocol 17; its length repeated as `image_len`); the 
 
 Streaming: `progress{id}` frames through the request's `ProgressEmitter`
 (`streaming.progress_forwarder`) with `phase` `load` / `generate` / `download`,
-`step`, `total`, `label` and, for the run, a stable `stage` id.
+`step`, `total`, `label` and, for the run, a stable `stage` id; a run's
+checkpoint reads add the byte level `file_step` / `file_total` / `file_label` /
+`file_component` (`ipc/PROTOCOL.md`, FLUX.3 streaming detail).
 
 Cancellation is observed INSIDE the work for the run (every phase begin and
 every denoise step: `Flux3Canceled` -> `Interrupted`) and for `download.start`

@@ -25,7 +25,10 @@ before DISK staging (a budget that shrinks after admission); a `cpu` run device
 planned, reserved and reported on the host side; the per-handle device
 ceiling (`device_cap_bytes`) in profiles, admissions and ladder re-plans;
 the host pin (`HostPinTests`: its own handle and floor key, the pinned encoder
-executes on the CPU and the RAM step keeps or drops it);
+executes on the CPU and the RAM step keeps or drops it); the session's
+load-progress sink (`LoadProgressTests`: loads triggered by transitions, the
+reload after a degrade retry, units re-read from disk, an explicit
+`load(progress=)` taking precedence);
 `placements` from
 the ledger; health / status / profiles shapes; the store (old profile floors
 and keep policy ignored); the Linux OOM backstop.
@@ -996,6 +999,86 @@ class SessionLifecycleTests(unittest.TestCase):
             rig.assert_outputs(self, rig.run(session))
         for component in ("enc", "dit", "ae"):
             self.assertEqual(rig.tiers(component), {Tier.DEVICE})
+
+
+@unittest.skipIf(torch is None, "torch not installed")
+class LoadProgressTests(unittest.TestCase):
+    """`Session.set_load_progress`: every checkpoint read of a step reaches the one sink."""
+
+    def setUp(self) -> None:
+        from . import _mechanics_test_fixtures as fx
+
+        fx.COMPUTE_LOG.clear()
+
+    @staticmethod
+    def _file_bytes(rig: _Rig, component: str) -> int:
+        return rig.manager._inventories("toy", rig.spec, {}, {"f32": FormatInfo(True, None, 0, "native", 1)})["f32"][component].file_bytes_total
+
+    def _assert_stream(self, rig: _Rig, frames: list[Any], component: str, *, reread: bool, total: int | None = None) -> None:
+        mine = [frame for frame in frames if frame.component == component]
+        self.assertTrue(mine, f"no frame for {component}")
+        expected_total = self._file_bytes(rig, component) if total is None else total
+        done = [frame.done_bytes for frame in mine]
+        self.assertEqual(done, sorted(done))
+        self.assertEqual(done[-1], expected_total)
+        self.assertEqual(done.count(expected_total), 1, "100% is reported exactly once")
+        for frame in mine:
+            self.assertEqual((frame.reread, frame.total_bytes, frame.file, frame.files), (reread, expected_total, rig.paths[component], (rig.paths[component],)))
+
+    def test_loads_triggered_by_phase_transitions_reach_the_sink(self) -> None:
+        rig = _Rig(self)
+        frames: list[Any] = []
+        with rig.acquire(MAX_KEEP) as session:
+            session.set_load_progress(frames.append)
+            # No explicit `load`: every component is read on entering its phase.
+            rig.assert_outputs(self, rig.run(session))
+        for component in ("enc", "dit", "ae"):
+            self._assert_stream(rig, frames, component, reread=False)
+
+    def test_the_reload_after_a_degrade_retry_reaches_the_sink(self) -> None:
+        rig = _Rig(self)
+        rig.meta_failures["dit"] = [rig.oom(ACT)]
+        frames: list[Any] = []
+        with rig.acquire() as session:
+            session.set_load_progress(frames.append)
+            rig.assert_outputs(self, rig.run(session))
+        self.assertEqual(session.history[-1].kind, RungKind.NEXT_VRAM_STEP)
+        # MAX loads every component on entering the first phase: the retried transition re-reads them.
+        self.assertEqual(session.history[-1].failure.step, "idle->encode")
+        self._assert_stream(rig, frames, "dit", reread=False)
+
+    def test_an_explicit_load_progress_wins_for_that_call(self) -> None:
+        rig = _Rig(self)
+        frames: list[Any] = []
+        explicit: list[tuple[int, int, str]] = []
+        with rig.acquire(MAX_KEEP) as session:
+            session.set_load_progress(frames.append)
+            session.load("dit", progress=lambda done, total, key: explicit.append((done, total, key)))
+            self.assertEqual([frame for frame in frames if frame.component == "dit"], [])
+            self.assertEqual(explicit[-1][:2], (self._file_bytes(rig, "dit"),) * 2)
+            # Cleared: later steps report nothing.
+            session.set_load_progress(None)
+            rig.run(session)
+        self.assertEqual(frames, [])
+
+    def test_units_brought_back_from_disk_by_a_transition_reach_the_sink_as_a_reread(self) -> None:
+        rig = _Rig(self)
+
+        def starve(ctx: Any) -> None:
+            rig.probes.host_available = 0
+
+        def unstarve(ctx: Any) -> None:
+            rig.probes.host_available = HUGE
+
+        with rig.acquire(PHASE_KEEP) as session:
+            rig.run(session, denoise=starve, decode=unstarve)
+        # The host shortfall dropped the DiT instead of parking it.
+        self.assertEqual(rig.tiers("dit"), {Tier.DROPPED})
+        frames: list[Any] = []
+        with rig.acquire(PHASE_KEEP) as again:
+            again.set_load_progress(frames.append)
+            rig.assert_outputs(self, rig.run(again))
+        self._assert_stream(rig, frames, "dit", reread=True)
 
 
 def _hint(nbytes: int) -> Any:

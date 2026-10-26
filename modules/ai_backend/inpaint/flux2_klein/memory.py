@@ -54,6 +54,9 @@ Notes:
   borrowed table of an unknown device class): it may admit on their weights alone. The
   displayed peaks are the plan's full forecast (`Planned.full_forecast`, every
   activation estimate included); `calibrated` says whether it is measured.
+- The weight format planned is the request's (`large_model.weight_format_of`):
+  a GGUF transformer plans compute path `gguf`, which no calibration table
+  measures, so its denoise forecast is an estimate (`calibrated: false`).
 - The persisted FLUX.2 settings of a build before the step axes are migrated
   by the Rust client (`legacy_memory_steps` in the cleaning tab's
   `flux2_klein/settings.rs`, which owns that table); this backend refuses the
@@ -136,7 +139,7 @@ def _inventories(spec: LargeModelSpec, options: Any) -> dict[str, ComponentInven
     """Header inventories of every component of `spec` for `options`, cached per file set, size and mtime."""
     found: dict[str, ComponentInventory] = {}
     for component in spec.components:
-        paths = [Path(path) for path in component.files(options, large_model.WEIGHT_FORMAT)]
+        paths = [Path(path) for path in component.files(options, large_model.weight_format_of(options))]
         key = (id(spec), component.name, tuple((str(path), path.stat().st_size, path.stat().st_mtime_ns) for path in paths))
         cached = _INVENTORY_CACHE.get(key)
         if cached is None:
@@ -241,7 +244,8 @@ class _Part:
 
 def _plan_part(spec: LargeModelSpec, options: Any, shape: Any, steps: Steps, budgets: Budgets, tables: CostTables) -> _Part:
     inventories = _inventories(spec, options)
-    result = plan(spec, {large_model.WEIGHT_FORMAT: inventories}, format=large_model.WEIGHT_FORMAT, formats=spec.formats(options), steps=steps, limits=Limits(), budgets=budgets, shape=shape, tables=tables, options=options)
+    weight_format = large_model.weight_format_of(options)
+    result = plan(spec, {weight_format: inventories}, format=weight_format, formats=spec.formats(options), steps=steps, limits=Limits(), budgets=budgets, shape=shape, tables=tables, options=options)
     if isinstance(result, Planned):
         return _Part(True, result.plan.steps, result.forecast, result.full_forecast)
     assert isinstance(result, PlanRefusal)

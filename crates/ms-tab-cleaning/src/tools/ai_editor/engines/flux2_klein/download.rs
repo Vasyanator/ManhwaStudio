@@ -31,6 +31,11 @@ Key functions:
   `flux2_text_encoder_path_after_toggle()`
 
 Notes:
+Only the 9B checkpoint downloads through the backend. A variant whose package is pinned in the
+Rust catalog (`Flux2Variant::downloads_from_catalog`, i.e. 4B) is fetched by the app itself
+(`ms_sysprobe::ai_models::external_catalog::flux2_klein_package_specs`), and since protocol 21
+the backend refuses `.download.*` with `variant = "4b"`; the engine must not call these methods
+for it.
 The HF token travels in the request and is NEVER persisted into the settings file. The
 drawing of this block (`draw_download_block`, `Flux2DownloadView`) lives in
 `ui/install.rs`, over the shared `hf_download_ui.rs`.
@@ -157,9 +162,10 @@ pub(super) fn flux2_text_encoder_path_after_toggle(
 /// a network call — and it is the NORMAL case for a variant whose repository is not gated
 /// (`Flux2Variant::requires_hf_token`).
 ///
-/// `variant` selects the checkpoint the call is about (`"9b"` / `"4b"`); the backend
-/// defaults to 9B when the field is absent, and refuses `"4b"` together with
-/// `uncensored = true`, which is why the panel never offers that pair.
+/// `variant` selects the checkpoint the call is about; the backend defaults to 9B when the
+/// field is absent. Only a variant that does NOT download from the catalog may be sent
+/// (`!Flux2Variant::downloads_from_catalog`): since protocol 21 the backend refuses `"4b"`
+/// outright, because the app fetches that package itself.
 #[must_use]
 pub(super) fn flux2_download_header(hf_token: &str, uncensored: bool, variant: Flux2Variant) -> Value {
     json!({

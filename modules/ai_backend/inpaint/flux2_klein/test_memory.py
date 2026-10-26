@@ -10,8 +10,10 @@ under (MAX, KEEP), the no-encoder case, the attention-mask row, `fits` on
 unknown / tiny memory, `calibrated`, MIN uses less VRAM than MAX), the combined
 VRAM-axis ceiling chain and its monotonicity for both handles together, «Энкодер
 на CPU» (`EncoderOnCpuTests`: no VRAM step puts the encoder on the card, the RAM
-step keeps or releases it), and a
-host run device (`cpu`: planned on the host alone, no VRAM figures).
+step keeps or releases it), a
+host run device (`cpu`: planned on the host alone, no VRAM figures), and a GGUF
+transformer format (planned in the request's format; its unmeasured `gguf`
+compute path makes the forecast an estimate, never an error).
 
 Notes:
 Header-only weight files (`_TempTreeCase`); the reference calibration table
@@ -29,7 +31,7 @@ from modules.ai_backend.inpaint.flux2_klein import memory
 from modules.ai_backend.runtime.large_models.cost_tables import REFERENCE_DEVICE_CLASS, load_tables
 from modules.ai_backend.runtime.large_models.tiers import AUTO_STEPS, RamStep, Steps, VramStep
 
-from ._test_fixtures import _TempTreeCase
+from ._test_fixtures import _TempTreeCase, _write_tiny_gguf
 from .test_characterization import _golden_environment
 
 GIB = 1024**3
@@ -114,6 +116,40 @@ class ForecastMemoryTests(_TempTreeCase):
         self.assertEqual((out["vram_step_effective"], out["ram_step_effective"]), ("max", "keep"))
         self.assertLess(out["phases"]["encode_standalone"]["vram_bytes"], gpu_encoder)
         self.assertGreater(out["phases"]["encode_standalone"]["ram_bytes"], 0)
+
+
+def _has_gguf() -> bool:
+    try:
+        import gguf  # noqa: F401 - availability probe
+    except ImportError:
+        return False
+    return True
+
+
+@unittest.skipUnless(_has_gguf(), "needs the gguf package (fixture writer)")
+class GgufFormatForecastTests(_TempTreeCase):
+    """`forecast_memory` plans the request's transformer format (`large_model.weight_format_of`)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        reference = load_tables(REFERENCE_DEVICE_CLASS)
+        tables = patch.object(memory, "_tables_for", lambda _device: reference)
+        tables.start()
+        self.addCleanup(tables.stop)
+        self.gguf = str(_write_tiny_gguf(self.root / "transformer_gguf" / "klein-q8.gguf"))
+        self.formats = [{"id": "bf16", "path": self.paths["transformer_path"]}, {"id": "q8_0", "path": self.gguf}]
+
+    def _forecast(self, **overrides: object) -> dict[str, object]:
+        normalized = svc.normalize_flux2_klein_params(self.params(**overrides))
+        return memory.forecast_memory(normalized, 512, 512, device="cuda:0")
+
+    def test_a_gguf_transformer_is_forecast_as_an_estimate(self) -> None:
+        out = self._forecast(transformer_path=self.gguf, transformer_format="q8_0", transformer_formats=self.formats)
+        self.assertTrue(out["fits"])
+        self.assertFalse(out["calibrated"], "no table measures the gguf compute path: the catch-all estimate")
+        bf16 = self._forecast(transformer_format="bf16", transformer_formats=self.formats)
+        self.assertTrue(bf16["calibrated"], "the measured bf16 denoise entry still applies to the bf16 candidate")
+        self.assertNotEqual(out["breakdown"]["transformer"], bf16["breakdown"]["transformer"], "each format is planned on its own file")
 
 
 class HostRunDeviceTests(_TempTreeCase):

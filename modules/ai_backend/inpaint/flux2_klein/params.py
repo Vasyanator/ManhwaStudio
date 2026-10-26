@@ -15,6 +15,10 @@ Main responsibilities:
 - `_lenient_paths` - the tolerant path view `status` uses before a run has
   ever happened;
 - `encoder_on_cpu` - the «Энкодер на CPU» flag and its default (on);
+- `derived_format` / `derived_encoder_format` / `_weight_formats` - the
+  weight-format fields of the wire (protocol 21) for the transformer and the
+  text encoder: the selected format id and the candidate files, validated,
+  or the id derived from the container when the request names none;
 - `text_encoder_dtype_name` - the ONE place that answers what dtype the
   text encoder runs in; it is deliberately NOT the request's
   `dtype`, which governs the transformer and the VAE alone.
@@ -24,21 +28,30 @@ Key functions:
 - _whole_region_overrides()
 - validate_region_size()
 - effective_steps(), _lenient_paths(), encoder_on_cpu()
+- derived_format(), derived_encoder_format(), _weight_formats()
 - text_encoder_dtype_name()
 
 Notes:
-Pure Python: no torch, no filesystem access beyond `Path.exists` in
-`_require_existing_path`, so importing this module costs nothing.
+Pure Python: no torch. Filesystem access is limited to `Path.exists` in
+`_require_existing_path` and the 4-byte container sniff of `derived_format`
+(`runtime.tensor_container.container_kind`, torch-free), so importing this
+module costs nothing.
+- Weight-format ids are OPAQUE here: they come from the client (the Rust
+  format list is their one owner) and only their shape is checked; this
+  package lists no quantization names. A GGUF file's quantization is read
+  from the file itself.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from ...runtime.large_models.tiers import RamStep, VramStep
+from ...runtime.tensor_container import container_kind
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +109,17 @@ MAX_REGION_PIXELS = 1024 * 1024
 
 #: Extreme aspect ratios collapse one latent axis to a handful of tokens.
 MAX_REGION_ASPECT_RATIO = 8.0
+
+#: The weight-format id derived for a safetensors file or a diffusers folder
+#: when the request names no format (protocol 21).
+SAFETENSORS_FORMAT = "bf16"
+
+#: The weight-format id derived for a GGUF file when the request names no format.
+GGUF_FORMAT = "gguf"
+
+#: The shape every weight-format id on the wire must have; the ids themselves
+#: are opaque to the backend (module notes).
+WEIGHT_FORMAT_ID_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
 
 
 # =====================================================================
@@ -161,6 +185,15 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
     `status` still reports the path and its `exists: false` flag, so nothing
     about a mistyped path is hidden.
 
+    **Weight format** (protocol 21): `transformer_format` is the selected
+    format id and `transformer_formats` the candidate files `[{id, path}]`,
+    best first (`_weight_formats`); when both are absent the id is derived
+    from the container (`derived_format`) and `transformer_formats` is `()`.
+    The normalized `transformer_formats` is a tuple of `(id, path)` pairs.
+    `text_encoder_format` / `text_encoder_formats` follow the same contract
+    for the encoder; an absent or missing encoder derives `SAFETENSORS_FORMAT`
+    (`derived_encoder_format`), since nothing is loaded from it.
+
     `whole_region=True` is a MODE, not a hint, and it settles
     `text_attention_in_mask` -> False on the caller's behalf; see
     `_whole_region_overrides` for why it is not meaningful there. The mask is
@@ -172,8 +205,9 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
     # Raises
     `ValueError` when the transformer or VAE path is empty or absent, when an
     enum value is not one of `VALID_DTYPES` / `VALID_VRAM_STEPS` /
-    `VALID_RAM_STEPS`, or when a retired field (`RETIRED_FIELDS`) is present,
-    naming it and its replacement.
+    `VALID_RAM_STEPS`, when a weight-format field breaks its contract
+    (`_weight_formats`), or when a retired field (`RETIRED_FIELDS`) is
+    present, naming it and its replacement.
     """
     merged: dict[str, Any] = {}
     if isinstance(params, dict):
@@ -183,6 +217,17 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
     text_encoder_path = str(merged.get("text_encoder_path") or "").strip()
     transformer_path = _require_existing_path(merged.get("transformer_path"), "transformer_path")
     vae_path = _require_existing_path(merged.get("vae_path"), "vae_path")
+    transformer_format, transformer_formats = _weight_formats(
+        merged, format_field="transformer_format", formats_field="transformer_formats", path=transformer_path, path_field="transformer_path"
+    )
+    text_encoder_format, text_encoder_formats = _weight_formats(
+        merged,
+        format_field="text_encoder_format",
+        formats_field="text_encoder_formats",
+        path=text_encoder_path,
+        path_field="text_encoder_path",
+        derive=derived_encoder_format,
+    )
 
     vram_step = _optional_choice(merged.get("vram_step"), VALID_VRAM_STEPS, "шаг «Видеопамять»")
     ram_step = _optional_choice(merged.get("ram_step"), VALID_RAM_STEPS, "шаг «Оперативная память»")
@@ -199,6 +244,14 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
     normalized: dict[str, Any] = {
         "text_encoder_path": text_encoder_path,
         "transformer_path": transformer_path,
+        # The selected weight format and its alternatives (`_weight_formats`);
+        # `transformer_path` is always the selected format's file.
+        "transformer_format": transformer_format,
+        "transformer_formats": transformer_formats,
+        # The same pair for the text encoder (`text_encoder_path` is always
+        # the selected format's folder or GGUF file).
+        "text_encoder_format": text_encoder_format,
+        "text_encoder_formats": text_encoder_formats,
         "vae_path": vae_path,
         "prompt": str(merged.get("prompt", "") or "").strip(),
         "steps": _clamp_int(merged.get("steps"), default=4, low=1, high=50),
@@ -350,6 +403,95 @@ def _require_existing_path(value: Any, field: str) -> str:
     if not Path(raw).exists():
         raise ValueError(f"Путь {field} не найден: {raw}")
     return raw
+
+
+def derived_format(path: str) -> str:
+    """The weight-format id of an unnamed format: `GGUF_FORMAT` for a GGUF file, `SAFETENSORS_FORMAT` for a folder or a safetensors file.
+
+    # Raises
+    `ValueError` when a file cannot be read (`tensor_container.container_kind`).
+    """
+    source = Path(path)
+    if source.is_dir():
+        return SAFETENSORS_FORMAT
+    return GGUF_FORMAT if container_kind(source) == "gguf" else SAFETENSORS_FORMAT
+
+
+def _format_id(value: Any, field: str) -> str:
+    """`value` when it is a weight-format id (`WEIGHT_FORMAT_ID_PATTERN`), else a `ValueError` naming `field`."""
+    if not isinstance(value, str) or WEIGHT_FORMAT_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError(
+            f"FLUX.2 klein: поле «{field}» должно быть идентификатором формата весов "
+            f"(1–32 символа a-z, 0-9, «_»), получено {value!r}"
+        )
+    return value
+
+
+def derived_encoder_format(path: str) -> str:
+    """`derived_format` of a text-encoder path, which may be empty or absent (the encoder is optional).
+
+    No encoder on disk means no encoder load, so the id is the plain
+    `SAFETENSORS_FORMAT`; the encode refuses separately (`require_text_encoder`).
+
+    # Raises
+    As `derived_format` for an existing file that cannot be read.
+    """
+    if not path or not Path(path).exists():
+        return SAFETENSORS_FORMAT
+    return derived_format(path)
+
+
+def _weight_formats(
+    merged: Mapping[str, Any],
+    *,
+    format_field: str,
+    formats_field: str,
+    path: str,
+    path_field: str,
+    derive: Callable[[str], str] = derived_format,
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """`(selected id, alternatives)` of one component's weight-format fields (protocol 21).
+
+    `merged[format_field]` is the selected id (absent or `null`: derived from
+    the file at `path` by `derive`, default `derived_format`). `merged[formats_field]`, when
+    present, is a non-empty list of `{id, path}` objects, best first, with
+    distinct ids and non-empty paths, and it must contain the selected id with
+    `path` equal to `path` (the component's `path_field`, compared exactly as
+    strings): the alternatives describe the request, they never redirect it.
+    Absent -> `()`. The paths of the alternatives need not exist (a format
+    whose file is missing is reported unavailable, never refused here).
+
+    # Raises
+    `ValueError` naming the offending field.
+    """
+    raw_id = merged.get(format_field)
+    selected = derive(path) if raw_id is None else _format_id(raw_id, format_field)
+    raw_list = merged.get(formats_field)
+    if raw_list is None:
+        return selected, ()
+    if not isinstance(raw_list, list) or not raw_list:
+        raise ValueError(f"FLUX.2 klein: поле «{formats_field}» должно быть непустым списком объектов {{id, path}}")
+    entries: list[tuple[str, str]] = []
+    for index, item in enumerate(raw_list):
+        where = f"{formats_field}[{index}]"
+        if not isinstance(item, Mapping) or set(item) != {"id", "path"}:
+            raise ValueError(f"FLUX.2 klein: элемент «{where}» должен быть объектом ровно с полями id и path, получено {item!r}")
+        format_id = _format_id(item["id"], f"{where}.id")
+        candidate = item["path"]
+        if not isinstance(candidate, str) or not candidate.strip():
+            raise ValueError(f"FLUX.2 klein: поле «{where}.path» должно быть непустой строкой, получено {candidate!r}")
+        if any(format_id == known for known, _ in entries):
+            raise ValueError(f"FLUX.2 klein: формат {format_id!r} указан в «{formats_field}» дважды")
+        entries.append((format_id, candidate))
+    paths = dict(entries)
+    if selected not in paths:
+        raise ValueError(f"FLUX.2 klein: выбранного формата {selected!r} («{format_field}») нет в списке «{formats_field}»")
+    if paths[selected] != path:
+        raise ValueError(
+            f"FLUX.2 klein: путь формата {selected!r} в «{formats_field}» ({paths[selected]}) "
+            f"не совпадает с «{path_field}» ({path})"
+        )
+    return selected, tuple(entries)
 
 
 def _refuse_retired_fields(params: dict[str, Any]) -> None:

@@ -19,6 +19,11 @@ Main responsibilities:
   reservations taken out, reclaimable bytes of idle holdings in, «Авто» limited
   by Q-P1, an optional per-handle `device_cap_bytes` ceiling kept for every
   re-plan), `reserve(ADMISSION, plan peak - own bytes)`;
+- disk-read progress of a session: `Session.set_load_progress(sink)` — every
+  checkpoint read of any step (fresh loads, re-reads after a degrade, DISK /
+  DROPPED units a transition brings back) reaches that one sink as
+  `loader.LoadProgress` frames; an explicit `Session.load(progress=)` still
+  wins for that call's fresh loads;
 - `Session.load / transition / run_phase / settle / finish`: every step
   reconciles each unit from its ledger tier to the plan's tier for that step
   (block-wise moves, fresh loads, hooks for juggled components), releases the
@@ -111,7 +116,7 @@ from .forecast import Forecast
 from .hooks import HookSet, apply_block_residency
 from .inventory import ComponentInventory, build_inventory
 from .ledger import Holdings, Ledger, UnitRef
-from .loader import LoadedComponent, TorchTransport, Transport, initial_tiers, load_component, set_unit_to_meta
+from .loader import LoadedComponent, LoadProgressSink, TorchTransport, Transport, component_read_progress, initial_tiers, load_component, set_unit_to_meta
 from .moves import drop, park, transfer_block_wise
 from .planner import (
     REASON_BUDGET_UNKNOWN,
@@ -712,6 +717,7 @@ class Session:
         self._extra_device = 0
         self._extra_host = 0
         self._progress: Any = None
+        self._load_sink: LoadProgressSink | None = None
         self.dropped_instead: list[UnitRef] = []
         self.hints: list[str] = []
 
@@ -793,11 +799,30 @@ class Session:
         return self._manager.placements(self.key)
 
     # ------------------------------------------------------------- steps
+    def set_load_progress(self, sink: LoadProgressSink | None) -> None:
+        """Register (or clear with `None`) the session's disk-read progress sink.
+
+        From then on every checkpoint read of a step — `load`, `transition`,
+        `run_phase` (its entry and the reload after a degrade retry), `settle`
+        — calls `sink(LoadProgress)`: a fresh component load as one stream
+        (`reread=False`, the whole component), the DISK / DROPPED units a step
+        brings back as one stream per component and step (`reread=True`).
+        Frames come synchronously on the thread driving the session, at most
+        every `PROGRESS_MIN_INTERVAL_SECONDS` (0.2 s) per stream plus one final
+        frame at 100%. Block streaming inside a phase (residency hooks) and
+        `finish` report nothing. A sink that raises is logged at debug and
+        ignored (`ByteProgress`). An explicit `load(progress=)` replaces the
+        sink for that call's fresh loads.
+        """
+        self._load_sink = sink
+
     def load(self, *components: str, progress: Any = None) -> None:
         """Bring `components` (all when none named) to their tiers in the current state (the first phase before any).
 
         A safe point: a memory failure walks the ladder. Components that the
         current state holds nowhere are not loaded (a later step loads them).
+        `progress` (a `ByteProgressCb`) gets the fresh loads' byte frames of
+        this call instead of the session sink (`set_load_progress`).
         """
         self._require_open()
         names = components or tuple(component.name for component in self._handle.spec.components)
@@ -1138,11 +1163,15 @@ class Session:
             if moves_out:
                 transfer_block_wise(moves_out, [], outgoing_to=tier, transport=transport, owner=f"large models {handle.key}")
         if park_out or incoming:
-            report = transfer_block_wise(park_out, incoming, outgoing_to=Tier.HOST, transport=transport, watch=self._watch, owner=f"large models {handle.key}")
+            report = transfer_block_wise(park_out, incoming, outgoing_to=Tier.HOST, transport=transport, watch=self._watch, owner=f"large models {handle.key}", read_progress=self._load_sink)
             if report.dropped_instead:
                 self.dropped_instead.extend(report.dropped_instead)
         for component, component_plan in fresh:
-            self._manager._load_fresh(handle, component, component_plan, self._inventories[component.name], options=self.options, watch=self._watch, progress=self._progress)
+            inventory = self._inventories[component.name]
+            progress = self._progress
+            if progress is None and self._load_sink is not None:
+                progress = component_read_progress(inventory, self._load_sink, reread=False)
+            self._manager._load_fresh(handle, component, component_plan, inventory, options=self.options, watch=self._watch, progress=progress)
         transport.release_cache()
         self._manager._publish(handle)
 

@@ -33,16 +33,20 @@ denoise and the VAE decode run as manager phases. The prompt-embedding cache
 encoder entirely, including on a machine where none is installed.
 
 Model layout:
-Nothing is downloaded. The user supplies three paths — a Qwen3 text-encoder
-folder, a transformer (`.safetensors` single file or a diffusers folder) and an
-`AutoencoderKLFlux2` folder; the tokenizer and the scheduler are DISCOVERED next
-to them, and a single-file transformer needs its own `config.json` beside it.
+Nothing is downloaded. The user supplies three paths — a Qwen3 text encoder (a
+folder, or a llama.cpp GGUF file), a transformer (`.safetensors` single file,
+a GGUF file or a diffusers folder) and an `AutoencoderKLFlux2` folder; the
+tokenizer and the scheduler are DISCOVERED next to them, and a single-file
+transformer needs its own `config.json` beside it. A GGUF file kept outside
+the package borrows its config, tokenizer and scheduler from the installed
+FLUX.2 klein 4B package when that config matches the file's header.
 
 Module layout (this file re-exports the package's public surface):
 - `params.py`       - request normalization, region validation, coercion helpers.
 - `progress.py`     - `phase:"load"` step numbering and the progress callback type.
 - `conversion.py`   - the transformer checkpoint's BFL -> diffusers key rule.
-- `components.py`   - the five components as files on disk.
+- `encoder_gguf.py` - llama.cpp GGUF <-> HF Qwen3 names of the text encoder.
+- `components.py`   - the five components as files on disk (and a GGUF file's config).
 - `attention.py`    - `text_attention_in_mask`: token grid, layout, the mask and its bytes.
 - `hardware.py`     - device resolution, memory snapshot, torch cache clearing.
 - `prompt_cache.py` - encoder fingerprint, the `.msprompt` container, the library.
@@ -84,7 +88,13 @@ from .params import (  # noqa: F401  - re-exported public surface
     VALID_DTYPES,
     VALID_RAM_STEPS,
     VALID_VRAM_STEPS,
+    GGUF_FORMAT,
+    SAFETENSORS_FORMAT,
+    WEIGHT_FORMAT_ID_PATTERN,
+    derived_encoder_format,
+    derived_format,
     effective_steps,
+    encoder_on_cpu,
     normalize_flux2_klein_params,
     text_encoder_dtype_name,
     validate_region_size,
@@ -100,6 +110,8 @@ from .params import (  # noqa: F401  - re-exported public surface
     _whole_region_overrides,
 )
 from .progress import (  # noqa: F401  - re-exported public surface
+    FILE_COMPONENT_TEXT_ENCODER,
+    FILE_COMPONENT_TRANSFORMER,
     LOAD_PHASE_STEPS,
     LOAD_STEP_ENCODE,
     LOAD_STEP_ENCODER_DONE,
@@ -111,9 +123,8 @@ from .progress import (  # noqa: F401  - re-exported public surface
     LOAD_STEP_TRANSFORMER,
     LOAD_STEP_VAE,
     LOAD_STEP_WARMUP,
-    FileProgressCb,
+    LoadFrames,
     ProgressCb,
-    _file_progress_reporter,
     _progress_reporter,
 )
 from .components import (  # noqa: F401  - re-exported public surface
@@ -123,7 +134,16 @@ from .components import (  # noqa: F401  - re-exported public surface
     component_safetensors_shards,
     component_search_roots,
     discover_component_dir,
+    find_text_encoder_config_dir,
     find_transformer_config_dir,
+    gguf_config_candidates,
+    gguf_layout,
+    installed_4b_package_root,
+    is_gguf_file,
+    text_encoder_config_dir,
+    FLUX2_KLEIN_4B_DIR_NAME,
+    GGUF_ENCODER_ARCHITECTURE,
+    GgufConfigSearch,
     is_fp8_scaled_checkpoint,
     model_index_search_roots,
     read_safetensors_header,
@@ -159,6 +179,12 @@ from .components import (  # noqa: F401  - re-exported public surface
     _require_component_dir,
     _weight_bytes,
     read_safetensors_header_and_data_start,
+)
+from .encoder_gguf import (  # noqa: F401  - re-exported public surface
+    encoder_state_key_of_gguf,
+    gguf_encoder_quant_types,
+    is_gguf_encoder_name,
+    require_known_encoder_names,
 )
 from .conversion import (  # noqa: F401  - re-exported public surface
     FLUX2_BFL_MARKER_KEY,
@@ -256,13 +282,26 @@ from .pipeline import (  # noqa: F401  - re-exported public surface
     residency_of,
 )
 from .large_model import (  # noqa: F401  - re-exported public surface
+    COMPUTE_GGUF,
+    COMPUTE_NATIVE,
+    ENCODE_VARIANT,
+    ENCODE_VARIANT_GGUF,
+    ENCODER_WEIGHT_FORMAT,
     EncoderOptions,
     PipelineOptions,
     encoder_model_name,
+    encoder_options,
+    encoder_path_for,
     encoder_spec,
+    gguf_quant_types,
     pipeline_model_name,
+    pipeline_options,
     pipeline_spec,
     register_specs,
+    require_loadable,
+    require_loadable_encoder,
+    transformer_path_for,
+    weight_format_of,
 )
 from .service import (  # noqa: F401  - re-exported public surface
     Flux2KleinInpaintService,

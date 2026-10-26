@@ -8,7 +8,8 @@ max(start, end) + one unit, host peak <= max(start, end) + one unit), the
 single-copy invariant after every unit (fake pools == ledger holdings), the
 host guard switching the remaining outgoing units to DROPPED (never past the
 guard; on a host run device also before every restored unit), DISK / DROPPED
-units re-read from the real file, `DeviceShort`, the
+units re-read from the real file (with `read_progress`: one `LoadProgress`
+stream per component over the disk units only), `DeviceShort`, the
 cache release after every evicted unit, and the refusal while hooks are live.
 
 Notes:
@@ -189,6 +190,44 @@ class MoveTests(unittest.TestCase):
         self.assertEqual(self.transport.host_bytes(), 0)
         self.assertTrue(torch.equal(self._forward(ae), self.ref_ae(self.x)))
         self.assertTrue(all(entry.get().is_meta for ref in dit.refs() for entry in dit.units[ref]))
+
+    def test_reread_progress_is_one_stream_over_the_disk_units_only(self) -> None:
+        import functools
+
+        from ..safetensors_stream import ByteProgress
+        from . import moves
+        from .moves import park, restore
+        from .tiers import Tier
+
+        dit = self._load("dit", self.dit_path, Tier.DEVICE)
+        park(dit, to=Tier.HOST, transport=self.transport, watch=self.fx.ShortAfter(4).watch())
+        dropped = [ref for ref in dit.refs() if self.ledger.tier(ref) is Tier.DROPPED]
+        self.assertTrue(dropped)
+        frames: list[Any] = []
+        # Every chunk reported (no throttle), so the aggregation itself is visible.
+        unthrottled = functools.partial(ByteProgress, interval_seconds=0.0)
+        with mock.patch.object(moves, "ByteProgress", unthrottled):
+            restore(dit, transport=self.transport, read_progress=frames.append)
+        total = sum(span.file_bytes for ref in dropped for span in dit.unit_spans[ref])
+        self.assertGreater(len(frames), len(dropped) - 1)
+        self.assertTrue(all(frame.component == "dit" and frame.reread and frame.total_bytes == total for frame in frames))
+        self.assertTrue(all(frame.file == self.dit_path and frame.files == (self.dit_path,) for frame in frames))
+        done = [frame.done_bytes for frame in frames]
+        # One stream across the units: never back to zero between units, 100% exactly once at the end.
+        self.assertEqual(done, sorted(done))
+        self.assertEqual(done[-1], total)
+        self.assertEqual(done.count(total), 1)
+        self.assertTrue(torch.equal(self._forward(dit), self.ref_dit(self.x)))
+
+    def test_a_host_only_restore_reports_nothing(self) -> None:
+        from .moves import park, restore
+        from .tiers import Tier
+
+        dit = self._load("dit", self.dit_path, Tier.DEVICE)
+        park(dit, to=Tier.HOST, transport=self.transport)
+        frames: list[Any] = []
+        restore(dit, transport=self.transport, read_progress=frames.append)
+        self.assertEqual(frames, [])
 
     def test_device_limit_refuses_before_moving(self) -> None:
         from .moves import DeviceShort, transfer_block_wise

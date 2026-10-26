@@ -33,6 +33,8 @@ Main items:
   settings file below, the engine id and the two capability gates; its PRESENTATION (picker
   caption, Hugging Face repository) is the `Flux2VariantPresentation` extension trait in
   `crates/ms-tab-cleaning/src/tools/ai_editor/engines/flux2_klein/variant_presentation.rs`.
+- `flux2_weight_format` (module): `Flux2WeightFormat` / `Flux2WeightAxis`, the ONE list of
+  FLUX.2 klein weight formats (bf16 + GGUF quants) and which ones each variant offers per axis.
 - `AiRuntime`: selected AI runtime (`backend`/`native`) recorded under `General.ai_runtime`.
 - `OrtLoadGuard` / `OrtLoadDecision` / `ort_load_decision` / `ort_load_scope_key` /
   `read_ort_load_guard`: per-scope ONNX Runtime SIGILL load-guard model and its pure
@@ -163,6 +165,12 @@ pub mod locale_store;
 // pulls the SAME file in with `include!("crates/ms-config/src/version_format.rs")`, so
 // the code the build script runs is the code `cargo test` covers; keep it std-only.
 pub mod version_format;
+
+// The FLUX.2 klein weight-format list (bf16 + GGUF quants) and its per-variant offer. It lives
+// here, next to `Flux2Variant` which keys the offer, because both the engine settings (above)
+// and the pinned catalog in `ms-sysprobe` (below the UI, above this crate) need the one list.
+pub mod flux2_weight_format;
+pub use flux2_weight_format::{Flux2WeightAxis, Flux2WeightFormat};
 
 use crate::bubble_status::default_bubble_status_rules_value;
 use anyhow::{Context, Result};
@@ -1110,9 +1118,11 @@ impl Flux2Variant {
         }
     }
 
-    /// Name of this variant's model directory under [`side_models_dir`]. It mirrors the
-    /// repository name the backend downloads from and must not drift from
-    /// `modules/ai_backend/inpaint/flux2_download.py`.
+    /// Name of this variant's model directory under [`side_models_dir`]. For
+    /// [`Self::Klein9B`] it mirrors the repository name the backend downloads from and must
+    /// not drift from `modules/ai_backend/inpaint/flux2_download.py`; for [`Self::Klein4B`]
+    /// every pinned catalog spec lives under it (`ms_sysprobe::ai_models::external_catalog`,
+    /// whose tests check the prefix).
     #[must_use]
     pub fn dir_name(self) -> &'static str {
         match self {
@@ -1179,13 +1189,30 @@ impl Flux2Variant {
             Self::Klein4B => false,
         }
     }
+
+    /// Whether this variant's files come from the application's pinned external catalog
+    /// (`ms_sysprobe::ai_models::external_catalog::flux2_klein_package_specs`) instead of the
+    /// backend's Hugging Face download.
+    ///
+    /// The 4B package (BFL bf16 files plus the GGUF quants of `Flux2WeightFormat`) is pinned
+    /// there and the backend refuses to download it; the gated 9B one keeps the backend
+    /// download.
+    #[must_use]
+    pub fn downloads_from_catalog(self) -> bool {
+        match self {
+            Self::Klein9B => false,
+            Self::Klein4B => true,
+        }
+    }
 }
 
 /// FLUX.2 klein: root of the diffusers tree the panel's Hugging Face download fills
 /// (`transformer/`, `text_encoder/`, `text_encoder_uncensored/`, `tokenizer/`, `vae/`,
 /// `scheduler/`).
 ///
-/// The backend creates and populates it; this side needs the path because the
+/// The backend creates and populates it for [`Flux2Variant::Klein9B`]; the pinned catalog
+/// does for [`Flux2Variant::Klein4B`] ([`Flux2Variant::downloads_from_catalog`], which adds
+/// the `transformer_gguf/` and `text_encoder_gguf/` folders). This side needs the path because the
 /// «Расцензуренный энкодер» toggle repoints `text_encoder_path` between the two encoder
 /// directories with no download at all when both are already on disk.
 #[must_use]
@@ -3333,6 +3360,8 @@ mod tests {
         assert!(!Flux2Variant::Klein4B.supports_uncensored_encoder());
         assert!(Flux2Variant::Klein9B.requires_hf_token());
         assert!(!Flux2Variant::Klein4B.requires_hf_token());
+        assert!(!Flux2Variant::Klein9B.downloads_from_catalog());
+        assert!(Flux2Variant::Klein4B.downloads_from_catalog());
     }
 
     /// Each variant's three model paths must live under ITS OWN directory: a shared one

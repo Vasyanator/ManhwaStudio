@@ -25,7 +25,7 @@ and `*.jpg` / `*.gguf` files are excluded even inside them
 Main responsibilities:
 - `resolve_format` - the wire `format` (absent = `fp8r`), a typed refusal otherwise;
 - `manifest_entries` / `download_target` - the format's manifest over
-  `hf_gated_download` (prefix plan, access states, per-repository token,
+  `hf_gated_download` (prefix plan, access states, token routing,
   publish gates, free space, resumable transfer with throttled progress);
 - `check_access` / `download` - the two wire answers;
 - `model_root` - the destination (mirrored by Rust `ms_config::flux3_klein_dir`;
@@ -115,7 +115,7 @@ def download_target(weight_format: WeightFormat) -> DownloadTarget:
     """The shared machinery's view of one format's download (`model_root()` read at call time: the tests' seam)."""
     return DownloadTarget(
         label=LABEL,
-        repos=(RepoSpec(REPO, gated=True),),
+        repos=(RepoSpec(REPO),),
         manifest=manifest_entries(weight_format),
         root=model_root(),
         no_token_message=NO_TOKEN_MESSAGE,

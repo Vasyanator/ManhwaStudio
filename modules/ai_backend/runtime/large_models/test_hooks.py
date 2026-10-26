@@ -9,14 +9,18 @@ misaligned layouts included, buffers included), the rest state between
 passes, the event protocol (a transport that runs side-stream copies only
 when an event is waited on), compute-first prefetch ordering, the learned
 prediction, the prefetch-depth bound, removal and the live host guard before
-every DISK staging buffer (a budget that shrinks after admission).
+every DISK staging buffer (a budget that shrinks after admission); the DISK
+tier over a GGUF file (`GgufDiskTests`: quantized uint8 rows streamed from the
+GGUF data start, forward identical to the resident reference).
 
 Notes:
-Skips without torch. CPU only: the transports "device" to CPU tensors.
+Skips without torch (the GGUF case also without `gguf`). CPU only: the
+transports "device" to CPU tensors.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
@@ -435,6 +439,95 @@ class HookTests(unittest.TestCase):
         with apply_block_residency(component, self.fx.FakeTransport(), plan=self.plan):
             with torch.no_grad():
                 self.assertTrue(torch.equal(component.module(self.x), self._expected()))
+
+
+def _gguf_toy_classes() -> tuple[type, type]:
+    """`(QBlock, QNet)`: a toy whose blocks hold one quantized uint8 row buffer and an F32 scale."""
+
+    class QBlock(torch.nn.Module):
+        def __init__(self, rows_shape: tuple[int, ...]) -> None:
+            super().__init__()
+            self.register_buffer("rows", torch.zeros(rows_shape, dtype=torch.uint8))
+            self.scale = torch.nn.Parameter(torch.zeros(16))
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # Every stored byte reaches the output: a wrong data start changes it.
+            return x * self.scale + self.rows.to(x.dtype).sum(dim=1).mean() * 0.001
+
+    class QNet(torch.nn.Module):
+        def __init__(self, rows_shape: tuple[int, ...], blocks: int) -> None:
+            super().__init__()
+            self.embed = torch.nn.Parameter(torch.zeros(16))
+            self.blocks = torch.nn.ModuleList([QBlock(rows_shape) for _ in range(blocks)])
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            h = x + self.embed
+            for block in self.blocks:
+                h = block(h)
+            return h
+
+    return QBlock, QNet
+
+
+@unittest.skipIf(torch is None, "torch not installed")
+@unittest.skipUnless(importlib.util.find_spec("gguf") is not None, "gguf is not installed")
+class GgufDiskTests(unittest.TestCase):
+    """The DISK tier reads quantized GGUF rows at the GGUF header's data start."""
+
+    BLOCKS = 4
+
+    def setUp(self) -> None:
+        from .. import _gguf_test_fixtures as fx
+
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        root = Path(self._dir.name)
+        tensors = [fx.make_tensor("embed", fx.Q.F32, (16,), seed=50)]
+        for index in range(self.BLOCKS):
+            tensors.append(fx.make_tensor(f"blocks.{index}.rows", fx.Q.Q8_0, (3, 64), seed=index))
+            tensors.append(fx.make_tensor(f"blocks.{index}.scale", fx.Q.F32, (16,), seed=10 + index))
+        self.path = fx.write_gguf(root / "toy.gguf", tensors, alignment=64)
+        _, net_class = _gguf_toy_classes()
+        rows_shape = tuple(tensors[1].raw.shape)
+        self.build = lambda: net_class(rows_shape, self.BLOCKS)
+        self.reference = self.build()
+        with torch.no_grad():
+            for tensor in tensors:
+                if tensor.name.endswith(".rows"):
+                    self.reference.get_buffer(tensor.name).copy_(torch.from_numpy(tensor.raw.copy()))
+                else:
+                    self.reference.get_parameter(tensor.name).copy_(torch.from_numpy(tensor.reference()))
+        self.x = torch.randn(5, 16, generator=torch.Generator().manual_seed(4))
+
+    def test_disk_tier_streams_quantized_rows_from_the_gguf_data_start(self) -> None:
+        from . import _mechanics_test_fixtures as fx
+        from .hooks import apply_block_residency
+        from .inventory import build_inventory
+        from .ledger import Ledger
+        from .loader import load_component
+        from .spec import ComponentSpec, ExecDevice, Role
+        from .tiers import ComponentPlan, Tier
+
+        def build_meta(options: Any, weight_format: str) -> Any:
+            with torch.device("meta"):
+                return self.build()
+
+        spec = ComponentSpec("net", Role.DIT, lambda options, weight_format: [self.path], fx.toy_block_of, build_meta=build_meta)
+        inventory = build_inventory(spec, [self.path])
+        self.assertTrue(all(entry.span.quant_type is not None for ref in inventory.blocks for entry in inventory.blocks[ref] if entry.key.endswith("rows")))
+        ledger = Ledger(max_in_flight=2)
+        plan = ComponentPlan("net", Tier.DISK, ExecDevice.RUN_DEVICE, 1, Tier.DISK)
+        component = load_component(spec, inventory, plan, options=None, weight_format="gguf", device="cpu", ledger=ledger)
+        with torch.no_grad():
+            expected = self.reference(self.x)
+        with apply_block_residency(component, fx.FakeTransport(), plan=plan):
+            for _ in range(2):
+                with torch.no_grad():
+                    self.assertTrue(torch.equal(component.module(self.x), expected))
+                # At rest the DISK blocks are meta placeholders of the stored uint8 layout.
+                rest = component.module.blocks[self.BLOCKS - 1].rows
+                self.assertTrue(rest.is_meta)
+                self.assertEqual(rest.dtype, torch.uint8)
 
 
 if __name__ == "__main__":

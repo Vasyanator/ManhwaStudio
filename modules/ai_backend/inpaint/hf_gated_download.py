@@ -7,9 +7,10 @@ manifest of repository PREFIXES resolved against live listings into a plan,
 the per-repository access check with the fixed `state` taxonomy, and the
 resumable transfer with two-level throttled progress, a free-space guard and
 real cancellation. A model package (`flux2_download.py`, `flux3_download.py`)
-supplies only WHAT it needs — a `DownloadTarget` (label, repositories with
-their gated flag, manifest rules, destination root) — and maps its own wire
-fields onto it.
+supplies only WHAT it needs — a `DownloadTarget` (label, repositories,
+manifest rules, destination root) — and maps its own wire fields onto it.
+Every repository this machinery serves is GATED (a token AND accepted
+conditions): a public repository is not a case it handles.
 
 Main responsibilities:
 - build the plan from PREFIXES resolved against the live repo listing, never
@@ -18,7 +19,8 @@ Main responsibilities:
 - answer the per-repository access check (`STATE_*`) the UI draws its links
   from; the gate is probed with `HfApi.auth_check`, never inferred from a
   listing (the metadata of a `gated: auto` repo is public);
-- send the token only to a GATED repository (`repo_token`), at all three
+- refuse an empty token before any network call (`no_token` / the target's
+  `no_token_message`), and send the token to every repository at all three
   network sites (access probe, listing, file transfer);
 - publish a file only at the size (and, for LFS, the sha256) the listing
   announced: the shared primitive `engines.model_download` retries transient
@@ -44,8 +46,8 @@ environment, never persists it, never logs it and never interpolates it into an
 error message; a message that must mention it says "токен". Messages from
 `huggingface_hub` are scrubbed of the token value before they leave.
 `probe_repo_access`, `repo_listing`, `fetch_listings` and `_fetch_one` receive
-the token TO SEND (already filtered by `repo_token`); the two entry points
-(`check_access`, `download`) do the filtering.
+the token TO SEND; the two entry points (`check_access`, `download`) strip it
+and refuse an empty one.
 """
 
 from __future__ import annotations
@@ -136,10 +138,9 @@ class DownloadCanceled(Exception):
 
 @dataclass(frozen=True)
 class RepoSpec:
-    """One repository a download touches; `gated` = the hub demands a token AND accepted conditions."""
+    """One repository a download touches; always gated (the hub demands a token AND accepted conditions)."""
 
     repo: str
-    gated: bool
 
 
 @dataclass(frozen=True)
@@ -192,8 +193,9 @@ class DownloadTarget:
     - `repos` are the repositories to check and fetch from, in report order;
     - `manifest` the rules in force (every rule's repo must be in `repos`);
     - `root` the directory that receives the files;
-    - `no_token_message` the refusal of `download` for an empty token on a
-      request that touches a gated repository (model-specific wording).
+    - `no_token_message` the refusal of `download` for an empty token
+      (model-specific wording; every repository is gated, so every request
+      needs a token).
     """
 
     label: str
@@ -201,11 +203,6 @@ class DownloadTarget:
     manifest: tuple[ManifestEntry, ...]
     root: Path
     no_token_message: str
-
-    @property
-    def token_required(self) -> bool:
-        """Whether this request needs a Hugging Face token at all (any repository is gated)."""
-        return any(spec.gated for spec in self.repos)
 
 
 class ListedFile(NamedTuple):
@@ -237,35 +234,6 @@ class PlannedFile:
     label: str
     size: int
     sha256: str | None = None
-
-
-def repo_token(spec: RepoSpec, token: str) -> str:
-    """The token to send to `spec.repo`: `token` for a gated repository, `""` otherwise.
-
-    A public repository is contacted ANONYMOUSLY even when the request carries
-    a token: an expired token forwarded to a public repository makes the hub
-    answer 401, which would be reported as `invalid_token` for a repository
-    that needs no token at all. The token value is never logged.
-    """
-    return token if spec.gated else ""
-
-
-def log_anonymous_repos(target: DownloadTarget, token: str) -> None:
-    """Record that a supplied token is deliberately withheld from public repositories.
-
-    Silent when no token was supplied or when every repository is gated. Logs
-    repository ids only — never the token.
-    """
-    if not token:
-        return
-    public = [spec.repo for spec in target.repos if not spec.gated]
-    if not public:
-        return
-    log.info(
-        "%s: репозитории %s публичные — запросы к ним выполняются без токена.",
-        target.label,
-        ", ".join(public),
-    )
 
 
 def is_excluded(path: str) -> bool:
@@ -435,7 +403,7 @@ def classify_repo_error(exc: BaseException) -> str:
 
 
 def probe_repo_access(repo: str, token: str) -> tuple[str, str]:
-    """Whether `token` (the token TO SEND, `repo_token`) may download `repo`. Returns `(state, message)`.
+    """Whether `token` (the token TO SEND) may download `repo`. Returns `(state, message)`.
 
     `message` is empty for `ok` and carries the technical detail otherwise,
     scrubbed of the token. A listing is NOT a proof of access (`model_info()`
@@ -482,10 +450,10 @@ def fetch_listings(repos: Iterable[str], token: str) -> dict[str, dict[str, List
 
 
 def _fetch_target_listings(target: DownloadTarget, token: str) -> dict[str, dict[str, ListedFile]]:
-    """Listings of every repository of `target`, each fetched with its own `repo_token`."""
+    """Listings of every repository of `target`, one `fetch_listings` call per repository."""
     listings: dict[str, dict[str, ListedFile]] = {}
     for spec in target.repos:
-        listings.update(fetch_listings([spec.repo], repo_token(spec, token)))
+        listings.update(fetch_listings([spec.repo], token))
     return listings
 
 
@@ -502,9 +470,8 @@ def check_access(
     computed for what it was showing a moment ago.
 
     An empty token short-circuits to `no_token` for every repository and makes
-    NO network call at all — but ONLY when a repository is gated
-    (`DownloadTarget.token_required`). A supplied token is still not sent
-    everywhere: `repo_token` decides per repository.
+    NO network call at all: every repository is gated. A supplied token is
+    sent to every repository.
 
     **`plan` is NULLABLE and a zeroed plan is never synthesised.** Access and
     listing are two different network operations: a token can pass `auth_check`
@@ -521,7 +488,7 @@ def check_access(
     token = (hf_token or "").strip()
     repos = tuple(spec.repo for spec in target.repos)
 
-    if not token and target.token_required:
+    if not token:
         return {
             **echo,
             "repos": {repo: {"state": STATE_NO_TOKEN, "message": ""} for repo in repos},
@@ -529,10 +496,9 @@ def check_access(
             "plan_error": "",
         }
 
-    log_anonymous_repos(target, token)
     states: dict[str, dict[str, str]] = {}
     for spec in target.repos:
-        state, message = probe_repo_access(spec.repo, repo_token(spec, token))
+        state, message = probe_repo_access(spec.repo, token)
         if state != STATE_OK:
             log.info("%s: доступ к %s — %s", target.label, spec.repo, state)
         states[spec.repo] = {"state": state, "message": scrub(message, token)}
@@ -679,8 +645,8 @@ def download(
     in flight are parked for the next run.
 
     # Errors
-    Raises `ValueError(target.no_token_message)` for an empty token on a request
-    that touches a gated repository (before any network call);
+    Raises `ValueError(target.no_token_message)` for an empty token (before
+    any network call);
     `DownloadCanceled` when the caller canceled; and `RuntimeError` for an
     inaccessible repository, a manifest prefix that resolved to nothing,
     insufficient free space, or a transport failure (permanent, or transient
@@ -688,10 +654,9 @@ def download(
     family).
     """
     token = (hf_token or "").strip()
-    if not token and target.token_required:
+    if not token:
         raise ValueError(target.no_token_message)
 
-    log_anonymous_repos(target, token)
     _check_canceled(should_cancel, target.label)
     try:
         listings = _fetch_target_listings(target, token)
@@ -701,7 +666,6 @@ def download(
     plan = resolve_plan(listings, target.manifest, target.root)
     pending = missing_files(plan)
     skipped = len(plan) - len(pending)
-    sent_tokens = {spec.repo: repo_token(spec, token) for spec in target.repos}
 
     total = sum(item.size for item in pending)
     # Bytes an earlier run already parked next to their destinations are on the
@@ -733,7 +697,7 @@ def download(
         )
         ran = _fetch_one(
             item,
-            token=sent_tokens[item.repo],
+            token=token,
             on_chunk=on_chunk,
             on_retry=on_retry,
             should_cancel=should_cancel,
@@ -838,8 +802,8 @@ def _fetch_one(
 ) -> bool:
     """Fetch one planned file, resuming what an earlier run left. Returns whether it ran.
 
-    `token` is the token TO SEND for `item.repo` (`repo_token`; empty for a
-    public repository, so no `Authorization` header goes out).
+    `token` is the token TO SEND for `item.repo` (the request's token; every
+    repository is gated).
 
     Resume, retry and the size gate all live in the shared primitive: a dropped
     connection or a body that ended cleanly but short is resumed with `Range`,

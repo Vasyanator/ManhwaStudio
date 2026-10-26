@@ -4,8 +4,9 @@ File: crates/ms-sysprobe/src/ai_models/external_catalog.rs
 Purpose:
 The pinned catalog of EXTERNAL (third-party) models the application downloads itself:
 Baberu OCR, the three PaddleOCR-VL variants, the Surya detection and recognition
-checkpoints, the SDXL diffusers configs and the curated SDXL inpainting model (the EasyOCR
-specs live with their language rule in `easyocr.rs`). This file is the single owner of each
+checkpoints, the SDXL diffusers configs, the curated SDXL inpainting model and the FLUX.2
+klein 4B package (BFL bf16 files plus the unsloth GGUF transformer and Qwen3 text-encoder
+quants) (the EasyOCR specs live with their language rule in `easyocr.rs`). This file is the single owner of each
 model's source (Hugging Face repository + pinned commit, or HTTPS base URL), file allowlist
 (exact size + sha256) and target directory under the caller's `side_models` root. Nothing
 else in the workspace may spell these values; the Python backend receives resolved paths and
@@ -14,8 +15,14 @@ never downloads these models.
 Key items:
 - `BABERU_OCR`, `PADDLE_VL_OFFICIAL_1_6`, `PADDLE_VL_OFFICIAL_1_5`, `PADDLE_VL_MANGA_JA`,
   `SURYA_DETECTION_2025_05_07`, `SURYA_RECOGNITION_2025_09_23`, `SDXL_CONFIG_BASE`,
-  `SDXL_CONFIG_INPAINT`, `SDXL_INPAINT_FP16`: the `ExternalModelSpec` statics consumed by
-  `external::download_external_model` / `external::installed_dir`.
+  `SDXL_CONFIG_INPAINT`, `SDXL_INPAINT_FP16`, `FLUX2_KLEIN_4B_BASE`,
+  `FLUX2_KLEIN_4B_TRANSFORMER_BF16`, `FLUX2_KLEIN_4B_TEXT_ENCODER_BF16`,
+  `FLUX2_KLEIN_4B_TRANSFORMER_GGUF_*`, `FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_*`: the
+  `ExternalModelSpec` statics consumed by `external::download_external_model` /
+  `external::installed_dir`.
+- `flux2_klein_spec` / `flux2_klein_package_specs` / `flux2_klein_weights_path`: the FLUX.2
+  klein lookups by `ms_config::Flux2Variant` + `Flux2WeightAxis` + `Flux2WeightFormat` (spec
+  of one component format, the bundle a selection needs, the path the backend is sent).
 - `all_specs()`: every spec of the application (catalog + EasyOCR), for whole-catalog
   checks.
 - `BaberuFiles` + `baberu_files()`: the one owner of the Baberu on-disk layout names; uses
@@ -31,6 +38,8 @@ Notes:
 */
 
 use std::path::{Path, PathBuf};
+
+use ms_config::{Flux2Variant, Flux2WeightAxis, Flux2WeightFormat};
 
 use super::external::{DirLayout, ExternalFile, ExternalModelSpec, ExternalSource};
 
@@ -314,6 +323,246 @@ pub static SDXL_INPAINT_FP16: ExternalModelSpec = ExternalModelSpec {
     files: &SDXL_INPAINT_FP16_FILES,
 };
 
+// FLUX.2 klein 4B. Every spec is `Shared`: the three BFL specs publish into the package root
+// `FLUX.2-klein-4B` (the same relative paths `ms_config::flux2_klein_*_dir` name and the
+// backend's former download produced, so an existing download is adopted, never refetched);
+// each GGUF component has a sibling folder holding one file per quant. The BFL repository
+// carries more (the repo-root single-file checkpoint, sample images); only the diffusers
+// folders the engine loads are listed. Pins: the Hugging Face tree API at each commit, small
+// BFL files cross-checked against an existing download (git blob sha1 equal to the tree's).
+
+/// The FLUX.2 klein 4B package root, relative to `side_models`
+/// (`ms_config::Flux2Variant::Klein4B.dir_name()`; a catalog test checks the agreement).
+const FLUX2_KLEIN_4B_DIR: &str = "FLUX.2-klein-4B";
+/// The BFL repository and commit every FLUX.2 klein 4B bf16 file is pinned at.
+const FLUX2_KLEIN_4B_BFL_SOURCE: ExternalSource = ExternalSource::HuggingFace { repo_id: "black-forest-labs/FLUX.2-klein-4B", revision: "e7b7dc27f91deacad38e78976d1f2b499d76a294" };
+/// The unsloth GGUF quantizations of the FLUX.2 klein 4B transformer.
+const FLUX2_KLEIN_4B_TRANSFORMER_GGUF_SOURCE: ExternalSource = ExternalSource::HuggingFace { repo_id: "unsloth/FLUX.2-klein-4B-GGUF", revision: "0084d1df98e2e2137fe776d55170bc4792ec1d66" };
+/// The unsloth GGUF quantizations of Qwen3-4B, the FLUX.2 klein 4B text encoder.
+const FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_SOURCE: ExternalSource = ExternalSource::HuggingFace { repo_id: "unsloth/Qwen3-4B-GGUF", revision: "22c9fc8a8c7700b76a1789366280a6a5a1ad1120" };
+/// Folder of the transformer GGUF files, relative to `side_models`.
+const FLUX2_KLEIN_4B_TRANSFORMER_GGUF_DIR: &str = "FLUX.2-klein-4B/transformer_gguf";
+/// Folder of the text-encoder GGUF files, relative to `side_models`.
+const FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_DIR: &str = "FLUX.2-klein-4B/text_encoder_gguf";
+/// The bf16 transformer folder inside the package root (`ms_config::flux2_klein_transformer_dir`).
+const FLUX2_KLEIN_TRANSFORMER_SUBDIR: &str = "transformer";
+/// The bf16 text-encoder folder inside the package root (`ms_config::flux2_klein_text_encoder_dir`).
+const FLUX2_KLEIN_TEXT_ENCODER_SUBDIR: &str = "text_encoder";
+
+// Everything the engine needs whatever the weight formats: licence, pipeline index, scheduler,
+// tokenizer, VAE, and the two component configs (a GGUF transformer / encoder takes its config
+// and tokenizer from here).
+static FLUX2_KLEIN_4B_BASE_FILES: [ExternalFile; 15] = [
+    ExternalFile::direct("LICENSE.md", 9_584, "ca02bc51900ab07789d1b70283329e7137f5af98f5161c23a1c81fc38a4af1fe"),
+    ExternalFile::direct("model_index.json", 446, "51a76cb1cf3ed37423a1128c79c22faee8e6fbe7f5aaeb737f0a258930dbaac0"),
+    ExternalFile::direct("scheduler/scheduler_config.json", 486, "067afb012cef64553a763447d1efd93daeffcc0123ca7e25b09f8de20b90762e"),
+    ExternalFile::direct("tokenizer/added_tokens.json", 707, "c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680"),
+    ExternalFile::direct("tokenizer/chat_template.jinja", 4_168, "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"),
+    ExternalFile::direct("tokenizer/merges.txt", 1_671_853, "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"),
+    ExternalFile::direct("tokenizer/special_tokens_map.json", 613, "76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd"),
+    ExternalFile::direct("tokenizer/tokenizer.json", 11_422_654, "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"),
+    ExternalFile::direct("tokenizer/tokenizer_config.json", 5_404, "443bfa629eb16387a12edbf92a76f6a6f10b2af3b53d87ba1550adfcf45f7fa0"),
+    ExternalFile::direct("tokenizer/vocab.json", 2_776_833, "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"),
+    ExternalFile::direct("vae/config.json", 821, "0d6dfb69ae95a5e2ac9836284bbb63d8b38ce67b25ba2dff380752b2a10ab948"),
+    ExternalFile::direct("vae/diffusion_pytorch_model.safetensors", 168_120_878, "ca70d2202afe6415bdbcb8793ba8cd99fd159cfe6192381504d6c4d3036e0f04"),
+    ExternalFile::direct("transformer/config.json", 541, "09733c74a3da6d17dd0a0472a091a8950c7c6935889c32c16cc800ede05029de"),
+    ExternalFile::direct("text_encoder/config.json", 1_536, "214b4c29a0d975e9fddf9994a5673f22cb2c4c5750352f9227c2c3251ebeab40"),
+    ExternalFile::direct("text_encoder/generation_config.json", 214, "4347b1aeed2b2b78bc059920a0b7f5fec71482e1344952b76d7665d638d71f13"),
+];
+
+/// FLUX.2 klein 4B shared part (`black-forest-labs/FLUX.2-klein-4B`): licence, pipeline index,
+/// scheduler, tokenizer, VAE and the transformer / text-encoder configs; no component weights.
+pub static FLUX2_KLEIN_4B_BASE: ExternalModelSpec = ExternalModelSpec {
+    id: "flux2_klein_4b_base",
+    source: FLUX2_KLEIN_4B_BFL_SOURCE,
+    dir: FLUX2_KLEIN_4B_DIR,
+    layout: DirLayout::Shared,
+    files: &FLUX2_KLEIN_4B_BASE_FILES,
+};
+
+static FLUX2_KLEIN_4B_TRANSFORMER_BF16_FILES: [ExternalFile; 1] = [
+    ExternalFile::direct("transformer/diffusion_pytorch_model.safetensors", 7_751_109_744, "9f29f9edcfdae452a653ffb51a534ca4decd389952c225724ff3b94042612a6e"),
+];
+
+/// FLUX.2 klein 4B bf16 transformer weights (about 7.8 GB) into `transformer/`.
+pub static FLUX2_KLEIN_4B_TRANSFORMER_BF16: ExternalModelSpec = ExternalModelSpec {
+    id: "flux2_klein_4b_transformer_bf16",
+    source: FLUX2_KLEIN_4B_BFL_SOURCE,
+    dir: FLUX2_KLEIN_4B_DIR,
+    layout: DirLayout::Shared,
+    files: &FLUX2_KLEIN_4B_TRANSFORMER_BF16_FILES,
+};
+
+static FLUX2_KLEIN_4B_TEXT_ENCODER_BF16_FILES: [ExternalFile; 3] = [
+    ExternalFile::direct("text_encoder/model-00001-of-00002.safetensors", 4_967_215_360, "8c0506e7f4936fa7e26183a4fd8da4e2bdbc5990ba64ae441f965d51228f36ea"),
+    ExternalFile::direct("text_encoder/model-00002-of-00002.safetensors", 3_077_766_632, "82f2bd839378541b0557bfabaf37c7d3d637071fdcb73302dedd7cf61162ce07"),
+    ExternalFile::direct("text_encoder/model.safetensors.index.json", 32_855, "06b3d5319b6d76d1a4a2433419180016cfd54ed62d086a5e6567a809f8c82634"),
+];
+
+/// FLUX.2 klein 4B bf16 Qwen3 text-encoder weights (two shards + index, about 8 GB) into
+/// `text_encoder/`.
+pub static FLUX2_KLEIN_4B_TEXT_ENCODER_BF16: ExternalModelSpec = ExternalModelSpec {
+    id: "flux2_klein_4b_text_encoder_bf16",
+    source: FLUX2_KLEIN_4B_BFL_SOURCE,
+    dir: FLUX2_KLEIN_4B_DIR,
+    layout: DirLayout::Shared,
+    files: &FLUX2_KLEIN_4B_TEXT_ENCODER_BF16_FILES,
+};
+
+static FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q8_0_FILES: [ExternalFile; 1] = [ExternalFile::direct("flux-2-klein-4b-Q8_0.gguf", 4_300_644_928, "24a812e8f9b640e21c784164ea48571d8017ca22873696f4badeeabb006d509c")];
+static FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q6_K_FILES: [ExternalFile; 1] = [ExternalFile::direct("flux-2-klein-4b-Q6_K.gguf", 3_409_273_408, "fb3b5430d9229f982616c7db084deff1db5035d0cb6558f2d4f704cfe5e609e2")];
+static FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q5_K_M_FILES: [ExternalFile; 1] = [ExternalFile::direct("flux-2-klein-4b-Q5_K_M.gguf", 3_073_368_640, "58c01c75fee2272eadb127f53e26dd05a5a8e7f812e37c36fa44603301f91e54")];
+static FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q4_K_M_FILES: [ExternalFile; 1] = [ExternalFile::direct("flux-2-klein-4b-Q4_K_M.gguf", 2_604_311_104, "0b25d143c8469b342bc5af3bce92b783bf6b0636d285f7b2f75e38af63af9a15")];
+
+/// FLUX.2 klein 4B transformer, GGUF `Q8_0` (`unsloth/FLUX.2-klein-4B-GGUF`).
+pub static FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q8_0: ExternalModelSpec = ExternalModelSpec {
+    id: "flux2_klein_4b_transformer_gguf_q8_0",
+    source: FLUX2_KLEIN_4B_TRANSFORMER_GGUF_SOURCE,
+    dir: FLUX2_KLEIN_4B_TRANSFORMER_GGUF_DIR,
+    layout: DirLayout::Shared,
+    files: &FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q8_0_FILES,
+};
+
+/// FLUX.2 klein 4B transformer, GGUF `Q6_K` (`unsloth/FLUX.2-klein-4B-GGUF`).
+pub static FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q6_K: ExternalModelSpec = ExternalModelSpec {
+    id: "flux2_klein_4b_transformer_gguf_q6_k",
+    source: FLUX2_KLEIN_4B_TRANSFORMER_GGUF_SOURCE,
+    dir: FLUX2_KLEIN_4B_TRANSFORMER_GGUF_DIR,
+    layout: DirLayout::Shared,
+    files: &FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q6_K_FILES,
+};
+
+/// FLUX.2 klein 4B transformer, GGUF `Q5_K_M` (`unsloth/FLUX.2-klein-4B-GGUF`).
+pub static FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q5_K_M: ExternalModelSpec = ExternalModelSpec {
+    id: "flux2_klein_4b_transformer_gguf_q5_k_m",
+    source: FLUX2_KLEIN_4B_TRANSFORMER_GGUF_SOURCE,
+    dir: FLUX2_KLEIN_4B_TRANSFORMER_GGUF_DIR,
+    layout: DirLayout::Shared,
+    files: &FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q5_K_M_FILES,
+};
+
+/// FLUX.2 klein 4B transformer, GGUF `Q4_K_M` (`unsloth/FLUX.2-klein-4B-GGUF`).
+pub static FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q4_K_M: ExternalModelSpec = ExternalModelSpec {
+    id: "flux2_klein_4b_transformer_gguf_q4_k_m",
+    source: FLUX2_KLEIN_4B_TRANSFORMER_GGUF_SOURCE,
+    dir: FLUX2_KLEIN_4B_TRANSFORMER_GGUF_DIR,
+    layout: DirLayout::Shared,
+    files: &FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q4_K_M_FILES,
+};
+
+static FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q8_0_FILES: [ExternalFile; 1] = [ExternalFile::direct("Qwen3-4B-Q8_0.gguf", 4_280_405_792, "eed555233267a33c7e8ee31682762cc7751b3f6d224039086e0e846f05fffa5d")];
+static FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q6_K_FILES: [ExternalFile; 1] = [ExternalFile::direct("Qwen3-4B-Q6_K.gguf", 3_306_261_792, "002b8b61c298976afc2c9c3ca65f9dbb28deba22c4b6381853dfaa92b5690022")];
+static FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q5_K_M_FILES: [ExternalFile; 1] = [ExternalFile::direct("Qwen3-4B-Q5_K_M.gguf", 2_889_514_272, "37edbd37f5b7a4d4e7a766400c57def1f790e809de03513b86bf11bb06979695")];
+static FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q4_K_M_FILES: [ExternalFile; 1] = [ExternalFile::direct("Qwen3-4B-Q4_K_M.gguf", 2_497_281_312, "f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a")];
+
+/// FLUX.2 klein 4B text encoder, Qwen3-4B GGUF `Q8_0` (`unsloth/Qwen3-4B-GGUF`).
+pub static FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q8_0: ExternalModelSpec = ExternalModelSpec {
+    id: "flux2_klein_4b_text_encoder_gguf_q8_0",
+    source: FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_SOURCE,
+    dir: FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_DIR,
+    layout: DirLayout::Shared,
+    files: &FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q8_0_FILES,
+};
+
+/// FLUX.2 klein 4B text encoder, Qwen3-4B GGUF `Q6_K` (`unsloth/Qwen3-4B-GGUF`).
+pub static FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q6_K: ExternalModelSpec = ExternalModelSpec {
+    id: "flux2_klein_4b_text_encoder_gguf_q6_k",
+    source: FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_SOURCE,
+    dir: FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_DIR,
+    layout: DirLayout::Shared,
+    files: &FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q6_K_FILES,
+};
+
+/// FLUX.2 klein 4B text encoder, Qwen3-4B GGUF `Q5_K_M` (`unsloth/Qwen3-4B-GGUF`).
+pub static FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q5_K_M: ExternalModelSpec = ExternalModelSpec {
+    id: "flux2_klein_4b_text_encoder_gguf_q5_k_m",
+    source: FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_SOURCE,
+    dir: FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_DIR,
+    layout: DirLayout::Shared,
+    files: &FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q5_K_M_FILES,
+};
+
+/// FLUX.2 klein 4B text encoder, Qwen3-4B GGUF `Q4_K_M` (`unsloth/Qwen3-4B-GGUF`).
+pub static FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q4_K_M: ExternalModelSpec = ExternalModelSpec {
+    id: "flux2_klein_4b_text_encoder_gguf_q4_k_m",
+    source: FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_SOURCE,
+    dir: FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_DIR,
+    layout: DirLayout::Shared,
+    files: &FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q4_K_M_FILES,
+};
+
+/// The FLUX.2 klein 4B spec holding the weights of `axis` in `format` (exhaustive: every
+/// format has a pinned 4B spec on both axes).
+fn flux2_klein_4b_weights_spec(axis: Flux2WeightAxis, format: Flux2WeightFormat) -> &'static ExternalModelSpec {
+    match (axis, format) {
+        (Flux2WeightAxis::Transformer, Flux2WeightFormat::Bf16) => &FLUX2_KLEIN_4B_TRANSFORMER_BF16,
+        (Flux2WeightAxis::Transformer, Flux2WeightFormat::Q80) => &FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q8_0,
+        (Flux2WeightAxis::Transformer, Flux2WeightFormat::Q6K) => &FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q6_K,
+        (Flux2WeightAxis::Transformer, Flux2WeightFormat::Q5KM) => &FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q5_K_M,
+        (Flux2WeightAxis::Transformer, Flux2WeightFormat::Q4KM) => &FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q4_K_M,
+        (Flux2WeightAxis::TextEncoder, Flux2WeightFormat::Bf16) => &FLUX2_KLEIN_4B_TEXT_ENCODER_BF16,
+        (Flux2WeightAxis::TextEncoder, Flux2WeightFormat::Q80) => &FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q8_0,
+        (Flux2WeightAxis::TextEncoder, Flux2WeightFormat::Q6K) => &FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q6_K,
+        (Flux2WeightAxis::TextEncoder, Flux2WeightFormat::Q5KM) => &FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q5_K_M,
+        (Flux2WeightAxis::TextEncoder, Flux2WeightFormat::Q4KM) => &FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q4_K_M,
+    }
+}
+
+/// The pinned spec holding the FLUX.2 klein weights of `axis` in `format` for `variant`.
+///
+/// `None` when the variant is not downloaded from this catalog
+/// (`Flux2Variant::downloads_from_catalog`, today 9B) or does not offer `format` on `axis`
+/// (`Flux2WeightFormat::offered_for`).
+#[must_use]
+pub fn flux2_klein_spec(variant: Flux2Variant, axis: Flux2WeightAxis, format: Flux2WeightFormat) -> Option<&'static ExternalModelSpec> {
+    if !variant.downloads_from_catalog() || !Flux2WeightFormat::offered_for(variant, axis).contains(&format) {
+        return None;
+    }
+    match variant {
+        Flux2Variant::Klein4B => Some(flux2_klein_4b_weights_spec(axis, format)),
+        Flux2Variant::Klein9B => None,
+    }
+}
+
+/// The bundle of specs a FLUX.2 klein selection needs installed: the shared base part, then
+/// the transformer spec of `transformer`, then the text-encoder spec of `text_encoder`.
+///
+/// Empty for a variant this catalog does not download (9B). A format the variant does not
+/// offer contributes no spec; callers normalize their selection with
+/// `Flux2WeightFormat::offered_for` first (every format is offered for 4B).
+#[must_use]
+pub fn flux2_klein_package_specs(variant: Flux2Variant, transformer: Flux2WeightFormat, text_encoder: Flux2WeightFormat) -> Vec<&'static ExternalModelSpec> {
+    let base = match variant {
+        Flux2Variant::Klein4B => &FLUX2_KLEIN_4B_BASE,
+        Flux2Variant::Klein9B => return Vec::new(),
+    };
+    let mut specs = vec![base];
+    specs.extend(flux2_klein_spec(variant, Flux2WeightAxis::Transformer, transformer));
+    specs.extend(flux2_klein_spec(variant, Flux2WeightAxis::TextEncoder, text_encoder));
+    specs
+}
+
+/// Where the FLUX.2 klein weights of `axis` in `format` live once installed under
+/// `side_models_root` (pass `ms_config::side_models_dir()`): the bf16 component FOLDER
+/// (`<package>/transformer` or `<package>/text_encoder`, the same paths as
+/// `ms_config::flux2_klein_transformer_dir` / `flux2_klein_text_encoder_dir`) or the GGUF
+/// FILE. Pure path joining: checks nothing on disk.
+///
+/// `None` exactly when [`flux2_klein_spec`] is `None`.
+#[must_use]
+pub fn flux2_klein_weights_path(side_models_root: &Path, variant: Flux2Variant, axis: Flux2WeightAxis, format: Flux2WeightFormat) -> Option<PathBuf> {
+    let spec = flux2_klein_spec(variant, axis, format)?;
+    let dir = spec.local_dir(side_models_root);
+    if format.is_gguf() {
+        // A GGUF spec pins exactly one file (catalog test), which is the component.
+        return spec.files.first().map(|file| join_relative(&dir, file.path));
+    }
+    Some(dir.join(match axis {
+        Flux2WeightAxis::Transformer => FLUX2_KLEIN_TRANSFORMER_SUBDIR,
+        Flux2WeightAxis::TextEncoder => FLUX2_KLEIN_TEXT_ENCODER_SUBDIR,
+    }))
+}
+
 
 /// The PaddleOCR-VL weights a user can select. All three run through the same vendored
 /// 1.6 model code in the backend; only the downloaded directory differs.
@@ -375,6 +624,17 @@ pub fn all_specs() -> Vec<&'static ExternalModelSpec> {
         &SDXL_CONFIG_BASE,
         &SDXL_CONFIG_INPAINT,
         &SDXL_INPAINT_FP16,
+        &FLUX2_KLEIN_4B_BASE,
+        &FLUX2_KLEIN_4B_TRANSFORMER_BF16,
+        &FLUX2_KLEIN_4B_TEXT_ENCODER_BF16,
+        &FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q8_0,
+        &FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q6_K,
+        &FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q5_K_M,
+        &FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q4_K_M,
+        &FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q8_0,
+        &FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q6_K,
+        &FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q5_K_M,
+        &FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q4_K_M,
     ];
     specs.extend(super::easyocr::EasyOcrScript::ALL.into_iter().map(super::easyocr::easyocr_spec));
     specs
@@ -434,6 +694,13 @@ mod tests {
         assert_eq!(SDXL_CONFIG_BASE.total_bytes(), 3_177_927);
         assert_eq!(SDXL_CONFIG_INPAINT.total_bytes(), 3_176_820);
         assert_eq!(SDXL_INPAINT_FP16.total_bytes(), 6_941_218_469);
+        assert_eq!(FLUX2_KLEIN_4B_BASE.total_bytes(), 184_016_738);
+        assert_eq!(FLUX2_KLEIN_4B_TRANSFORMER_BF16.total_bytes(), 7_751_109_744);
+        assert_eq!(FLUX2_KLEIN_4B_TEXT_ENCODER_BF16.total_bytes(), 8_045_014_847);
+        assert_eq!(FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q8_0.total_bytes(), 4_300_644_928);
+        assert_eq!(FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q4_K_M.total_bytes(), 2_604_311_104);
+        assert_eq!(FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q8_0.total_bytes(), 4_280_405_792);
+        assert_eq!(FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q4_K_M.total_bytes(), 2_497_281_312);
     }
 
     #[test]
@@ -450,6 +717,107 @@ mod tests {
         assert_eq!(SDXL_INPAINT_FP16.source, SDXL_CONFIG_INPAINT.source);
         assert_eq!(SDXL_INPAINT_FP16.files.iter().filter(|file| file.path.ends_with(".fp16.safetensors")).count(), 4);
         assert!(all_specs().iter().flat_map(|spec| spec.files).filter(|file| file.origin != FileOrigin::Direct).all(|file| file.path.ends_with(".pth")));
+    }
+
+    /// Every 4B spec in a stable order: base, bf16 transformer, bf16 encoder, then the GGUF
+    /// specs of both axes.
+    fn flux2_klein_4b_specs() -> Vec<&'static ExternalModelSpec> {
+        all_specs().into_iter().filter(|spec| spec.id.starts_with("flux2_klein_4b_")).collect()
+    }
+
+    #[test]
+    fn every_offered_flux2_format_resolves_to_its_own_spec_and_nothing_else_does() {
+        let mut resolved: Vec<&str> = Vec::new();
+        for variant in Flux2Variant::all() {
+            for axis in Flux2WeightAxis::all() {
+                for &format in Flux2WeightFormat::all() {
+                    let offered = variant.downloads_from_catalog() && Flux2WeightFormat::offered_for(variant, axis).contains(&format);
+                    let spec = flux2_klein_spec(variant, axis, format);
+                    assert_eq!(spec.is_some(), offered, "{variant:?} {axis:?} {format:?}");
+                    assert_eq!(flux2_klein_weights_path(Path::new("side"), variant, axis, format).is_some(), offered);
+                    if let Some(spec) = spec {
+                        let axis_token = match axis {
+                            Flux2WeightAxis::Transformer => "transformer",
+                            Flux2WeightAxis::TextEncoder => "text_encoder",
+                        };
+                        let kind = if format.is_gguf() { "gguf_" } else { "" };
+                        assert_eq!(spec.id, format!("flux2_klein_4b_{axis_token}_{kind}{}", format.wire()));
+                        if format.is_gguf() {
+                            assert_eq!(spec.files.len(), 1, "{}", spec.id);
+                            assert!(spec.files[0].path.ends_with(&format!("-{}.gguf", format.quant_token().unwrap_or_default())), "{}", spec.id);
+                        }
+                        resolved.push(spec.id);
+                    }
+                }
+            }
+        }
+        // Every 4B weights spec is reachable exactly once; only the base is not a weights spec.
+        let mut expected: Vec<&str> = flux2_klein_4b_specs().iter().map(|spec| spec.id).filter(|id| *id != FLUX2_KLEIN_4B_BASE.id).collect();
+        expected.sort_unstable();
+        resolved.sort_unstable();
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn flux2_klein_4b_specs_are_shared_and_live_under_the_variant_dir() {
+        let specs = flux2_klein_4b_specs();
+        assert_eq!(specs.len(), 11);
+        let package = Flux2Variant::Klein4B.dir_name();
+        for spec in specs {
+            assert_eq!(spec.layout, DirLayout::Shared, "{}", spec.id);
+            assert!(spec.dir == package || spec.dir.starts_with(&format!("{package}/")), "{}", spec.id);
+        }
+        assert_eq!(FLUX2_KLEIN_4B_DIR, package);
+        // The bf16 parts must not overlap: one file has one owning spec in the package root.
+        for (a, b) in [(&FLUX2_KLEIN_4B_BASE, &FLUX2_KLEIN_4B_TRANSFORMER_BF16), (&FLUX2_KLEIN_4B_BASE, &FLUX2_KLEIN_4B_TEXT_ENCODER_BF16), (&FLUX2_KLEIN_4B_TRANSFORMER_BF16, &FLUX2_KLEIN_4B_TEXT_ENCODER_BF16)] {
+            assert!(a.files.iter().all(|file| b.files.iter().all(|other| other.path != file.path)), "{} / {}", a.id, b.id);
+        }
+    }
+
+    #[test]
+    fn flux2_klein_4b_bf16_paths_agree_with_the_config_dirs() {
+        let variant = Flux2Variant::Klein4B;
+        let package = ms_config::flux2_klein_dir(variant);
+        assert_eq!(package.strip_prefix(ms_config::side_models_dir()).ok(), Some(Path::new(FLUX2_KLEIN_4B_DIR)));
+        let side = Path::new("side");
+        let root = join_relative(side, FLUX2_KLEIN_4B_DIR);
+        for (axis, config_dir, spec) in [
+            (Flux2WeightAxis::Transformer, ms_config::flux2_klein_transformer_dir(variant), &FLUX2_KLEIN_4B_TRANSFORMER_BF16),
+            (Flux2WeightAxis::TextEncoder, ms_config::flux2_klein_text_encoder_dir(variant, false), &FLUX2_KLEIN_4B_TEXT_ENCODER_BF16),
+        ] {
+            let relative = config_dir.strip_prefix(&package).ok().map(Path::to_path_buf);
+            let folder = flux2_klein_weights_path(side, variant, axis, Flux2WeightFormat::Bf16);
+            assert_eq!(folder.as_deref().and_then(|path| path.strip_prefix(&root).ok()), relative.as_deref());
+            let subdir = relative.as_deref().and_then(Path::to_str).unwrap_or_default();
+            assert!(spec.files.iter().all(|file| file.path.starts_with(&format!("{subdir}/"))), "{}", spec.id);
+        }
+        let vae = ms_config::flux2_klein_vae_dir(variant);
+        let vae_relative = vae.strip_prefix(&package).ok().and_then(Path::to_str).unwrap_or_default();
+        assert!(FLUX2_KLEIN_4B_BASE.files.iter().any(|file| file.path == format!("{vae_relative}/config.json")));
+        assert!(FLUX2_KLEIN_4B_BASE.files.iter().any(|file| file.path == format!("{vae_relative}/diffusion_pytorch_model.safetensors")));
+        // The GGUF encoder takes its config and tokenizer from the base part.
+        assert!(FLUX2_KLEIN_4B_BASE.files.iter().any(|file| file.path == "transformer/config.json"));
+        assert!(FLUX2_KLEIN_4B_BASE.files.iter().any(|file| file.path == "text_encoder/config.json"));
+        assert!(FLUX2_KLEIN_4B_BASE.files.iter().any(|file| file.path == "tokenizer/tokenizer.json"));
+    }
+
+    #[test]
+    fn flux2_klein_gguf_paths_and_bundles() {
+        let side = Path::new("side");
+        let path = flux2_klein_weights_path(side, Flux2Variant::Klein4B, Flux2WeightAxis::Transformer, Flux2WeightFormat::Q80);
+        assert_eq!(path, Some(side.join("FLUX.2-klein-4B").join("transformer_gguf").join("flux-2-klein-4b-Q8_0.gguf")));
+        let path = flux2_klein_weights_path(side, Flux2Variant::Klein4B, Flux2WeightAxis::TextEncoder, Flux2WeightFormat::Q4KM);
+        assert_eq!(path, Some(side.join("FLUX.2-klein-4B").join("text_encoder_gguf").join("Qwen3-4B-Q4_K_M.gguf")));
+
+        let ids = |specs: Vec<&'static ExternalModelSpec>| specs.into_iter().map(|spec| spec.id).collect::<Vec<_>>();
+        assert_eq!(ids(flux2_klein_package_specs(Flux2Variant::Klein4B, Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16)), ["flux2_klein_4b_base", "flux2_klein_4b_transformer_bf16", "flux2_klein_4b_text_encoder_bf16"]);
+        assert_eq!(ids(flux2_klein_package_specs(Flux2Variant::Klein4B, Flux2WeightFormat::Q6K, Flux2WeightFormat::Q5KM)), ["flux2_klein_4b_base", "flux2_klein_4b_transformer_gguf_q6_k", "flux2_klein_4b_text_encoder_gguf_q5_k_m"]);
+        for &transformer in Flux2WeightFormat::all() {
+            for &text_encoder in Flux2WeightFormat::all() {
+                assert_eq!(flux2_klein_package_specs(Flux2Variant::Klein4B, transformer, text_encoder).len(), 3);
+                assert!(flux2_klein_package_specs(Flux2Variant::Klein9B, transformer, text_encoder).is_empty());
+            }
+        }
     }
 
     #[test]

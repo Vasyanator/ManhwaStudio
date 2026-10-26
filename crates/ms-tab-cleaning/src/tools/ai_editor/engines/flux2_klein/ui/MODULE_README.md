@@ -34,9 +34,12 @@ never work started from inside a widget closure.
 - `mod.rs`: `Flux2PanelCtx` and the panel body, plus the two pinned parts. Edit it to move a
   control between blocks or to change the order of the panel.
 - `install.rs`: the source-mode switch, the editable model-path rows and their pickers,
-  the derived paths of the download mode, and the FLUX.2 half of the Hugging Face download
-  block (heading, repository line, the token-row conditions, the encoder toggle) — the ONLY
-  file where the two checkpoints differ on screen. The token row and the check / plan /
+  the derived paths of the download mode, the FLUX.2 half of the Hugging Face download
+  block of 9B (heading, repository line, the token-row conditions, the encoder toggle), and
+  the CATALOG download block of 4B (`draw_catalog_download_block`: «Веса трансформера» /
+  «Веса текстового энкодера» as `WheelComboBox`es whose rows carry the size and a ✓ when
+  installed, the derived paths, and one bundle block through the shared
+  `draw_ocr_model_download`, drawn only while its snapshot matches the current bundle). The token row and the check / plan /
   download controls themselves are the shared `draw_hf_token_row` / `draw_hf_download_controls`
   (`../../shared/hf_download_ui.rs`), and so is `gated_button`, the gated-action button with
   its mandatory disabled tooltip that the component list and the prompt-cache controls use.
@@ -47,7 +50,9 @@ never work started from inside a widget closure.
   component list — one row per component carrying presence, size, residency and the
   backend's own action buttons.
 - `advanced.rs`: «Для экспертов» — the generation parameters, the growth of the mask contour
-  (`mask_dilate_px`) and the precision / VAE tiling / fp8-encoder switches. The feather and the
+  (`mask_dilate_px`) and the precision / VAE tiling / fp8-encoder switches; the fp8 switch is
+  closed, showing its effective value (off) with the reason, while a GGUF encoder format is in
+  effect (D8). The feather and the
   colour match are NOT here: they are the host's post-process, drawn by the shared
   «Постобработка» section (`../../shared/postprocess_section.rs`) over
   `Flux2KleinSettings::postprocess`; its edits raise `Flux2PanelCtx::postprocess_changed` (a save,
@@ -82,9 +87,11 @@ never work started from inside a widget closure.
   untouched while it is closed.
 - **A backend literal this build does not know degrades to "not known"**, with the literal
   on hover, and offers no action. It is never guessed into one of the known states.
-- **The two FLUX.2 klein engines draw the SAME body**, differing only where
-  `Flux2PanelCtx::variant` says a capability is absent, and both differences are OMISSIONS
-  in `install.rs`: no Hugging Face token row for an ungated repository
+- **The two FLUX.2 klein engines draw the SAME body**, differing where
+  `Flux2PanelCtx::variant` says a capability is absent or the settings say the weight formats
+  are in effect (4B in download mode: the catalog block instead of the Hugging Face one, the
+  format rows of «Память и скорость», the fp8 gate; in manual mode the encoder FILE button
+  where GGUF encoder formats exist). The 9B differences are OMISSIONS in `install.rs`: no Hugging Face token row for an ungated repository
   (`requires_hf_token`), no uncensored-encoder toggle where no such encoder is published
   (`supports_uncensored_encoder`). A control the backend would refuse is not drawn disabled
   — it is not drawn. The token row has ONE exception, because omitting it is otherwise a

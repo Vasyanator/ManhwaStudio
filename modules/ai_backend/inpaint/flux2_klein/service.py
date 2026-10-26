@@ -23,9 +23,13 @@ Main responsibilities:
 - `component_action` - one per-component residency action, each a manager
   session (load / unload / park in RAM / back to the GPU / warm-up);
 - the `prompt_cache_*` methods - the library surface, keyed identically to the
-  in-memory cache through `_prompt_cache_key`;
+  in-memory cache through `_prompt_cache_key` (encoder file AND weight format);
 - `large_model_profiles` - the adapter `large_models.profiles` calls: the
-  pipeline's step pickers planned with the encoder's admission claimed
+  pipeline's step pickers planned with the encoder's admission claimed (the
+  encoder counted unless it is neither needed nor resident: `_encoder_need`,
+  the one owner of that rule), plus
+  the encoder's own format rows (`encoder_formats`); both handles are planned
+  in the request's selected formats (`large_model.weight_format_of`)
   (`large_model_name` / `large_model_inputs` stay the single-handle fallback);
 - `set_phase_observer` - the calibration tool's hook (every manager step of
   both handles, plus the FLUX.2 `warmup`);
@@ -57,6 +61,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -66,7 +71,7 @@ if TYPE_CHECKING:
 from ...runtime.health_snapshot import HealthSnapshot
 from ...runtime.large_models.manager import LargeModelManager, MemoryLimitsStore, ProfilesReport, Session, SessionObserver
 from ...runtime.large_models.forecast import Forecast
-from ...runtime.large_models.planner import Planned
+from ...runtime.large_models.planner import Planned, PlanResult
 from ...runtime.large_models.spec import ExecDevice
 from ...runtime.large_models.spec import RequestShape
 from ...runtime.large_models.tiers import IDLE_PHASE, RamStep, Steps, VramStep
@@ -84,7 +89,9 @@ from .components import (
     _first_unavailable_reason,
     _require_component_dir,
     checkpoint_is_distilled,
+    component_dir_for_path,
     component_search_roots,
+    is_gguf_file,
     require_encoder_transformer_compatible,
     require_text_encoder,
     text_encoder_available,
@@ -92,6 +99,7 @@ from .components import (
 from .params import (
     _lenient_paths,
     _PATH_KEYS,
+    derived_format,
     effective_steps,
     encoder_on_cpu,
     MIN_REGION_SIDE,
@@ -112,8 +120,9 @@ from .pipeline import (
     residency_of,
 )
 from .progress import (
-    _file_progress_reporter,
     _progress_reporter,
+    FILE_COMPONENT_TEXT_ENCODER,
+    FILE_COMPONENT_TRANSFORMER,
     LOAD_PHASE_STEPS,
     LOAD_STEP_ENCODE,
     LOAD_STEP_ENCODER_DONE,
@@ -125,6 +134,7 @@ from .progress import (
     LOAD_STEP_TRANSFORMER,
     LOAD_STEP_VAE,
     LOAD_STEP_WARMUP,
+    LoadFrames,
     ProgressCb,
 )
 from .prompt_cache import (
@@ -168,15 +178,74 @@ def _encoder_load_steps(requested: Steps) -> Steps:
     return _TO_RAM_STEPS
 
 
-def _reservation_of(admitted: Forecast) -> tuple[int, int]:
-    """`(device bytes, host growth)` a plan's admission reserves: its device peak, and its host peak above the baseline RSS.
+@dataclass(frozen=True)
+class EncoderNeed:
+    """What a request asks of the text encoder handle (`Flux2KleinInpaintService._encoder_need`).
 
-    The baseline is read back from the idle state (`host_peak` = baseline +
-    host weights there), the same figure the manager subtracts.
+    `encodes`: an encoder is installed and some prompt the run needs (the
+    prompt, plus `""` under classifier-free guidance) is missing from the
+    prompt cache — the run will load the encoder and encode. `resident`: the
+    encoder handle this request would use holds bytes in RAM or VRAM right
+    now.
     """
-    idle = admitted.phases[IDLE_PHASE]
-    baseline = max(0, idle.host_peak - idle.host_weights)
-    return int(admitted.device_peak), max(0, int(admitted.host_peak) - baseline)
+
+    encodes: bool
+    resident: bool
+
+    @property
+    def counted(self) -> bool:
+        """Whether the forecast counts the encoder: left out ONLY when it is not resident AND the cache covers every prompt."""
+        return self.encodes or self.resident
+
+
+def _load_frames(callback: ProgressCb | None, normalized: Mapping[str, Any]) -> LoadFrames | None:
+    """The request's `LoadFrames` over `callback` (`None` without one): the transformer and the text encoder report their reads.
+
+    `file_label` is the transformer's file or folder name and the encoder's
+    GGUF file or transformers folder name (`_encoder_file_label`); the VAE
+    reports no bytes.
+    """
+    if callback is None:
+        return None
+    files = {
+        large_model.TRANSFORMER: (FILE_COMPONENT_TRANSFORMER, Path(normalized["transformer_path"]).name),
+        large_model.TEXT_ENCODER: (FILE_COMPONENT_TEXT_ENCODER, _encoder_file_label(normalized)),
+    }
+    return LoadFrames(callback, files)
+
+
+def _encoder_file_label(normalized: Mapping[str, Any]) -> str:
+    """The `file_label` of the text encoder read: the GGUF file's name, else the transformers folder's name (a weights file inside it names its folder)."""
+    source = Path(normalized["text_encoder_path"])
+    if is_gguf_file(source):
+        return source.name
+    return component_dir_for_path(source).name
+
+
+def _host_baseline(forecast: Forecast) -> int:
+    """The backend's baseline RSS a forecast's host peaks include, read back from its idle state (`host_peak` = baseline + host weights there)."""
+    idle = forecast.phases[IDLE_PHASE]
+    return max(0, int(idle.host_peak) - int(idle.host_weights))
+
+
+def _reservation_of(admitted: Forecast) -> tuple[int, int]:
+    """`(device bytes, host growth)` a plan's admission reserves: its device peak, and its host peak above the baseline RSS (`_host_baseline`, the figure the manager subtracts)."""
+    return int(admitted.device_peak), max(0, int(admitted.host_peak) - _host_baseline(admitted))
+
+
+def _with_host_baseline(selected: dict[str, Any], result: PlanResult) -> dict[str, Any]:
+    """`selected` (a report's wire `selected`) with `forecast.host_baseline` added: the baseline RSS inside its `host_peak`.
+
+    Additive (v21): the client sums the pipeline's and the encoder's host
+    peaks, and each one already includes the backend process once; it
+    subtracts one baseline. `result` is the `PlanResult` `selected` was
+    serialized from (its shown forecast: a plan's full one, a refusal's
+    closest attempt). A `selected` without a forecast is returned unchanged.
+    """
+    forecast = result.full_forecast if isinstance(result, Planned) else result.forecast
+    if forecast is None or selected.get("forecast") is None:
+        return selected
+    return {**selected, "forecast": {**selected["forecast"], "host_baseline": _host_baseline(forecast)}}
 
 
 def _private_manager(model_manager: SmallModelManager) -> LargeModelManager:
@@ -242,12 +311,36 @@ class Flux2KleinInpaintService:
             return None
 
     def _pipeline_key(self, normalized: Mapping[str, Any], device: str) -> str:
-        options = large_model.PipelineOptions(normalized["transformer_path"], normalized["vae_path"], normalized["dtype"], 0, 1, False, False, False, 0, None)
-        return large_model.pipeline_spec(normalized["dtype"]).key(options, large_model.WEIGHT_FORMAT, normalize_device(device) or str(device))
+        """The pipeline's residency key for the transformer / VAE paths and `dtype` of `normalized` (a normalized request or the lenient status paths) on `device`.
+
+        Only the key-bearing fields are filled: the key names the selected
+        format's file, which is always `transformer_path`, so the format id
+        (`transformer_format`, else derived from the container) never changes it.
+
+        # Raises
+        `ValueError` / `OSError` when the transformer file cannot be sniffed
+        (`params.derived_format`); `_handle_key` turns that into "no key".
+        """
+        transformer_path = str(normalized["transformer_path"])
+        transformer_format = normalized.get("transformer_format") or derived_format(transformer_path)
+        options = large_model.PipelineOptions(
+            transformer_path=transformer_path,
+            vae_path=str(normalized["vae_path"]),
+            dtype=normalized["dtype"],
+            max_sequence_length=0,
+            steps=1,
+            guidance=False,
+            text_attention_in_mask=False,
+            vae_tiling=False,
+            vae_tile_px=0,
+            vae_scale=None,
+            transformer_format=transformer_format,
+        )
+        return large_model.pipeline_spec(normalized["dtype"]).key(options, large_model.weight_format_of(options), normalize_device(device) or str(device))
 
     def _encoder_key(self, paths: Mapping[str, Any], fp8: bool, device: str, *, on_cpu: bool) -> str:
         options = large_model.EncoderOptions(str(paths.get("text_encoder_path") or ""), bool(fp8), 0, on_cpu=on_cpu)
-        return large_model.encoder_spec(fp8).key(options, large_model.WEIGHT_FORMAT, normalize_device(device) or str(device))
+        return large_model.encoder_spec(fp8).key(options, large_model.weight_format_of(options), normalize_device(device) or str(device))
 
     def _parts(self, key: str | None) -> dict[str, tuple[int, int]]:
         """`{component: (device bytes, host bytes)}` the large pool holds for `key` (empty when nothing)."""
@@ -261,6 +354,20 @@ class Flux2KleinInpaintService:
     def _holds(self, key: str | None) -> bool:
         """Whether the handle `key` holds any byte anywhere."""
         return any(device or host for device, host in self._parts(key).values())
+
+    def _encoder_need(self, normalized: dict[str, Any], device: str) -> EncoderNeed:
+        """THE decision of what the request in `normalized` asks of the text encoder on `device` (`EncoderNeed`).
+
+        Used by `large_model_profiles` (whether the encoder is counted) and by
+        the run (whether the encoder's combined ceiling is planned). Never
+        waits for the service lock: the cache test is one dict membership
+        test (`_prompt_cached`'s reasoning) and residency is read from the
+        arbiter's ledger (`_holds`), like `health` and the status snapshot,
+        so a forecast is answered during a running generation.
+        """
+        encodes = text_encoder_available(normalized) and bool(self._prompts_to_encode(normalized))
+        resident = bool(normalized["text_encoder_path"]) and self._holds(self._handle_key(lambda: self._encoder_key(normalized, normalized["text_encoder_fp8"], device, on_cpu=normalized["encoder_on_cpu"]), "text_encoder"))
+        return EncoderNeed(encodes=encodes, resident=resident)
 
     def _observer(self, model: str) -> SessionObserver | None:
         observer = self._phase_observer
@@ -282,13 +389,20 @@ class Flux2KleinInpaintService:
         """
         self._phase_observer = observer
 
-    def _acquire(self, model: str, options: Any, shape: Any, steps: Steps, device: str, *, device_cap_bytes: int | None = None) -> Session:
+    def _acquire(self, model: str, options: Any, shape: Any, steps: Steps, device: str, frames: LoadFrames | None, *, device_cap_bytes: int | None = None) -> Session:
         """Admit one session of `model` with `steps` (call under `self._lock`, pipeline before encoder: module notes).
 
+        `frames`: the request's progress, whose `sink` becomes the session's
+        load-progress sink — EVERY checkpoint read of the session (its loads,
+        a DISK-tier component brought back inside a phase, a degrade retry's
+        reload) streams its bytes on the current step (`LoadFrames`).
         `device_cap_bytes`: the per-handle device ceiling (`None` = none; the
         encoder's under the combined VRAM-axis rule, `memory` module notes).
         """
-        return self._large.acquire(model, options, shape, device=device, format=large_model.WEIGHT_FORMAT, steps=steps, observer=self._observer(model), device_cap_bytes=device_cap_bytes)
+        session = self._large.acquire(model, options, shape, device=device, format=large_model.weight_format_of(options), steps=steps, observer=self._observer(model), device_cap_bytes=device_cap_bytes)
+        if frames is not None:
+            session.set_load_progress(frames.sink)
+        return session
 
     def _combined_ceilings(self, alone: ProfilesReport, encoder_options: large_model.EncoderOptions, shape: RequestShape, device: str, *, until: VramStep) -> tuple[RamStep, dict[VramStep, int | None]] | None:
         """`(RAM step, memory.combined_ceilings)` of the pipeline report `alone`'s VRAM column, with the manager's live budgets; `None` when there is no VRAM axis to keep monotone.
@@ -309,7 +423,7 @@ class Flux2KleinInpaintService:
             if not isinstance(row, Planned):
                 return None
             claim = _reservation_of(row.forecast)
-            beside = self._large.profiles(encoder_model, encoder_options, shape, device=device, steps=cell, claimed_device_bytes=claim[0], claimed_host_bytes=claim[1], device_cap_bytes=memory.encoder_device_cap(ceiling, row.full_forecast))
+            beside = self._large.profiles(encoder_model, encoder_options, shape, device=device, format=large_model.weight_format_of(encoder_options), steps=cell, claimed_device_bytes=claim[0], claimed_host_bytes=claim[1], device_cap_bytes=memory.encoder_device_cap(ceiling, row.full_forecast))
             if not isinstance(beside.selected, Planned):
                 return None
             return memory.combined_device_peak(row.full_forecast, beside.selected.full_forecast)
@@ -365,11 +479,26 @@ class Flux2KleinInpaintService:
         same requested `steps`, with the combined VRAM-axis ceiling a run would give it
         (`_combined_ceilings`, `memory` module notes); (3) the pipeline is planned again with the encoder's
         reservation claimed, and that report is the answer
-        (`ProfilesReport.to_dict()`; `model` is the dtype's registration). The
-        additive key `encoder` is the encoder's `selected` (`null` when the
-        run will not encode: the prompt is cached or no encoder is
-        installed). An encoder that does not fit makes `selected.fits`
-        `false`, with the encoder's `reason` / `shortest_resource`. Read-only.
+        (`ProfilesReport.to_dict()`; `model` is the dtype's registration):
+        `selected` stays the PIPELINE's plan (the encoder enters it only as a
+        claim), so the run's total is `selected` + `encoder`, summed by the
+        client; each of the two `forecast` objects carries the additive
+        `host_baseline` (the baseline RSS inside its `host_peak`,
+        `_with_host_baseline`) so that sum counts the process once. The additive key `encoder` is the encoder's `selected`, or
+        `null` when the encoder is not needed AND not resident
+        (`EncoderNeed.counted`: every prompt the run needs is cached and the
+        encoder handle holds no byte, or no encoder is installed); a resident
+        encoder is counted even when the prompt is cached. `encoder_formats`
+        is the encoder report's `formats` rows (one per `text_encoder_formats`
+        candidate; `[]` when `encoder` is `null`). An encoder that does not
+        fit makes `selected.fits` `false`, with the encoder's `reason` /
+        `shortest_resource`. Read-only; never waits for the service lock.
+
+        `format` is the transformer weight format to plan; `None` plans the
+        request's selected one (`large_model.weight_format_of`), NOT the
+        manager's best available format, so the answer describes the run the
+        same params would start. The `formats` rows list every candidate of
+        `transformer_formats`.
 
         # Raises
         `ValueError` for invalid params (or a format the model lacks).
@@ -379,9 +508,11 @@ class Flux2KleinInpaintService:
         guidance = self._effective_guidance_scale(normalized) > 1.0
         model = large_model.pipeline_model_name(normalized["dtype"])
         options = large_model.pipeline_options(normalized, guidance=guidance)
+        format = format or large_model.weight_format_of(options)
         alone = self._large.profiles(model, options, shape, device=device, format=format, steps=steps)
-        if not (text_encoder_available(normalized) and self._prompts_to_encode(normalized)):
-            return {**alone.to_dict(), "encoder": None}
+        if not self._encoder_need(normalized, device).counted:
+            answer = alone.to_dict()
+            return {**answer, "selected": _with_host_baseline(answer["selected"], alone.selected), "encoder": None, "encoder_formats": []}
         pipeline_claim = _reservation_of(alone.selected.forecast) if isinstance(alone.selected, Planned) else (0, 0)
         encoder_options = large_model.encoder_options(normalized)
         cap = None
@@ -389,15 +520,18 @@ class Flux2KleinInpaintService:
             selected_vram = alone.selected.plan.steps.vram
             ceilings = self._combined_ceilings(alone, encoder_options, shape, device, until=selected_vram)
             cap = memory.encoder_device_cap(ceilings[1][selected_vram], alone.selected.full_forecast) if ceilings is not None else None
-        encoder = self._large.profiles(large_model.encoder_model_name(encoder_options.fp8), encoder_options, shape, device=device, steps=steps, claimed_device_bytes=pipeline_claim[0], claimed_host_bytes=pipeline_claim[1], device_cap_bytes=cap)
-        encoder_selected = encoder.to_dict()["selected"]
+        encoder = self._large.profiles(large_model.encoder_model_name(encoder_options.fp8), encoder_options, shape, device=device, format=large_model.weight_format_of(encoder_options), steps=steps, claimed_device_bytes=pipeline_claim[0], claimed_host_bytes=pipeline_claim[1], device_cap_bytes=cap)
+        encoder_report = encoder.to_dict()
+        encoder_selected = _with_host_baseline(encoder_report["selected"], encoder.selected)
+        encoder_formats = encoder_report["formats"]
         if not isinstance(encoder.selected, Planned):
             answer = alone.to_dict()
-            answer["selected"] = {**answer["selected"], "fits": False, "vram": None, "ram": None, "needs_reclaim": None, "reason": encoder_selected["reason"], "shortest_resource": encoder_selected["shortest_resource"]}
-            return {**answer, "encoder": encoder_selected}
+            answer["selected"] = {**_with_host_baseline(answer["selected"], alone.selected), "fits": False, "vram": None, "ram": None, "needs_reclaim": None, "reason": encoder_selected["reason"], "shortest_resource": encoder_selected["shortest_resource"]}
+            return {**answer, "encoder": encoder_selected, "encoder_formats": encoder_formats}
         encoder_claim = _reservation_of(encoder.selected.forecast)
         combined: ProfilesReport = self._large.profiles(model, options, shape, device=device, format=format, steps=steps, claimed_device_bytes=encoder_claim[0], claimed_host_bytes=encoder_claim[1])
-        return {**combined.to_dict(), "encoder": encoder_selected}
+        answer = combined.to_dict()
+        return {**answer, "selected": _with_host_baseline(answer["selected"], combined.selected), "encoder": encoder_selected, "encoder_formats": encoder_formats}
 
     # ---- status / health ----
     def status(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -594,7 +728,8 @@ class Flux2KleinInpaintService:
                     f"по размеру с областью {width}x{height}"
                 )
         self._last_paths = {key: normalized[key] for key in _PATH_KEYS}
-        report = _progress_reporter(progress_callback, "load", LOAD_PHASE_STEPS)
+        frames = _load_frames(progress_callback, normalized)
+        report = _progress_reporter(frames, "load", LOAD_PHASE_STEPS)
         steps = memory.requested_steps(normalized)
 
         with self._lock:
@@ -609,7 +744,7 @@ class Flux2KleinInpaintService:
                 # bare matmul shape error inside the denoise.
                 require_encoder_transformer_compatible(normalized)
                 large_model.require_loadable(normalized, encoder=bool(self._prompts_to_encode(normalized)))
-                result = self._run_locked(normalized, region_rgb, mask_u8, reference_rgb, steps, report, progress_callback)
+                result = self._run_locked(normalized, region_rgb, mask_u8, reference_rgb, steps, report, frames)
                 self._last_error = None
                 self._publish_health_locked()
             except Exception as exc:
@@ -626,7 +761,7 @@ class Flux2KleinInpaintService:
         reference_rgb: np.ndarray | None,
         steps: Steps,
         report: Callable[[int, str], None],
-        progress_callback: ProgressCb | None,
+        frames: LoadFrames | None,
     ) -> dict[str, Any]:
         """The run under `self._lock`: pipeline session, prompt, denoise, decode; answers the raw decode.
 
@@ -642,24 +777,25 @@ class Flux2KleinInpaintService:
         cold = not self._holds(self._handle_key(lambda: self._pipeline_key(normalized, device), "pipeline"))
         retries = 0
         # The encoder's combined ceiling is planned before the pipeline holds a
-        # reservation (`_combined_ceilings`); only when this run will encode.
+        # reservation (`_combined_ceilings`); only when this run will encode
+        # (a resident encoder over a cached prompt is never touched by the run).
         ceilings = None
-        if text_encoder_available(normalized) and self._prompts_to_encode(normalized):
-            alone = self._large.profiles(model, options, shape, device=device, format=large_model.WEIGHT_FORMAT, steps=steps)
+        if self._encoder_need(normalized, device).encodes:
+            alone = self._large.profiles(model, options, shape, device=device, format=large_model.weight_format_of(options), steps=steps)
             ceilings = self._combined_ceilings(alone, large_model.encoder_options(normalized), shape, device, until=VramStep.MIN)
-        session = self._acquire(model, options, shape, steps, device)
+        session = self._acquire(model, options, shape, steps, device, frames)
         loaded = False
         try:
             with session:
                 self._device = device
                 self._active_key = session.key
-                self._load_pipeline_locked(session, normalized, report, progress_callback, cold=cold)
+                self._load_pipeline_locked(session, normalized, report, cold=cold)
                 loaded = True
-                embeds, encoder_retries = self._prompt_embeds_locked(normalized, report, steps=steps, device=device, shape=shape, device_cap_bytes=self._encoder_cap(ceilings, session))
+                embeds, encoder_retries = self._prompt_embeds_locked(normalized, report, steps=steps, device=device, shape=shape, device_cap_bytes=self._encoder_cap(ceilings, session), frames=frames)
                 retries += encoder_retries
                 latents_cpu, image_processor = session.run_phase(
                     large_model.PHASE_DENOISE,
-                    lambda ctx: self._denoise(ctx, region_rgb, mask_u8, normalized, embeds, progress_callback, reference_rgb),
+                    lambda ctx: self._denoise(ctx, region_rgb, mask_u8, normalized, embeds, frames, reference_rgb),
                 )
                 decoded, tiled = session.run_phase(
                     large_model.PHASE_DECODE,
@@ -704,14 +840,14 @@ class Flux2KleinInpaintService:
         session: Session,
         normalized: dict[str, Any],
         report: Callable[[int, str], None],
-        progress_callback: ProgressCb | None,
         *,
         cold: bool,
     ) -> None:
         """Bring the pipeline handle into its denoise state; on a `cold` handle report steps 1-6 and warm the VAE up.
 
         A cold handle held no byte when the run started: its components are
-        read from disk here (the transformer with byte-level progress), placed
+        read from disk here (their bytes reach the session's load-progress
+        sink, `_acquire`), placed
         into the denoise state, and the VAE runs one 64x64 decode. A warm
         handle reports nothing (a hot run's load phase is steps 0 and 9 only);
         the manager restores whatever it parked when the denoise phase starts.
@@ -724,16 +860,9 @@ class Flux2KleinInpaintService:
             self._ensure_scheduler_locked(scheduler_dir)
             return
         log.info("FLUX.2 klein: загрузка пайплайна (трансформер + VAE) на %s, шаги «%s» -> «%s».", session.device, session.steps_requested.label, session.steps_effective.label)
-        transformer_label = "Загрузка трансформера"
-        report(LOAD_STEP_TRANSFORMER, transformer_label)
-        # The second, byte-level bar for a single-file checkpoint (the label
-        # names the FILE): a diffusers folder reports steps only, as it always did.
-        progress = None
-        transformer_source = Path(normalized["transformer_path"])
-        if transformer_source.is_file():
-            byte_progress = _file_progress_reporter(progress_callback, "load", LOAD_PHASE_STEPS, LOAD_STEP_TRANSFORMER, transformer_label, transformer_source.name)
-            progress = lambda done, total, _key: byte_progress(done, total)  # noqa: E731 - one-line adapter
-        session.load(large_model.TRANSFORMER, progress=progress)
+        # The byte level of this read rides on this step (`LoadFrames`).
+        report(LOAD_STEP_TRANSFORMER, "Загрузка трансформера")
+        session.load(large_model.TRANSFORMER)
         report(LOAD_STEP_TOKENIZER, "Загрузка токенизатора")
         self._ensure_tokenizer_locked(tokenizer_dir)
         report(LOAD_STEP_VAE, "Загрузка VAE")
@@ -875,18 +1004,20 @@ class Flux2KleinInpaintService:
         device: str,
         shape: Any,
         device_cap_bytes: int | None = None,
+        frames: LoadFrames | None = None,
     ) -> tuple[dict[str, Any], int]:
         """`({"prompt", "negative"} host embeddings, encoder retries)`; encodes what the cache misses.
 
         On a full cache hit no encoder is touched (a mask edit, a new seed or a
         repeated prompt goes straight to the denoise). `negative` is `None`
         unless classifier-free guidance is active. `device_cap_bytes`: the
-        encoder's device ceiling beside the pipeline (`_encoder_cap`).
+        encoder's device ceiling beside the pipeline (`_encoder_cap`);
+        `frames` the request's progress (the encoder session's sink).
         """
         missing = self._prompts_to_encode(normalized)
         retries = 0
         if missing:
-            retries = self._encode_prompts_locked(normalized, missing, report, steps=steps, device=device, shape=shape, device_cap_bytes=device_cap_bytes)
+            retries = self._encode_prompts_locked(normalized, missing, report, frames, steps=steps, device=device, shape=shape, device_cap_bytes=device_cap_bytes)
         else:
             report(LOAD_STEP_ENCODER_DONE, "Промпт взят из кэша")
         embeds: dict[str, Any] = {"prompt": self._cached_embeds(normalized, normalized["prompt"]), "negative": None}
@@ -899,6 +1030,7 @@ class Flux2KleinInpaintService:
         normalized: dict[str, Any],
         texts: list[str],
         report: Callable[[int, str], None],
+        frames: LoadFrames | None,
         *,
         steps: Steps,
         device: str,
@@ -915,6 +1047,9 @@ class Flux2KleinInpaintService:
         prompt-cache build's own release).
         `device_cap_bytes` is the encoder's device ceiling beside an admitted
         pipeline (`None` when no pipeline is involved: the cache build).
+        `frames` is the request's progress: the encoder's read streams its
+        bytes on `LOAD_STEP_TEXT_ENCODER` (a read inside the encode phase, on
+        the current step).
         """
         require_text_encoder(normalized, what="кодирование промпта")
         from diffusers import Flux2KleinInpaintPipeline
@@ -925,7 +1060,7 @@ class Flux2KleinInpaintService:
         model = large_model.encoder_model_name(options.fp8)
         msl = int(normalized["max_sequence_length"])
         report(LOAD_STEP_TEXT_ENCODER, "Загрузка текстового энкодера")
-        encoder_session = self._acquire(model, options, shape, steps, device, device_cap_bytes=device_cap_bytes)
+        encoder_session = self._acquire(model, options, shape, steps, device, frames, device_cap_bytes=device_cap_bytes)
         with encoder_session:
             encoder_session.load(large_model.TEXT_ENCODER)
             report(LOAD_STEP_ENCODE, "Кодирование промпта")
@@ -956,7 +1091,7 @@ class Flux2KleinInpaintService:
         The encoder is released afterwards — that is the point of the button —
         unless its handle already held bytes when the call arrived (that one
         belongs to the previous run's settings). Progress: step 0, then the
-        prompt steps 7-9. Returns `{"prompt", "encoded", "prompt_cached", "device"}`.
+        prompt steps 7-9 (step 7 also streams the encoder read's bytes). Returns `{"prompt", "encoded", "prompt_cached", "device"}`.
 
         # Raises
         `ValueError` for invalid params or an empty prompt; `LargeModelRefused`
@@ -967,7 +1102,8 @@ class Flux2KleinInpaintService:
         if not text:
             raise ValueError("Кэшировать нечего: промпт пуст. Введите текст промпта и повторите.")
         self._last_paths = {key: normalized[key] for key in _PATH_KEYS}
-        report = _progress_reporter(progress_callback, "load", LOAD_PHASE_STEPS)
+        frames = _load_frames(progress_callback, normalized)
+        report = _progress_reporter(frames, "load", LOAD_PHASE_STEPS)
         with self._lock:
             try:
                 if self._prompt_cache_key(normalized, text) in self._prompt_cache:
@@ -980,7 +1116,7 @@ class Flux2KleinInpaintService:
                     device = self._device_name()
                     resident = self._holds(self._handle_key(lambda: self._encoder_key(normalized, normalized["text_encoder_fp8"], device, on_cpu=normalized["encoder_on_cpu"]), "text_encoder"))
                     shape = large_model.request_shape(MIN_REGION_SIDE, MIN_REGION_SIDE, with_reference=False, max_sequence_length=int(normalized["max_sequence_length"]), steps=1)
-                    self._encode_prompts_locked(normalized, [text], report, steps=memory.requested_steps(normalized), device=device, shape=shape, release=not resident)
+                    self._encode_prompts_locked(normalized, [text], report, frames, steps=memory.requested_steps(normalized), device=device, shape=shape, release=not resident)
                     encoded = True
                 self._last_error = None
                 self._publish_health_locked()
@@ -1021,13 +1157,14 @@ class Flux2KleinInpaintService:
         action = _require_action_name(action)
         normalized = normalize_flux2_klein_params(params)
         self._last_paths = {key: normalized[key] for key in _PATH_KEYS}
-        report = _progress_reporter(progress_callback, "load", LOAD_PHASE_STEPS)
+        frames = _load_frames(progress_callback, normalized)
+        report = _progress_reporter(frames, "load", LOAD_PHASE_STEPS)
         if not self._lock.acquire(blocking=False):
             raise RuntimeError(_component_busy_message(component, action))
         try:
             try:
                 self._require_action_available_locked(component, action, normalized)
-                performed = self._component_action_locked(normalized, component, action, report, progress_callback)
+                performed = self._component_action_locked(normalized, component, action, report, frames)
             except Exception as exc:
                 self._last_error = str(exc)
                 self._publish_health_locked()
@@ -1074,7 +1211,7 @@ class Flux2KleinInpaintService:
         component: str,
         action: str,
         report: Callable[[int, str], None],
-        progress_callback: ProgressCb | None,
+        frames: LoadFrames | None,
     ) -> bool:
         """Dispatch one validated action through the manager; `True` when something changed. Caller holds `self._lock`."""
         if action == "unload":
@@ -1091,7 +1228,7 @@ class Flux2KleinInpaintService:
             steps = _encoder_load_steps(memory.requested_steps(normalized))
             options = large_model.encoder_options(normalized)
             report(LOAD_STEP_TEXT_ENCODER, "Загрузка текстового энкодера")
-            with self._acquire(large_model.encoder_model_name(options.fp8), options, shape, steps, device) as session:
+            with self._acquire(large_model.encoder_model_name(options.fp8), options, shape, steps, device, frames) as session:
                 session.load(large_model.TEXT_ENCODER)
             report(LOAD_STEP_ENCODER_DONE, "Текстовый энкодер загружен")
             return True
@@ -1104,11 +1241,11 @@ class Flux2KleinInpaintService:
             # `None` until admitted: an admission refusal left nothing to drop.
             admitted_key: str | None = None
             try:
-                with self._acquire(model, options, shape, memory.requested_steps(normalized), device) as session:
+                with self._acquire(model, options, shape, memory.requested_steps(normalized), device, frames) as session:
                     admitted_key = session.key
                     self._device = device
                     self._active_key = session.key
-                    self._load_pipeline_locked(session, normalized, report, progress_callback, cold=True)
+                    self._load_pipeline_locked(session, normalized, report, cold=True)
             except BaseException:
                 if admitted_key is not None:
                     self._drop_failed_load_locked(admitted_key)
@@ -1121,13 +1258,13 @@ class Flux2KleinInpaintService:
             # moves a unit up, so `settle` loads it there explicitly.
             label = "Выгрузка трансформера в оперативную память" if action == "to_ram" else "Возврат трансформера на устройство"
             report(LOAD_STEP_PLACEMENT, label)
-            with self._acquire(model, options, shape, _TO_RAM_STEPS if action == "to_ram" else _TO_GPU_STEPS, device) as session:
+            with self._acquire(model, options, shape, _TO_RAM_STEPS if action == "to_ram" else _TO_GPU_STEPS, device, frames) as session:
                 self._active_key = session.key
                 if action == "to_gpu":
                     session.settle()
             return True
         # `warmup`: the VAE is its only component.
-        with self._acquire(model, options, shape, memory.requested_steps(normalized), device) as session:
+        with self._acquire(model, options, shape, memory.requested_steps(normalized), device, frames) as session:
             session.load(large_model.VAE)
             report(LOAD_STEP_WARMUP, "Прогрев модели")
             return self._warmup_locked(session)
@@ -1526,7 +1663,7 @@ class Flux2KleinInpaintService:
 
     # ---- phase 2: the prompt ----
     def _prompt_cache_key(self, normalized: dict[str, Any], text: str) -> tuple[Any, ...]:
-        """Everything that changes an embedding: encoder, text, length, dtype, fp8.
+        """Everything that changes an embedding: encoder (its file and weight format), text, length, dtype, fp8.
 
         Where the encoder ran is deliberately absent — the same encoder computes the same
         embedding whether it ran on the host or the accelerator, and including it
@@ -1538,6 +1675,7 @@ class Flux2KleinInpaintService:
         """
         return (
             normalized["text_encoder_path"],
+            normalized["text_encoder_format"],
             text,
             int(normalized["max_sequence_length"]),
             text_encoder_dtype_name(),

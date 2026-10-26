@@ -6,23 +6,22 @@ Unit tests for the FLUX.2 klein model acquisition module — the Python half of
 `dev-docs/flux2_model_download.md`.
 
 Main responsibilities:
-- verify variant resolution: an absent or empty `variant` field means `9b`, both
-  names resolve case-insensitively, an unknown name and a non-string are typed
-  refusals rather than a silent fallback, and `4b` + `uncensored` is refused
-  with no downgrade to the official encoder;
-- verify the 4B plan against the live listing: its own duplicate root
-  single-file transformer and its three sample images are excluded, the
-  destination is `FLUX.2-klein-4B`, the totals are 15.98 GB over 19 files, and a
-  complete checkout plans ZERO bytes (the `.cache/` directory `hf download`
-  leaves behind takes no part in it);
-- verify the token gate follows the REPOSITORY, not the feature: a token-less
-  4B check reaches the hub and answers `ok`, a token-less 9B check still
-  short-circuits to `no_token` without a network call, and `.check` echoes the
-  variant it answered for;
-- verify a token that IS supplied is sent to gated repositories ONLY: a stale
-  token leaves the public 4B check at `ok` with a full plan and never reaches
-  the hub, its files are fetched with no `Authorization` header, and both 9B
-  paths (valid token -> `ok`, stale token -> `invalid_token`) are unchanged;
+- pin the 9B `.check` / `.start` answers, the `DownloadTarget` they hand the
+  shared machinery and the 9B token rules value for value (characterization
+  written before the 4B download was retired);
+- verify variant resolution: an absent or empty `variant` field means `9b`, it
+  resolves case-insensitively, an unknown name and a non-string are typed
+  refusals rather than a silent fallback, and a variant without an uncensored
+  encoder refuses the toggle with no downgrade to the official encoder;
+- verify the retired `4b` is refused by `resolve_variant`, `.check` and
+  `.start` (with or without `uncensored`, any case) with the message that the
+  application downloads it, before any network call;
+- verify a token-less 9B check short-circuits to `no_token` without a network
+  call and `.check` echoes the variant it answered for;
+- verify the token routing: the request's token reaches every gated 9B
+  repository unchanged (valid token -> `ok`, stale token -> `invalid_token`),
+  never leaks into a reported message, and the transfer sends it as a bearer
+  header;
 - verify the plan builder resolves PREFIXES against a listing and, in doing so,
   excludes the duplicate 18 GB root transformer, the four GGUF quants, the sample
   images, the README and `.gitattributes`, and takes the tokenizer from the
@@ -87,7 +86,6 @@ from modules.ai_backend.inpaint import hf_gated_download as hgd
 OFFICIAL = fd.OFFICIAL_REPO_9B
 UNCENSORED = fd.UNCENSORED_REPO_9B
 V9B = fd.VARIANT_9B
-V4B = fd.VARIANT_4B
 
 #: A trimmed but structurally faithful copy of the two real listings (measured
 #: against the hub): the shard names, the duplicate root transformer, the four
@@ -138,39 +136,7 @@ FAKE_UNCENSORED: dict[str, int] = {
     "tokenizer_config.json": 393,
 }
 
-#: The 4B repository, measured live 2026-09-05. Same layout as the 9B one, an
-#: unsharded transformer, its own duplicate root single-file checkpoint, and
-#: three sample images instead of one. The repository is PUBLIC.
-FAKE_4B: dict[str, int] = {
-    ".gitattributes": 1580,
-    "LICENSE.md": 9584,
-    "README.md": 9991,
-    "editing.jpg": 2506178,
-    "flux-2-klein-4b.safetensors": 7751105712,
-    "model_index.json": 446,
-    "others.jpg": 3386946,
-    "realism.jpg": 2855711,
-    "scheduler/scheduler_config.json": 486,
-    "text_encoder/config.json": 1536,
-    "text_encoder/generation_config.json": 214,
-    "text_encoder/model-00001-of-00002.safetensors": 4967215360,
-    "text_encoder/model-00002-of-00002.safetensors": 3077766632,
-    "text_encoder/model.safetensors.index.json": 32855,
-    "tokenizer/added_tokens.json": 707,
-    "tokenizer/chat_template.jinja": 4168,
-    "tokenizer/merges.txt": 1671853,
-    "tokenizer/special_tokens_map.json": 613,
-    "tokenizer/tokenizer.json": 11422654,
-    "tokenizer/tokenizer_config.json": 5404,
-    "tokenizer/vocab.json": 2776833,
-    "transformer/config.json": 541,
-    "transformer/diffusion_pytorch_model.safetensors": 7751109744,
-    "vae/config.json": 821,
-    "vae/diffusion_pytorch_model.safetensors": 168120878,
-}
-
 FAKE_LISTINGS = {OFFICIAL: FAKE_OFFICIAL, UNCENSORED: FAKE_UNCENSORED}
-FAKE_LISTINGS_4B = {V4B.repo: FAKE_4B}
 
 
 class PlanBuilderTests(unittest.TestCase):
@@ -300,7 +266,7 @@ class PlanBuilderTests(unittest.TestCase):
 
 
 class VariantResolutionTests(unittest.TestCase):
-    """`resolve_variant` / `require_uncensored_supported` / `token_required`."""
+    """`resolve_variant` / `require_uncensored_supported`."""
 
     def test_an_absent_variant_field_means_9b(self) -> None:
         # The wire default, pinned: a client built before the field existed sends
@@ -314,9 +280,10 @@ class VariantResolutionTests(unittest.TestCase):
         self.assertIs(fd.resolve_variant(""), fd.VARIANT_9B)
         self.assertIs(fd.resolve_variant("   "), fd.VARIANT_9B)
 
-    def test_both_variants_resolve_case_insensitively(self) -> None:
-        for value, expected in (("9b", V9B), ("9B", V9B), ("4b", V4B), (" 4B ", V4B)):
-            self.assertIs(fd.resolve_variant(value), expected, value)
+    def test_the_variant_resolves_case_insensitively(self) -> None:
+        for value in ("9b", "9B", " 9b "):
+            self.assertIs(fd.resolve_variant(value), V9B, value)
+        self.assertEqual(set(fd.VARIANTS), {"9b"})
 
     def test_an_unknown_variant_is_a_typed_refusal(self) -> None:
         # Never a silent fallback to 9B: that would fetch 34.7 GB the user did
@@ -325,114 +292,214 @@ class VariantResolutionTests(unittest.TestCase):
             fd.resolve_variant("9")
         message = str(caught.exception)
         self.assertIn("9", message)
-        self.assertIn("«4b»", message)
         self.assertIn("«9b»", message)
+        self.assertNotIn("«4b»", message)
 
     def test_a_non_string_variant_is_a_typed_refusal(self) -> None:
         for value in (9, 4.0, True, ["4b"]):
             with self.assertRaises(ValueError):
                 fd.resolve_variant(value)
 
-    def test_the_uncensored_encoder_is_refused_for_4b(self) -> None:
+    def test_the_uncensored_encoder_is_refused_for_a_variant_without_one(self) -> None:
+        # No table entry lacks an uncensored encoder today; the guard is pinned
+        # on a synthetic one so it cannot rot into a silent downgrade.
+        bare = fd.ModelVariant(key="xb", repo="example/xb", dir_name="XB", uncensored_repo=None)
         with self.assertRaises(ValueError) as caught:
-            fd.require_uncensored_supported(V4B, True)
+            fd.require_uncensored_supported(bare, True)
         message = str(caught.exception)
-        self.assertIn("4B", message)
+        self.assertIn("XB", message)
         self.assertIn("не поддерживается", message)
         # And no downgrade: the refusal points at the toggle and at 9B.
         self.assertIn("«9b»", message)
+        fd.require_uncensored_supported(bare, False)
+        self.assertFalse(bare.supports_uncensored)
 
     def test_the_uncensored_encoder_is_allowed_for_9b(self) -> None:
         fd.require_uncensored_supported(V9B, True)
-        fd.require_uncensored_supported(V4B, False)
         self.assertTrue(V9B.supports_uncensored)
-        self.assertFalse(V4B.supports_uncensored)
 
-    def test_only_a_gated_request_needs_a_token(self) -> None:
-        self.assertTrue(fd.token_required(V9B, False))
-        self.assertTrue(fd.token_required(V9B, True))
-        self.assertFalse(fd.token_required(V4B, False))
-
-    def test_each_variant_has_its_own_destination_directory(self) -> None:
+    def test_the_9b_destination_directory(self) -> None:
         self.assertEqual(V9B.dir_name, "FLUX.2-klein-9B")
-        self.assertEqual(V4B.dir_name, "FLUX.2-klein-4B")
-        self.assertNotEqual(fd.model_root(V9B), fd.model_root(V4B))
-        self.assertEqual(fd.model_root(V4B).name, "FLUX.2-klein-4B")
+        self.assertEqual(fd.model_root(V9B).name, "FLUX.2-klein-9B")
 
 
-class Variant4BPlanTests(unittest.TestCase):
-    """The 4B plan against the live listing measured on 2026-09-05."""
+class NineBAnswerCharacterizationTests(unittest.TestCase):
+    """The 9B `.check` / `.start` answers and token rules, pinned value for value.
 
-    def _plan(self, root: str = "/models") -> list[hgd.PlannedFile]:
-        return fd.resolve_plan(FAKE_LISTINGS_4B, variant=V4B, uncensored=False, root=root)
+    Written against the module as it stood before the 4B download was retired,
+    so that retiring it provably changed nothing a 9B request can observe: the
+    answer dictionaries, the `DownloadTarget` handed to the shared machinery,
+    the per-repository token and the no-token refusal.
+    """
 
-    def test_only_the_4b_repository_is_needed(self) -> None:
-        self.assertEqual(fd.required_repos(V4B, False), (V4B.repo,))
-        self.assertEqual({item.repo for item in self._plan()}, {V4B.repo})
+    TOKEN = "hf_" + "c" * 34
 
-    def test_the_duplicate_root_transformer_is_excluded_here_too(self) -> None:
-        # 7.75 GB of the SAME weights as `transformer/`. Taking both is the
-        # duplicate-on-disk case the manifest exists to avoid.
-        labels = [item.label for item in self._plan()]
-        self.assertNotIn("flux-2-klein-4b.safetensors", labels)
-        self.assertIn("transformer/diffusion_pytorch_model.safetensors", labels)
-        self.assertIn("transformer/config.json", labels)
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._saved = (fd.model_root, hgd.probe_repo_access, hgd.fetch_listings, hgd.download)
+        fd.model_root = lambda variant: Path(self._tmp.name) / variant.dir_name  # type: ignore[assignment]
+        hgd.probe_repo_access = lambda repo, token: (hgd.STATE_OK, "")  # type: ignore[assignment]
+        hgd.fetch_listings = lambda repos, token: {r: FAKE_LISTINGS[r] for r in repos}  # type: ignore[assignment]
 
-    def test_the_three_sample_images_are_excluded(self) -> None:
-        labels = [item.label for item in self._plan()]
-        self.assertFalse([label for label in labels if label.endswith(".jpg")])
-        self.assertNotIn("README.md", labels)
-        self.assertIn("LICENSE.md", labels)
+    def tearDown(self) -> None:
+        fd.model_root, hgd.probe_repo_access, hgd.fetch_listings, hgd.download = self._saved  # type: ignore[assignment]
+        self._tmp.cleanup()
 
-    def test_the_plan_totals_match_the_live_repository(self) -> None:
-        plan = self._plan()
-        # The same 15.98 GB `check_access` reports against the real checkout.
-        self.assertEqual(sum(item.size for item in plan), 15980141329)
-        self.assertEqual(len(plan), 19)
+    def _root(self) -> Path:
+        return Path(self._tmp.name) / "FLUX.2-klein-9B"
 
-    def test_destinations_land_under_the_4b_directory(self) -> None:
-        plan = fd.resolve_plan(FAKE_LISTINGS_4B, variant=V4B, uncensored=False, root=None)
-        root = fd.model_root(V4B)
-        for item in plan:
-            self.assertEqual(Path(item.dest), root.joinpath(*item.label.split("/")))
-        paths = fd.component_paths(V4B, False)
-        self.assertEqual(paths["transformer"], str(root / "transformer"))
-        self.assertEqual(paths["text_encoder"], str(root / "text_encoder"))
-        self.assertEqual(paths["vae"], str(root / "vae"))
+    def test_the_check_answer_with_the_official_encoder(self) -> None:
+        expected = {
+            "variant": "9b",
+            "repos": {OFFICIAL: {"state": "ok", "message": ""}},
+            "plan": {"total_bytes": 34722790808, "missing_bytes": 34722790808, "missing_files": 23},
+            "plan_error": "",
+        }
+        for variant in (None, "", "9b", " 9B "):
+            with self.subTest(variant=variant):
+                self.assertEqual(fd.check_access(self.TOKEN, uncensored=False, variant=variant), expected)
 
-    def test_an_uncensored_4b_plan_is_refused_rather_than_downgraded(self) -> None:
-        with self.assertRaises(ValueError):
-            fd.resolve_plan(FAKE_LISTINGS_4B, variant=V4B, uncensored=True, root="/models")
-        with self.assertRaises(ValueError):
-            fd.required_repos(V4B, True)
-        with self.assertRaises(ValueError):
-            fd.manifest_entries(V4B, True)
+    def test_the_check_answer_with_the_uncensored_encoder(self) -> None:
+        expected = {
+            "variant": "9b",
+            "repos": {
+                OFFICIAL: {"state": "ok", "message": ""},
+                UNCENSORED: {"state": "ok", "message": ""},
+            },
+            "plan": {"total_bytes": 34734185315, "missing_bytes": 34734185315, "missing_files": 22},
+            "plan_error": "",
+        }
+        self.assertEqual(fd.check_access(self.TOKEN, uncensored=True, variant="9b"), expected)
 
-    def test_a_complete_checkout_plans_zero_bytes(self) -> None:
-        # What the real 15.98 GB checkout must report: everything present, no
-        # transfer. The `.cache/` directory `hf download` leaves behind takes no
-        # part in the plan and cannot make it non-empty.
-        with tempfile.TemporaryDirectory() as tmp:
-            plan = self._plan(root=tmp)
-            # Sparse files at the ANNOUNCED length: `is_complete_on_disk`
-            # compares `os.path.getsize`, which reports the logical size, so a
-            # 15.98 GB checkout costs a few inodes here instead of 15.98 GB.
-            for item in plan:
-                Path(item.dest).parent.mkdir(parents=True, exist_ok=True)
-                with open(item.dest, "wb") as handle:
-                    handle.truncate(item.size)
-            noise = Path(tmp) / ".cache" / "huggingface" / "download"
-            noise.mkdir(parents=True, exist_ok=True)
-            (noise / "model_index.json.metadata").write_text("irrelevant", encoding="utf-8")
+    def test_a_tokenless_check_is_no_token_without_the_network(self) -> None:
+        def explode(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("a gated repo must not be probed without a token")
 
-            totals = hgd.plan_totals(plan)
-            self.assertEqual(totals["missing_bytes"], 0)
-            self.assertEqual(totals["missing_files"], 0)
-            self.assertEqual(totals["total_bytes"], 15980141329)
+        hgd.probe_repo_access = explode  # type: ignore[assignment]
+        hgd.fetch_listings = explode  # type: ignore[assignment]
+        answer = fd.check_access("", uncensored=True)
+        self.assertEqual(answer["variant"], "9b")
+        self.assertEqual(
+            {repo: state["state"] for repo, state in answer["repos"].items()},
+            {OFFICIAL: hgd.STATE_NO_TOKEN, UNCENSORED: hgd.STATE_NO_TOKEN},
+        )
+        self.assertIsNone(answer["plan"])
+
+    def test_the_start_answer_and_the_target_it_hands_the_machinery(self) -> None:
+        seen: list[tuple[str, hgd.DownloadTarget]] = []
+
+        def fake_download(token: str, target: hgd.DownloadTarget, **kwargs: Any) -> dict[str, int]:
+            seen.append((token, target))
+            return {"downloaded_bytes": 7, "skipped_files": 3}
+
+        hgd.download = fake_download  # type: ignore[assignment]
+        root = self._root()
+        for uncensored, encoder in ((False, "text_encoder"), (True, "text_encoder_uncensored")):
+            with self.subTest(uncensored=uncensored):
+                answer = fd.download(self.TOKEN, uncensored=uncensored, variant="9b")
+                self.assertEqual(
+                    answer,
+                    {
+                        "paths": {
+                            "transformer": str(root / "transformer"),
+                            "text_encoder": str(root / encoder),
+                            "vae": str(root / "vae"),
+                        },
+                        "downloaded_bytes": 7,
+                        "skipped_files": 3,
+                    },
+                )
+                token, target = seen[-1]
+                self.assertEqual(token, self.TOKEN)
+                self.assertEqual(target.label, "FLUX.2 klein")
+                self.assertEqual(target.root, root)
+                self.assertEqual(target.no_token_message, fd.NO_TOKEN_MESSAGE)
+                repos = (hgd.RepoSpec(OFFICIAL),)
+                if uncensored:
+                    repos += (hgd.RepoSpec(UNCENSORED),)
+                self.assertEqual(target.repos, repos)
+                encoder_rule = (
+                    hgd.ManifestEntry(UNCENSORED, "", "text_encoder_uncensored")
+                    if uncensored
+                    else hgd.ManifestEntry(OFFICIAL, "text_encoder/", "text_encoder")
+                )
+                self.assertEqual(
+                    target.manifest,
+                    (
+                        hgd.ManifestEntry(OFFICIAL, "transformer/", "transformer"),
+                        hgd.ManifestEntry(OFFICIAL, "tokenizer/", "tokenizer"),
+                        hgd.ManifestEntry(OFFICIAL, "vae/", "vae"),
+                        hgd.ManifestEntry(OFFICIAL, "scheduler/scheduler_config.json", "scheduler/scheduler_config.json"),
+                        hgd.ManifestEntry(OFFICIAL, "model_index.json", "model_index.json"),
+                        hgd.ManifestEntry(OFFICIAL, "LICENSE.md", "LICENSE.md"),
+                        encoder_rule,
+                    ),
+                )
+
+    def test_a_tokenless_start_is_refused_with_the_no_token_message(self) -> None:
+        def explode(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("a gated download must not reach the network without a token")
+
+        hgd.fetch_listings = explode  # type: ignore[assignment]
+        hgd.download = self._saved[3]  # type: ignore[assignment]
+        with self.assertRaises(ValueError) as caught:
+            fd.download("", uncensored=False)
+        self.assertEqual(
+            str(caught.exception),
+            "Не указан токен Hugging Face. Оба репозитория FLUX.2 klein закрыты "
+            "условиями, поэтому загрузка без токена невозможна.",
+        )
+
+
+class RetiredVariantTests(unittest.TestCase):
+    """`variant="4b"` is refused: the application's model catalog downloads 4B."""
+
+    MESSAGE = (
+        "FLUX.2 klein 4B скачивается самим приложением (каталог моделей), "
+        "а не бэкендом. Обновите ManhwaStudio."
+    )
+
+    def setUp(self) -> None:
+        self._saved = (hgd.probe_repo_access, hgd.fetch_listings, hgd.download)
+
+        def explode(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("a retired variant must not touch the network")
+
+        hgd.probe_repo_access = explode  # type: ignore[assignment]
+        hgd.fetch_listings = explode  # type: ignore[assignment]
+        hgd.download = explode  # type: ignore[assignment]
+
+    def tearDown(self) -> None:
+        hgd.probe_repo_access, hgd.fetch_listings, hgd.download = self._saved  # type: ignore[assignment]
+
+    def test_resolve_variant_refuses_4b_in_any_case(self) -> None:
+        for value in ("4b", "4B", " 4b "):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError) as caught:
+                    fd.resolve_variant(value)
+                self.assertEqual(str(caught.exception), self.MESSAGE)
+
+    def test_check_refuses_4b_with_the_message(self) -> None:
+        for token, uncensored in (("", False), ("t", False), ("t", True)):
+            with self.subTest(token=token, uncensored=uncensored):
+                with self.assertRaises(ValueError) as caught:
+                    fd.check_access(token, uncensored=uncensored, variant="4b")
+                self.assertEqual(str(caught.exception), self.MESSAGE)
+
+    def test_start_refuses_4b_with_the_message(self) -> None:
+        for token, uncensored in (("", False), ("t", False), ("t", True)):
+            with self.subTest(token=token, uncensored=uncensored):
+                with self.assertRaises(ValueError) as caught:
+                    fd.download(token, uncensored=uncensored, variant="4b")
+                self.assertEqual(str(caught.exception), self.MESSAGE)
+
+    def test_4b_is_retired_not_offered(self) -> None:
+        self.assertNotIn("4b", fd.VARIANTS)
+        self.assertEqual(set(fd.RETIRED_VARIANTS), {"4b"})
 
 
 class TokenlessAccessTests(unittest.TestCase):
-    """4B is PUBLIC: an empty token must not short-circuit to `no_token`."""
+    """An empty token on the gated 9B request short-circuits to `no_token`."""
 
     def setUp(self) -> None:
         self._probe = hgd.probe_repo_access
@@ -447,24 +514,6 @@ class TokenlessAccessTests(unittest.TestCase):
         fd.model_root = self._root  # type: ignore[assignment]
         self._tmp.cleanup()
 
-    def test_an_empty_token_still_reaches_the_hub_for_4b(self) -> None:
-        seen: list[tuple[str, str]] = []
-
-        def probe(repo: str, token: str) -> tuple[str, str]:
-            seen.append((repo, token))
-            return hgd.STATE_OK, ""
-
-        hgd.probe_repo_access = probe  # type: ignore[assignment]
-        hgd.fetch_listings = lambda repos, token: {r: FAKE_4B for r in repos}  # type: ignore[assignment]
-
-        answer = fd.check_access("", uncensored=False, variant="4b")
-
-        self.assertEqual(seen, [(V4B.repo, "")])
-        self.assertEqual(answer["variant"], "4b")
-        self.assertEqual(answer["repos"][V4B.repo]["state"], hgd.STATE_OK)
-        self.assertEqual(answer["plan"]["total_bytes"], 15980141329)
-        self.assertEqual(answer["plan"]["missing_files"], 19)
-
     def test_an_empty_token_is_still_no_token_for_9b(self) -> None:
         def explode(*args: Any, **kwargs: Any) -> Any:
             raise AssertionError("a gated repo must not be probed without a token")
@@ -478,12 +527,12 @@ class TokenlessAccessTests(unittest.TestCase):
 
     def test_the_answer_echoes_the_variant_it_was_computed_for(self) -> None:
         hgd.probe_repo_access = lambda repo, token: (hgd.STATE_OK, "")  # type: ignore[assignment]
-        hgd.fetch_listings = lambda repos, token: {r: FAKE_LISTINGS.get(r, FAKE_4B) for r in repos}  # type: ignore[assignment]
+        hgd.fetch_listings = lambda repos, token: {r: FAKE_LISTINGS[r] for r in repos}  # type: ignore[assignment]
 
         self.assertEqual(fd.check_access("t", uncensored=False)["variant"], "9b")
-        self.assertEqual(fd.check_access("t", uncensored=False, variant="4b")["variant"], "4b")
+        self.assertEqual(fd.check_access("t", uncensored=False, variant="9B")["variant"], "9b")
 
-    def test_check_refuses_an_unknown_variant_and_an_uncensored_4b(self) -> None:
+    def test_check_refuses_an_unknown_variant(self) -> None:
         def explode(*args: Any, **kwargs: Any) -> Any:
             raise AssertionError("a malformed request must not touch the network")
 
@@ -492,32 +541,16 @@ class TokenlessAccessTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             fd.check_access("t", uncensored=False, variant="2b")
-        with self.assertRaises(ValueError):
-            fd.check_access("t", uncensored=True, variant="4b")
 
-    def test_download_needs_no_token_for_4b_and_still_needs_one_for_9b(self) -> None:
-        def offline(repos: Any, token: str) -> Any:
-            raise ConnectionError("offline")
-
-        hgd.fetch_listings = offline  # type: ignore[assignment]
-
-        # 9B: refused for the token itself, before any listing is attempted.
-        with self.assertRaises(ValueError):
-            fd.download("", uncensored=False)
-        # 4B: the token gate does not apply, so the call proceeds and fails on
-        # the (stubbed) network instead — which is what proves it got past it.
-        with self.assertRaises(RuntimeError):
-            fd.download("", uncensored=False, variant="4b")
-
-    def test_download_refuses_an_uncensored_4b_before_the_network(self) -> None:
+    def test_download_needs_a_token_for_9b_and_refuses_an_unknown_variant(self) -> None:
         def explode(*args: Any, **kwargs: Any) -> Any:
-            raise AssertionError("a malformed request must not touch the network")
+            raise AssertionError("a refused request must not touch the network")
 
         hgd.fetch_listings = explode  # type: ignore[assignment]
 
-        with self.assertRaises(ValueError) as caught:
-            fd.download("t", uncensored=True, variant="4b")
-        self.assertIn("не поддерживается", str(caught.exception))
+        # Refused for the token itself, before any listing is attempted.
+        with self.assertRaises(ValueError):
+            fd.download("", uncensored=False)
         with self.assertRaises(ValueError):
             fd.download("t", uncensored=False, variant="nope")
 
@@ -545,19 +578,13 @@ def _token_recording_api(
 ) -> Any:
     """Build a fake `HfApi` class that records the token every call carried.
 
-    It answers the way the real hub does for the two kinds of repository this
-    module touches: a PUBLIC repository serves an anonymous request and answers
-    401 to a token it cannot validate (the stale-token dead end), while a GATED
-    one answers 401 to no token and to a wrong one. `valid_token` is the only
-    token accepted; `None` means no token is valid anywhere.
+    It answers the way the real hub does for a GATED repository: 401 to no
+    token and to a wrong one. `valid_token` is the only token accepted; `None`
+    means no token is valid anywhere.
     """
 
     def answer(call: str, repo: str, token: str | None) -> None:
         seen.append((call, repo, token))
-        if repo in fd.PUBLIC_REPOS:
-            if token is not None and token != valid_token:
-                raise _http_error(401, "not_found")
-            return
         if token is None or token != valid_token:
             raise _http_error(401, "gated")
 
@@ -603,8 +630,8 @@ class ListingDigestTests(unittest.TestCase):
     def test_repo_listing_keeps_the_lfs_digest_and_the_plan_carries_it(self) -> None:
         import types as _types
 
-        listing = dict(FAKE_4B)
-        planned = fd.resolve_plan({V4B.repo: listing}, variant=V4B, uncensored=False, root="/m")
+        listing = dict(FAKE_OFFICIAL)
+        planned = fd.resolve_plan({OFFICIAL: listing}, variant=V9B, uncensored=False, root="/m")
         shard = next(item.source for item in planned if item.source.endswith(".safetensors"))
 
         class _Api:
@@ -621,16 +648,16 @@ class ListingDigestTests(unittest.TestCase):
 
         self_sha = self.SHA
         with _FakeHfApi(_Api):
-            got = hgd.repo_listing(V4B.repo, "")
+            got = hgd.repo_listing(OFFICIAL, "")
 
         self.assertEqual(got[shard], hgd.ListedFile(listing[shard], self.SHA))
         self.assertTrue(all(value.sha256 is None for path, value in got.items() if path != shard))
-        plan = fd.resolve_plan({V4B.repo: got}, variant=V4B, uncensored=False, root="/m")
+        plan = fd.resolve_plan({OFFICIAL: got}, variant=V9B, uncensored=False, root="/m")
         by_source = {item.source: item for item in plan}
         self.assertEqual(by_source[shard].sha256, self.SHA)
 
     def test_the_transfer_gets_the_planned_digest(self) -> None:
-        item = hgd.PlannedFile(V4B.repo, "a.safetensors", "/m/a.safetensors", "a.safetensors", 10, self.SHA)
+        item = hgd.PlannedFile(OFFICIAL, "a.safetensors", "/m/a.safetensors", "a.safetensors", 10, self.SHA)
         seen: dict[str, Any] = {}
 
         def fake_transfer(url: str, dest: str, **kwargs: Any) -> bool:
@@ -649,14 +676,8 @@ class ListingDigestTests(unittest.TestCase):
         self.assertEqual(seen["expected_size"], 10)
 
 
-class PerRepositoryTokenTests(unittest.TestCase):
-    """The token is put on the wire for GATED repositories only.
-
-    A user who set 9B up earlier keeps a token in the settings. Once it expires,
-    forwarding it to the PUBLIC 4B repository makes the hub answer 401, which
-    `classify_repo_error` reports as `invalid_token`: no plan, a disabled
-    button, and no token editor on the 4B panel to recover from. The decision is
-    made per repository so that a request touching both kinds stays correct.
+class TokenRoutingTests(unittest.TestCase):
+    """The request's token reaches every (gated) repository, unchanged and never leaked.
 
     `probe_repo_access` and `repo_listing` run FOR REAL here against a fake
     `HfApi`; only the transport is a stand-in.
@@ -675,36 +696,6 @@ class PerRepositoryTokenTests(unittest.TestCase):
     def tearDown(self) -> None:
         fd.model_root = self._root  # type: ignore[assignment]
         self._tmp.cleanup()
-
-    def test_the_token_follows_the_repository_not_the_request(self) -> None:
-        self.assertEqual(fd.repo_token(V4B.repo, self.STALE), "")
-        self.assertEqual(fd.repo_token(V9B.repo, self.STALE), self.STALE)
-        self.assertEqual(fd.repo_token(UNCENSORED, self.STALE), self.STALE)
-        # An empty token stays empty wherever it goes.
-        self.assertEqual(fd.repo_token(V9B.repo, ""), "")
-        self.assertEqual(fd.repo_token(V4B.repo, ""), "")
-        # Derived from the variant table, never hand-listed.
-        self.assertEqual(fd.PUBLIC_REPOS, frozenset({V4B.repo}))
-        self.assertEqual(
-            fd.PUBLIC_REPOS,
-            frozenset(v.repo for v in fd.VARIANTS.values() if not v.gated),
-        )
-
-    def test_a_stale_token_does_not_break_the_public_4b_check(self) -> None:
-        seen: list[tuple[str, str, str | None]] = []
-        api = _token_recording_api(seen, valid_token=None, listings={V4B.repo: FAKE_4B})
-
-        with _FakeHfApi(api):
-            answer = fd.check_access(self.STALE, uncensored=False, variant="4b")
-
-        self.assertEqual(answer["variant"], "4b")
-        self.assertEqual(answer["repos"][V4B.repo]["state"], hgd.STATE_OK)
-        self.assertEqual(answer["plan_error"], "")
-        self.assertIsNotNone(answer["plan"])
-        self.assertEqual(answer["plan"]["total_bytes"], 15980141329)
-        # Both network calls were made, and NEITHER carried the token.
-        self.assertEqual([call for call, _repo, _tok in seen], ["auth", "info"])
-        self.assertEqual({token for _call, _repo, token in seen}, {None})
 
     def test_a_valid_token_still_reaches_the_gated_9b_repository(self) -> None:
         good = "hf_" + "g" * 34
@@ -745,13 +736,12 @@ class PerRepositoryTokenTests(unittest.TestCase):
         self.assertNotIn(self.STALE, answer["repos"][OFFICIAL]["message"])
 
 
-class PublicDownloadTokenTests(unittest.TestCase):
-    """The transfer itself: no `Authorization` header on a public repository.
+class DownloadTokenTests(unittest.TestCase):
+    """The transfer itself sends the request's token as a bearer header.
 
     A check that passes followed by a download that 401s would be worse than
-    either alone, so the same per-repository rule is verified on the transfer
-    path, where `download_bearer_to_path` runs for real against a fake
-    `requests`.
+    either alone, so the token is verified on the transfer path too, where
+    `download_bearer_to_path` runs for real against a fake `requests`.
     """
 
     SMALL = {
@@ -776,22 +766,15 @@ class PublicDownloadTokenTests(unittest.TestCase):
         fd.model_root, hgd.fetch_listings = self._saved  # type: ignore[assignment]
         self._tmp.cleanup()
 
-    def _headers(self, variant: str) -> list[dict[str, str]]:
-        """Run a whole download of `variant` with a stale token; return the headers sent."""
+    def _headers(self, run: Callable[[], Any]) -> list[dict[str, str]]:
+        """Run a whole download with a stale token through `run`; return the headers sent."""
         fake = _FakeRequests(lambda url: b"x" * 4096, 1024)
         with _FakeRequestsModule(fake):
-            fd.download(self.STALE, uncensored=False, variant=variant)
+            run()
         return [headers for _url, headers in fake.calls]
 
-    def test_a_public_download_sends_no_authorization_header(self) -> None:
-        headers = self._headers("4b")
-
-        self.assertEqual(len(headers), len(self.SMALL))
-        for sent in headers:
-            self.assertNotIn("Authorization", sent)
-
     def test_a_gated_download_still_sends_the_token(self) -> None:
-        headers = self._headers("9b")
+        headers = self._headers(lambda: fd.download(self.STALE, uncensored=False, variant="9b"))
 
         self.assertEqual(len(headers), len(self.SMALL))
         for sent in headers:

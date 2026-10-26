@@ -451,9 +451,10 @@ def _handle_download_start(
     """Download every missing model file, streaming two-level byte progress.
 
     `variant` selects both the repositories and the destination directory; an
-    unknown name and `variant:"4b"` together with `uncensored:true` are typed
-    refusals from the downloader and reach the user unchanged, like every other
-    readable refusal below.
+    unknown name and the retired `variant:"4b"` (protocol 21: the application
+    downloads 4B from its own model catalog) are typed refusals from the
+    downloader and reach the user unchanged, like every other readable refusal
+    below.
 
     Unlike every other method of this handler group, cancellation is observed
     INSIDE the work: `cancel_event.is_set` is handed to the downloader, which

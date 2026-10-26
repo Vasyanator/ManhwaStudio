@@ -6,7 +6,8 @@ Unit tests of the external-model downloader core (`download_with`), its transien
 retry, and the stat-only status probe, driven by in-memory `RangeFetcher`s (one plain, one
 scripted with drops / short bodies / error statuses) and an injected backoff sleep that only
 records — plus the repair path `verify_with` (shared-file corruption invalidating every
-spec that lists it) — no network, no real waiting, scratch data only under a unique `tempfile`
+spec that lists it) and adoption of present-but-unmarked files (`unmarked_files_present`,
+`adopt_external_model`; a fetcher that panics proves no request is made) — no network, no real waiting, scratch data only under a unique `tempfile`
 directory removed on drop. One opt-in `#[ignore]` test downloads the real Baberu
 spec when `MS_TEST_EXTERNAL_DOWNLOAD=1`.
 
@@ -1047,4 +1048,164 @@ fn verify_is_busy_while_the_spec_downloads_and_honours_cancel() {
     let result = verify_with(root.path(), spec, &[spec], &cancel, &quiet_policy(), &mut |_| {});
     assert!(matches!(result, Err(ExternalModelError::Cancelled)), "{result:?}");
     assert!(spec.local_dir(root.path()).join("a.bin").exists(), "cancel deletes nothing");
+}
+
+/// A server that must never be asked: adoption works on local files only, and a download
+/// right after a successful adoption keeps every file without a request.
+struct NoNetworkFetcher;
+
+impl RangeFetcher for NoNetworkFetcher {
+    fn fetch(&self, url: &str, offset: u64) -> Result<FetchResponse, FetchError> {
+        panic!("adoption must not touch the network: fetch {url} at {offset}")
+    }
+}
+
+/// Writes every file of `spec` with the given bodies at its catalog path, as an older
+/// downloader would have left them (no marker, no staging).
+fn place_files(root: &Path, spec: &ExternalModelSpec, bodies: &BTreeMap<String, Vec<u8>>) {
+    let dir = spec.local_dir(root);
+    for file in spec.files {
+        let path = join_relative(&dir, file.path);
+        std::fs::create_dir_all(path.parent().unwrap_or(&dir)).unwrap_or_else(|err| panic!("{err}"));
+        let body = bodies.get(&url_of(file)).unwrap_or_else(|| panic!("no body for {}", file.path));
+        std::fs::write(&path, body).unwrap_or_else(|err| panic!("{err}"));
+    }
+}
+
+#[test]
+fn adoption_of_present_unmarked_files_writes_the_marker_without_network() {
+    let (spec, bodies) = make_spec("adopt_ok", REV_A, &[("transformer/w.safetensors", &content(300_000, 70)), ("config.json", &content(40, 71))]);
+    let root = temp_root();
+    assert!(!unmarked_files_present(root.path(), spec), "nothing on disk");
+    place_files(root.path(), spec, &bodies);
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Missing);
+    assert!(unmarked_files_present(root.path(), spec));
+
+    let mut reports = Vec::new();
+    let dir = adopt_external_model(root.path(), spec, &AtomicBool::new(false), &mut |progress| reports.push(*progress))
+        .unwrap_or_else(|err| panic!("adoption failed: {err}"));
+    assert_eq!(dir, spec.local_dir(root.path()));
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Installed);
+    assert!(!unmarked_files_present(root.path(), spec), "an installed spec is not adoptable");
+    assert!(!dir.join(STAGING_DIR).exists(), "adoption creates no staging");
+    assert!(reports.iter().all(|progress| progress.phase == ExternalDownloadPhase::Adopting && progress.file_done <= progress.file_total));
+    assert_eq!(reports.last().map(|progress| progress.total_done), Some(spec.total_bytes()));
+
+    // Already installed: a second adoption hashes nothing; a download keeps every file without
+    // a single request.
+    let mut again = 0_usize;
+    adopt_external_model(root.path(), spec, &AtomicBool::new(false), &mut |_| again += 1).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(again, 0);
+    run(&NoNetworkFetcher, root.path(), spec, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Installed);
+}
+
+#[test]
+fn a_same_size_mismatch_refuses_adoption_deletes_nothing_and_a_download_repairs_only_that_file() {
+    let good = content(200_000, 72);
+    let other = content(5000, 73);
+    let (spec, bodies) = make_spec("adopt_mismatch", REV_A, &[("a.bin", &good), ("b.bin", &other)]);
+    let root = temp_root();
+    place_files(root.path(), spec, &bodies);
+    let dir = spec.local_dir(root.path());
+    let mut damaged = good.clone();
+    damaged[1234] ^= 0x5A;
+    std::fs::write(dir.join("a.bin"), &damaged).unwrap_or_else(|err| panic!("{err}"));
+    assert!(unmarked_files_present(root.path(), spec), "same size: the stat-only probe cannot tell");
+
+    let result = adopt_external_model(root.path(), spec, &AtomicBool::new(false), &mut |_| {});
+    assert!(matches!(&result, Err(ExternalModelError::HashMismatch { file: "a.bin", expected, actual }) if *expected == sha_hex(&good) && *actual == sha_hex(&damaged)), "{result:?}");
+    assert_eq!(read(&dir.join("a.bin")), damaged, "the mismatching file is kept as it is");
+    assert_eq!(read(&dir.join("b.bin")), other);
+    assert!(!dir.join(COMPLETE_MARKER).exists());
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Missing);
+
+    let fetcher = FakeFetcher::new(bodies, RangeMode::Honour);
+    run(&fetcher, root.path(), spec, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(fetcher.calls(), vec![(url_of(&spec.files[0]), 0)], "only the differing file is downloaded");
+    assert_eq!(read(&dir.join("a.bin")), good);
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Installed);
+}
+
+#[test]
+fn absent_or_wrong_size_files_are_not_adoptable_and_adoption_reports_them_untouched() {
+    let (spec, bodies) = make_spec("adopt_sizes", REV_A, &[("a.bin", &content(3000, 74)), ("b.bin", &content(10, 75))]);
+    let root = temp_root();
+    place_files(root.path(), spec, &bodies);
+    let dir = spec.local_dir(root.path());
+    std::fs::write(dir.join("b.bin"), b"short").unwrap_or_else(|err| panic!("{err}"));
+    assert!(!unmarked_files_present(root.path(), spec));
+    let result = adopt_external_model(root.path(), spec, &AtomicBool::new(false), &mut |_| panic!("no hashing before the size check"));
+    assert!(matches!(result, Err(ExternalModelError::SizeMismatch { file: "b.bin", expected: 10, actual: 5 })), "{result:?}");
+    assert_eq!(read(&dir.join("b.bin")), b"short");
+
+    std::fs::remove_file(dir.join("b.bin")).unwrap_or_else(|err| panic!("{err}"));
+    let result = adopt_external_model(root.path(), spec, &AtomicBool::new(false), &mut |_| panic!("no hashing before the size check"));
+    assert!(matches!(result, Err(ExternalModelError::NotDownloaded { .. })), "{result:?}");
+    assert!(dir.join("a.bin").is_file());
+    assert!(!dir.join(COMPLETE_MARKER).exists());
+}
+
+/// A shared directory with NO marker at all (the shape of the FLUX.2 klein 4B folder the
+/// backend used to download) is adoptable and gets its per-spec marker; a marker of ANOTHER
+/// identity (an older pin of the same id) is an older install, never adoptable: the adoption
+/// refuses and leaves the old marker and the files untouched.
+#[test]
+fn a_markerless_shared_directory_is_adopted_but_a_foreign_marker_is_never_adopted() {
+    let body = content(4000, 76);
+    let file = ExternalFile::direct("model.gguf", total_len(&body), leak(sha_hex(&body)));
+    let spec = shared_spec("adopt_shared", "Shared/adopt", vec![file]);
+    let root = temp_root();
+    let dir = spec.local_dir(root.path());
+    std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("{err}"));
+    std::fs::write(dir.join("model.gguf"), &body).unwrap_or_else(|err| panic!("{err}"));
+    assert!(unmarked_files_present(root.path(), spec), "no marker at all: adoptable");
+    adopt_external_model(root.path(), spec, &AtomicBool::new(false), &mut |_| {}).unwrap_or_else(|err| panic!("{err}"));
+    assert!(dir.join(".ms_model_complete.adopt_shared.json").is_file());
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Installed);
+
+    let old_marker = br#"{"id":"adopt_shared","url":"https://old.example","files":[]}"#;
+    std::fs::write(spec.marker_path(root.path()), old_marker).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Missing);
+    assert!(!unmarked_files_present(root.path(), spec), "a foreign marker is an older install");
+    let result = adopt_external_model(root.path(), spec, &AtomicBool::new(false), &mut |_| panic!("no hashing over a foreign marker"));
+    assert!(matches!(result, Err(ExternalModelError::NotDownloaded { .. })), "{result:?}");
+    assert_eq!(read(&spec.marker_path(root.path())), old_marker.to_vec(), "the old marker is kept for the download's upgrade");
+    assert_eq!(read(&dir.join("model.gguf")), body);
+}
+
+/// An Exclusive repin with the SAME file sizes: the old install's marker makes the new spec
+/// non-adoptable, so the upgrade goes through the download, which removes the file only the
+/// old pin listed.
+#[test]
+fn a_same_size_repin_is_upgraded_by_the_download_never_adopted() {
+    let shared = content(3000, 78);
+    let (old_spec, old_bodies) = make_spec("repin_adopt", REV_A, &[("shared.json", &shared), ("stale.txt", &content(50, 79))]);
+    let root = temp_root();
+    run(&FakeFetcher::new(old_bodies, RangeMode::Honour), root.path(), old_spec, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+
+    let (new_spec, new_bodies) = make_spec("repin_adopt", REV_B, &[("shared.json", &shared)]);
+    assert_eq!(external_model_status(root.path(), new_spec), ExternalModelStatus::Missing);
+    assert!(!unmarked_files_present(root.path(), new_spec), "same sizes, but an older version is installed");
+
+    let dir = run(&FakeFetcher::new(new_bodies, RangeMode::Honour), root.path(), new_spec, &AtomicBool::new(false))
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert!(!dir.join("stale.txt").exists(), "the download path cleans what only the old pin listed");
+    assert_eq!(external_model_status(root.path(), new_spec), ExternalModelStatus::Installed);
+}
+
+#[test]
+fn adoption_is_busy_while_the_spec_has_another_job_and_honours_cancel() {
+    let (spec, bodies) = make_spec("adopt_busy", REV_A, &[("a.bin", &content(300_000, 77))]);
+    let root = temp_root();
+    place_files(root.path(), spec, &bodies);
+    let held = BusyGuard::try_acquire(spec.id).unwrap_or_else(|_| panic!("free id"));
+    let result = adopt_external_model(root.path(), spec, &AtomicBool::new(false), &mut |_| {});
+    assert!(matches!(result, Err(ExternalModelError::Busy { .. })), "{result:?}");
+    drop(held);
+    let result = adopt_external_model(root.path(), spec, &AtomicBool::new(true), &mut |_| {});
+    assert!(matches!(result, Err(ExternalModelError::Cancelled)), "{result:?}");
+    assert!(spec.local_dir(root.path()).join("a.bin").is_file(), "cancel deletes nothing");
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Missing);
+    assert!(unmarked_files_present(root.path(), spec), "a cancelled adoption stays adoptable");
 }

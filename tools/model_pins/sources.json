@@ -374,6 +374,60 @@
       "note": "curated SDXL inpaint repo (named in modules/ai_backend/inpaint/sdxl.py), files StableDiffusionXLInpaintPipeline.from_pretrained(..., variant='fp16') loads"
     },
     {
+      "id": "flux2-klein-4b/black-forest-labs/FLUX.2-klein-4B",
+      "kind": "hf_repo",
+      "repo": "black-forest-labs/FLUX.2-klein-4B",
+      "revision": "e7b7dc27f91deacad38e78976d1f2b499d76a294",
+      "paths": [
+        "LICENSE.md",
+        "model_index.json",
+        "scheduler/scheduler_config.json",
+        "tokenizer/added_tokens.json",
+        "tokenizer/chat_template.jinja",
+        "tokenizer/merges.txt",
+        "tokenizer/special_tokens_map.json",
+        "tokenizer/tokenizer.json",
+        "tokenizer/tokenizer_config.json",
+        "tokenizer/vocab.json",
+        "vae/config.json",
+        "vae/diffusion_pytorch_model.safetensors",
+        "transformer/config.json",
+        "text_encoder/config.json",
+        "text_encoder/generation_config.json",
+        "transformer/diffusion_pytorch_model.safetensors",
+        "text_encoder/model-00001-of-00002.safetensors",
+        "text_encoder/model-00002-of-00002.safetensors",
+        "text_encoder/model.safetensors.index.json"
+      ],
+      "note": "ms_sysprobe external_catalog FLUX2_KLEIN_4B_BASE + _TRANSFORMER_BF16 + _TEXT_ENCODER_BF16 (the diffusers folders the FLUX.2 klein engine loads)"
+    },
+    {
+      "id": "flux2-klein-4b/unsloth/FLUX.2-klein-4B-GGUF",
+      "kind": "hf_repo",
+      "repo": "unsloth/FLUX.2-klein-4B-GGUF",
+      "revision": "0084d1df98e2e2137fe776d55170bc4792ec1d66",
+      "paths": [
+        "flux-2-klein-4b-Q8_0.gguf",
+        "flux-2-klein-4b-Q6_K.gguf",
+        "flux-2-klein-4b-Q5_K_M.gguf",
+        "flux-2-klein-4b-Q4_K_M.gguf"
+      ],
+      "note": "ms_sysprobe external_catalog FLUX2_KLEIN_4B_TRANSFORMER_GGUF_* (one per ms_config::Flux2WeightFormat GGUF quant)"
+    },
+    {
+      "id": "flux2-klein-4b/unsloth/Qwen3-4B-GGUF",
+      "kind": "hf_repo",
+      "repo": "unsloth/Qwen3-4B-GGUF",
+      "revision": "22c9fc8a8c7700b76a1789366280a6a5a1ad1120",
+      "paths": [
+        "Qwen3-4B-Q8_0.gguf",
+        "Qwen3-4B-Q6_K.gguf",
+        "Qwen3-4B-Q5_K_M.gguf",
+        "Qwen3-4B-Q4_K_M.gguf"
+      ],
+      "note": "ms_sysprobe external_catalog FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_* (one per ms_config::Flux2WeightFormat GGUF quant)"
+    },
+    {
       "id": "lama-mpe/main-repo",
       "kind": "hf_repo",
       "repo": "Vasyanator2/ManhwaStudio_AI_Models",

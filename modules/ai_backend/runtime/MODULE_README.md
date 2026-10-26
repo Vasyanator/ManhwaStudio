@@ -17,8 +17,10 @@ health-fact calls);
 `rocm_runtime.py` and `rocm_mmap_transfer.py` are the two ROCm/HIP workarounds: the first is applied
 once at backend startup, the second is applied per weight transfer by the Torch services.
 `safetensors_stream.py` and `encoder_truncation.py` are stdlib-only (torch lazily, per read);
-`memory_probe.py` depends only on `torch_support.py`. They are the shared, model-agnostic
-checkpoint/memory utilities model packages build on (first consumer: `inpaint/flux2_klein/`).
+`gguf_stream.py` builds on `safetensors_stream.py` (stdlib, `gguf.constants` lazily) and
+`tensor_container.py` on both; `memory_probe.py` depends only on `torch_support.py`. They are the
+shared, model-agnostic checkpoint/memory utilities model packages build on (first consumer:
+`inpaint/flux2_klein/`).
 
 The only outbound dependency of this package is `rocm_runtime._resolve_cache_root()`, which lazily
 imports `..engines.paddle_onnx` to reuse the ONNX model-root resolution and falls back to
@@ -76,7 +78,8 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   patch), with its policy as the binding's arguments. `test_torch_device.py` covers the resolution
   order, both device policies, the iGPU rule table, the discrete resolution and the cache release.
 - `rocm_runtime.py`: `configure_rocm_runtime()` — MIOpen tuning and the allocator override, applied
-  once at backend startup. It is also what tells `error_text` whether this process is on ROCm.
+  once at backend startup. It is also what tells `error_text` whether this process is on ROCm. On
+  ROCm it removes a truthy `DIFFUSERS_GGUF_CUDA_KERNELS` (diffusers would fetch a CUDA-only kernel).
 - `error_text.py`: `sanitize_torch_error()` — strips Torch's `expandable_segments:True` out-of-memory
   advice from a message on its way to the user, and `configure_error_text()` /
   `rocm_advice_rewrite_enabled()`, the ROCm gate that decides whether it strips anything at all.
@@ -88,15 +91,46 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
 - `rocm_mmap_transfer.py`: the ROCm host->device weight-transfer workaround
   (`mmap_staging_required()`, `stage_cpu_tensor()`, `move_module_to()`, `patched_module_to()`,
   `invalidate_maps_cache()`).
-- `safetensors_stream.py`: model-agnostic safetensors container I/O — the one header parser
+- `safetensors_stream.py`: model-agnostic checkpoint I/O — the one safetensors header parser
   (`read_safetensors_header_and_data_start` / `read_safetensors_header`, ceiling
-  `MAX_SAFETENSORS_HEADER_BYTES`), the per-tensor contract (`TensorSpan`, `parse_tensor_spans`:
-  mappable dtype, length == shape x itemsize, no overlap, file order), the tensor-at-a-time
-  reader (`StreamingSafetensorsReader`), rate-limited byte progress (`ByteProgress`,
-  `ByteProgressCb`), the opt-in `SAFETENSORS_DTYPES_WITH_F8` table and the backend's ONE
+  `MAX_SAFETENSORS_HEADER_BYTES`), the per-tensor contract (`TensorSpan` incl. `quant_type`,
+  `parse_tensor_spans`: mappable dtype, length == shape x itemsize, no overlap, file order), the
+  span-layout rule of both containers (`check_span_layout`), the container-agnostic
+  tensor-at-a-time reader (`StreamingTensorReader`) and its safetensors subclass
+  (`StreamingSafetensorsReader`; a tensor is read in `READ_CHUNK_BYTES` chunks straight into
+  its own buffer), rate-limited byte progress (`ByteProgress`, `ByteProgressCb`,
+  `PROGRESS_MIN_INTERVAL_SECONDS`), the opt-in `SAFETENSORS_DTYPES_WITH_F8` table and the backend's ONE
   meta-module filler (`fill_module_from_safetensors` -> `FillReport`, `MissingWeightsError`,
   `LEAVE_ON_META`, `TensorWrite`). Stdlib only; torch is imported lazily by `read_tensor` and the
   filler.
+- `gguf_stream.py`: model-agnostic GGUF header parsing — `read_gguf_header` -> `GgufHeader`
+  (version 2/3, alignment, data start, spans in file order, scalar/string metadata, names of
+  zero-element tensors), `is_gguf_file`, `ggml_type_name`, ceiling `MAX_GGUF_HEADER_BYTES`; every
+  count field is preflighted (cardinality cap + bytes left) before its loop, so a hostile count
+  is refused at once, never walked. Turns
+  each tensor info into a `TensorSpan`: dims reversed into torch order; plain types map to their
+  token in the caller's `dtypes`; every block-quantized type becomes `U8` rows
+  `(*rows, bytes_per_row)` with `quant_type` = the ggml type id.
+- `tensor_container.py`: THE container dispatch — `container_kind` (GGUF magic sniff, else
+  safetensors), `read_container_layout` -> `ContainerLayout` (a header view: spans, data start,
+  file size, the GGUF header) and `open_tensor_reader` (a `StreamingTensorReader`).
+- `_gguf_test_fixtures.py`: TEST-ONLY writer of tiny real GGUF files (`gguf.GGUFWriter`) shared by
+  every GGUF test: `make_tensor` (F32 / F16 / BF16 / Q8_0 / Q4_0 / Q5_0 via `gguf.quants`;
+  Q4_K / Q5_K / Q6_K as random blocks with finite scales), `FixtureTensor.reference()` (the
+  `gguf.quants` dequantization), `write_gguf`, and BFL- / llama.cpp-style name sets
+  (`bfl_style_tensors`, `llama_style_tensors` with a quantized `token_embd.weight`,
+  `mixed_fixture_tensors`).
+- `test_gguf_stream.py`, `test_tensor_container.py`: the parser (round trip against
+  `gguf.GGUFReader`, every malformed-header refusal) and the dispatch (both kinds, exact bytes,
+  no torch import).
+- `gguf_layers.py`: the GGUF dequantizing layers — `GgufLinear` / `GgufEmbedding` (persistent
+  uint8 `weight` buffer in the file's row layout, quant type on the module, so it survives
+  `TensorSlot.set`, packed views, meta and `state_dict`; the embedding dequantizes only looked-up
+  rows), `dequantize` / `bytes_per_row` / `require_dequantizable` over diffusers' pure-torch block
+  functions only (never its CUDA `ops`), and `swap_gguf_modules` (header quant map -> replaced
+  `nn.Linear` / `nn.Embedding`, validated before any swap). Imports torch and diffusers at top:
+  import it lazily from torch-free modules. `test_gguf_layers.py`: bit-exact parity with diffusers,
+  forward parity, survival of slot moves, refusals.
 - `memory_probe.py`: `memory_snapshot` — the tolerant `{vram,ram}_{total,free}` snapshot, `0` =
   unknown, never raises — and `cuda_device_index`.
 - `encoder_truncation.py`: `keep_layers_for_hidden_states` — how many decoder layers a text
@@ -297,6 +331,23 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
 - Every module here must surface a missing package or an unusable device as an explicit error. No
   silent fallback to CPU, to a different provider, or to a guessed path. (`memory_probe` is the
   deliberate exception for a REPORT: a missing figure is `0` = unknown, never a guessed value.)
+- **`tensor_container` is the ONE place that decides which container a checkpoint file is.** The
+  large-model inventory, the residency hooks' DISK data start and the meta-module filler all go
+  through it (`read_container_layout` / `open_tensor_reader`); no other site sniffs a magic,
+  branches on a `.gguf` suffix or calls a container parser to read tensors. Both containers
+  produce the same `TensorSpan` (offsets relative to the data start, file order) under one layout
+  rule, `check_span_layout`: no overlap, and — at reader construction only — inside the file. A
+  layout is a HEADER VIEW (sizing works on header-only files); the readers refuse a truncated
+  file before the first read.
+- **GGUF is parsed and read without `mmap`.** The header parser uses plain `read()`; tensor bytes
+  go through `StreamingTensorReader` into a fresh `bytearray` (anonymous memory, one tensor at a
+  time), so no ROCm staging is needed and the host peak is one tensor. A block-quantized GGUF
+  tensor enters the span contract as `U8` rows `(*rows, bytes_per_row)` with
+  `TensorSpan.quant_type`; the large-model planner and residency treat it as ordinary bytes.
+  The container is policy-free: IQ / TQ types parse, zero-element tensors get no span (listed
+  in `GgufHeader.empty_tensors`, so a model expecting one fails as a missing weight), more than
+  4 dims are accepted (ComfyUI-GGUF 5-D weights). Whether a type can be dequantized is the
+  consumer's decision. A missing `gguf` package is a `RuntimeError` naming it.
 - **The meta-module filler contract** (`fill_module_from_safetensors`): files in the given order,
   each in file order, ONE tensor at a time — when a file tensor is read the filler references no
   earlier one (pinned by `test_safetensors_stream.py` and FLUX.2's characterization tests). Key
@@ -309,9 +360,13 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   default writer checks the shape and copies with `.to(device)` into
   `nn.Parameter(requires_grad=False)` / the buffer; a `write` callback replaces that step per file
   tensor. A CUDA/HIP device is synchronized after every file tensor (measured HIP pile-up of host
-  staging buffers otherwise). Byte progress: one rate-limited report per read tensor, the last one
-  always. On any refusal the module is partially filled and must be discarded.
-- **`safetensors_stream`, `memory_probe` and `encoder_truncation` are model-agnostic.** They carry
+  staging buffers otherwise). Byte progress: bytes are counted per read chunk (16 MiB), so one
+  large tensor reports several times; reports at most every 0.2 s (five frames per second: the
+  UI derives the read speed from consecutive frames), plus exactly one 100% frame after the last
+  write. The interval is for checkpoint LOADS only; downloads pace their own frames. On any
+  refusal the module is partially filled and must be discarded.
+- **`safetensors_stream`, `gguf_stream`, `tensor_container`, `memory_probe` and
+  `encoder_truncation` are model-agnostic.** They carry
   model-agnostic checkpoint I/O, memory probes and the hidden-state truncation rule: no
   model-family names and no refusal policy (FLUX.2 klein's fp8-scaled refusal stays in
   `inpaint/flux2_klein/`). The default `SAFETENSORS_DTYPES` deliberately has no 8-bit float
@@ -349,9 +404,13 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
 - To change the staging gate, the `/proc/self/maps` classifier, or the `Module.to` patch, edit
   `rocm_mmap_transfer.py`; add the corresponding case to `test_rocm_mmap_transfer.py`.
 - To change which safetensors dtypes are mappable by default, what makes a header or tensor entry
-  malformed, how a tensor is read, or the byte-progress rate limit, edit `safetensors_stream.py`
+  malformed, how a tensor is read (chunk size), or the byte-progress rate limit, edit `safetensors_stream.py`
   and `test_safetensors_stream.py` (and re-run `inpaint/flux2_klein/` tests: FLUX.2 re-binds these
   names). A model-specific refusal belongs in that model's package, not here.
+- To change how a GGUF header is parsed, which ggml types become `U8` rows, or how a file's
+  container is recognized, edit `gguf_stream.py` / `tensor_container.py` and their tests (and
+  `_gguf_test_fixtures.py` when a new type must be writable); re-run `large_models/` tests. A new
+  container is a new parser plus one branch in `tensor_container`, never a check at a call site.
 - To change how a `meta`-built module is filled from checkpoint files, edit
   `fill_module_from_safetensors` and re-run `inpaint/flux2_klein/` and `inpaint/flux3_klein/`
   tests. It is the one direct-to-device filler: FLUX.3 klein's standalone loaders (`load_dit`,

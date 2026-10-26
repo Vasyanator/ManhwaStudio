@@ -17,7 +17,11 @@ Main responsibilities:
   and both numbers named plus a structured log line, a single-file transformer
   and an encoder weights file resolve to the same configs the loaders read, and
   the guard stays SILENT for an empty path, a missing config or a config without
-  the field — those are other faults with better diagnoses of their own.
+  the field — those are other faults with better diagnoses of their own;
+- verify the installed-4B-package fallback of a GGUF component kept outside
+  the package: the tokenizer / scheduler root (GGUF only, never for
+  `model_index.json`) and the transformer config, accepted only when
+  consistent with the GGUF header.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ import unittest
 from pathlib import Path
 
 from modules.ai_backend.inpaint import flux2_klein as svc
-from modules.ai_backend.inpaint.flux2_klein import large_model
+from modules.ai_backend.inpaint.flux2_klein import components, large_model
 
 from ._test_fixtures import _make_model_tree, _TempTreeCase, _write_safetensors
 
@@ -63,6 +67,76 @@ class ComponentDiscoveryTests(_TempTreeCase):
         message = str(caught.exception)
         self.assertIn("scheduler_config.json", message)
         self.assertIn(str(self.root), message)
+
+
+@unittest.skipUnless(importlib.util.find_spec("gguf") is not None, "needs the gguf package")
+class GgufPackageFallbackTests(_TempTreeCase):
+    """A GGUF component outside the package borrows from the installed 4B package, and only what fits."""
+
+    #: The transformer `config.json` the small BFL GGUF below describes.
+    CONFIG = {"_class_name": "Flux2Transformer2DModel", "num_layers": 1, "num_single_layers": 2, "num_attention_heads": 2, "attention_head_dim": 16, "in_channels": 8, "joint_attention_dim": 24}
+
+    def setUp(self) -> None:
+        super().setUp()
+        from modules.ai_backend.runtime._gguf_test_fixtures import Q, make_tensor, write_gguf
+
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        self.gguf = Path(outside.name) / "sd_models" / "klein-q8.gguf"
+        self.gguf.parent.mkdir(parents=True)
+        write_gguf(
+            self.gguf,
+            [
+                make_tensor("img_in.weight", Q.BF16, (32, 8), seed=1),
+                make_tensor("txt_in.weight", Q.BF16, (32, 24), seed=2),
+                make_tensor("double_blocks.0.img_attn.qkv.weight", Q.Q8_0, (96, 32), seed=3),
+                make_tensor("single_blocks.0.linear1.weight", Q.Q8_0, (64, 32), seed=4),
+                make_tensor("single_blocks.1.linear1.weight", Q.Q8_0, (64, 32), seed=5),
+            ],
+        )
+
+    def _install(self, subdir: str, files: dict[str, object]) -> Path:
+        folder = self.installed_package / subdir
+        folder.mkdir(parents=True)
+        for name, content in files.items():
+            (folder / name).write_text(json.dumps(content), encoding="utf-8")
+        return folder
+
+    def test_the_package_supplies_the_tokenizer_only_for_a_gguf_component(self) -> None:
+        for name in ("tokenizer/tokenizer_config.json", "scheduler/scheduler_config.json"):
+            (self.root / name).unlink()
+        tokenizer = self._install("tokenizer", {"tokenizer_config.json": {}})
+        paths = {**self.paths, "transformer_path": str(self.gguf)}
+        roots = svc.component_search_roots(paths)
+        self.assertEqual(roots[-1], self.installed_package, "appended last")
+        self.assertEqual(svc.discover_component_dir(roots, "tokenizer", svc._TOKENIZER_MARKERS), tokenizer)
+        self.assertNotIn(self.installed_package, svc.component_search_roots(self.paths), "no GGUF, no fallback")
+        self.assertNotIn(self.installed_package, svc.model_index_search_roots(paths), "the manifest is never borrowed")
+
+    def test_a_consistent_package_config_is_borrowed(self) -> None:
+        folder = self._install("transformer", {"config.json": self.CONFIG})
+        self.assertEqual(components.find_transformer_config_dir(self.gguf), folder)
+        self.assertEqual(large_model.transformer_config_dir(str(self.gguf)), folder)
+
+    def test_an_inconsistent_package_config_is_refused_with_the_reason(self) -> None:
+        self._install("transformer", {"config.json": {**self.CONFIG, "num_single_layers": 20}})
+        self.assertIsNone(components.find_transformer_config_dir(self.gguf))
+        with self.assertRaises(FileNotFoundError) as caught:
+            large_model.transformer_config_dir(str(self.gguf))
+        message = str(caught.exception)
+        self.assertIn("одиночных блоков: в файле 2, в config.json 20", message)
+        self.assertIn(str(self.installed_package / "transformer"), message)
+
+    def test_an_inconsistent_config_beside_the_file_is_skipped_for_the_package(self) -> None:
+        beside = self.gguf.parent / "transformer"
+        beside.mkdir()
+        (beside / "config.json").write_text(json.dumps({**self.CONFIG, "num_layers": 8}), encoding="utf-8")
+        folder = self._install("transformer", {"config.json": self.CONFIG})
+        self.assertEqual(components.find_transformer_config_dir(self.gguf), folder)
+
+    def test_the_package_fallback_needs_every_required_field(self) -> None:
+        self._install("transformer", {"config.json": {key: value for key, value in self.CONFIG.items() if key != "num_layers"}})
+        self.assertIsNone(components.find_transformer_config_dir(self.gguf))
 
 
 class CheckpointIsDistilledTests(_TempTreeCase):

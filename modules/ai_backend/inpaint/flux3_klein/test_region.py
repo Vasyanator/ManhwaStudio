@@ -10,7 +10,11 @@ required, the whole region regenerated),
 reference order (the region is #0), `seed: null` drawn and echoed, the
 progress frames (stable `stage` ids), cancellation at a phase begin and at a
 denoise step with no session left in use and a follow-up run that succeeds,
-a generated image of the wrong size refused, and the pre-run refusals.
+a generated image of the wrong size refused, and the pre-run refusals;
+the disk-read frames (`DiskReadProgressTests`: one component-labelled `load`
+frame stream per checkpoint read, in the stage that reads, at the manager's
+cadence under an injected clock; re-reads labelled the same; the
+`file_component` / `file_label` rules).
 
 Notes:
 CPU only; files go to temporary directories.
@@ -20,12 +24,17 @@ from __future__ import annotations
 
 import io
 import unittest
+from collections import defaultdict
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
 
+from ...runtime import safetensors_stream
+from ...runtime.large_models import moves
+from ...runtime.large_models.loader import LoadProgress
 from . import region, service
 from ._service_test_fixtures import ServiceRig
 from .config import WeightFormat
@@ -125,7 +134,13 @@ class RegionTests(unittest.TestCase):
 
     def test_progress_frames_carry_stable_stages(self) -> None:
         frames: list[tuple[str, int, int, str]] = []
-        self._edit(progress=lambda phase, step, total, label, *, stage=None: frames.append((phase, step, total, stage)))
+
+        def progress(phase: str, step: int, total: int, label: str, *, stage: str | None = None, **file: Any) -> None:
+            # Step frames only: the disk-read frames have their own tests.
+            if not file:
+                frames.append((phase, step, total, stage))
+
+        self._edit(progress=progress)
         stages = region.progress_stages()
         self.assertEqual(frames[0], ("load", 0, len(stages) - 1, "prepare"))
         load_stages = [stage for phase, _, _, stage in frames if phase == "load"]
@@ -147,8 +162,9 @@ class RegionTests(unittest.TestCase):
             with self.subTest(when=when):
                 frames: list[str] = []
 
-                def progress(phase: str, step: int, total: int, label: str, *, stage: str | None = None) -> None:
-                    frames.append(f"{stage}:{step}")
+                def progress(phase: str, step: int, total: int, label: str, *, stage: str | None = None, **file: Any) -> None:
+                    if not file:
+                        frames.append(f"{stage}:{step}")
 
                 def cancel() -> bool:
                     return after is None or any(frame.startswith(after) for frame in frames)
@@ -188,6 +204,123 @@ class RegionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     call()
         self.assertEqual(self.rig.dits, [], "no refusal read a weight")
+
+
+class _TickingClock:
+    """An injected `ByteProgress` clock: every call advances `tick` seconds (exact in binary); `now` reads without advancing."""
+
+    def __init__(self, tick: float) -> None:
+        self.now = 0.0
+        self.tick = tick
+
+    def __call__(self) -> float:
+        self.now += self.tick
+        return self.now
+
+
+class DiskReadProgressTests(unittest.TestCase):
+    """`edit_region_bytes`'s disk-read frames over the real manager (stand-in models, tiny real checkpoints)."""
+
+    #: The rate limit of every stream (`safetensors_stream.PROGRESS_MIN_INTERVAL_SECONDS`).
+    INTERVAL = 0.2
+
+    def setUp(self) -> None:
+        self.rig = ServiceRig(self, variants=(WeightFormat.FP8R,))
+        self.region = _region()
+        self.clock = _TickingClock(0.125)
+        clock = self.clock
+
+        class ClockedProgress(safetensors_stream.ByteProgress):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **{**kwargs, "clock": clock})
+
+        # 16-byte read chunks: a 64-byte stand-in tensor is four reads, so one
+        # stream spans several clock ticks and the rate limit is observable.
+        for owner, name, value in ((safetensors_stream, "ByteProgress", ClockedProgress), (moves, "ByteProgress", ClockedProgress), (safetensors_stream, "READ_CHUNK_BYTES", 16)):
+            patcher = patch.object(owner, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _edit(self, **params: Any) -> tuple[list[dict[str, Any]], list[tuple[str, int, int, str | None]]]:
+        """One run: (disk-read frames with the clock time they came at, step frames)."""
+        reads: list[dict[str, Any]] = []
+        steps: list[tuple[str, int, int, str | None]] = []
+
+        def progress(phase: str, step: int, total: int, label: str, *, stage: str | None = None, **file: Any) -> None:
+            if file:
+                reads.append({"phase": phase, "step": step, "total": total, "label": label, "stage": stage, "at": self.clock.now, **file})
+            else:
+                steps.append((phase, step, total, stage))
+
+        all_params = {"source_root": str(self.rig.root), "prompt": "remove the text", "steps": 2, **params}
+        region.edit_region_bytes(self.rig.service, _png(self.region, "RGB"), _png(_mask(), "L"), (), all_params, progress_callback=progress)
+        return reads, steps
+
+    def _assert_stream(self, frames: list[dict[str, Any]]) -> None:
+        """One read: bytes grow to the total, 100% exactly once, frames at least one interval apart but the final one."""
+        done = [frame["file_step"] for frame in frames]
+        total = frames[0]["file_total"]
+        self.assertEqual(done, sorted(done))
+        self.assertEqual(done[-1], total)
+        self.assertEqual(done.count(total), 1, "100% is reported exactly once")
+        self.assertEqual({frame["file_total"] for frame in frames}, {total})
+        times = [frame["at"] for frame in frames[:-1]]
+        for earlier, later in zip(times, times[1:]):
+            self.assertGreaterEqual(later - earlier, self.INTERVAL)
+
+    def test_a_cold_run_reads_every_component_as_one_labelled_stream(self) -> None:
+        reads, steps = self._edit()
+        stages = region.progress_stages()
+        by_component: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for frame in reads:
+            by_component[frame["file_component"]].append(frame)
+            # The frame of the stage in force, plus the byte level: the overall bar does not move.
+            self.assertEqual(frame["phase"], "load")
+            self.assertEqual((frame["step"], frame["total"]), (stages.index(frame["stage"]), len(stages) - 1))
+            self.assertIn(("load", frame["step"], frame["total"], frame["stage"]), steps)
+        self.assertEqual(set(by_component), {"transformer", "vae", "text_encoder"})
+        expected = {
+            "transformer": (Phase.DIT_LOAD.value, "model.safetensors"),
+            "vae": (Phase.AE_LOAD.value, "ae.safetensors"),
+            "text_encoder": (Phase.ENCODER_LOAD.value, "model-00001-of-00001.safetensors"),
+        }
+        for component, frames in by_component.items():
+            with self.subTest(component=component):
+                self.assertEqual({(frame["stage"], frame["file_label"]) for frame in frames}, {expected[component]})
+                self._assert_stream(frames)
+        # 192 bytes of DiT in 16-byte chunks, one tick each: several frames, not one.
+        self.assertGreaterEqual(len(by_component["transformer"]), 3)
+
+    def test_units_brought_back_from_disk_read_as_the_same_component(self) -> None:
+        # The first run under VRAM «Минимум» x RAM «Минимум» drops what it does not
+        # use; the second re-reads the DiT units on entering the denoise (`reread`).
+        self._edit(vram_step="min", ram_step="min")
+        with patch.object(region, "file_label", wraps=region.file_label) as labels:
+            reads, _ = self._edit(vram_step="min", ram_step="min")
+        rereads = [call.args[0] for call in labels.call_args_list if call.args[0].reread]
+        self.assertTrue(rereads, "the run re-read units from disk")
+        dit = [frame for frame in reads if frame["stage"] == Phase.DIT_RESTORE.value]
+        self.assertTrue(dit)
+        self.assertEqual({(frame["file_component"], frame["file_label"]) for frame in dit}, {("transformer", "model.safetensors")})
+        self._assert_stream(dit)
+
+    def test_no_callback_registers_no_sink(self) -> None:
+        with patch.object(service.Flux3KleinService, "generate", autospec=True, side_effect=service.Flux3KleinService.generate) as generate:
+            region.edit_region_bytes(self.rig.service, _png(self.region, "RGB"), _png(_mask(), "L"), (), {"source_root": str(self.rig.root), "prompt": "p", "steps": 1})
+        self.assertIsNone(generate.call_args.kwargs["load_progress"])
+
+    def test_component_ids_and_labels(self) -> None:
+        self.assertEqual([region.file_component_id(name) for name in ("dit", "encoder", "ae", "other")], ["transformer", "text_encoder", "vae", "other"])
+
+        def frame(*files: str, current: str | None = None) -> LoadProgress:
+            paths = tuple(Path(name) for name in files)
+            return LoadProgress(component="encoder", file=Path(current) if current else (paths[0] if paths else None), files=paths, done_bytes=0, total_bytes=0, reread=False)
+
+        self.assertEqual(region.file_label(frame("/m/variants/fp8r/model.safetensors")), "model.safetensors")
+        # Sharded in one folder: the folder, so the label does not change mid-bar.
+        self.assertEqual(region.file_label(frame("/m/text_encoder/a.safetensors", "/m/text_encoder/b.safetensors", current="/m/text_encoder/b.safetensors")), "text_encoder")
+        self.assertEqual(region.file_label(frame("/m/x/a.safetensors", "/m/y/b.safetensors", current="/m/y/b.safetensors")), "b.safetensors")
+        self.assertEqual(region.file_label(frame()), "")
 
 
 if __name__ == "__main__":

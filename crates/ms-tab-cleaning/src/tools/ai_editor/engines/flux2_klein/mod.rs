@@ -36,7 +36,11 @@ two `.download.*` methods carry; nothing else on the wire changes, because every
 method is already keyed by the three component paths. The 4B model is ungated and
 apache-2.0, so its download block draws no Hugging Face token row, and no uncensored text
 encoder is published for it, so that toggle is not drawn and the flag is forced off before
-it can reach a path or the wire. The backend keeps ONE pipeline and ONE text encoder
+it can reach a path or the wire. The 4B package is pinned in the Rust catalog instead of
+being fetched by the backend: its download block offers the two weight formats
+(«Веса трансформера» / «Веса текстового энкодера», bf16 or a GGUF quant) and ONE pinned
+bundle download through the engine's `OcrModelDownloadController` (which also adopts an
+existing unmarked download once). The backend keeps ONE pipeline and ONE text encoder
 resident, keyed by those paths, so selecting the other variant unloads the previous one —
 the panel says so and this side orchestrates nothing.
 
@@ -309,14 +313,21 @@ use ms_region_postprocess::{PostprocessSettings, dilate_ellipse};
 use ms_backend_ipc as backend_ipc;
 use ms_canvas::OverlayRectPx;
 use ms_config as config;
-use ms_config::Flux2Variant;
+use ms_config::{Flux2Variant, Flux2WeightAxis, Flux2WeightFormat};
+// The catalog package of a variant that downloads from the Rust catalog (4B): its pinned specs
+// per weight format, and the explicit-download controller and panel block shared with the
+// Translation tab (the SDXL engine is the other cleaning consumer).
+use ms_sysprobe::ai_models::external::ExternalModelSpec;
+use ms_sysprobe::ai_models::external_catalog::{flux2_klein_package_specs, flux2_klein_spec};
+use ms_tab_translation::ocr_model_download::{JobKind, OcrModelDownloadController, OcrModelDownloadState, OcrModelPanelSnapshot, bundle_key};
+use ms_tab_translation::panels::ocr_model_download::{ModelDownloadAction, draw_ocr_model_download};
 use crate::tools::base::RegionEditToolBase;
 use crate::tools::region_edit_v2::geometry::{AspectLimit, FrameConstraints};
 use ms_local_ai::backend_health::ai_backend_offline_error;
 // The one client of `large_models.*`: the step vocabulary, the forecast query and the caps.
 use ms_local_ai::large_models::{LIMITS_EDIT_DEBOUNCE, LargeModelStep, ProfilesRequest, RamStep, StepChoice, VramStep, format_gib};
 // The axes widget the large-model cleaning engines share (FLUX.2 and FLUX.3 klein).
-use crate::tools::ai_editor::large_model_resources::{ResourcesAction, ResourcesController, ResourcesView, draw_large_model_resources, forecast_line};
+use crate::tools::ai_editor::large_model_resources::{ResourcesAction, ResourcesController, ResourcesView, draw_encoder_formats, draw_large_model_resources, forecast_line};
 // The model-agnostic parts the large-model engines share: streamed progress, the Hugging Face
 // download, the settings-file rules and the mask -> working-mode rule.
 use super::shared::*;

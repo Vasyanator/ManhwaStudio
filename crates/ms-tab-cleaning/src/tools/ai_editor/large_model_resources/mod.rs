@@ -17,12 +17,17 @@ Key structures:
 
 Key functions:
 - `draw_large_model_resources()`: the widget.
-- `step_row_label()`, `auto_item_label()`, `forecast_line()`, `cap_changes_for()`: the PURE decisions (unit
-  tested; `forecast_line` is also what an engine's readiness line prints).
+- `draw_encoder_formats()`: the text encoder's weight-format rows, drawn separately by an
+  engine whose encoder has several formats (FLUX.2 klein 4B).
+- `step_row_label()`, `auto_item_label()`, `run_forecast()`, `forecast_line()`,
+  `format_row_label()`, `cap_changes_for()`: the PURE decisions (unit tested; `forecast_line`
+  — the whole run, text encoder included — is also what an engine's readiness line prints).
 
 Notes:
-- Model-agnostic: FLUX.2 passes no format (one weight format); FLUX.3 klein passes
-  `Some(&mut format)` and gets the format rows.
+- Model-agnostic: a model with one weight format (FLUX.2 klein 9B, and 4B outside download
+  mode) passes no format; FLUX.3 klein and FLUX.2 klein 4B in download mode (its transformer
+  format) pass `Some(&mut format)` and get the format rows. The encoder's rows (`encoder_formats`) are a
+  separate call, so the widget's signature and actions serve every engine unchanged.
 - Step SEMANTICS are the backend's (`runtime/large_models/tiers.py`); labels, hints and wire
   ids come from `ms_local_ai::large_models`. The widget talks to nothing: the engine's
   `ResourcesController` owns the `ProfilesQuery`, the `LimitsWriter` and the reset worker.
@@ -35,7 +40,7 @@ pub(super) use controller::ResourcesController;
 
 use eframe::egui;
 use ms_local_ai::large_models::{
-    Axis, AxisRows, CapChange, Forecast, LargeModelProfiles, LargeModelStep, LargeModelsError, Limits, SelectedPlan, StepChoice, StepRow,
+    Axis, AxisRows, CapChange, Forecast, FormatRow, LargeModelProfiles, LargeModelStep, LargeModelsError, Limits, SelectedPlan, StepChoice, StepRow,
     SuggestionKind, format_duration, format_gib,
 };
 use ms_widgets::{ByteCapEdit, WheelComboBox};
@@ -150,12 +155,46 @@ pub(super) fn auto_item_label<S: LargeModelStep>(recommended: Option<S>) -> Stri
     }
 }
 
-/// The one-line forecast of a plan: peaks and the time of a repeated run, with the first
-/// run's time beside it. `None` without a forecast. Shared by the widget and the engine's
-/// always-visible readiness line, so the two cannot read differently.
+/// The forecast of the WHOLE run an answer describes: the selected plan's, plus the text
+/// encoder's when the answer carries one (`profiles.encoder`; the backend sends it exactly
+/// when the run must count the encoder). `None` without a selected forecast.
+///
+/// Combined the way the backend's ADMISSION combines them (`service.py`
+/// `large_model_profiles` / `_reservation_of`): the pipeline is planned with the encoder's
+/// reservation CLAIMED beside it, so the two reservations add up. Device memory: the two
+/// device peaks add. Host memory: both host peaks include the backend's baseline RSS, which
+/// the process holds once, so the sum takes it out once (`Forecast::host_baseline`; a
+/// backend that does not report it counts it twice, an over-estimate, never an under one).
+/// Time: encode and denoise run one after the other, so loads and totals add, and a step's
+/// time stays the pipeline's. Calibrated only when both halves are.
 #[must_use]
-pub(super) fn forecast_line(selected: &SelectedPlan) -> Option<String> {
-    selected.forecast.as_ref().map(forecast_text)
+pub(super) fn run_forecast(profiles: &LargeModelProfiles) -> Option<Forecast> {
+    let pipeline = profiles.selected.forecast.as_ref()?;
+    let Some(encoder) = profiles.encoder.as_ref().and_then(|encoder| encoder.forecast.as_ref()) else {
+        return Some(pipeline.clone());
+    };
+    let baseline = encoder.host_baseline.or(pipeline.host_baseline).unwrap_or(0).min(encoder.host_peak);
+    Some(Forecast {
+        device_peak: pipeline.device_peak.saturating_add(encoder.device_peak),
+        host_peak: pipeline.host_peak.saturating_add(encoder.host_peak - baseline),
+        peak_phase: pipeline.peak_phase.clone(),
+        load_cold_s: pipeline.load_cold_s + encoder.load_cold_s,
+        load_warm_s: pipeline.load_warm_s + encoder.load_warm_s,
+        per_step_s: pipeline.per_step_s,
+        total_s: pipeline.total_s + encoder.total_s,
+        calibrated: pipeline.calibrated && encoder.calibrated,
+        device_calibrated: pipeline.device_calibrated && encoder.device_calibrated,
+        host_baseline: pipeline.host_baseline,
+    })
+}
+
+/// The one-line forecast of the whole run ([`run_forecast`]): peaks and the time of a
+/// repeated run, with the first run's time beside it. `None` without a forecast. Shared by
+/// the widget and the engine's always-visible readiness line, so the two cannot read
+/// differently.
+#[must_use]
+pub(super) fn forecast_line(profiles: &LargeModelProfiles) -> Option<String> {
+    run_forecast(profiles).as_ref().map(forecast_text)
 }
 
 fn forecast_text(forecast: &Forecast) -> String {
@@ -367,17 +406,17 @@ fn draw_axis_picker<S: LargeModelStep>(
     }
 }
 
-/// The selected plan: the forecast (with the uncalibrated note), the encoder and the reclaim
-/// lines. A stale answer is drawn weak, so the panel does not flicker while the next lands.
-/// `encoder_cpu_only`: «Энкодер на CPU» is on, so the encoder line names RAM alone
-/// ([`encoder_line`]).
+/// The selected plan: the WHOLE run's forecast ([`run_forecast`], with the uncalibrated
+/// note), the encoder line as its breakdown, and the reclaim line. A stale answer is drawn
+/// weak, so the panel does not flicker while the next lands. `encoder_cpu_only`: «Энкодер на
+/// CPU» is on, so the encoder line names RAM alone ([`encoder_line`]).
 fn draw_selected(ui: &mut egui::Ui, profiles: &LargeModelProfiles, stale: bool, encoder_cpu_only: bool) {
     let selected = &profiles.selected;
-    if let Some(forecast) = selected.forecast.as_ref() {
+    if let Some(forecast) = run_forecast(profiles) {
         if !forecast.calibrated {
             ui.small(t!("large_models.forecast.uncalibrated_hint"));
         }
-        let line = forecast_text(forecast);
+        let line = forecast_text(&forecast);
         let tooltip = tf!("large_models.forecast.peak_phase_tooltip", phase = forecast.peak_phase);
         if stale {
             ui.weak(line).on_hover_text(tooltip);
@@ -440,20 +479,53 @@ fn draw_formats(ui: &mut egui::Ui, profiles: &LargeModelProfiles, format: &mut S
         return;
     }
     ui.label(t!("large_models.format.heading_label"));
-    for row in &profiles.formats {
-        let text = match row.fits_best {
-            Some(pair) => tf!("large_models.format.row_fits_label", format = row.id, vram = pair.vram.label(), ram = pair.ram.label()),
-            None => tf!("large_models.format.row_does_not_fit_label", format = row.id),
-        };
+    if let Some(picked) = draw_format_rows(ui, &profiles.formats, format) {
+        actions.push(ResourcesAction::ApplyFormat(picked));
+    }
+}
+
+/// Draws the TEXT ENCODER's weight-format rows (`profiles.encoder_formats`) under their own
+/// heading, with the same row labels and visuals as the model's format rows. Draws nothing
+/// with fewer than two rows (one format offers no choice; older backends and FLUX.3 report
+/// none).
+///
+/// `format` is the engine's encoder-format choice; a picked row is written into it and its id
+/// returned (`None` when nothing new was picked). Separate from
+/// [`draw_large_model_resources`] so that widget's signature and [`ResourcesAction`] stay the
+/// same for every engine.
+pub(super) fn draw_encoder_formats(ui: &mut egui::Ui, profiles: &LargeModelProfiles, format: &mut String) -> Option<String> {
+    if profiles.encoder_formats.len() < 2 {
+        return None;
+    }
+    ui.label(t!("large_models.format.encoder_heading_label"));
+    draw_format_rows(ui, &profiles.encoder_formats, format)
+}
+
+/// The label of one format row: the format and the step pair `Auto` resolves to in it, or
+/// that it does not fit.
+#[must_use]
+fn format_row_label(row: &FormatRow) -> String {
+    match row.fits_best {
+        Some(pair) => tf!("large_models.format.row_fits_label", format = row.id, vram = pair.vram.label(), ram = pair.ram.label()),
+        None => tf!("large_models.format.row_does_not_fit_label", format = row.id),
+    }
+}
+
+/// The selectable rows of one format list (an unavailable row is disabled and says why on
+/// hover). A click on another row writes it into `format` and returns its id.
+fn draw_format_rows(ui: &mut egui::Ui, rows: &[FormatRow], format: &mut String) -> Option<String> {
+    let mut picked = None;
+    for row in rows {
         let reason = row.reason.clone().unwrap_or_default();
         let response = ui
-            .add_enabled(row.available, egui::Button::selectable(*format == row.id, text))
+            .add_enabled(row.available, egui::Button::selectable(*format == row.id, format_row_label(row)))
             .on_disabled_hover_text(tf!("large_models.format.unavailable_tooltip", reason = reason));
         if response.clicked() && *format != row.id {
             format.clone_from(&row.id);
-            actions.push(ResourcesAction::ApplyFormat(row.id.clone()));
+            picked = Some(row.id.clone());
         }
     }
+    picked
 }
 
 #[cfg(test)]
@@ -518,26 +590,24 @@ mod tests {
             total_s: 1.0,
             calibrated: true,
             device_calibrated: true,
+            host_baseline: None,
         };
         assert_eq!(encoder_line(&encoder, true), "Text encoder (on the CPU): ≈ 8.0 GiB RAM");
         assert_eq!(encoder_line(&encoder, false), "Text encoder: ≈ 2.0 GiB video memory, 8.0 GiB RAM");
     }
 
-    #[test]
-    fn the_forecast_line_exists_only_with_a_forecast() {
-        let _locale = english();
-        let mut selected = SelectedPlan {
-            requested: StepChoice::default(),
-            vram: Some(VramStep::Phase),
-            ram: Some(RamStep::Keep),
-            fits: true,
-            needs_reclaim: None,
-            reason: None,
-            shortest_resource: None,
-            forecast: None,
-        };
-        assert_eq!(forecast_line(&selected), None);
-        selected.forecast = Some(Forecast {
+    /// The pinned v13 profiles answer, for tests that need a whole `LargeModelProfiles`.
+    fn fixture_profiles() -> LargeModelProfiles {
+        ms_local_ai::large_models::parse_profiles(
+            &serde_json::from_str::<Value>(include_str!("../../../../../ms-local-ai/fixtures/large_models_profiles_v13.json")).expect("fixture JSON"),
+        )
+        .expect("fixture parses")
+    }
+
+    /// The pipeline's forecast of the line tests: 1.5 GiB device, 4 GiB host of which 1 GiB is
+    /// the backend's baseline.
+    fn pipeline_forecast() -> Forecast {
+        Forecast {
             device_peak: 3 << 29,
             host_peak: 1 << 32,
             peak_phase: "denoise".to_string(),
@@ -547,15 +617,114 @@ mod tests {
             total_s: 40.0,
             calibrated: true,
             device_calibrated: true,
-        });
+            host_baseline: Some(1 << 30),
+        }
+    }
+
+    #[test]
+    fn the_forecast_line_exists_only_with_a_forecast() {
+        let _locale = english();
+        let mut profiles = fixture_profiles();
+        profiles.encoder = None;
+        profiles.selected.forecast = None;
+        assert_eq!(forecast_line(&profiles), None);
+        profiles.selected.forecast = Some(pipeline_forecast());
         // The repeated run swaps the cold load (30 s) for the warm one (3 s): 40 - 30 + 3.
         assert_eq!(
-            forecast_line(&selected).as_deref(),
+            forecast_line(&profiles).as_deref(),
             Some("≈ 1.5 GiB video memory, 4.0 GiB RAM, ~13 s (40 s on the first run)")
         );
+        let mut selected = profiles.selected.clone();
+        selected.reason = None;
         assert_eq!(refusal_text(&selected), "Does not fit into video memory.", "no reason: the generic one");
         selected.reason = Some(ms_local_ai::large_models::RefusalReason::HostShort);
         assert_eq!(refusal_text(&selected), "Not enough system memory.");
+    }
+
+    /// With an encoder in the answer, the run's forecast is the sum the backend's admission
+    /// assumes: device peaks add, host peaks add with the shared baseline taken out once,
+    /// times add; without a reported baseline the host sum errs high, never low.
+    #[test]
+    fn the_run_forecast_adds_the_text_encoder_as_admission_does() {
+        let _locale = english();
+        let mut profiles = fixture_profiles();
+        profiles.selected.forecast = Some(pipeline_forecast());
+        let encoder_forecast = Forecast {
+            device_peak: 1 << 30,
+            host_peak: (1 << 30) + (1 << 31),
+            peak_phase: "encode".to_string(),
+            load_cold_s: 10.0,
+            load_warm_s: 1.0,
+            per_step_s: 0.0,
+            total_s: 12.0,
+            calibrated: false,
+            device_calibrated: true,
+            host_baseline: Some(1 << 30),
+        };
+        let encoder = profiles.encoder.as_mut().expect("the fixture carries the encoder plan");
+        encoder.forecast = Some(encoder_forecast.clone());
+        let total = run_forecast(&profiles).expect("a forecast");
+        assert_eq!(total.device_peak, (3 << 29) + (1 << 30), "device peaks add");
+        assert_eq!(total.host_peak, (1 << 32) + (1 << 31), "the encoder adds its growth, not a second baseline");
+        assert!((total.total_s - 52.0).abs() < 1e-9 && (total.load_cold_s - 40.0).abs() < 1e-9 && (total.load_warm_s - 4.0).abs() < 1e-9);
+        assert!((total.per_step_s - 1.0).abs() < 1e-9, "a denoise step is the pipeline's");
+        assert!(!total.calibrated, "calibrated only when both halves are");
+        // 2.5 GiB device, 6 GiB host, repeated 52 - 40 + 4 = 16 s.
+        assert_eq!(forecast_line(&profiles).as_deref(), Some("≈ 2.5 GiB video memory, 6.0 GiB RAM, ~16 s (52 s on the first run)"));
+
+        let encoder = profiles.encoder.as_mut().expect("the fixture carries the encoder plan");
+        encoder.forecast = Some(Forecast { host_baseline: None, ..encoder_forecast });
+        profiles.selected.forecast = Some(Forecast { host_baseline: None, ..pipeline_forecast() });
+        assert_eq!(run_forecast(&profiles).map(|total| total.host_peak), Some((1 << 32) + (1 << 30) + (1 << 31)), "no baseline: counted twice, over not under");
+
+        profiles.encoder = None;
+        assert_eq!(run_forecast(&profiles), profiles.selected.forecast, "no encoder: the plan's own forecast");
+    }
+
+    fn format_row(id: &str, fits_best: Option<StepChoice>) -> FormatRow {
+        FormatRow {
+            id: id.to_string(),
+            available: true,
+            reason: None,
+            dit_bytes: None,
+            compute_path: None,
+            quality_rank: None,
+            fits_best,
+        }
+    }
+
+    #[test]
+    fn a_format_row_label_names_where_auto_lands_or_that_it_does_not_fit() {
+        let _locale = english();
+        let pair = StepChoice { vram: VramStep::Phase, ram: RamStep::Keep };
+        assert_eq!(format_row_label(&format_row("q4_k_m", Some(pair))), "q4_k_m — fits as «Current stage only» / «Keep models in memory»");
+        assert_eq!(format_row_label(&format_row("bf16", None)), "bf16 — does not fit");
+    }
+
+    /// The encoder rows draw only when there is a choice (two rows or more), and drawing them
+    /// picks nothing by itself.
+    #[test]
+    fn the_encoder_rows_draw_only_with_a_choice() {
+        let mut profiles = fixture_profiles();
+        let ctx = egui::Context::default();
+        let mut format = "bf16".to_string();
+        let draw = |profiles: &LargeModelProfiles, format: &mut String| {
+            let mut picked = Some(String::new());
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| picked = draw_encoder_formats(ui, profiles, format));
+            let shapes = output.shapes.len();
+            // Headless: egui 0.36 panics when a `TexturesDelta` is dropped unapplied.
+            output.drop_without_applying_deltas();
+            (shapes, picked)
+        };
+        let (empty, picked) = draw(&profiles, &mut format);
+        assert_eq!(picked, None);
+        profiles.encoder_formats = vec![format_row("bf16", None)];
+        assert_eq!(draw(&profiles, &mut format), (empty, None), "one row offers no choice: nothing drawn");
+        profiles.encoder_formats.push(format_row("q8_0", None));
+        let (drawn, picked) = draw(&profiles, &mut format);
+        assert!(drawn > empty, "two rows are drawn");
+        assert_eq!(picked, None);
+        assert_eq!(format, "bf16", "drawing does not change the choice");
     }
 
     /// Every `large_models.*` / `ai_backend.large_models.*` key is in BOTH hand-maintained
