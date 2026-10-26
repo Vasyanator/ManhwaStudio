@@ -16,6 +16,9 @@ Key items:
   wire id, the sources each variant offers and the dtype token of its unquantized files.
 - `Flux2WeightFormat::offered_for`: per variant, axis and encoder source, the formats the
   engine may select; `closest_offered` maps a stored choice onto such a list.
+- `flux2_prompt_cache_precision_order` / `_rank`: the prompt cache's precision preference
+  (the format ids plus the provenance ids `fp8` and `gguf`), sent as
+  `params.prompt_cache_precision_order`.
 
 Notes:
 - The files behind each offered format are pinned in
@@ -143,6 +146,39 @@ const UNCENSORED_9B_FORMATS: [Flux2WeightFormat; 4] = [
 
 /// The formats of a component that is not published at all (no format can be selected).
 const NONE_OFFERED: [Flux2WeightFormat; 0] = [];
+
+/// Precision id of an entry made by the unquantized encoder with weight-only fp8
+/// (`text_encoder_fp8`): not a [`Flux2WeightFormat`], an entry PROVENANCE id of the prompt cache.
+pub const FLUX2_PROMPT_PRECISION_FP8: &str = "fp8";
+
+/// Precision id the backend derives for a hand-picked `.gguf` encoder whose quant it does not
+/// name (manual mode sends no format, protocol 21).
+pub const FLUX2_PROMPT_PRECISION_GGUF: &str = "gguf";
+
+/// The prompt-cache precision order, most precise first: every [`Flux2WeightFormat`] wire id in
+/// [`Flux2WeightFormat::all`] order, with [`FLUX2_PROMPT_PRECISION_FP8`] right after `q8_0`
+/// (an 8-bit float of the full encoder sits between the 8-bit and the 6-bit quants) and the
+/// unnamed [`FLUX2_PROMPT_PRECISION_GGUF`] last.
+const PROMPT_CACHE_PRECISION_ORDER: [&str; 7] = ["bf16", "q8_0", FLUX2_PROMPT_PRECISION_FP8, "q6_k", "q5_k_m", "q4_k_m", FLUX2_PROMPT_PRECISION_GGUF];
+
+/// The order in which the backend prefers prompt-cache entries of one encoder source, most
+/// precise first (sent as `params.prompt_cache_precision_order`, protocol 23). An entry's
+/// precision id is `fp8` when it was encoded with weight-only fp8, else its format id; an id
+/// missing from this list ranks last. Rust owns the order; the backend treats the ids as opaque.
+#[must_use]
+pub fn flux2_prompt_cache_precision_order() -> &'static [&'static str] {
+    &PROMPT_CACHE_PRECISION_ORDER
+}
+
+/// The rank of a precision id in [`flux2_prompt_cache_precision_order`] (0 = most precise); an
+/// unknown id ranks after every known one, exactly as the backend ranks it.
+#[must_use]
+pub fn flux2_prompt_cache_precision_rank(precision: &str) -> usize {
+    PROMPT_CACHE_PRECISION_ORDER
+        .iter()
+        .position(|id| *id == precision)
+        .unwrap_or(PROMPT_CACHE_PRECISION_ORDER.len())
+}
 
 impl Flux2WeightFormat {
     /// Every format, best quality first.
@@ -306,6 +342,22 @@ mod tests {
         assert_eq!(Flux2EncoderSource::from_wire(" uncensored "), Some(Flux2EncoderSource::Uncensored));
         assert_eq!(Flux2EncoderSource::from_wire("Uncensored"), None);
         assert_eq!(Flux2EncoderSource::from_wire(""), None);
+    }
+
+    /// The precision order is the format list (best first) with fp8 after `q8_0` and the
+    /// unnamed GGUF last; an unknown id ranks after all of them.
+    #[test]
+    fn the_prompt_cache_precision_order_follows_the_format_list() {
+        let mut expected: Vec<&str> = Flux2WeightFormat::all().iter().map(|format| format.wire()).collect();
+        let q8 = expected.iter().position(|id| *id == Flux2WeightFormat::Q80.wire()).expect("q8_0 is a format");
+        expected.insert(q8 + 1, FLUX2_PROMPT_PRECISION_FP8);
+        expected.push(FLUX2_PROMPT_PRECISION_GGUF);
+        assert_eq!(flux2_prompt_cache_precision_order(), expected.as_slice());
+        assert_eq!(flux2_prompt_cache_precision_order(), ["bf16", "q8_0", "fp8", "q6_k", "q5_k_m", "q4_k_m", "gguf"]);
+        assert_eq!(flux2_prompt_cache_precision_rank("bf16"), 0);
+        assert!(flux2_prompt_cache_precision_rank("fp8") < flux2_prompt_cache_precision_rank("q6_k"));
+        assert_eq!(flux2_prompt_cache_precision_rank("f32"), flux2_prompt_cache_precision_order().len());
+        assert_eq!(flux2_prompt_cache_precision_rank(""), flux2_prompt_cache_precision_order().len());
     }
 
     #[test]

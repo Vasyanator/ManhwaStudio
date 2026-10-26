@@ -64,7 +64,7 @@ functions with unit tests, not conditionals inside the drawing code.
   source of TWO picker entries (9B and 4B, one per `config::Flux2Variant`); its own
   `MODULE_README.md` is the map of the split and is where to look before editing it (IPC methods
   `inpaint.flux2_klein` streaming,
-  `.status`, `.unload`, `.component_action` streaming, the six
+  `.status`, `.unload`, `.component_action` streaming, the four
   `.prompt_cache.*` methods; the model download is the app's catalog, not a backend method). The user paints the
   area the model is ALLOWED to change, writes a prompt and gets that area regenerated; everything
   outside the painted mask must survive untouched, which is why the engine declares exactly ONE
@@ -77,23 +77,23 @@ functions with unit tests, not conditionals inside the drawing code.
   Google/Yandex/DeepL picker, which together fill in the ENGLISH field that is the only one sent, reusing the translation tab's own
   `translate_texts_via_translator` on a worker thread. That English field is never empty:
   `FLUX2_DEFAULT_PROMPT` is substituted both for a new settings file and for one whose prompt is
-  missing or blank, because an empty prompt blocks the run gate. Under it sits ONE compact line
-  about the PROMPT CACHE: `.status` answers `prompt_cached` for the prompt it was asked about (an
-  optional field — an absent one reads as "not known", never as "not cached"), and the line is shown
-  only while that answer still describes the prompt in the field. Which of the competing facts takes
-  that single line is the pure `flux2_prompt_cache_line`, and an unknown state draws NOTHING — an
-  outstanding query is not information. The LIBRARY that produces the caches is folded behind the
-  «Библиотека промптов» toggle beside the prompt (session state, never a setting), and folding it
-  away changes no gate. «Кэшировать» runs the streaming `.prompt_cache.build` on the SAME progress bar as a
-  generation (so neither can start while the other runs — reading the Qwen3 encoder off disk
-  costs tens of seconds, which a cached prompt skips entirely). The saved caches form a LIBRARY that lives
-  backend-side (`prompt_cache/`, one folder per encoder family): `.prompt_cache.list` fills a
-  `WheelComboBox` of named entries, `.save`/`.load` take a NAME (typed in an inline field beside
-  the button, following the watermark library and the typing presets rather than a modal of its
-  own), and `.export`/`.import` carry one entry through a `.msprompt` file with the same
-  non-blocking picker the model paths use. An imported file of a foreign family is stored under
-  that family and reported as such; the engine shows a warning, because such an entry never appears
-  in this family's list and the backend refuses to load it. `.status` and `.prompt_cache.list` are
+  missing or blank, because an empty prompt blocks the run gate. Under it sit the preset NAME
+  field with «Кэшировать» / «Переименовать», then ONE compact line about the PROMPT CACHE: whether
+  the prompt is served (`.status.prompt_cached`, three-state, shown only while that answer still
+  describes the field; or a preset of the typed text in the listing) and the encoder of the entry
+  in use; which fact takes that line is the pure `flux2_prompt_cache_line`, and an unknown state
+  draws NOTHING. The cached prompts form ONE LIBRARY PER MODEL (protocol 23, backend-side, named
+  presets; any encoder variant of the model may serve an entry): a run uses an entry
+  automatically when the typed text matches it exactly, choosing by the request's encoder source,
+  then precision, the other source as a fallback — the BACKEND's selection, rendered and never
+  re-derived here. «Кэшировать» runs the streaming `.prompt_cache.build` on the SAME progress bar
+  as a generation and is closed when the new entry would never be used (the current encoder's
+  own entry exists — a different name then offers «Переименовать» — or a strictly more precise
+  one of the same source). The «Библиотека промптов» toggle (session state) unfolds the shared
+  preset picker (`../shared/prompt_library_ui.rs`, a `SearchableComboBox`: row «Нет» = the last
+  uncached text, persisted as `uncached_prompt`; choosing a preset writes its TEXT into the
+  field) and «Экспорт» / «Импорт», which carry one entry through a `.msprompt` file with the
+  same non-blocking picker the model paths use. `.status` and `.prompt_cache.list` are
   re-armed through the same one-shot flags as the memory forecast, so editing the prompt cannot
   turn a keystroke into a request. GENERATION WITHOUT A LOCAL TEXT ENCODER is supported — see the
   contracts below. Model paths (Qwen3 text encoder folder, transformer file or diffusers folder,
@@ -219,7 +219,7 @@ functions with unit tests, not conditionals inside the drawing code.
   keep-in-view clamp — and a resize drag costs exactly one request, on release, rather than one per
   rendered frame. The size change is held in `region_resize_pending` because the rectangle usually
   does not change on the release frame itself. Everything that is NOT the geometry (a parameter,
-  the memory steps, a loaded prompt cache, a finished run, the settings load) still arms the
+  the memory steps, a built prompt cache, a finished run, the settings load) still arms the
   forecast directly, and a test pins that. Events that change the MACHINE rather than the
   question (a finished run, a component action, a cap or floor change, a backend reconnect, a
   download) INVALIDATE the held answer (`Flux2KleinEngine::invalidate_forecast`).
@@ -309,36 +309,24 @@ functions with unit tests, not conditionals inside the drawing code.
 - A settings file written by an older build carries keys that map to no field any more:
   `whole_region` (the mode is derived from the mask), `max_sequence_length` (PINNED to
   `FLUX2_MAX_SEQ` = 512 rather than a setting — 512 is the maximum, so every value a user could
-  pick is a reduction, and the length is part of the prompt-cache key, so lowering it invalidates
-  the whole saved `.msprompt` library at once) and `brush_radius` (the brush belongs to
+  pick is a reduction, and the length is part of every library entry's key, so lowering it
+  orphans the whole saved `.msprompt` library at once) and `brush_radius` (the brush belongs to
   the host's `MaskBrush`). `Flux2KleinSettings` does NOT use `deny_unknown_fields`, so serde drops
   them and the document loads with every other setting intact; no migration exists for any of them
   and none may be added. A test pins that such a document loads identically to the same document
   without the keys.
 - FLUX.2 klein RUNS WITHOUT A LOCAL TEXT ENCODER when the prompt is already cached: the denoise and
-  the VAE decode never read the encoder, so a `.msprompt` carried to a machine that never downloaded
-  the 16 GB Qwen3 is enough. The run gate (`flux2_run_block_reason`) therefore waives the
-  `text_encoder_path` requirement on `prompt_cached == Some(true)` and ONLY on that — `None` is "not
-  known" (or a backend too old to report the field, which could not generate without an encoder
-  anyway). The transformer, the VAE, the tokenizer and the scheduler are never waived, and the
-  backend keeps the final say (`_first_unavailable_reason`); this gate exists to explain a refusal
-  before the click, never to duplicate the decision. Three optional `.status`/`.prompt_cache` fields
-  carry the state, all parsed as three-state `Option<bool>` where an absent field means "not known"
-  and never `false`: `.status.text_encoder_available` (an empty path and a path that does not exist
-  are the same `false` — the second is what a settings file copied from another machine looks like),
-  `.prompt_cache.load.encoder_verified` (whether the encoder fingerprint was compared or the file's
-  metadata was taken on trust) and `.prompt_cache.list.text_encoder_available`. The UI consequences:
-  the one line under the prompt taking an amber warning (a warning, not an error — ready caches
-  still work) unless the prompt is already cached, in which case the affirmative wins because the
-  run works either way,
-  «Кэшировать» and «Сохранить кэш» disabled with their own tooltip (they are the only two library
-  operations that need the encoder, and the backend refuses both), «Загрузить»/«Экспорт»/«Импорт»
-  untouched, and a ONE-OFF notice in the prompt-cache warning slot after a load whose
-  `encoder_verified` was `false`. With no encoder there is no ACTIVE family, so `.prompt_cache.list`
-  answers an EMPTY top-level `family` and lists every family at once; each entry then carries its
-  own `family` and the combo shows it as `<family> / <name>`. That label is DISPLAY-ONLY — the wire
-  identifies an entry by NAME alone, and a name present in two families is a backend error rather
-  than an arbitrary choice.
+  the VAE decode never read the encoder, so a cached prompt is enough. The run gate
+  (`flux2_run_block_reason`) therefore waives the `text_encoder_path` requirement on
+  `prompt_cached == Some(true)` and ONLY on that — `None` is "not known". The transformer, the
+  VAE, the tokenizer and the scheduler are never waived, and the backend keeps the final say
+  (`_first_unavailable_reason`); this gate exists to explain a refusal before the click, never to
+  duplicate the decision. `.status.text_encoder_available` and
+  `.prompt_cache.list.text_encoder_available` are three-state `Option<bool>` (absent = "not
+  known", never `false`; an empty path and a path that does not exist are the same `false`). The
+  UI consequences: the one line under the prompt taking an amber warning unless the prompt is
+  served, in which case the affirmative wins, and «Кэшировать» closed with its own tooltip (it
+  must encode); the picker, «Экспорт» and «Импорт» keep working.
 - FLUX.2 klein's request blob is `region.png ++ mask.png` with the mask an L8 PNG of EXACTLY the
   region size; the response header's `image_len` is validated with STRICT equality against the blob
   length and the decoded PNG must be exactly the region size. The response also carries
@@ -507,7 +495,9 @@ functions with unit tests, not conditionals inside the drawing code.
   test).
 - To change FLUX.2 klein's parameters, prompt block, prompt-cache library, memory steps or
   model-download block: `flux2_klein/`, whose `MODULE_README.md` says which
-  file owns which of them. The wire names of its methods live in `backend_ipc::protocol`.
+  file owns which of them. The wire names of its methods live in `backend_ipc::protocol`. The
+  model-agnostic half of the prompt library (listing shapes, exact-text preset match, «Нет»
+  stash, the preset picker) is `shared/prompt_library*`, ready for another engine's library.
 - To change what one of FLUX.2 klein's lines SAYS, edit its pure function and its test, never the
   drawing code (`flux2_klein/decisions.rs`): `flux2_readiness_line` (the readiness line),
   `flux2_prompt_cache_line` (the one line under the prompt), `flux2_component_rows` / `flux2_component_row_tooltip` (a row of the

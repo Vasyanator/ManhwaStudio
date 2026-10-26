@@ -14,8 +14,9 @@ Main responsibilities:
   `mod.rs`;
 - the prompt translation (`start_translate`, `poll_translate`) and the non-blocking file
   dialogs (`start_picker`, `poll_picker`);
-- the six `.prompt_cache.*` jobs, the header they share and the outcome they apply
-  (`start_prompt_cache_*`, `poll_prompt_cache`, `apply_prompt_cache_outcome`).
+- the `.prompt_cache.*` jobs (build / rename, export, import, the library listing), the header
+  they share and the outcome they apply (`start_prompt_cache_*`, `poll_prompt_cache`,
+  `apply_prompt_cache_outcome`, `poll_and_maybe_query_prompt_cache_list`).
 
 Key functions:
 - one `start_*` / `poll_*` pair per operation, all on `impl Flux2KleinEngine`
@@ -265,107 +266,68 @@ impl Flux2KleinEngine {
         self.dirty = true;
         self.status_wanted = true;
         self.resources.arm();
-        // The encoder family — and therefore the whole library listing — is decided by
-        // the model paths, so a new path invalidates the list just as it does the catalog.
+        // Every listed entry's `current_encoder` is an answer about the encoder path, so a new
+        // path invalidates the listing just as it does the catalog.
         self.prompt_cache_list_wanted = true;
     }
 
-    /// Starts the prompt-cache build on a worker thread.
+    /// Starts the prompt-cache build (`renamed` = «Переименовать») on a worker thread.
     ///
-    /// Streaming, and it claims the shared progress bar exactly as a generation does —
-    /// reading the Qwen3 encoder takes long enough that the user needs to see it move.
-    /// Claiming the generation here, on the GUI thread, is what makes a cancel and a moved
-    /// frame able to retire and stop it, just like a run.
-    pub(super) fn start_prompt_cache_build(&mut self) {
+    /// The preset name is the name field; an empty field sends no `name`, and the backend then
+    /// keeps the preset's name or derives one from the text (its rule, one owner). Streaming, and it claims the shared progress bar exactly as a
+    /// generation does — reading the Qwen3 encoder takes long enough that the user needs to see
+    /// it move; a rename answers at once (the backend encodes nothing the current encoder
+    /// already serves). Claiming the generation here, on the GUI thread, is what makes a cancel
+    /// able to retire and stop it, just like a run.
+    pub(super) fn start_prompt_cache_build(&mut self, renamed: bool) {
         if self.prompt_cache_rx.is_some() {
             return;
         }
-        let header = self.prompt_cache_header(&[]);
+        let name = normalize_preset_name(&self.prompt_cache_name_input);
+        let header = if name.is_empty() { self.prompt_cache_header(&[]) } else { self.prompt_cache_header(&[("name", json!(name))]) };
         let claim = begin_progress_generation(&self.progress);
         let progress = Arc::clone(&self.progress);
         let (tx, rx) = mpsc::channel();
         self.prompt_cache_rx = Some(rx);
-        self.prompt_cache_status =
-            Some(t!("cleaning.tools.flux2_klein.prompt_cache_building_status").to_string());
+        self.prompt_cache_status = Some(
+            if renamed { t!("cleaning.tools.flux2_klein.prompt_cache_renaming_status") } else { t!("cleaning.tools.flux2_klein.prompt_cache_building_status") }
+                .to_string(),
+        );
         // A warning belongs to the operation that produced it, not to the next one.
         self.prompt_cache_warning = None;
         thread::spawn(move || {
-            let result = build_flux2_prompt_cache(header, &progress, &claim);
-            let _ = tx.send(result);
+            let _ = tx.send(build_flux2_prompt_cache(header, renamed, &progress, &claim));
         });
     }
 
-    /// Stores the current prompt's cache in the library under the name in the field.
-    pub(super) fn start_prompt_cache_save(&mut self) {
-        let name = self.prompt_cache_name_input.trim().to_string();
-        if name.is_empty() {
-            return;
-        }
-        let header = self.prompt_cache_header(&[("name", json!(name.clone()))]);
-        self.start_prompt_cache_job(
-            t!("cleaning.tools.flux2_klein.prompt_cache_saving_status"),
-            move || save_flux2_prompt_cache(header).map(|()| Flux2PromptCacheOutcome::Saved(name)),
-        );
-    }
-
-    /// Loads the selected library entry into the backend's live cache.
-    pub(super) fn start_prompt_cache_load(&mut self) {
-        let Some(name) = self.prompt_cache_selected.clone() else {
-            return;
-        };
-        let header = self.prompt_cache_header(&[("name", json!(name))]);
-        self.start_prompt_cache_job(
-            t!("cleaning.tools.flux2_klein.prompt_cache_loading_status"),
-            move || load_flux2_prompt_cache(header).map(Flux2PromptCacheOutcome::Loaded),
-        );
-    }
-
-    /// Writes the entry the export dialog was opened for to the dialog's `target`.
+    /// Writes the library file the export dialog was opened for to the dialog's `target`.
     pub(super) fn start_prompt_cache_export(&mut self, target: SaveTarget) {
-        let Some(name) = self.prompt_cache_export_name.take() else {
+        let Some(file) = self.prompt_cache_export_file.take() else {
             return;
         };
         let path = target.write_path().to_path_buf();
-        let header = self.prompt_cache_header(&[
-            ("name", json!(name)),
-            ("path", json!(path.to_string_lossy())),
-        ]);
-        self.start_prompt_cache_job(
-            t!("cleaning.tools.flux2_klein.prompt_cache_exporting_status"),
-            move || {
-                // The backend writes the whole file to the target's write path; only then is the
-                // target published (a no-op on desktop, a blocking stream on Android).
-                export_flux2_prompt_cache(header)?;
-                target.commit().map_err(|err| err.user_message())?;
-                Ok(Flux2PromptCacheOutcome::Exported(path))
-            },
-        );
+        let header = self.prompt_cache_header(&[("file", json!(file)), ("path", json!(path.to_string_lossy()))]);
+        self.start_prompt_cache_job(t!("cleaning.tools.flux2_klein.prompt_cache_exporting_status"), move || {
+            // The backend writes the whole file to the target's write path; only then is the
+            // target published (a no-op on desktop, a blocking stream on Android).
+            export_flux2_prompt_cache(header)?;
+            target.commit().map_err(|err| err.user_message())?;
+            Ok(Flux2PromptCacheOutcome::Exported(path))
+        });
     }
 
-    /// Takes the file at `path` into the library.
-    ///
-    /// No `name` is sent: the backend then names the entry after the file's own stem,
-    /// which is what the user just picked and therefore recognises.
+    /// Takes the file at `path` into the library it belongs to (the backend decides which, from
+    /// the file itself).
     pub(super) fn start_prompt_cache_import(&mut self, path: PathBuf) {
-        let family = self.prompt_cache_family().to_string();
         let header = self.prompt_cache_header(&[("path", json!(path.to_string_lossy()))]);
-        self.start_prompt_cache_job(
-            t!("cleaning.tools.flux2_klein.prompt_cache_importing_status"),
-            move || import_flux2_prompt_cache(header, &family),
-        );
+        self.start_prompt_cache_job(t!("cleaning.tools.flux2_klein.prompt_cache_importing_status"), move || import_flux2_prompt_cache(header));
     }
 
-    /// Builds a prompt-cache request header: the normalized settings under `params`
-    /// (which is what identifies the encoder family) plus the operation's own fields.
+    /// Builds a prompt-cache request header: the normalized settings under `params` (the
+    /// library id, the encoder paths and source, the precision order) plus the operation's own
+    /// fields.
     pub(super) fn prompt_cache_header(&self, extra: &[(&str, Value)]) -> Value {
         flux2_prompt_cache_header(&self.settings.normalized(), extra)
-    }
-
-    /// The encoder family the library listing describes, empty when it is not known yet.
-    pub(super) fn prompt_cache_family(&self) -> &str {
-        self.prompt_cache_library
-            .as_ref()
-            .map_or("", |library| library.family.as_str())
     }
 
     /// Runs one prompt-cache `job` on a worker thread, showing `running` meanwhile.
@@ -399,16 +361,12 @@ impl Flux2KleinEngine {
                 Ok(Ok(library)) => {
                     self.prompt_cache_list_rx = None;
                     self.prompt_cache_list_error = None;
-                    // A selection that the refreshed listing no longer contains is
-                    // dropped rather than left pointing at a deleted entry.
-                    if let Some(selected) = self.prompt_cache_selected.as_ref()
-                        && !library.entries.iter().any(|entry| &entry.name == selected)
-                    {
-                        self.prompt_cache_selected = None;
-                    }
-                    // A CHANGED library (not the first listing) re-asks the forecast: what the
-                    // backend counts for the encoder may follow the prompt caches it holds.
-                    if self.prompt_cache_library.as_ref().is_some_and(|previous| *previous != library) {
+                    // A listing that differs from the one held — the FIRST one included: the
+                    // first `.list` of a process is what migrates the old caches, and `.status`
+                    // never does — re-asks `.status` (whether the prompt is served) and the
+                    // forecast (whether the encoder counts).
+                    if self.prompt_cache_library.as_ref() != Some(&library) {
+                        self.status_wanted = true;
                         self.invalidate_forecast();
                     }
                     self.prompt_cache_library = Some(library);
@@ -436,12 +394,7 @@ impl Flux2KleinEngine {
         }
     }
 
-    /// Drains the prompt-cache channel into the status line under the prompt field.
-    ///
-    /// A finished BUILD re-arms `.status`, which is what turns the line above the buttons
-    /// green, and invalidates the forecast (the encoder may no longer be part of the run). A
-    /// finished LOAD additionally writes the prompt the file was built from into the field,
-    /// so the user sees exactly what they loaded, and persists it.
+    /// Drains the prompt-cache channel into the outcome line of the library fold.
     pub(super) fn poll_prompt_cache(&mut self) {
         let Some(rx) = self.prompt_cache_rx.as_ref() else {
             return;
@@ -467,78 +420,39 @@ impl Flux2KleinEngine {
 
     /// Applies one finished prompt-cache operation and returns the line to show for it.
     ///
-    /// Save and import both change the library, so both re-arm `.list`: the combo must
-    /// show the new entry without the user reopening the panel. A load whose
-    /// `encoder_verified` came back `false` additionally raises the one-off notice that the
-    /// entry's encoder identity was taken on trust.
+    /// A build (or rename) and an import change the library, so both re-arm `.list` — whose
+    /// arrival re-asks `.status` and the forecast. A build also re-asks them at once: the run
+    /// may no longer need the encoder. An import that landed in ANOTHER model's library raises
+    /// the one-off warning that it will not be listed here.
     pub(super) fn apply_prompt_cache_outcome(&mut self, outcome: Flux2PromptCacheOutcome) -> String {
         match outcome {
-            Flux2PromptCacheOutcome::Built => {
-                // The live cache changed, so the catalog's `prompt_cached` is stale — and so is
-                // the forecast: whether the run will ENCODE (and so whether the encoder counts
-                // into the total) is the backend's answer about that same cache.
+            Flux2PromptCacheOutcome::Built { written, renamed } => {
+                self.prompt_cache_list_wanted = true;
                 self.status_wanted = true;
                 self.invalidate_forecast();
-                t!("cleaning.tools.flux2_klein.prompt_cache_built_status").to_string()
-            }
-            Flux2PromptCacheOutcome::Saved(name) => {
-                self.prompt_cache_list_wanted = true;
-                // The entry the user has just created is the one they will act on next.
-                self.prompt_cache_selected = Some(name.clone());
-                tf!(
-                    "cleaning.tools.flux2_klein.prompt_cache_saved_status",
-                    name = name
-                )
-            }
-            // An entry that carries no prompt is refused rather than half-applied: an
-            // empty prompt would block the run gate, and silently clearing the field would
-            // look like the tool had lost the user's text.
-            Flux2PromptCacheOutcome::Loaded(loaded) if loaded.prompt.is_empty() => {
-                t!("cleaning.tools.flux2_klein.prompt_cache_load_empty_error").to_string()
-            }
-            Flux2PromptCacheOutcome::Loaded(loaded) => {
-                self.settings.prompt = loaded.prompt;
-                self.dirty = true;
-                self.status_wanted = true;
-                self.resources.arm();
-                // The load SUCCEEDED and everything checkable was checked; what could not
-                // be checked is the encoder's own fingerprint, because there is no local
-                // encoder to compare it against. That is a one-off remark about this
-                // operation — it rides the same warning slot as the foreign-family notice
-                // and is cleared by the next operation — not a standing alarm.
-                if loaded.encoder_verified == Some(false) {
-                    self.prompt_cache_warning = Some(
-                        t!("cleaning.tools.flux2_klein.prompt_cache_unverified_encoder_warning")
-                            .to_string(),
-                    );
+                if !written.is_empty() {
+                    t!("cleaning.tools.flux2_klein.prompt_cache_built_status").to_string()
+                } else if renamed {
+                    t!("cleaning.tools.flux2_klein.prompt_cache_renamed_status").to_string()
+                } else {
+                    t!("cleaning.tools.flux2_klein.prompt_cache_already_built_status").to_string()
                 }
-                t!("cleaning.tools.flux2_klein.prompt_cache_loaded_status").to_string()
             }
             Flux2PromptCacheOutcome::Exported(path) => tf!(
                 "cleaning.tools.flux2_klein.prompt_cache_exported_status",
                 path = path.display()
             ),
-            Flux2PromptCacheOutcome::Imported {
-                name,
-                family_matches,
-            } => {
+            Flux2PromptCacheOutcome::Imported { name, library_matches, already_present } => {
                 self.prompt_cache_list_wanted = true;
-                // A foreign entry was still imported — into ITS family's folder, so it is
-                // not lost — but it will not appear in this family's list and the backend
-                // will refuse to load it. Saying so is the whole point: the alternative is
-                // a successful import the user then cannot find anywhere.
-                if family_matches == Some(false) {
-                    self.prompt_cache_warning = Some(
-                        t!("cleaning.tools.flux2_klein.prompt_cache_import_foreign_warning")
-                            .to_string(),
-                    );
-                } else if !name.is_empty() {
-                    self.prompt_cache_selected = Some(name.clone());
+                if library_matches == Some(false) {
+                    self.prompt_cache_warning =
+                        Some(t!("cleaning.tools.flux2_klein.prompt_cache_import_other_library_warning").to_string());
                 }
-                tf!(
-                    "cleaning.tools.flux2_klein.prompt_cache_imported_status",
-                    name = name
-                )
+                if already_present {
+                    tf!("cleaning.tools.flux2_klein.prompt_cache_import_already_present_status", name = name)
+                } else {
+                    tf!("cleaning.tools.flux2_klein.prompt_cache_imported_status", name = name)
+                }
             }
         }
     }
@@ -581,31 +495,50 @@ mod tests {
         );
     }
 
-    /// A finished «Кэшировать» changes what the run will encode, so the held forecast is
-    /// marked stale and asked again; a CHANGED library listing does the same, while the
-    /// first listing and an identical one do not re-ask.
+    /// A finished «Кэшировать» changes what the run will encode, so the held forecast and
+    /// `.status` are re-asked and the listing too; a listing that differs from the one held
+    /// (the first one included: it is what migrates the old caches) re-asks `.status` and the
+    /// forecast, an identical one does not.
     #[test]
-    fn a_built_prompt_cache_and_a_changed_library_re_ask_the_forecast() {
+    fn a_built_prompt_cache_and_a_changed_library_re_ask_status_and_the_forecast() {
         let _locale_guard = ms_config::locale_store::GLOBAL_LOCALE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut engine = Flux2KleinEngine::default();
+        let mut engine = Flux2KleinEngine { prompt_cache_list_wanted: false, status_wanted: false, ..Flux2KleinEngine::default() };
         engine.resources.wanted = false;
-        engine.apply_prompt_cache_outcome(Flux2PromptCacheOutcome::Built);
-        assert!(engine.resources.wanted, "a built cache re-arms the forecast");
+        engine.apply_prompt_cache_outcome(Flux2PromptCacheOutcome::Built { written: Vec::new(), renamed: true });
+        assert!(engine.resources.wanted && engine.status_wanted && engine.prompt_cache_list_wanted, "a build re-asks everything it changed");
 
-        let listing = |names: &[&str]| Flux2PromptCacheList {
-            entries: names.iter().map(|name| Flux2PromptCacheEntry { name: (*name).to_string(), ..Flux2PromptCacheEntry::default() }).collect(),
-            ..Flux2PromptCacheList::default()
+        let listing = |texts: &[&str]| {
+            parse_prompt_library_listing(&json!({
+                "texts": texts.iter().map(|text| json!({ "prompt": text, "entries": [{ "file": format!("{text}.msprompt") }] })).collect::<Vec<_>>()
+            }))
         };
-        let deliver = |engine: &mut Flux2KleinEngine, library: Flux2PromptCacheList| {
+        let deliver = |engine: &mut Flux2KleinEngine, library: PromptLibraryListing| {
             let (tx, rx) = mpsc::channel();
             tx.send(Ok(library)).expect("the receiver is alive");
             engine.prompt_cache_list_rx = Some(rx);
+            engine.prompt_cache_list_wanted = false;
             engine.resources.wanted = false;
+            engine.status_wanted = false;
             engine.poll_and_maybe_query_prompt_cache_list();
-            engine.resources.wanted
+            (engine.resources.wanted, engine.status_wanted)
         };
-        assert!(!deliver(&mut engine, listing(&["sfx"])), "the first listing is not a change");
-        assert!(!deliver(&mut engine, listing(&["sfx"])), "an identical listing is not a change");
-        assert!(deliver(&mut engine, listing(&["sfx", "title"])), "a changed listing re-arms the forecast");
+        let mut fresh = Flux2KleinEngine::default();
+        assert_eq!(deliver(&mut fresh, listing(&["sfx"])), (true, true), "the first listing may have migrated old caches");
+        assert_eq!(deliver(&mut fresh, listing(&["sfx"])), (false, false), "an identical listing is not a change");
+        assert_eq!(deliver(&mut fresh, listing(&["sfx", "title"])), (true, true), "a changed listing re-arms both");
+    }
+
+    /// An import into another model's library warns once; an entry already present says so.
+    #[test]
+    fn an_import_reports_another_library_and_an_entry_already_present() {
+        let _locale_guard = ms_config::locale_store::GLOBAL_LOCALE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut engine = Flux2KleinEngine::default();
+        let line = engine.apply_prompt_cache_outcome(Flux2PromptCacheOutcome::Imported { name: "sfx".to_string(), library_matches: Some(false), already_present: false });
+        assert_eq!(line, tf!("cleaning.tools.flux2_klein.prompt_cache_imported_status", name = "sfx"));
+        assert!(engine.prompt_cache_warning.is_some() && engine.prompt_cache_list_wanted);
+        let mut present = Flux2KleinEngine::default();
+        let line = present.apply_prompt_cache_outcome(Flux2PromptCacheOutcome::Imported { name: "sfx".to_string(), library_matches: None, already_present: true });
+        assert_eq!(line, tf!("cleaning.tools.flux2_klein.prompt_cache_import_already_present_status", name = "sfx"));
+        assert!(present.prompt_cache_warning.is_none(), "an unknown library match invents no warning");
     }
 }

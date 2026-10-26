@@ -2,7 +2,7 @@
 
 ## Purpose
 The model-agnostic building blocks the LARGE-model engines of the «ИИ-редактор области» share
-(FLUX.2 klein and FLUX.3 klein). Each lives here so every large-model engine composes it
+(FLUX.2 klein and FLUX.3 klein; the prompt library is used by FLUX.2 klein only so far). Each lives here so every large-model engine composes it
 instead of copying it. An engine adds only what is its own: its
 request headers, its settings document and migrations, its staleness rules, its sentences.
 
@@ -21,6 +21,9 @@ engine (flux2_klein/, flux3_klein/)
                          region_edit_v2::engine_settings_file
   -> region_mask         mask_for_run
   -> postprocess_section draw_postprocess_section (the «Постобработка» chrome, bottom-docked)
+  -> prompt_library      PromptLibraryListing / Text / Entry + parsers (protocol 23 EntryInfo),
+                         find / derived_pick / track_uncached / apply_pick / sync_preset_name
+  -> prompt_library_ui   draw_prompt_library_picker (SearchableComboBox, row «Нет» + presets)
 ```
 `mod.rs` re-exports every submodule flat, so an engine writes `use super::shared::*;`. The
 forecast / caps / learned-floor half of «Память и скорость» is NOT here: it is
@@ -62,6 +65,16 @@ forecast / caps / learned-floor half of «Память и скорость» is 
   (collapsed by default, titled `ms_region_postprocess::section_title()`) around
   `ms_region_postprocess::draw_postprocess_body`. For an engine whose runs answer raw pixels
   (`AiEngine::postprocess_settings`); the host re-derives a pending result from what it edits.
+
+- `prompt_library.rs`: the model-agnostic half of a model's prompt-cache LIBRARY (GUI-free): the
+  `EntryInfo` / `.prompt_cache.list` shapes and their tolerant parsers (every field optional; a
+  row with nothing to pick is dropped), the exact-text preset match (`find`: trimmed, case- and
+  inner-whitespace-sensitive), the derived picker selection, the «Нет» stash rule
+  (`track_uncached`), the pick rule (`apply_pick`), the name-field sync (`sync_preset_name`) and
+  the display helpers (`default_preset_name`, `preview_line`, `format_library_created`).
+- `prompt_library_ui.rs`: `draw_prompt_library_picker` — the labelled `SearchableComboBox` of
+  presets (row 0 «Нет»; primary = preset name, secondary = the encoder of the entry in use and its
+  date, hover = the prompt and every entry's encoder); the encoder caption is the engine's closure.
 
 ## Contracts and invariants
 - **Nothing names a model.** Log lines take a `log_label`; user texts are
@@ -106,6 +119,16 @@ forecast / caps / learned-floor half of «Память и скорость» is 
   `ScrollArea` or a pinned section: `bottom_aligned` measures the free room against that `Ui`.
   Its `id` is stable and never localized. The body, defaults and ranges belong to
   `ms-region-postprocess`; never copy a dial into an engine.
+- **The prompt library renders the backend's selection, never re-derives it.** Which entry a run
+  uses is `selected` / `prompt_cache_entry`; this side only matches the typed text to a preset.
+  The picker's selection is DERIVED from the prompt field every frame and never stored; choosing a
+  row writes the preset's TEXT (or the «Нет» stash) into the field and nothing else — the
+  embeddings are read by the run.
+- **A preset name is normalized exactly as the backend stores it** (`normalize_preset_name`:
+  the explicit `NAME_REMOVED_RANGES` table, trim, 100-character cap). The table mirrors
+  `modules/ai_backend/runtime/prompt_library.py`; both sides' tests read
+  `modules/ai_backend/runtime/fixtures/preset_name_normalization.json`, so change the rule only
+  together with that file and the Python side.
 - Visibility ceiling: `pub(in crate::tools::ai_editor::engines)`.
 
 ## Editing map
@@ -119,5 +142,8 @@ forecast / caps / learned-floor half of «Память и скорость» is 
   teardown flush: `../../../region_edit_v2/engine_settings_file.rs`.
 - To change where the «Постобработка» section sits or its chrome: `postprocess_section.rs`; its
   dials and texts: `ms-region-postprocess` (`ui.rs`).
+- To change how a library listing is read, what the typed text matches or what «Нет» keeps:
+  `prompt_library.rs`; how the picker looks: `prompt_library_ui.rs` and the
+  `cleaning.tools.prompt_library.*` keys.
 - Tests sit at the end of each file; the catalog tests (every key in every shipped locale, with
   its placeholders) are in `hf_download_ui.rs` and `stream_progress_ui.rs`.

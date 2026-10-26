@@ -39,10 +39,11 @@ Coverage:
   vocabulary and the per-component availability are the service's single answer,
   never re-derived here), returns the post-action snapshot, and propagates every
   refusal;
-- the six `inpaint.flux2_klein.prompt_cache.*` methods: `build` streams the
-  prompt phase and is cancellable, `name`/`path` are required non-empty strings,
-  `overwrite` defaults to `false`, an import's `name` is optional and trimmed,
-  and the import answer carries `family_matches` for the foreign-family warning;
+- the four `inpaint.flux2_klein.prompt_cache.*` methods (protocol 23): `build`
+  streams the prompt phase, is cancellable and forwards an optional string
+  `name`; `export` requires a non-empty `file` and `path`; `import` a non-empty
+  `path`; the answers pass through verbatim; `.save` / `.load` are gone (no
+  handler, not in `ALL_METHODS`);
 - the two `inpaint.flux2_klein.download.*` methods are gone (protocol 22: the
   application's model catalog downloads the weights): no handler, not in
   `ALL_METHODS`;
@@ -72,8 +73,6 @@ from modules.ai_backend.ipc.protocol import (
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST,
-    METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD,
-    METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE,
     METHOD_INPAINT_FLUX2_KLEIN_STATUS,
     METHOD_INPAINT_FLUX2_KLEIN_UNLOAD,
 )
@@ -187,55 +186,27 @@ class _FakeFlux2KleinService:
 
     # ---- prompt-cache library ----
     def prompt_cache_build(
-        self, params: dict[str, Any] | None, *, progress_callback: Any = None
+        self, params: dict[str, Any] | None, *, name: str | None = None, progress_callback: Any = None
     ) -> dict[str, Any]:
-        self.prompt_cache_calls.append(("build", params, {}))
+        self.prompt_cache_calls.append(("build", params, {"name": name}))
         if progress_callback is not None:
             for frame in BUILD_PROGRESS_SCRIPT:
                 progress_callback(*frame)
         if self._raise_exc is not None:
             raise self._raise_exc
-        return {"prompt": "clean", "encoded": True, "prompt_cached": True, "device": "cuda:0"}
+        return {"prompt": "clean", "name": name or "clean", "encoded": True, "written": [], "renamed": False, "prompt_cached": True, "device": "cuda:0"}
 
     def prompt_cache_list(self, params: dict[str, Any] | None) -> dict[str, Any]:
         self.prompt_cache_calls.append(("list", params, {}))
-        return {"family": "text_encoder-abcd1234", "directory": "/x", "entries": [], "skipped": []}
+        return {"library": "flux2_klein_9b", "directory": "/x", "texts": [], "skipped": [], "text_encoder_available": True, "legacy": None}
 
-    def prompt_cache_save(
-        self, params: dict[str, Any] | None, name: str, *, overwrite: bool = False
-    ) -> dict[str, Any]:
-        self.prompt_cache_calls.append(("save", params, {"name": name, "overwrite": overwrite}))
-        return {"family": "f", "name": name, "path": "/x/f/n.msprompt", "size_bytes": 42}
+    def prompt_cache_export(self, params: dict[str, Any] | None, file: str, path: str) -> dict[str, Any]:
+        self.prompt_cache_calls.append(("export", params, {"file": file, "path": path}))
+        return {"library": "flux2_klein_9b", "file": file, "path": path, "size_bytes": 42}
 
-    def prompt_cache_load(self, params: dict[str, Any] | None, name: str) -> dict[str, Any]:
-        self.prompt_cache_calls.append(("load", params, {"name": name}))
-        return {"family": "f", "name": name, "prompt": "clean", "prompt_cached": True}
-
-    def prompt_cache_export(
-        self, params: dict[str, Any] | None, name: str, path: str
-    ) -> dict[str, Any]:
-        self.prompt_cache_calls.append(("export", params, {"name": name, "path": path}))
-        return {"family": "f", "name": name, "path": path, "size_bytes": 42}
-
-    def prompt_cache_import(
-        self,
-        params: dict[str, Any] | None,
-        path: str,
-        *,
-        name: str | None = None,
-        overwrite: bool = False,
-    ) -> dict[str, Any]:
-        self.prompt_cache_calls.append(
-            ("import", params, {"path": path, "name": name, "overwrite": overwrite})
-        )
-        return {
-            "family": "other-ffffffff",
-            "name": name or "theirs",
-            "path": "/x/other/theirs.msprompt",
-            "size_bytes": 42,
-            "family_matches": False,
-            "current_family": "text_encoder-abcd1234",
-        }
+    def prompt_cache_import(self, params: dict[str, Any] | None, path: str) -> dict[str, Any]:
+        self.prompt_cache_calls.append(("import", params, {"path": path}))
+        return {"library": "flux2_klein_4b", "file": "theirs-0123456789-abcdef01.msprompt", "prompt": "clean", "name": "theirs", "library_matches": False, "already_present": False, "origin": "imported"}
 
 
 class _RecordingDispatcher:
@@ -681,7 +652,7 @@ def test_component_action_honours_cancellation_before_start() -> None:
 def test_prompt_cache_build_streams_the_prompt_phase() -> None:
     svc = _FakeFlux2KleinService()
     emitter, disp = _emitter()
-    params = {"prompt": "clean background"}
+    params = {"prompt": "clean background", "prompt_library": "flux2_klein_9b"}
 
     handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD)
     header, blob = handler(_ctx(svc, emitter=emitter), {"params": params}, b"", _no_cancel())
@@ -690,7 +661,7 @@ def test_prompt_cache_build_streams_the_prompt_phase() -> None:
         (phase, step) for phase, step, _total, _label in BUILD_PROGRESS_SCRIPT
     ]
     assert all(frame_blob == b"" for _h, frame_blob in disp.frames)
-    assert svc.prompt_cache_calls == [("build", params, {})]
+    assert svc.prompt_cache_calls == [("build", params, {"name": None})]
     assert header["prompt_cached"] is True
     assert blob == b""
 
@@ -700,7 +671,23 @@ def test_prompt_cache_build_without_an_emitter_still_answers() -> None:
     handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD)
     header, _blob = handler(_ctx(svc), {"params": None}, b"", _no_cancel())
     assert header["encoded"] is True
-    assert svc.prompt_cache_calls == [("build", {}, {})]
+    assert svc.prompt_cache_calls == [("build", {}, {"name": None})]
+
+
+@pytest.mark.parametrize("name", ["Кот", "", "  spaced  "])
+def test_prompt_cache_build_forwards_the_name_verbatim(name: str) -> None:
+    svc = _FakeFlux2KleinService()
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD)
+    header, _blob = handler(_ctx(svc), {"params": {}, "name": name}, b"", _no_cancel())
+    assert svc.prompt_cache_calls == [("build", {}, {"name": name})]
+    assert header["name"] == (name or "clean")
+
+
+@pytest.mark.parametrize("bad_name", [7, [], {}, True])
+def test_prompt_cache_build_refuses_a_non_string_name(bad_name: Any) -> None:
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD)
+    with pytest.raises(ValueError):
+        handler(_ctx(_FakeFlux2KleinService()), {"params": {}, "name": bad_name}, b"", _no_cancel())
 
 
 def test_prompt_cache_build_honours_cancellation_before_start() -> None:
@@ -716,114 +703,37 @@ def test_prompt_cache_build_honours_cancellation_before_start() -> None:
 def test_prompt_cache_list_passes_the_params_through() -> None:
     svc = _FakeFlux2KleinService()
     handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST)
-    header, blob = handler(
-        _ctx(svc), {"params": {"text_encoder_path": "/enc"}}, b"", _no_cancel()
-    )
-    assert header["family"] == "text_encoder-abcd1234"
-    assert header["entries"] == []
+    params = {"text_encoder_path": "/enc", "prompt_library": "flux2_klein_9b"}
+    header, blob = handler(_ctx(svc), {"params": params}, b"", _no_cancel())
+    assert header["library"] == "flux2_klein_9b"
+    assert header["texts"] == []
+    assert header["legacy"] is None
     assert blob == b""
-    assert svc.prompt_cache_calls == [("list", {"text_encoder_path": "/enc"}, {})]
+    assert svc.prompt_cache_calls == [("list", params, {})]
 
 
-def test_prompt_cache_save_forwards_the_name_and_the_overwrite_flag() -> None:
-    svc = _FakeFlux2KleinService()
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE)
-    header, _blob = handler(
-        _ctx(svc), {"params": {}, "name": "пресет", "overwrite": True}, b"", _no_cancel()
-    )
-    assert header["name"] == "пресет"
-    assert svc.prompt_cache_calls == [("save", {}, {"name": "пресет", "overwrite": True})]
-
-
-def test_prompt_cache_save_defaults_to_refusing_an_overwrite() -> None:
-    svc = _FakeFlux2KleinService()
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE)
-    handler(_ctx(svc), {"params": {}, "name": "пресет"}, b"", _no_cancel())
-    assert svc.prompt_cache_calls[0][2]["overwrite"] is False
-
-
-@pytest.mark.parametrize(
-    "method",
-    [
-        METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE,
-        METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD,
-    ],
-)
-@pytest.mark.parametrize("name", [None, "", "   ", 7])
-def test_a_missing_or_empty_name_is_a_request_error(method: str, name: Any) -> None:
-    header: dict[str, Any] = {"params": {}}
-    if name is not None:
-        header["name"] = name
-    handler = get_handler(method)
-    with pytest.raises(ValueError):
-        handler(_ctx(_FakeFlux2KleinService()), header, b"", _no_cancel())
-
-
-def test_prompt_cache_load_returns_the_prompt_from_the_file() -> None:
-    svc = _FakeFlux2KleinService()
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD)
-    header, _blob = handler(_ctx(svc), {"params": {}, "name": "пресет"}, b"", _no_cancel())
-    assert header["prompt"] == "clean"
-    assert header["prompt_cached"] is True
-
-
-def test_prompt_cache_export_requires_both_a_name_and_a_path() -> None:
+def test_prompt_cache_export_requires_both_a_file_and_a_path() -> None:
     handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT)
-    with pytest.raises(ValueError):
-        handler(_ctx(_FakeFlux2KleinService()), {"params": {}, "name": "n"}, b"", _no_cancel())
-    with pytest.raises(ValueError):
-        handler(
-            _ctx(_FakeFlux2KleinService()), {"params": {}, "path": "/x.msprompt"}, b"", _no_cancel()
-        )
+    for header in ({"params": {}, "file": "n.msprompt"}, {"params": {}, "path": "/x.msprompt"}, {"params": {}, "file": " ", "path": "/x.msprompt"}, {"params": {}, "name": "n", "path": "/x.msprompt"}):
+        with pytest.raises(ValueError):
+            handler(_ctx(_FakeFlux2KleinService()), header, b"", _no_cancel())
 
     svc = _FakeFlux2KleinService()
-    header, _blob = handler(
-        _ctx(svc), {"params": {}, "name": "n", "path": "/x.msprompt"}, b"", _no_cancel()
-    )
-    assert header["path"] == "/x.msprompt"
-    assert svc.prompt_cache_calls == [("export", {}, {"name": "n", "path": "/x.msprompt"})]
+    header, _blob = handler(_ctx(svc), {"params": {}, "file": "n.msprompt", "path": "/x.msprompt"}, b"", _no_cancel())
+    assert header == {"library": "flux2_klein_9b", "file": "n.msprompt", "path": "/x.msprompt", "size_bytes": 42}
+    assert svc.prompt_cache_calls == [("export", {}, {"file": "n.msprompt", "path": "/x.msprompt"})]
 
 
-def test_prompt_cache_import_reports_a_foreign_family() -> None:
+def test_prompt_cache_import_passes_the_answer_through() -> None:
     svc = _FakeFlux2KleinService()
     handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT)
-    header, _blob = handler(
-        _ctx(svc), {"params": {}, "path": "/in/theirs.msprompt"}, b"", _no_cancel()
-    )
-    # The Rust side warns on this; the import itself is not an error.
-    assert header["family_matches"] is False
-    assert header["family"] == "other-ffffffff"
-    assert svc.prompt_cache_calls == [
-        ("import", {}, {"path": "/in/theirs.msprompt", "name": None, "overwrite": False})
-    ]
-
-
-def test_prompt_cache_import_accepts_an_explicit_name() -> None:
-    svc = _FakeFlux2KleinService()
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT)
-    handler(
-        _ctx(svc),
-        {"params": {}, "path": "/in/theirs.msprompt", "name": "  взято  ", "overwrite": True},
-        b"",
-        _no_cancel(),
-    )
-    assert svc.prompt_cache_calls[0][2] == {
-        "path": "/in/theirs.msprompt",
-        "name": "взято",
-        "overwrite": True,
-    }
-
-
-@pytest.mark.parametrize("bad_name", [7, [], {}])
-def test_prompt_cache_import_refuses_a_non_string_name(bad_name: Any) -> None:
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT)
+    header, _blob = handler(_ctx(svc), {"params": {}, "path": "/in/theirs.msprompt"}, b"", _no_cancel())
+    # The Rust side warns on another library; the import itself is not an error.
+    assert header["library_matches"] is False
+    assert header["library"] == "flux2_klein_4b"
+    assert svc.prompt_cache_calls == [("import", {}, {"path": "/in/theirs.msprompt"})]
     with pytest.raises(ValueError):
-        handler(
-            _ctx(_FakeFlux2KleinService()),
-            {"params": {}, "path": "/in/x.msprompt", "name": bad_name},
-            b"",
-            _no_cancel(),
-        )
+        handler(_ctx(_FakeFlux2KleinService()), {"params": {}}, b"", _no_cancel())
 
 
 def test_every_prompt_cache_method_is_registered() -> None:
@@ -831,12 +741,17 @@ def test_every_prompt_cache_method_is_registered() -> None:
         METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST,
-        METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE,
-        METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT,
     ):
         assert get_handler(method) is not None
+
+
+@pytest.mark.parametrize("method", ["inpaint.flux2_klein.prompt_cache.save", "inpaint.flux2_klein.prompt_cache.load"])
+def test_the_save_and_load_methods_are_gone(method: str) -> None:
+    # Protocol 23: a preset is saved by `.build` and read by the run itself.
+    assert get_handler(method) is None
+    assert method not in ALL_METHODS
 
 
 # ---------------------------------------------------------------------------

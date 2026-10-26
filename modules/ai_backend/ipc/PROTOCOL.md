@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `22` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `23` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `crates/ms-backend-ipc/src/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -78,7 +78,7 @@ WebSocket is only a carrier.
 
 | Field             | Type   | Required on            | Meaning                                                                 |
 |-------------------|--------|------------------------|-------------------------------------------------------------------------|
-| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 22. Optional/ignored on others.  |
+| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 23. Optional/ignored on others.  |
 | `id`              | u64    | all framed messages    | Correlation id. `0` means a server-initiated frame (events, hello).     |
 | `kind`            | string | all                    | One of `hello`,`request`,`response`,`progress`,`event`,`cancel`,`error`.|
 | `method`          | string | `request`              | Method name, e.g. `ocr.manga`. See §5.                                  |
@@ -425,15 +425,13 @@ application's model catalog fetches every component, 4B and 9B (v22 removed
 | method                          | request fields (inline)                                                                 | blob(req)              | response fields (status=ok)                                            | blob(resp) | stream  | cancel |
 |---------------------------------|------------------------------------------------------------------------------------------|------------------------|--------------------------------------------------------------------------|------------|---------|--------|
 | `inpaint.flux2_klein`           | `image_len: int`, `mask_len: int`, `reference_len: int?`, `params: object` (see below)     | region PNG ++ mask PNG [++ reference PNG] | `image_len: int`, `oom_recovered: bool`, `applied: {vae_tiling: bool}`, `text_attention_in_mask: bool`, `vram_step`, `ram_step`, `vram_step_effective`, `ram_step_effective`, `degraded: bool`, `degrade_reason: string\|null` (§5.10) | result PNG | **yes** | yes    |
-| `inpaint.flux2_klein.status`    | `params: object={}` (the three paths and `prompt`; may be partial)                         | none                   | `available: bool`, `reason: string\|null`, `components: object`, `components_busy: bool`, `loaded: bool`, `device: string`, `prompt_cached: bool`, `text_encoder_available: bool`, `guidance_supported: bool` | none | no | no |
+| `inpaint.flux2_klein.status`    | `params: object={}` (the three paths and `prompt`; may be partial)                         | none                   | `available: bool`, `reason: string\|null`, `components: object`, `components_busy: bool`, `loaded: bool`, `device: string`, `prompt_cached: bool`, `prompt_cache_entry: EntryInfo\|null` (v23), `text_encoder_available: bool`, `guidance_supported: bool` | none | no | no |
 | `inpaint.flux2_klein.unload`    | (none)                                                                                     | none                   | `unloaded: bool`                                                          | none       | no      | no     |
 | `inpaint.flux2_klein.component_action` | `params: object`, `component: string`, `action: string`                             | none                   | `component`, `action`, `performed: bool`, `components: object`, `components_busy: false`, `device: string` | none | **yes** | yes |
-| `inpaint.flux2_klein.prompt_cache.build`  | `params: object`                                                         | none                   | `prompt: string`, `encoded: bool`, `prompt_cached: true`, `device: string` | none      | **yes** | yes    |
-| `inpaint.flux2_klein.prompt_cache.list`   | `params: object` (`text_encoder_path` optional)                          | none                   | `family: string`, `directory: string`, `entries: array`, `skipped: array`, `text_encoder_available: bool` | none | no | no |
-| `inpaint.flux2_klein.prompt_cache.save`   | `params: object`, `name: string`, `overwrite: bool=false`                | none                   | `family`, `name`, `path`, `size_bytes`, `prompt`, `created_at`            | none       | no      | no     |
-| `inpaint.flux2_klein.prompt_cache.load`   | `params: object`, `name: string`                                         | none                   | `family`, `name`, `path`, `prompt`, `prompt_cached: true`, `max_sequence_length`, `dtype`, `created_at`, `encoder_verified: bool` | none | no | no |
-| `inpaint.flux2_klein.prompt_cache.export` | `params: object`, `name: string`, `path: string` (`*.msprompt`)          | none                   | `family`, `name`, `path`, `size_bytes`                                    | none       | no      | no     |
-| `inpaint.flux2_klein.prompt_cache.import` | `params: object`, `path: string` (`*.msprompt`), `name: string?`, `overwrite: bool=false` | none | `family`, `name`, `path`, `size_bytes`, `prompt`, `created_at`, `current_family`, `family_matches: bool` | none | no | no |
+| `inpaint.flux2_klein.prompt_cache.build`  | `params: object` (`prompt_library` required), `name: string?`           | none                   | `prompt: string`, `name: string`, `encoded: bool`, `written: [EntryInfo]`, `renamed: bool`, `prompt_cached: true`, `device: string` | none | **yes** | yes |
+| `inpaint.flux2_klein.prompt_cache.list`   | `params: object` (`prompt_library` required; paths optional)             | none                   | `library: string`, `directory: string`, `texts: [{prompt, name, selected: EntryInfo, entries: [EntryInfo]}]`, `skipped: [{file, reason}]`, `text_encoder_available: bool`, `legacy: {migrated, deleted, not_migrated, directory}\|null` | none | no | no |
+| `inpaint.flux2_klein.prompt_cache.export` | `params: object` (`prompt_library` required), `file: string`, `path: string` (`*.msprompt`) | none   | `library`, `file`, `path`, `size_bytes`                                   | none       | no      | no     |
+| `inpaint.flux2_klein.prompt_cache.import` | `params: object`, `path: string` (`*.msprompt`)                          | none                   | `library`, `file`, `prompt`, `name`, `library_matches: bool`, `already_present: bool`, `origin` | none | no | no |
 
 `params` keys (all optional except `transformer_path` and `vae_path`;
 out-of-range numbers are clamped, an unknown enum or a missing/absent
@@ -453,7 +451,13 @@ runs on the CPU from RAM at every VRAM step; §5.10 "Encoder on the CPU"),
 `max_sequence_length` (64..512, default 512),
 `text_attention_in_mask: bool` (default `false`; see below),
 `transformer_format` / `transformer_formats` and `text_encoder_format` /
-`text_encoder_formats` (v21; see "weight formats" below).
+`text_encoder_formats` (v21; see "weight formats" below),
+`prompt_library` (v23: the model's prompt library id, `^[a-z0-9_]{1,40}$`,
+`flux2_klein_9b` / `flux2_klein_4b`; absent or `null` = no library, memory
+only), `text_encoder_source` (v23: the selected encoder source id,
+`^[a-z0-9_]{1,32}$`, e.g. `stock` / `uncensored`; absent, `null` or `""` =
+unknown), `prompt_cache_precision_order` (v23: distinct precision ids, most
+precise first; absent = `[]`); see "prompt library" below.
 Retired fields are refused BY NAME (a request error naming the field, the
 protocol that retired it and what replaced it), even with a `null` value: a
 stale client gets a clear error instead of a silently ignored choice. They are
@@ -692,95 +696,110 @@ through the SAME admission (reserves, limits, reclaim) that a generation does.
   and after it returns (`download.start` also polls it at every chunk); cancelling a
   FLUX.2 run mid-way is not supported yet.
 
-**FLUX.2 klein prompt cache.** Encoding a prompt costs a ~16 GB read of the Qwen3
-encoder (tens of seconds) and yields ~4 MiB of
-embeddings, so embeddings are cached in memory and can be kept on disk. The
-in-memory cache, `prompt_cache.build`, `prompt_cache.load` and `status`'s
-`prompt_cached` all use ONE key: prompt text + encoder path +
-`max_sequence_length` + `dtype` + `text_encoder_fp8`.
+**FLUX.2 klein prompt library** (v23). Encoding a prompt costs an encoder read of
+up to ~16 GB (tens of seconds) and yields ~12.6 MB (9B) / ~7.9 MB (4B) of
+embeddings, so embeddings are kept in memory (LRU of 8) and as NAMED PRESETS in
+one library per MODEL: `<program root>/prompt_cache/<prompt_library>/`. Any
+encoder variant of the model may serve its entries.
 
-- `prompt_cached` in `.status` is `true` only when a READY embedding exists for
-  exactly that combination. An empty prompt, an unset path or an unknown enum
-  answers `false` without an error — the UI polls this while the user types.
-- `prompt_cache.build` encodes the prompt and NOTHING else: no transformer, no
-  VAE, no image. It streams the same `phase:"load"` frames as a run, but only the
-  prompt phase's steps occur (0, then 7-9 of the same 0..9 scale), because no
-  pipeline is built. Only the encoder handle is admitted, so it never demands
-  room for the 9B transformer. `encoded: false` means the cache
-  already covered the prompt and nothing was read. The encoder is released
-  afterwards unless one was already resident with the same settings.
-- **The library** lives at `<program root>/prompt_cache/<encoder family>/<name>.msprompt`.
-  A family directory is `<encoder folder name>-<8 hex of the encoder fingerprint>`
-  — readable, and unique even though every checkout names its folder
-  `text_encoder`. Family and entry names are sanitized to a single path
-  component, so neither a user-chosen name nor a hand-made file can write outside
-  the library. An existing entry name is refused unless `overwrite: true`:
-  rebuilding a lost entry costs the encoder read it was saved to avoid. Every
-  write is atomic (`<name>.<pid>.part` + `fsync` + `os.replace`).
-- **`.msprompt`** is a safetensors container with one `prompt_embeds` tensor and
-  a string `__metadata__` map: `format`
-  (`manhwastudio.flux2_klein.prompt_cache`), `format_version`, the ORIGINAL
-  `prompt`, `max_sequence_length`, `dtype`, `text_encoder_fp8`,
-  `text_encoder_id`, `text_encoder_family`, `text_encoder_path` (informational
-  only) and `created_at`. `text_encoder_id` is a SHA-256 of the encoder's
-  `config.json` plus the sorted `(file name, size)` list of its weight files —
-  cheap on purpose: hashing the 16 GB would cost more than re-encoding.
-- **A file that does not match is refused, never "loaded to see".** `.load`
-  answers `status:"error"` naming the field that disagrees: another encoder,
-  another `max_sequence_length`, another dtype (including a metadata that
-  disagrees with the tensor's own dtype token), another fp8 setting, a container
-  without our format marker, or a newer `format_version`. Foreign embeddings
-  would load silently and denoise into a different picture — a wrong result with
-  no error attached.
-- **`.import` files an entry under the family recorded IN THE FILE**, not under
-  the currently selected encoder, so an imported cache is never lost among
-  another encoder's entries. A mismatch is not an error: the answer carries
-  `family_matches: false` (with `current_family`) for the client to warn about.
-  `.load` of a foreign entry stays a hard error — importing files a cache away,
-  loading feeds a generation.
-- `.list` returns `entries` (`name`, `family`, `prompt`, `created_at`,
-  `size_bytes`, `max_sequence_length`, `dtype`) plus `skipped` (`name`, `reason`,
-  and `family` in a library-wide listing): a corrupt or foreign file in the
-  directory is reported, never fatal.
-- The blob is always empty; this method never streams a preview.
+- **Selection (one owner, the backend).** For every text a run needs — the
+  prompt, plus `""` under effective classifier-free guidance — the candidates
+  are the memory and library embeddings of the EXACT text (the stripped prompt;
+  case and inner whitespace count) at the request's `max_sequence_length`, minus
+  those whose width the transformer does not accept. They are ranked: the
+  request's `text_encoder_source` first (only when non-empty), then
+  `prompt_cache_precision_order` (an entry's precision id is `fp8` when its
+  encoder ran with `text_encoder_fp8`, else its format id; unknown ids last),
+  memory before a file, newer, file name. The client never re-derives this; it
+  renders `prompt_cache_entry` / `selected`.
+- `.status` `prompt_cached` is `true` only when EVERY needed text is served;
+  `prompt_cache_entry` is the `EntryInfo` of the prompt's choice (`null` when
+  none). An empty prompt, an unset path or an invalid field answers
+  `false` / `null` without an error — the UI polls this while the user types.
+  `.status` never migrates.
+- **`EntryInfo`** = `{file, name, encoder_source, encoder_format, encoder_fp8,
+  encoder_label, current_encoder, created_at, size_bytes, origin}`. `origin` is
+  `built` | `imported` | `migrated_v1` | `migrated_v1_unverified` for a library
+  file, `memory` for an embedding encoded in this process and not saved (then
+  `file` and `name` are `""`, `size_bytes` 0; an embedding read from a file
+  reports that file). `current_encoder` = made by the request's encoder (same
+  fingerprint AND `text_encoder_fp8`; `false` without an encoder).
+  `encoder_source` is `""` when unknown (manual mode, unverified migration);
+  `encoder_label` is then the encoder's folder or file name.
+- **`.prompt_cache.build`** («Кэшировать») writes, for every needed text, an
+  entry of the CURRENT encoder unless one exists, reusing an embedding the
+  backend already encoded with that encoder, else encoding through the encoder
+  handle alone (no transformer, no VAE, no image; frames 0, then 7-9 of the
+  0..9 `load` scale; the encoder is released afterwards unless it was resident).
+  It requires an encoder (an entry names the encoder that made it).
+  `encoded: false` = nothing was read; `written` = the entries actually written
+  (`[]` when all existed). `name` (optional): absent or empty keeps the preset's
+  name (a new preset gets the first ~40 characters of the text); a different
+  name RENAMES the preset — every entry of that text, a header rewrite, no
+  encode, `renamed: true`. The empty negative prompt's entry is never named.
+- **`.prompt_cache.list`** reconciles the library with its files and answers its
+  presets, newest first; `""` is never listed, nor a text without an entry at
+  the request's length. Each row: `prompt`, `name` (the newest non-empty entry
+  name), `entries` ranked by the selection rule, `selected` = the first.
+  `skipped` lists files that are not valid entries (never fatal, never deleted).
+  `legacy` reports this process's v1 migration (`null` when there was nothing
+  to migrate).
+- **`.prompt_cache.export`** copies the entry `file` (a bare file name from a
+  listing) to `path`, atomically; an existing destination is replaced (the
+  save dialog asked).
+- **`.prompt_cache.import`** copies `path` into the library IT belongs to (a v2
+  file's `library`; a non-FLUX.2 library is refused) — `library_matches` says
+  whether that is the requested one; `already_present: true` when the same
+  entry was there (nothing written). A v1 file is converted by the migration
+  rules below; one that would be deleted or kept is refused naming the reason.
+- **Container v2** (`.msprompt`): a safetensors file with one `prompt_embeds`
+  bf16 tensor and a string `__metadata__`: `format`
+  (`manhwastudio.prompt_cache`), `format_version` (`2`), `library`, `name`,
+  `prompt`, `max_sequence_length`, `dtype`, `encoder_source`, `encoder_format`,
+  `encoder_fp8`, `encoder_id`, `encoder_label`, `created_at`, `origin`, plus
+  informational `text_encoder_path` / `migrated_from`. File names are
+  deterministic (`<slug>-<text hash>-<encoder id>[-fp8].msprompt`); the file is
+  the truth, `index.json` beside it a rebuildable cache. `encoder_id` is a
+  SHA-256 of the encoder's `config.json` plus the sorted `(file name, size)` of
+  its weight files (a GGUF file: config + name + size), salted with the RoPE
+  base when the loader normalizes it — cheap on purpose.
+- **v1 migration** (once per process, on the first `.list` / `.build` /
+  `.import` / run naming a library). The v22 layout
+  `prompt_cache/<encoder family>/<name>.msprompt` (format
+  `manhwastudio.flux2_klein.prompt_cache` v1) is classified against every
+  locally findable encoder: an entry recorded under the pre-RoPE-fix identity
+  of a RoPE-normalized encoder, or under an unknown uncensored encoder, is
+  DELETED (its embeddings are, or may be, wrong); every other one is written as
+  a v2 entry (name = its file name, library by tensor width), verified, and only
+  then is its v1 file deleted; an emptied family directory is removed; a file
+  that cannot be migrated (float16, unknown width, unreadable) stays in place
+  and is counted in `not_migrated`.
+- The blob is always empty; these methods never stream a preview.
+- v22's `.prompt_cache.save` / `.load` are gone (unknown methods): a preset is
+  saved by `.build` and read by the run itself.
 
 **Generating without a text encoder.** `text_encoder_path` is OPTIONAL: an
 embedding is all a run needs, and the four denoising steps and the VAE decode
-never touch the encoder. A `.msprompt` copied to a machine where the 16 GB Qwen3
-was never downloaded therefore works — the client sends no encoder path (or one
-that no longer exists, which is what a settings file carried over from another
-machine looks like; both mean the same thing), calls `prompt_cache.load` and then
-generates.
+never touch the encoder. A machine where the Qwen3 encoder was never downloaded
+therefore generates every prompt its library serves — the client sends no
+encoder path (or one that no longer exists, which is what a settings file
+carried over from another machine looks like; both mean the same thing).
 
-- The absence is an error only where a prompt actually has to be ENCODED: a
-  generation whose prompt is not in the cache, and `prompt_cache.build`. Both
-  answer `status:"error"` before anything is loaded, naming both ways out —
-  configure an encoder, or load a ready cache for this prompt. A path that exists
-  but carries no `config.json` stays a hard error rather than degrading into "no
-  encoder".
-- **What `.load` still checks with no encoder present**: the format marker, the
-  format version, `max_sequence_length`, the dtype (metadata AND the tensor's own
-  dtype token) and the fp8 flag. Only the fingerprint comparison is skipped, and
-  the answer says which happened in `encoder_verified` — `true` when the
-  fingerprint was compared, `false` when the file's own metadata was taken on
-  trust. Clients should surface the difference rather than hide it.
-- **The library has no current family without an encoder**, because the family
-  name is derived from the encoder. `.list` then spans EVERY family: each entry
-  names its own `family`, the top-level `family` is `""` (none is active) and
-  `directory` is the library root. `.load` and `.export` look a name up across
-  families; a name present in two of them is a `status:"error"` naming both
-  rather than an arbitrary choice. `.save` is the one library method that still
-  REQUIRES an encoder — the entry it writes has to name the encoder that produced
-  it.
+- The absence is an error only where a prompt actually has to be ENCODED: a run
+  with a text no embedding serves, and `prompt_cache.build`. Both answer
+  `status:"error"` before anything is loaded. A path that exists but carries no
+  `config.json` stays a hard error rather than degrading into "no encoder". A
+  run whose chosen file vanished after the plan re-plans; with no encoder to
+  fall back on it is refused naming the file.
 - `.status` reports `text_encoder_available` next to `available`. `available` is
   not `false` merely because the encoder is missing when `prompt_cached` is
   `true`; the client is expected to warn from `text_encoder_available: false`
-  that only ready caches will work. Only the encoder is optional — the
+  that only cached prompts will work. Only the encoder is optional — the
   `tokenizer/` and `scheduler/` directories are pipeline components and are still
   required.
-- `large_models.profiles` answers `encoder: null` on such a machine (nothing will
-  be encoded and nothing can be resident), so the forecast is the pipeline's alone. It is advice; the
-  manager's admission of the run is the guard.
+- `large_models.profiles` answers `encoder: null` when nothing will be encoded
+  and the encoder is not resident, so the forecast is the pipeline's alone. It
+  is advice; the manager's admission of the run is the guard.
 
 **FLUX.2 klein: guidance and distilled checkpoints.** `.status` answers
 `guidance_supported: bool` — whether `guidance_scale` can do anything at all on

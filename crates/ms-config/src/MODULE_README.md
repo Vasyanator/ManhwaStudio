@@ -86,7 +86,10 @@ that defines the type.
   `bf16` / `f16`): the ONE list of FLUX.2 klein weight formats for both axes, with
   `offered_for(variant, axis, source)` (transformer and stock encoder: all five for both
   variants; 9B uncensored encoder: no `Q5_K_M`; 4B uncensored: empty) and `closest_offered`
-  (keep, else the next smaller offered quant, else bf16) for a source switch.
+  (keep, else the next smaller offered quant, else bf16) for a source switch. It also owns the
+  prompt cache's precision order (`flux2_prompt_cache_precision_order`: the format ids best
+  first, `fp8` after `q8_0`, `gguf` last; `_rank` puts an unknown id last), which the engine
+  sends as `params.prompt_cache_precision_order` and the backend treats as opaque ids.
   The files of each offered format are pinned in `ms_sysprobe::ai_models::external_catalog`;
   the Python backend lists no quants (the ids are opaque to it).
 - `app_tab.rs`: `AppTab` — the editor tab set. `ALL` + `key()` (the persistence contract) and
@@ -229,7 +232,7 @@ binary that installs a UI locale). Those crates enable `test-support` from their
   Its `DocKind` is inferred from the file name (`settings.json` → `ProjectSettings`, else
   `UserConfig`) unless `JsonConfig::with_kind` names it.
 - **Persisted spellings are frozen.** `AppTab::key()`, `Flux2Variant::wire()` /
-  `dir_name()` / `settings_file_name()`, `Flux2WeightFormat::wire()`,
+  `dir_name()` / `settings_file_name()` / `prompt_library_id()` (a backend directory name), `Flux2WeightFormat::wire()`,
   `Flux2EncoderSource::wire()`, `MemoryProfile::as_config_str()`,
   `StorageMode::as_config_str()` (A11), `TorchFlavour::as_token()`, the `GfxArch` spelling and the
   `bubble_status` field names are on disk in users' documents. They are byte-stable across

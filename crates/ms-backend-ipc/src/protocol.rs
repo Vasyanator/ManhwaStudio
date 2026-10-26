@@ -135,7 +135,21 @@ use serde_json::{Map, Value, json};
 /// 22: `inpaint.flux2_klein.download.check` / `.start` are removed (the app's model catalog
 /// downloads every FLUX.2 klein weight, 4B and 9B; the backend answers the old names as unknown
 /// methods). No other wire change.
-pub const PROTOCOL_VERSION: u32 = 22;
+/// 23: FLUX.2 klein prompt library: one library per model
+/// (`prompt_cache/<library id>/`, container v2 `manhwastudio.prompt_cache` +
+/// `index.json`) of NAMED presets, served on an exact prompt match by any
+/// encoder variant; new optional `inpaint.flux2_klein*` params `prompt_library`,
+/// `text_encoder_source`, `prompt_cache_precision_order`; `.status` gains
+/// `prompt_cache_entry` (EntryInfo or null) and its `prompt_cached` covers memory
+/// and library; `.prompt_cache.build` takes optional `name` and answers
+/// {prompt, name, encoded, written, renamed, prompt_cached, device};
+/// `.prompt_cache.list` answers {library, directory, texts, skipped,
+/// text_encoder_available, legacy}; `.prompt_cache.export` takes `file`;
+/// `.prompt_cache.import` answers {library, file, prompt, name, library_matches,
+/// already_present, origin}; `.prompt_cache.save` / `.load` are removed; v1
+/// entries are migrated once (pre-RoPE-fix and unprovable uncensored ones are
+/// deleted).
+pub const PROTOCOL_VERSION: u32 = 23;
 
 // ============================================================================
 // FRAME SIZE GUARDS
@@ -240,36 +254,28 @@ pub const METHOD_INPAINT_FLUX2_KLEIN_UNLOAD: &str = "inpaint.flux2_klein.unload"
 /// never a silent no-op. The wire contract is `dev-docs/flux2_component_residency.md`.
 pub const METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION: &str =
     "inpaint.flux2_klein.component_action";
-/// Encodes the `params.prompt` with the Qwen3 text encoder and keeps the
-/// embeddings in the backend's prompt cache (streaming: reading the ~16 GB encoder
-/// takes tens of seconds, and the progress frames carry `phase`/`step`/`total`/`label` just
-/// like a generation). Afterwards `.status` reports `prompt_cached = true` for that
-/// prompt and a generation skips the encoder entirely.
+/// Makes a prompt-cache LIBRARY entry from the CURRENT text encoder for every text the run
+/// needs (`params.prompt`, plus the empty negative prompt under an effective guidance), under the
+/// preset name `name` (top-level, optional: absent keeps the preset's name or derives one).
+/// Streaming: reading the encoder takes tens of seconds, and the progress frames carry
+/// `phase`/`step`/`total`/`label` just like a generation. A text already served by an entry of
+/// the current encoder is not re-encoded; a different `name` renames the preset. Answers
+/// `{prompt, name, encoded, written: [EntryInfo], renamed, prompt_cached, device}`; refused
+/// without an encoder.
 pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD: &str =
     "inpaint.flux2_klein.prompt_cache.build";
-/// Lists the saved prompt-cache LIBRARY entries of the encoder family named by
-/// `params`. The answer carries the family name plus one record per entry (name,
-/// the prompt it was built from, and when it was created).
+/// Lists the library `params.prompt_library`: one row per cached text (`prompt`, preset `name`,
+/// the `selected` entry a run would use and every entry), plus `skipped`,
+/// `text_encoder_available` and the one-time v1 migration report `legacy`. One-shot.
 pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST: &str =
     "inpaint.flux2_klein.prompt_cache.list";
-/// Stores the cached embeddings of `params.prompt` in the library under
-/// `params.name`. A name already taken is refused with an explicit error rather
-/// than overwritten. One-shot.
-pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE: &str =
-    "inpaint.flux2_klein.prompt_cache.save";
-/// Loads library entry `params.name` into the backend's live cache and answers with
-/// the `prompt` it was built from, so the tool can show what was actually loaded. An
-/// entry belonging to a different encoder family is refused. One-shot.
-pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD: &str =
-    "inpaint.flux2_klein.prompt_cache.load";
-/// Writes library entry `params.name` to the file `params.path`, for handing it to
-/// someone else. One-shot.
+/// Writes library entry `file` (top-level) to the file `path`, for handing it to someone
+/// else. One-shot.
 pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT: &str =
     "inpaint.flux2_klein.prompt_cache.export";
-/// Takes the file `params.path` into the library. A file built for a DIFFERENT
-/// encoder family is still imported — into that family's folder, so it is not lost —
-/// and the answer says so; such an entry does not appear in the current family's
-/// listing and cannot be loaded. One-shot.
+/// Takes the `.msprompt` file `path` (v2, or v1 converted by the migration rules) into the
+/// library it belongs to; the answer says whether that is the request's library
+/// (`library_matches`) and whether the entry was already present. One-shot.
 pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT: &str =
     "inpaint.flux2_klein.prompt_cache.import";
 /// FLUX.3 klein region edit (streaming, mid-run cancel). Request header: `image_len`,

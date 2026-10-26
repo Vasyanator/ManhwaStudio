@@ -29,8 +29,9 @@ Run order (a memory contract, see `service._run_locked`): the pipeline handle
 is admitted and loaded first, the text encoder handle second (on the GPU when
 the device holds it beside the pipeline, else on the CPU from RAM), then the
 denoise and the VAE decode run as manager phases. The prompt-embedding cache
-(in memory, LRU; a library of `.msprompt` files on disk) lets a run skip the
-encoder entirely, including on a machine where none is installed.
+(in memory, LRU; one library of `.msprompt` presets per model on disk, served
+by an exact text match whatever encoder variant made the entry) lets a run
+skip the encoder entirely, including on a machine where none is installed.
 
 Model layout:
 Nothing is downloaded. The user supplies three paths — a Qwen3 text encoder (a
@@ -51,7 +52,8 @@ Module layout (this file re-exports the package's public surface):
 - `components.py`   - the five components as files on disk (and a GGUF file's config).
 - `attention.py`    - `text_attention_in_mask`: token grid, layout, the mask and its bytes.
 - `hardware.py`     - device resolution, memory snapshot, torch cache clearing.
-- `prompt_cache.py` - encoder fingerprint, the `.msprompt` container, the library.
+- `prompt_cache.py` - encoder identity and provenance, the FLUX.2 libraries over
+                      `runtime.prompt_library`, the v1 migration.
 - `pipeline.py`     - what a phase does with the placed modules; residency / actions.
 - `large_model.py`  - the manager specs, options, phase work, decode fallbacks.
 - `memory.py`       - step pair and step keys, the combined VRAM-axis rule, the two-handle forecast.
@@ -74,7 +76,7 @@ log = logging.getLogger(__name__)
 
 # The names below are the package's public surface (`server.py`, the FLUX.2 test
 # modules). WARNING: the patch points (`memory_snapshot`, `_clear_torch_cache`,
-# `_resolve_selected_backend_device`, `_tables_for`, `write_prompt_file`,
+# `_resolve_selected_backend_device`, `_tables_for`, `program_root`,
 # `build_text_attention_mask`, ...) must be patched on their DEFINING module, never
 # on this package: the re-export here is a separate binding, so patching it would
 # be a silent no-op for every real caller.
@@ -199,39 +201,29 @@ from .conversion import (  # noqa: F401  - re-exported public surface
     require_known_layout,
 )
 from .prompt_cache import (  # noqa: F401  - re-exported public surface
+    FLUX2_LIBRARY_IDS,
+    LEGACY_LIBRARY_BY_WIDTH,
     PROMPT_CACHE_DIRNAME,
-    PROMPT_CACHE_FAMILY_HASH_CHARS,
-    PROMPT_CACHE_FORMAT,
-    PROMPT_CACHE_SUFFIX,
     PROMPT_CACHE_TENSOR,
-    PROMPT_CACHE_VERSION,
     PROMPT_EMBED_CACHE_ENTRIES,
-    encoder_family_name,
-    find_prompt_cache_entry,
-    list_prompt_cache_entries,
-    list_prompt_cache_families,
-    local_encoder_identity,
-    prompt_cache_entry_path,
-    prompt_cache_family_dir,
+    V1_FORMAT,
+    KnownEncoder,
+    MigrationReport,
+    V1Verdict,
+    classify_v1_entry,
+    convert_v1_metadata,
+    encoder_label,
+    encoder_provenance,
+    ensure_legacy_migrated,
+    flux2_library_spec,
+    is_current_encoder,
+    known_local_encoders,
+    library_of,
+    migrate_legacy_families,
     prompt_cache_root,
-    prompt_file_metadata,
-    publish_bytes_atomically,
-    read_prompt_file_header,
-    read_prompt_file_tensor,
-    require_free_entry_path,
-    require_prompt_file_destination,
-    require_prompt_file_source,
-    sanitize_name_component,
+    read_v1_header,
     text_encoder_fingerprint,
-    validate_prompt_file_metadata,
-    write_prompt_file,
-    _ENCODER_WEIGHT_SUFFIXES,
-    _MAX_NAME_LENGTH,
-    _PROMPT_CACHE_DTYPE_TOKENS,
-    _SAFE_NAME_EXTRA,
-    _encoder_origin_hint,
-    _foreign_prompt_file_message,
-    _short_id,
+    transformer_text_width,
 )
 from .attention import (  # noqa: F401  - re-exported public surface
     MASK_ROW_ALIGNMENT,

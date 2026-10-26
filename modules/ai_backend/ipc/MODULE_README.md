@@ -35,8 +35,7 @@ frame_ws_server.py       — WebSocket (TCP) listener; token-authed handshake, s
                 ├── flux_fill.py   — inpaint.flux_fill (+ unload, + status); streaming
                 ├── flux2_klein.py — inpaint.flux2_klein (+ status, unload,
                 │                    component_action,
-                │                    prompt_cache.build/list/save/load/export/import,
-                │                    download.check/start); streaming
+                │                    prompt_cache.build/list/export/import); streaming
                 ├── flux3_klein.py — inpaint.flux3_klein (+ status, unload,
                 │                    download.check/start); streaming, mid-run cancel
                 ├── streaming.py   — shared request / progress helpers (no methods)

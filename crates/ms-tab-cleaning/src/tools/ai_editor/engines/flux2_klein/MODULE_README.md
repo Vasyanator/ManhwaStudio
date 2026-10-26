@@ -3,8 +3,8 @@
 ## Purpose
 The FLUX.2 klein engine of the «ИИ-редактор области» tool: one implementation of
 `region_edit_v2::engine::AiEngine`. It owns everything model-specific — the persisted
-parameters, the two memory steps and their large-model forecast, the prompt-cache library, the
-model download (the app's catalog), the per-component residency, the request/response wire contracts, the
+parameters, the two memory steps and their large-model forecast, its side of the model's shared
+prompt library, the model download (the app's catalog), the per-component residency, the request/response wire contracts, the
 OOM recovery, the worker threads and its own progress bar — and nothing host-specific:
 the on-canvas frame, the painted mask stack and the pending result belong to the host.
 
@@ -37,8 +37,9 @@ former download (diffusers `transformer/`), which is then used through the catal
 legacy spec (`flux2_klein_transformer_layout`, runtime `installed_formats.transformer_layout`).
 
 Everything else, on screen and on the wire, is identical: every method is keyed by the three
-component paths, and the prompt-cache family is fingerprinted backend-side from the encoder,
-so each variant and source gets its own family without a wire change. In download mode both
+component paths, and each variant has its own prompt LIBRARY (`params.prompt_library` =
+`Flux2Variant::prompt_library_id`, protocol 23) that every encoder source and format of that
+variant shares. In download mode both
 variants send the selected weight formats with their candidates (see "Contracts and
 invariants").
 
@@ -97,7 +98,8 @@ rows, floor, «Пределы»).
 
 MODEL-AGNOSTIC PARTS LIVE IN `../shared/` (`use super::shared::*` in `mod.rs`): the progress
 state of all three long operations and its streaming call, the Hugging Face token controls
-and their drawing, the settings-file quarantine and save backoff, and `mask_for_run`. What
+and their drawing, the settings-file quarantine and save backoff, `mask_for_run`, and the
+prompt library's listing shapes, preset rules and picker (`prompt_library*`). What
 stays here is what is FLUX.2's own: its headers, its settings document and migration, its
 sentences.
 
@@ -113,7 +115,8 @@ sentences.
   `components.rs`, `advanced.rs` and `mask_hint.rs` draw the blocks it calls into. See
   `ui/MODULE_README.md`.
 - `decisions.rs`: the PURE decisions the panel renders — `flux2_readiness_line`,
-  `flux2_prompt_cache_line`, `flux2_guidance_supported`, `flux2_run_block_reason`,
+  `flux2_prompt_cache_line` (with `flux2_encoder_caption`, the localized name of the encoder
+  an entry was made by), `flux2_guidance_supported`, `flux2_run_block_reason`,
   `region_block_reason`, the catalog bundle of the selection and its state
   (`flux2_catalog_bundle`, `flux2_catalog_bundle_missing`, `flux2_catalog_job_running`), the
   gated repositories still missing (`flux2_gated_repos_missing`: what draws the token row), the
@@ -122,7 +125,8 @@ sentences.
   — with the line/tone types
   they answer in. Edit it to change what a
   line or a refusal SAYS, or which control the backend's answer closes.
-- `settings.rs`: `Flux2KleinSettings`, its defaults, `normalized()`, `params()`, the
+- `settings.rs`: `Flux2KleinSettings`, its defaults, `normalized()`, `params()` (with the
+  protocol-23 library fields; the persisted «Нет» stash `uncached_prompt` never travels), the
   dtype vocabulary, the two step ids (`step_choice` / `set_step_choice`), the one-time
   migration of the retired placement (`legacy_memory_steps`, the one owner of the placement ->
   step-pair table; an untouched default document goes to «Авто» / «Авто»),
@@ -148,9 +152,12 @@ sentences.
   `flux2_status_for_paths`, the merged `flux2_component_rows`, `flux2_install_seed`,
   `flux2_pipeline_busy`. Edit it to change what a catalog MEANS; the parsers that build
   one live in `wire.rs`.
-- `prompt_cache.rs`: the `.msprompt` library — entry/listing/load shapes,
-  `flux2_prompt_cache_gates`, `prompt_cache_state_for`, and the six `.prompt_cache.*`
-  calls with their parsers.
+- `prompt_cache.rs`: the FLUX.2 side of the shared prompt library — `flux2_cache_button`
+  («Кэшировать» / «Переименовать» / closed with a reason: an entry of the current encoder, or a
+  strictly more precise one of the same source, already serves the text), the export / import
+  gates (`flux2_prompt_cache_gates`), `prompt_cache_state_for`, and the four `.prompt_cache.*`
+  calls (`build` streaming, `list`, `export`, `import`) with their parsers. The listing shapes,
+  the exact-text preset match, the «Нет» stash and the picker are `../shared/prompt_library*`.
 - `run_outcome.rs`: what one run answers with (`Flux2RunOutcome`: the raw decode and the latent
   mask; `Flux2JobResult`: plus the run's mask and `whole_region`) and the one
   memory flag it writes back (`parse_applied_flags`: `vae_tiling` only, tolerant of the v13 and
@@ -279,8 +286,19 @@ sentences.
   lives is `flux2_guidance_supported`. The stored `guidance_scale` is never clamped,
   rewritten or hidden by this: the backend owns the run's semantics and the setting has to
   come back on a checkpoint that is not distilled.
-- **`FLUX2_MAX_SEQ` (wire.rs) is part of the prompt-cache key.** Lowering it invalidates
+- **`FLUX2_MAX_SEQ` (wire.rs) is part of every library entry's key.** Lowering it orphans
   every saved `.msprompt` entry at once.
+- **The prompt library (protocol 23).** Every `params` carries `prompt_library`,
+  `prompt_cache_precision_order` (`ms_config::flux2_prompt_cache_precision_order`, Rust-owned)
+  and, in download mode only, `text_encoder_source`. Which entry a run uses is the BACKEND's
+  selection (`selected` of a listing row, `.status.prompt_cache_entry`); this side renders it
+  and never re-derives it. The typed text IS a preset when it equals the preset's text after
+  trimming (`PromptLibraryListing::find`); the picker's selection, the name field
+  (`sync_preset_name`) and the cache line all follow from that every frame, nothing stores it.
+  The «Нет» stash (`uncached_prompt`) is persisted in the settings file and never sent; its
+  change alone owes a save and re-asks nothing. A rename is a `.build` with a different `name`;
+  an empty name field sends none. Choosing a preset only writes its TEXT into the field (the
+  settings-changed path); the embeddings are read by the run.
 - **The HF token never enters the settings file** and must never be logged; this module only
   edits it (the token row, `HfTokenControl`).
 - Layering: only `ui/` may draw, and it decides nothing a test would want to assert —

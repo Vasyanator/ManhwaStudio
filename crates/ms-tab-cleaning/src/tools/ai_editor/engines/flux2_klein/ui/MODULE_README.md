@@ -9,7 +9,9 @@ panel and every block under it. This is the ONLY part of `flux2_klein` that draw
 exactly one frame, and the `draw` method whose ORDER is the design:
 
 ```
-the PROMPT block (English field, the one cache line, the translator and library toggles)
+the PROMPT block (English field, preset name + «Кэшировать» / «Переименовать», the one
+cache line, the translator and library toggles; the library fold = the shared preset picker,
+«Экспорт», «Импорт» and the outcome / migration lines)
 -> «Сила изменения» -> the READINESS line -> three SIBLING collapsible sections
 («Установка модели» / «Память и скорость» / «Для экспертов») -> the mask note
 -> «Постобработка» (the shared `draw_postprocess_section`, LAST: it docks at the bottom)
@@ -32,7 +34,11 @@ never work started from inside a widget closure.
 
 ## Files and submodules
 - `mod.rs`: `Flux2PanelCtx` and the panel body, plus the two pinned parts. Edit it to move a
-  control between blocks or to change the order of the panel.
+  control between blocks or to change the order of the panel. The prompt block matches the
+  field against the model's library every frame (`track_uncached`, `sync_preset_name`,
+  `flux2_prompt_cache_gates`) and draws the shared `draw_prompt_library_picker` in its fold; a
+  pick writes the preset's TEXT through `apply_pick` and raises the settings change, a moved
+  «Нет» stash alone raises `uncached_changed` (a save, nothing re-asked).
 - `install.rs`: the source-mode switch, the editable model-path rows and their pickers,
   the derived paths of the download mode, and the CATALOG download block of both variants
   (`draw_catalog_download_block`): the «Расцензуренный энкодер» toggle where the variant offers

@@ -4,8 +4,8 @@ File: modules/ai_backend/inpaint/flux2_klein/service.py
 Purpose:
 `Flux2KleinInpaintService` - the object `server.py` puts on `AppState` and every
 `inpaint.flux2_klein.*` IPC handler calls. It owns the service lock, the
-in-memory prompt-embedding cache, the tokenizer / scheduler caches and the
-request methods; WHERE the weights live during and between runs is decided by
+in-memory prompt-embedding cache (with its provenance), the tokenizer /
+scheduler caches and the request methods; WHERE the weights live during and between runs is decided by
 the large-model manager (`runtime.large_models`), which this service drives
 through `Session`s of the FLUX.2 specs (`large_model.py`).
 
@@ -22,8 +22,13 @@ Main responsibilities:
   a lower «Видеопамять» step);
 - `component_action` - one per-component residency action, each a manager
   session (load / unload / park in RAM / back to the GPU / warm-up);
-- the `prompt_cache_*` methods - the library surface, keyed identically to the
-  in-memory cache through `_prompt_cache_key` (encoder file AND weight format);
+- `_prompt_plan` - THE answer to "which embedding serves each text this run
+  needs, and which must be encoded": memory and the model's library
+  (`runtime.prompt_library`) ranked by `select_entry`; the run, `.status`
+  (`prompt_cached`, `prompt_cache_entry`) and the encoder forecast all derive
+  from it;
+- the `prompt_cache_*` methods (`build` / `list` / `export` / `import`) - the
+  library surface (protocol 23: named presets, one library per model);
 - `large_model_profiles` - the adapter `large_models.profiles` calls: the
   pipeline's step pickers planned with the encoder's admission claimed (the
   encoder counted unless it is neither needed nor resident: `_encoder_need`,
@@ -48,8 +53,11 @@ Notes:
   pipeline -> encoder. It also lets an action refuse "busy" before any session
   exists. Pinned by `test_service.LockOrderTests`.
 - Symbols the test suite monkeypatches are reached through their defining
-  module (`hardware._clear_torch_cache`, `prompt_cache.write_prompt_file`,
+  module (`hardware._clear_torch_cache`, `prompt_library.serialize_tensor`,
   `attention.build_text_attention_mask`, ...).
+- The memory cache is an `OrderedDict` touched only under the service lock;
+  its provenance index (`_memory_index`) is a copy-on-write `dict` that the
+  lock-free `_prompt_plan` (status, forecast) reads.
 - torch / diffusers / transformers are imported lazily.
 """
 
@@ -63,11 +71,12 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     import numpy as np
 
+from ...runtime import prompt_library as pl
 from ...runtime.health_snapshot import HealthSnapshot
 from ...runtime.large_models.manager import LargeModelManager, MemoryLimitsStore, ProfilesReport, Session, SessionObserver
 from ...runtime.large_models.forecast import Forecast
@@ -79,7 +88,7 @@ from ...runtime.model_manager import SmallModelManager
 from ...runtime.residency.footprint import normalize_device
 from ...runtime.residency.holdings import Pool
 from ..region_imaging import decode_image_rgb, decode_mask, encode_png_rgb, require_solid_mask
-from . import attention, hardware, large_model, memory, pipeline, prompt_cache
+from . import attention, hardware, large_model, memory, pipeline
 from .components import (
     _SCHEDULER_MARKER,
     _SCHEDULER_SUBDIR,
@@ -99,12 +108,13 @@ from .components import (
 from .params import (
     _lenient_paths,
     _PATH_KEYS,
+    _to_bool,
     derived_format,
     effective_steps,
     encoder_on_cpu,
     MIN_REGION_SIDE,
     normalize_flux2_klein_params,
-    text_encoder_dtype_name,
+    prompt_library_fields,
     validate_region_size,
 )
 from .pipeline import (
@@ -138,24 +148,19 @@ from .progress import (
     ProgressCb,
 )
 from .prompt_cache import (
-    encoder_family_name,
-    find_prompt_cache_entry,
-    list_prompt_cache_entries,
-    list_prompt_cache_families,
-    local_encoder_identity,
-    prompt_cache_entry_path,
-    prompt_cache_family_dir,
-    prompt_cache_root,
-    prompt_file_metadata,
+    FLUX2_LIBRARY_IDS,
     PROMPT_EMBED_CACHE_ENTRIES,
-    publish_bytes_atomically,
-    read_prompt_file_header,
-    read_prompt_file_tensor,
-    require_free_entry_path,
-    require_prompt_file_destination,
-    require_prompt_file_source,
-    text_encoder_fingerprint,
-    validate_prompt_file_metadata,
+    V1_FORMAT,
+    classify_v1_entry,
+    convert_v1_metadata,
+    encoder_provenance,
+    ensure_legacy_migrated,
+    is_current_encoder,
+    known_local_encoders,
+    library_of,
+    migration_report,
+    parse_v1_header,
+    transformer_text_width,
 )
 
 log = logging.getLogger(__name__)
@@ -176,6 +181,98 @@ def _encoder_load_steps(requested: Steps) -> Steps:
     if requested.vram is VramStep.MAX or requested.ram in (RamStep.KEEP, RamStep.AUTO):
         return requested
     return _TO_RAM_STEPS
+
+
+#: The `origin` of an embedding encoded in this process and not (yet) in a library file.
+MEMORY_ORIGIN = "memory"
+
+
+@dataclass(frozen=True)
+class MemoryEmbedding:
+    """Provenance of one in-memory embedding (the tensor itself lives in `_prompt_cache` under `key`).
+
+    `library`: the library id of the request that produced it (`""` = none);
+    `entry`: the library entry it was read from (`None` = encoded here);
+    `width`: the tensor's last dimension.
+    """
+
+    key: tuple[Any, ...]
+    library: str
+    text: str
+    max_sequence_length: int
+    encoder: pl.EncoderProvenance
+    width: int | None
+    entry: pl.LibraryEntry | None
+    created_at: str
+
+
+@dataclass(frozen=True)
+class PromptChoice:
+    """The embedding that serves one text: from memory or from a file of the library `library` (`""` = none)."""
+
+    text: str
+    source: Literal["memory", "library"]
+    entry: pl.LibraryEntry | MemoryEmbedding
+    library: str
+
+    @property
+    def encoder(self) -> pl.EncoderProvenance:
+        return self.entry.encoder
+
+
+@dataclass(frozen=True)
+class PromptPlan:
+    """`_prompt_plan`'s answer: the choice per served text and the texts left to encode (in the order the run needs them)."""
+
+    served: Mapping[str, PromptChoice]
+    to_encode: tuple[str, ...]
+
+
+def _memory_key(library: str, text: str, max_sequence_length: int, encoder: pl.EncoderProvenance, origin_file: str) -> tuple[Any, ...]:
+    """The in-memory cache key: library, text, length, encoder identity, precision, and the file it came from (`"encoded"` when encoded here)."""
+    return (library, text, int(max_sequence_length), encoder.encoder_id, encoder.precision_id(), origin_file or "encoded")
+
+
+def _tensor_width(tensor: Any) -> int | None:
+    shape = tuple(getattr(tensor, "shape", ()) or ())
+    return int(shape[-1]) if shape else None
+
+
+def _entry_info(entry: pl.LibraryEntry | MemoryEmbedding, current: pl.EncoderProvenance | None) -> dict[str, Any]:
+    """The wire `EntryInfo` of a library entry or a memory embedding (protocol 23, PROTOCOL.md §5.4).
+
+    A memory embedding read from a file reports that file's entry; one
+    encoded here reports `origin: "memory"` with an empty `file` and `name`.
+    `current_encoder`: made by the request's current encoder (same
+    fingerprint and fp8 flag; false without one).
+    """
+    if isinstance(entry, MemoryEmbedding):
+        if entry.entry is not None:
+            return _entry_info(entry.entry, current)
+        return {
+            "file": "",
+            "name": "",
+            "encoder_source": entry.encoder.source,
+            "encoder_format": entry.encoder.format,
+            "encoder_fp8": entry.encoder.fp8,
+            "encoder_label": entry.encoder.label,
+            "current_encoder": is_current_encoder(entry.encoder, current),
+            "created_at": entry.created_at,
+            "size_bytes": 0,
+            "origin": MEMORY_ORIGIN,
+        }
+    return {
+        "file": entry.file,
+        "name": entry.name,
+        "encoder_source": entry.encoder.source,
+        "encoder_format": entry.encoder.format,
+        "encoder_fp8": entry.encoder.fp8,
+        "encoder_label": entry.encoder.label,
+        "current_encoder": is_current_encoder(entry.encoder, current),
+        "created_at": entry.created_at,
+        "size_bytes": int(entry.size_bytes),
+        "origin": entry.origin,
+    }
 
 
 @dataclass(frozen=True)
@@ -290,9 +387,12 @@ class Flux2KleinInpaintService:
         self._scheduler: Any = None
         self._scheduler_dir: str | None = None
         self._last_paths: dict[str, str] = {}
-        # Phase-1 results, keyed by everything that changes them
-        # (`_prompt_cache_key`). Always on, LRU, host-resident.
+        # Prompt embeddings in memory (`_memory_key` -> host tensor). Always
+        # on, LRU, touched only under `_lock`; `_memory_index` is its
+        # provenance, replaced wholesale on every change (copy-on-write) so the
+        # lock-free `_prompt_plan` can iterate it.
         self._prompt_cache: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+        self._memory_index: dict[tuple[Any, ...], MemoryEmbedding] = {}
         self._guidance_ignored_note: tuple[Any, ...] | None = None
         self._phase_observer: SessionObserver | None = None
 
@@ -355,17 +455,19 @@ class Flux2KleinInpaintService:
         """Whether the handle `key` holds any byte anywhere."""
         return any(device or host for device, host in self._parts(key).values())
 
-    def _encoder_need(self, normalized: dict[str, Any], device: str) -> EncoderNeed:
+    def _encoder_need(self, normalized: dict[str, Any], device: str, *, plan: PromptPlan | None = None) -> EncoderNeed:
         """THE decision of what the request in `normalized` asks of the text encoder on `device` (`EncoderNeed`).
 
         Used by `large_model_profiles` (whether the encoder is counted) and by
-        the run (whether the encoder's combined ceiling is planned). Never
-        waits for the service lock: the cache test is one dict membership
-        test (`_prompt_cached`'s reasoning) and residency is read from the
-        arbiter's ledger (`_holds`), like `health` and the status snapshot,
-        so a forecast is answered during a running generation.
+        the run (whether the encoder's combined ceiling is planned; it passes
+        its own `plan`). Never waits for the service lock: the prompt plan
+        reads the copy-on-write memory index and the library snapshot
+        (`_prompt_plan`), and residency is read from the arbiter's ledger
+        (`_holds`), like `health` and the status snapshot, so a forecast is
+        answered during a running generation.
         """
-        encodes = text_encoder_available(normalized) and bool(self._prompts_to_encode(normalized))
+        plan = plan if plan is not None else self._prompt_plan(normalized, blocking_load=True)
+        encodes = text_encoder_available(normalized) and bool(plan.to_encode)
         resident = bool(normalized["text_encoder_path"]) and self._holds(self._handle_key(lambda: self._encoder_key(normalized, normalized["text_encoder_fp8"], device, on_cpu=normalized["encoder_on_cpu"]), "text_encoder"))
         return EncoderNeed(encodes=encodes, resident=resident)
 
@@ -538,10 +640,13 @@ class Flux2KleinInpaintService:
         """Component availability and residency for the given (or last) paths.
 
         `params` is read leniently: an absent or empty path is reported as "not
-        configured". `prompt_cached` answers whether a READY embedding exists
-        for `params` (`_prompt_cached`); `text_encoder_available` whether an
+        configured". `prompt_cached` answers whether EVERY text the run needs
+        is served by memory or the library (`_status_prompt_plan`), and
+        `prompt_cache_entry` is the `EntryInfo` of the embedding that would
+        serve the prompt (`null` when none); `text_encoder_available` whether an
         encoder is present on this machine; `guidance_supported` whether the
-        guidance slider can do anything on this checkpoint.
+        guidance slider can do anything on this checkpoint. Never migrates v1
+        entries.
 
         **Per-component residency** (`residency`, `actions`) comes from the
         large pool's ledger parts and is reported only when the service lock was
@@ -552,7 +657,7 @@ class Flux2KleinInpaintService:
         """
         paths = _lenient_paths(params) or dict(self._last_paths)
         components = _component_states(paths)
-        prompt_cached = self._prompt_cached(params)
+        prompt_cached, prompt_entry = self._status_prompt_cache(params)
         reason = _first_unavailable_reason(components, prompt_cached=prompt_cached)
         device = self._device_label()
         residency, busy = self._components_residency_nowait(paths, params, device)
@@ -567,6 +672,7 @@ class Flux2KleinInpaintService:
             "loaded": self._holds(self._active_key),
             "device": device,
             "prompt_cached": prompt_cached,
+            "prompt_cache_entry": prompt_entry,
             "text_encoder_available": text_encoder_available(paths),
             # `is not True` on purpose: an undeclared checkpoint (`None`) is run
             # with guidance live, so it must report the slider as supported.
@@ -738,13 +844,17 @@ class Flux2KleinInpaintService:
                 # headers and configs, which on a cold page cache take long
                 # enough that the user would see nothing happen.
                 report(LOAD_STEP_PREPARE, "Подготовка запуска FLUX.2 klein")
-                if self._prompts_to_encode(normalized):
+                self._migrate_legacy(normalized)
+                # The plan is made ONCE, under the lock, and the run follows it
+                # (`_prompt_embeds_locked` re-plans only when a chosen file vanished).
+                plan = self._prompt_plan(normalized, blocking_load=True)
+                if plan.to_encode:
                     require_text_encoder(normalized, what="генерация с этим промптом")
                 # A 4B transformer beside a 9B encoder would otherwise die as a
                 # bare matmul shape error inside the denoise.
                 require_encoder_transformer_compatible(normalized)
-                large_model.require_loadable(normalized, encoder=bool(self._prompts_to_encode(normalized)))
-                result = self._run_locked(normalized, region_rgb, mask_u8, reference_rgb, steps, report, frames)
+                large_model.require_loadable(normalized, encoder=bool(plan.to_encode))
+                result = self._run_locked(normalized, region_rgb, mask_u8, reference_rgb, steps, report, frames, plan)
                 self._last_error = None
                 self._publish_health_locked()
             except Exception as exc:
@@ -762,11 +872,12 @@ class Flux2KleinInpaintService:
         steps: Steps,
         report: Callable[[int, str], None],
         frames: LoadFrames | None,
+        plan: PromptPlan,
     ) -> dict[str, Any]:
         """The run under `self._lock`: pipeline session, prompt, denoise, decode; answers the raw decode.
 
         `mask_u8` is the binarized latent mask from the wire, passed to the
-        pipeline unchanged.
+        pipeline unchanged; `plan` the run's prompt plan (`_prompt_plan`).
         """
         height, width = region_rgb.shape[:2]
         device = self._device_name()
@@ -780,7 +891,7 @@ class Flux2KleinInpaintService:
         # reservation (`_combined_ceilings`); only when this run will encode
         # (a resident encoder over a cached prompt is never touched by the run).
         ceilings = None
-        if self._encoder_need(normalized, device).encodes:
+        if self._encoder_need(normalized, device, plan=plan).encodes:
             alone = self._large.profiles(model, options, shape, device=device, format=large_model.weight_format_of(options), steps=steps)
             ceilings = self._combined_ceilings(alone, large_model.encoder_options(normalized), shape, device, until=VramStep.MIN)
         session = self._acquire(model, options, shape, steps, device, frames)
@@ -791,7 +902,7 @@ class Flux2KleinInpaintService:
                 self._active_key = session.key
                 self._load_pipeline_locked(session, normalized, report, cold=cold)
                 loaded = True
-                embeds, encoder_retries = self._prompt_embeds_locked(normalized, report, steps=steps, device=device, shape=shape, device_cap_bytes=self._encoder_cap(ceilings, session), frames=frames)
+                embeds, encoder_retries = self._prompt_embeds_locked(normalized, plan, report, steps=steps, device=device, shape=shape, device_cap_bytes=self._encoder_cap(ceilings, session), frames=frames)
                 retries += encoder_retries
                 latents_cpu, image_processor = session.run_phase(
                     large_model.PHASE_DENOISE,
@@ -998,6 +1109,7 @@ class Flux2KleinInpaintService:
     def _prompt_embeds_locked(
         self,
         normalized: dict[str, Any],
+        plan: PromptPlan,
         report: Callable[[int, str], None],
         *,
         steps: Steps,
@@ -1006,24 +1118,88 @@ class Flux2KleinInpaintService:
         device_cap_bytes: int | None = None,
         frames: LoadFrames | None = None,
     ) -> tuple[dict[str, Any], int]:
-        """`({"prompt", "negative"} host embeddings, encoder retries)`; encodes what the cache misses.
+        """`({"prompt", "negative"} host embeddings, encoder retries)` following `plan`.
 
-        On a full cache hit no encoder is touched (a mask edit, a new seed or a
-        repeated prompt goes straight to the denoise). `negative` is `None`
-        unless classifier-free guidance is active. `device_cap_bytes`: the
-        encoder's device ceiling beside the pipeline (`_encoder_cap`);
-        `frames` the request's progress (the encoder session's sink).
+        Served texts are taken from memory or read from their library file
+        (which then stays in memory); `plan.to_encode` is encoded. On a full
+        hit no encoder is touched («Промпт взят из кэша»). A library file that
+        vanished or changed since the plan (`LibraryEntryGone`) re-plans once;
+        a text still unserved then is encoded when an encoder is available,
+        else the run is refused naming the file. `negative` is `None` unless
+        classifier-free guidance is active. `device_cap_bytes`: the encoder's
+        device ceiling beside the pipeline (`_encoder_cap`); `frames` the
+        request's progress (the encoder session's sink).
+
+        # Raises
+        `ValueError` when a chosen file vanished and nothing can replace it.
         """
-        missing = self._prompts_to_encode(normalized)
+        tensors: dict[str, Any] = {}
+        lost: dict[str, str] = {}
+        for text, choice in plan.served.items():
+            tensor = self._serve_locked(choice)
+            if tensor is None:
+                lost[text] = choice.entry.file if isinstance(choice.entry, pl.LibraryEntry) else ""
+            else:
+                tensors[text] = tensor
+        missing = list(plan.to_encode)
+        if lost:
+            replan = self._prompt_plan(normalized, blocking_load=True)
+            for text in lost:
+                choice = replan.served.get(text)
+                tensor = self._serve_locked(choice) if choice is not None else None
+                if tensor is None:
+                    missing.append(text)
+                else:
+                    tensors[text] = tensor
+            if missing and not text_encoder_available(normalized):
+                files = ", ".join(sorted(file for text, file in lost.items() if text in missing and file)) or "—"
+                raise ValueError(
+                    f"Файл кэша промпта пропал или изменился во время запуска ({files}), а текстовый энкодер "
+                    "недоступен — закодировать промпт заново нечем. Укажите текстовый энкодер или выберите "
+                    "другой сохранённый промпт."
+                )
         retries = 0
         if missing:
-            retries = self._encode_prompts_locked(normalized, missing, report, frames, steps=steps, device=device, shape=shape, device_cap_bytes=device_cap_bytes)
+            retries, encoded = self._encode_prompts_locked(normalized, missing, report, frames, steps=steps, device=device, shape=shape, device_cap_bytes=device_cap_bytes)
+            tensors.update(encoded)
         else:
             report(LOAD_STEP_ENCODER_DONE, "Промпт взят из кэша")
-        embeds: dict[str, Any] = {"prompt": self._cached_embeds(normalized, normalized["prompt"]), "negative": None}
+        embeds: dict[str, Any] = {"prompt": tensors[normalized["prompt"]], "negative": None}
         if self._effective_guidance_scale(normalized) > 1.0:
-            embeds["negative"] = self._cached_embeds(normalized, "")
+            embeds["negative"] = tensors[""]
         return embeds, retries
+
+    def _serve_locked(self, choice: PromptChoice) -> Any | None:
+        """The tensor of `choice` (caller holds `self._lock`); `None` when it is gone (a memory entry evicted, a library file vanished or changed).
+
+        A library read is remembered in memory under its file's key, so the
+        next run does not read the file again.
+        """
+        if isinstance(choice.entry, MemoryEmbedding):
+            tensor = self._prompt_cache.get(choice.entry.key)
+            if tensor is not None:
+                self._prompt_cache.move_to_end(choice.entry.key)
+            return tensor
+        entry = choice.entry
+        library = library_of(choice.library)
+        try:
+            tensor = library.read_tensor(entry)
+        except pl.LibraryEntryGone as exc:
+            log.warning("FLUX.2 klein: кэш промпта %s больше не годится (%s); запуск подберёт другой или закодирует промпт.", entry.file, exc)
+            return None
+        remembered = MemoryEmbedding(
+            key=_memory_key(library.spec.library_id, entry.prompt, entry.max_sequence_length, entry.encoder, entry.file),
+            library=library.spec.library_id,
+            text=entry.prompt,
+            max_sequence_length=entry.max_sequence_length,
+            encoder=entry.encoder,
+            width=_tensor_width(tensor),
+            entry=entry,
+            created_at=entry.created_at,
+        )
+        self._store_embeds(remembered, tensor)
+        log.info("FLUX.2 klein: промпт взят из библиотеки %s: %s (энкодер %s, %s).", library.spec.library_id, entry.file, entry.encoder.label, entry.encoder.precision_id())
+        return tensor
 
     def _encode_prompts_locked(
         self,
@@ -1037,10 +1213,12 @@ class Flux2KleinInpaintService:
         shape: Any,
         release: bool = False,
         device_cap_bytes: int | None = None,
-    ) -> int:
-        """Encode `texts` into the cache through an encoder session; returns its retries.
+    ) -> tuple[int, dict[str, Any]]:
+        """Encode `texts` through an encoder session into the memory cache; returns `(retries, {text: embedding})`.
 
         THE place a missing encoder becomes fatal (`require_text_encoder`).
+        Each embedding is remembered with the current encoder's provenance
+        (`encoder_provenance`, computed before anything is loaded).
         Where the encoder computes is the plan's: the GPU when `steps` and the
         device allow it, else the CPU from RAM; between runs it stays as the
         steps keep it, unless `release` drops it after the encode (the
@@ -1052,6 +1230,10 @@ class Flux2KleinInpaintService:
         the current step).
         """
         require_text_encoder(normalized, what="кодирование промпта")
+        provenance = encoder_provenance(normalized)
+        if provenance is None:
+            # `require_text_encoder` just found the encoder: only a race with a deletion gets here.
+            raise ValueError(f"Текстовый энкодер пропал: {normalized['text_encoder_path']}")
         from diffusers import Flux2KleinInpaintPipeline
 
         roots = component_search_roots(normalized)
@@ -1073,59 +1255,131 @@ class Flux2KleinInpaintService:
             results = encoder_session.run_phase(large_model.PHASE_ENCODE, encode)
             key = encoder_session.key
             retries = encoder_session.retries
+        library = normalized.get("prompt_library") or ""
+        created_at = pl.utc_now()
+        encoded: dict[str, Any] = {}
         for text, embeds in zip(texts, results):
-            self._store_embeds(self._prompt_cache_key(normalized, text), embeds)
+            remembered = MemoryEmbedding(
+                key=_memory_key(library, text, msl, provenance, ""),
+                library=library,
+                text=text,
+                max_sequence_length=msl,
+                encoder=provenance,
+                width=_tensor_width(embeds),
+                entry=None,
+                created_at=created_at,
+            )
+            self._store_embeds(remembered, embeds)
+            encoded[text] = embeds
         if release:
             self._unload_models_locked((model,))
         if self._holds(key):
             report(LOAD_STEP_ENCODER_DONE, "Текстовый энкодер оставлен в памяти")
         else:
             report(LOAD_STEP_ENCODER_DONE, "Текстовый энкодер выгружен")
-        return retries
+        return retries, encoded
 
     # ---- prompt cache: build ----
-    def prompt_cache_build(self, params: dict[str, Any] | None, *, progress_callback: ProgressCb | None = None) -> dict[str, Any]:
-        """Encode the prompt into the cache WITHOUT generating anything ("Кэшировать").
+    def prompt_cache_build(self, params: dict[str, Any] | None, *, name: str | None = None, progress_callback: ProgressCb | None = None) -> dict[str, Any]:
+        """«Кэшировать»: save an entry of the CURRENT encoder for every text the run needs into the model's library, under the preset name `name`.
 
-        Only the encoder handle is used (no pipeline is admitted or loaded).
-        The encoder is released afterwards — that is the point of the button —
-        unless its handle already held bytes when the call arrived (that one
-        belongs to the previous run's settings). Progress: step 0, then the
-        prompt steps 7-9 (step 7 also streams the encoder read's bytes). Returns `{"prompt", "encoded", "prompt_cached", "device"}`.
+        The texts are the prompt plus `""` under effective classifier-free
+        guidance. A text that already has an entry of the current encoder
+        (same fingerprint and fp8 flag) is not written again; the others reuse
+        an embedding this process encoded with that encoder, else they are
+        encoded through the encoder handle alone (no pipeline is admitted;
+        the encoder is released afterwards unless its handle already held
+        bytes when the call arrived). Progress: step 0, then the prompt steps
+        7-9 (step 7 streams the encoder read's bytes).
+
+        **The name.** A preset is the library's entries of one exact prompt
+        text; its name is stored in each entry. `name` empty or absent keeps the
+        preset's current name (a new preset gets `default_preset_name`); a
+        different name renames the preset — a header rewrite of all its
+        entries, no encode (so "rename" is a build whose entries already exist).
+        The empty negative prompt's entry is never named.
+
+        Returns `{"prompt", "name", "encoded", "written": [EntryInfo],
+        "renamed", "prompt_cached": true, "device"}`.
 
         # Raises
-        `ValueError` for invalid params or an empty prompt; `LargeModelRefused`
-        when the encode does not fit; whatever the encoder load raises.
+        `ValueError` for invalid params, an empty prompt, a request without
+        `prompt_library`, no or an unidentifiable encoder, or a failed write;
+        `LargeModelRefused` when the encode does not fit; whatever the encoder
+        load raises.
         """
         normalized = normalize_flux2_klein_params(params)
         text = normalized["prompt"]
         if not text:
             raise ValueError("Кэшировать нечего: промпт пуст. Введите текст промпта и повторите.")
+        library = self._require_library(normalized["prompt_library"])
         self._last_paths = {key: normalized[key] for key in _PATH_KEYS}
         frames = _load_frames(progress_callback, normalized)
         report = _progress_reporter(frames, "load", LOAD_PHASE_STEPS)
         with self._lock:
             try:
-                if self._prompt_cache_key(normalized, text) in self._prompt_cache:
-                    report(LOAD_STEP_ENCODER_DONE, "Промпт уже в кэше")
-                    encoded = False
-                else:
-                    require_text_encoder(normalized, what="кэширование промпта")
+                self._migrate_legacy(normalized)
+                require_text_encoder(normalized, what="кэширование промпта")
+                current = encoder_provenance(normalized)
+                if current is None:
+                    raise ValueError(f"Текстовый энкодер пропал: {normalized['text_encoder_path']}")
+                msl = int(normalized["max_sequence_length"])
+                snap = library.reconcile()
+                requested = pl.normalize_preset_name(name or "")
+                preset_name = requested or snap.preset_name(text) or pl.default_preset_name(text)
+                to_write = [needed for needed in self._texts_needed(normalized) if not any(is_current_encoder(entry.encoder, current) for entry in library.entries_for(needed, msl))]
+                tensors = {needed: tensor for needed in to_write if (tensor := self._memory_tensor_of(library.spec.library_id, needed, msl, current)) is not None}
+                need = [needed for needed in to_write if needed not in tensors]
+                encoded = bool(need)
+                if need:
                     large_model.require_loadable_encoder(normalized)
                     report(LOAD_STEP_PREPARE, "Подготовка кэширования промпта")
                     device = self._device_name()
                     resident = self._holds(self._handle_key(lambda: self._encoder_key(normalized, normalized["text_encoder_fp8"], device, on_cpu=normalized["encoder_on_cpu"]), "text_encoder"))
-                    shape = large_model.request_shape(MIN_REGION_SIDE, MIN_REGION_SIDE, with_reference=False, max_sequence_length=int(normalized["max_sequence_length"]), steps=1)
-                    self._encode_prompts_locked(normalized, [text], report, frames, steps=memory.requested_steps(normalized), device=device, shape=shape, release=not resident)
-                    encoded = True
+                    shape = large_model.request_shape(MIN_REGION_SIDE, MIN_REGION_SIDE, with_reference=False, max_sequence_length=msl, steps=1)
+                    _retries, fresh = self._encode_prompts_locked(normalized, need, report, frames, steps=memory.requested_steps(normalized), device=device, shape=shape, release=not resident)
+                    tensors.update(fresh)
+                else:
+                    report(LOAD_STEP_ENCODER_DONE, "Промпт уже в кэше" if to_write else "Промпт уже в библиотеке")
+                written: list[pl.LibraryEntry] = []
+                extra = {"text_encoder_path": str(normalized["text_encoder_path"])}
+                for needed in to_write:
+                    entry, new = library.write_entry(needed, tensors[needed], current, max_sequence_length=msl, name=preset_name if needed == text else "", origin=pl.ORIGIN_BUILT, extra=extra)
+                    if new:
+                        written.append(entry)
+                renamed = bool(library.rename_text(text, preset_name)) if requested else False
                 self._last_error = None
                 self._publish_health_locked()
             except Exception as exc:
                 self._last_error = str(exc)
                 self._publish_health_locked()
                 raise
-        log.info("FLUX.2 klein: кэш промпта готов (%s), длина промпта %d символов.", "закодирован" if encoded else "уже был в памяти", len(text))
-        return {"prompt": text, "encoded": encoded, "prompt_cached": True, "device": self._device_label()}
+        log.info(
+            "FLUX.2 klein: промпт «%s» в библиотеке %s: записано %d, %s, %s.",
+            preset_name,
+            library.spec.library_id,
+            len(written),
+            "закодирован" if encoded else "без кодирования",
+            "переименован" if renamed else "имя прежнее",
+        )
+        return {
+            "prompt": text,
+            "name": preset_name,
+            "encoded": encoded,
+            "written": [_entry_info(entry, current) for entry in written],
+            "renamed": renamed,
+            "prompt_cached": True,
+            "device": self._device_label(),
+        }
+
+    def _memory_tensor_of(self, library_id: str, text: str, max_sequence_length: int, current: pl.EncoderProvenance) -> Any | None:
+        """An in-memory embedding of `text` made by the encoder `current` (caller holds `self._lock`); `None` when there is none."""
+        for key, remembered in self._memory_index.items():
+            if remembered.library == library_id and remembered.text == text and remembered.max_sequence_length == max_sequence_length and is_current_encoder(remembered.encoder, current):
+                tensor = self._prompt_cache.get(key)
+                if tensor is not None:
+                    return tensor
+        return None
 
     # ---- per-component actions ----
     def component_action(
@@ -1280,407 +1534,303 @@ class Flux2KleinInpaintService:
         self._scheduler_dir = key
         return self._scheduler
 
-    def _current_family(self, params: dict[str, Any] | None) -> tuple[str, str] | None:
-        """`(encoder fingerprint, library family)` for the encoder named in `params`,
-        or `None` when no encoder is installed on this machine.
-
-        Reads the encoder path leniently — the library methods that only browse,
-        export or import do not need a transformer or a VAE, and requiring them
-        would refuse a perfectly meaningful request. `None` is a legitimate
-        answer, not a failure: without an encoder there is no current family, and
-        the callers say so instead of inventing one.
+    # ---- prompt library ----
+    @staticmethod
+    def _require_library(library_id: str | None) -> pl.PromptLibrary:
+        """The library a library operation works on; the request must name one (`params.prompt_library`).
 
         # Raises
-        `ValueError` when the path exists but cannot be fingerprinted (see
-        `local_encoder_identity`).
+        `ValueError` when it names none (or an invalid id).
         """
-        return local_encoder_identity(_lenient_paths(params).get("text_encoder_path", ""))
+        if not library_id:
+            raise ValueError("FLUX.2 klein: в запросе нет «prompt_library» — неизвестно, библиотеку какой модели открыть.")
+        return library_of(library_id)
 
-    def _require_current_family(
-        self, params: dict[str, Any] | None, *, what: str
-    ) -> tuple[str, str]:
-        """`_current_family`, but the encoder is mandatory. `what` names the operation.
+    @staticmethod
+    def _migrate_legacy(params: Mapping[str, Any]) -> None:
+        """Run the one-time v1 migration (`prompt_cache.ensure_legacy_migrated`) when the request names a library.
 
-        Used by the one library operation that cannot fall back on a file's own
-        metadata: a SAVE has to record which encoder produced the embedding, and
-        an unidentifiable encoder leaves nothing to record. The message therefore
-        does NOT offer "load a ready cache" as an alternative the way
-        `require_text_encoder` does — here it would not be one.
+        A request without one (the calibration tool, tests) never touches the
+        library root. The request's encoder joins the known encoders with its
+        source.
+        """
+        if not params.get("prompt_library"):
+            return
+        ensure_legacy_migrated([(str(params.get("text_encoder_path") or ""), str(params.get("text_encoder_source") or ""))])
+
+    @staticmethod
+    def _lenient_library_request(params: dict[str, Any] | None) -> dict[str, Any]:
+        """What the browse-only library methods read from `params`, without requiring a transformer or a VAE.
+
+        Returns `{prompt_library, text_encoder_source, prompt_cache_precision_order,
+        text_encoder_path, text_encoder_format, text_encoder_fp8, transformer_path,
+        max_sequence_length}`.
 
         # Raises
-        `ValueError` when there is no local encoder, or it cannot be fingerprinted.
+        `ValueError` when a prompt-library field breaks its contract.
         """
-        paths = _lenient_paths(params)
-        encoder_path = paths.get("text_encoder_path", "")
-        if not text_encoder_available(paths):
-            where = f" (путь не найден: {encoder_path})" if encoder_path else ""
-            raise ValueError(
-                f"Текстовый энкодер недоступен{where}, а {what} без него невозможно: запись "
-                "библиотеки обязана назвать энкодер, которым построена, а опознать его нечем. "
-                "Укажите каталог текстового энкодера в настройках."
-            )
-        encoder_id = text_encoder_fingerprint(encoder_path)
-        return encoder_id, encoder_family_name(encoder_path, encoder_id)
+        raw = params if isinstance(params, dict) else {}
+        library, source, order = prompt_library_fields(raw)
+        paths = _lenient_paths(raw)
+        fmt = raw.get("text_encoder_format")
+        try:
+            length = max(64, min(512, int(raw.get("max_sequence_length") or 512)))
+        except (TypeError, ValueError):
+            length = 512
+        return {
+            "prompt_library": library,
+            "text_encoder_source": source,
+            "prompt_cache_precision_order": order,
+            "text_encoder_path": paths.get("text_encoder_path", ""),
+            "text_encoder_format": fmt if isinstance(fmt, str) else "",
+            "text_encoder_fp8": _to_bool(raw.get("text_encoder_fp8"), False),
+            "transformer_path": paths.get("transformer_path", ""),
+            "max_sequence_length": length,
+        }
+
+    @staticmethod
+    def _current_or_none(request: Mapping[str, Any]) -> pl.EncoderProvenance | None:
+        """`encoder_provenance` of `request`, `None` (logged) when the encoder exists but cannot be identified: browsing never fails over it."""
+        try:
+            return encoder_provenance(request)
+        except ValueError as exc:
+            log.info("FLUX.2 klein: текущий текстовый энкодер не опознан, записи библиотеки не сверяются с ним: %s", exc)
+            return None
 
     def prompt_cache_list(self, params: dict[str, Any] | None) -> dict[str, Any]:
-        """List the library entries of the CURRENT encoder's family — or of all of them.
+        """The presets of the request's library (`params.prompt_library`).
 
-        Only the encoder path is needed, so the listing works while the
-        transformer and the VAE are still unset. A corrupt or foreign file in the
-        directory is reported in `skipped` rather than failing the call — see
-        `list_prompt_cache_entries`.
+        Needs no transformer or VAE (lenient). Runs the one-time v1 migration
+        first and reconciles the library against its files. One row per prompt
+        text (the empty negative prompt is never listed), newest first:
+        `{prompt, name, selected, entries}`, where `entries` are the text's
+        entries at the request's `max_sequence_length` whose width the
+        transformer accepts, best first by the selection rule, and `selected`
+        the first of them (the entry a run would read when memory holds
+        nothing better). A text without such entries is not listed. Every
+        `EntryInfo` says whether the current encoder made it
+        (`current_encoder`), so the client decides «Кэшировать» from it.
 
-        **Without an encoder on this machine there is no current family**, and
-        refusing the call there would hide the very entries that make an
-        encoder-less machine usable. The listing then spans EVERY family in the
-        library, `family` comes back empty (nothing is active) and `directory` is
-        the library root. Each entry names its own `family` in both cases, which
-        is how the client tells the active listing from a foreign one — no second
-        naming scheme is introduced, the family in an entry is the one recorded
-        in its file.
-
-        Returns `{"family", "directory", "entries", "skipped",
-        "text_encoder_available"}`.
+        Returns `{"library", "directory", "texts", "skipped": [{file, reason}],
+        "text_encoder_available", "legacy": {migrated, deleted, not_migrated,
+        directory} | null}`.
 
         # Raises
-        `ValueError` when an encoder path is present but cannot be fingerprinted.
+        `ValueError` for a request without `prompt_library` or a malformed
+        library field.
         """
-        identity = self._current_family(params)
-        if identity is not None:
-            family = identity[1]
-            entries, skipped = list_prompt_cache_entries(family)
-            return {
-                "family": family,
-                "directory": str(prompt_cache_family_dir(family)),
-                "entries": entries,
-                "skipped": skipped,
-                "text_encoder_available": True,
-            }
-
-        entries: list[dict[str, Any]] = []
-        skipped: list[dict[str, str]] = []
-        for known in list_prompt_cache_families():
-            family_entries, family_skipped = list_prompt_cache_entries(known)
-            entries.extend(family_entries)
-            # A skipped file is named by its family too, or two corrupt files of
-            # the same name in different families would report as one.
-            skipped.extend({**item, "family": known} for item in family_skipped)
-        entries.sort(key=lambda entry: (str(entry["family"]), str(entry["name"])))
+        request = self._lenient_library_request(params)
+        library = self._require_library(request["prompt_library"])
+        self._migrate_legacy(request)
+        snap = library.reconcile()
+        current = self._current_or_none(request)
+        pref = pl.Preference(request["text_encoder_source"], request["prompt_cache_precision_order"])
+        width = transformer_text_width(request["transformer_path"])
+        msl = request["max_sequence_length"]
+        texts: list[dict[str, Any]] = []
+        for text in snap.texts():
+            if text == "":
+                continue
+            usable = [entry for entry in snap.by_text.get((text, msl), ()) if width is None or entry.width == width]
+            if not usable:
+                continue
+            ranked = sorted(usable, key=lambda entry: pl.rank_key(entry.encoder, entry.created_at, False, entry.file, pref))
+            texts.append({"prompt": text, "name": snap.preset_name(text), "selected": _entry_info(ranked[0], current), "entries": [_entry_info(entry, current) for entry in ranked]})
+        legacy = migration_report()
         return {
-            "family": "",
-            "directory": str(prompt_cache_root()),
-            "entries": entries,
-            "skipped": skipped,
-            "text_encoder_available": False,
+            "library": library.spec.library_id,
+            "directory": str(library.directory),
+            "texts": texts,
+            "skipped": [{"file": file, "reason": reason} for file, reason in sorted(snap.skipped.items())],
+            "text_encoder_available": text_encoder_available(request),
+            "legacy": legacy.to_wire() if legacy is not None and legacy.found_anything else None,
         }
 
-    def prompt_cache_save(
-        self, params: dict[str, Any] | None, name: str, *, overwrite: bool = False
-    ) -> dict[str, Any]:
-        """Store the cached embedding of `params["prompt"]` in the library under `name`.
+    def prompt_cache_export(self, params: dict[str, Any] | None, file: str, path: str) -> dict[str, Any]:
+        """Copy the entry `file` of the request's library to the `.msprompt` path `path` (a byte copy, atomic).
 
-        Saving NEVER encodes: a prompt that is not in the cache is a named error
-        pointing at `prompt_cache.build`, because a save that silently spent two
-        minutes reading a 16 GB encoder would be a different operation than the
-        one the user asked for.
+        An existing destination is overwritten: the path comes from the
+        client's save dialog, where "replace?" was already asked.
 
-        The entry lands in `prompt_cache/<family>/<name>.msprompt`, where the
-        family is the current encoder's (`encoder_family_name`). The file records
-        the encoder it was built with, its family, the sequence length, the dtype
-        and the fp8 flag, so `prompt_cache_load` can refuse an incompatible one;
-        the write itself is atomic (`write_prompt_file`), and an existing name is
-        refused unless `overwrite` was asked for (`require_free_entry_path`).
-
-        **Saving needs the encoder itself**, unlike loading: the file records the
-        fingerprint of the encoder that produced the embedding, and there is
-        nothing to record when none is installed. A cache that arrived as a file
-        already has that file, so nothing is lost by refusing here.
-
-        Returns `{"family", "name", "path", "size_bytes", "prompt", "created_at"}`;
-        `name` is the SANITIZED name actually written, which may differ from the
-        one that was asked for.
+        Returns `{"library", "file", "path", "size_bytes"}`.
 
         # Raises
-        `ValueError` for invalid params, an empty prompt, an unusable name, a
-        missing or unidentifiable encoder, an existing entry without `overwrite`,
-        or a prompt that is not in the cache.
+        `ValueError` for a request without `prompt_library`, a malformed file
+        name, an entry that is not in the library, a source that is no longer a
+        regular file inside the library (`pl.UnsafeLibraryPath`), or a rejected
+        destination (`require_entry_destination`).
         """
-        normalized = normalize_flux2_klein_params(params)
-        text = normalized["prompt"]
-        if not text:
-            raise ValueError("Сохранять нечего: промпт пуст.")
-        encoder_id, family = self._require_current_family(
-            params, what="сохранение кэша промпта в библиотеку"
-        )
-        dest = require_free_entry_path(
-            prompt_cache_entry_path(family, name), overwrite=overwrite
-        )
-
-        key = self._prompt_cache_key(normalized, text)
-        with self._lock:
-            embeds = self._prompt_cache.get(key)
-            if embeds is not None:
-                self._prompt_cache.move_to_end(key)
-        if embeds is None:
-            raise ValueError(
-                "Промпт ещё не закодирован — сохранять нечего. Сначала постройте кэш "
-                "(«Кэшировать»/inpaint.flux2_klein.prompt_cache.build) или выполните "
-                "генерацию с этим промптом: сохранение ничего не кодирует само."
-            )
-
-        # Deliberately outside the lock: the tensor is already ours (a later
-        # eviction cannot invalidate the reference), and serialization plus a
-        # disk write must not block `status()`, `unload()` or an eviction
-        # callback.
-        metadata = prompt_file_metadata(normalized, text, encoder_id, family)
-        size = prompt_cache.write_prompt_file(dest, embeds, metadata)
-        log.info("FLUX.2 klein: кэш промпта сохранён в %s (%d байт).", dest, size)
-        return {
-            "family": family,
-            "name": dest.stem,
-            "path": str(dest),
-            "size_bytes": int(size),
-            "prompt": text,
-            "created_at": metadata["created_at"],
-        }
-
-    def prompt_cache_load(self, params: dict[str, Any] | None, name: str) -> dict[str, Any]:
-        """Load a library entry of the current family into the cache.
-
-        The entry's own prompt text is what the embedding belongs to, so it is
-        returned for the client to show; everything else about the file
-        (encoder, sequence length, dtype, fp8) must match the current settings or
-        the load is refused by name — see `validate_prompt_file_metadata` for why
-        a mismatch cannot be tolerated. **An entry of another family is refused
-        here even though `prompt_cache_import` accepts one**: importing files a
-        cache away for later, while loading puts embeddings into the very cache a
-        generation reads from.
-
-        The header is checked BEFORE torch is imported and before a byte of
-        tensor is allocated.
-
-        **Without an encoder on this machine** the entry is looked up across
-        every family (`find_prompt_cache_entry`) — there is no current one to
-        restrict the search to — and the fingerprint is the only check that is
-        skipped: the format marker, the version, `max_sequence_length`, the
-        dtype, the tensor's own dtype token and the fp8 flag are verified as
-        always, because none of them needs an encoder. The answer says which of
-        the two happened in `encoder_verified`, so a client never has to guess
-        whether the identity was checked or taken on trust.
-
-        Returns `{"family", "name", "path", "prompt", "prompt_cached",
-        "max_sequence_length", "dtype", "created_at", "encoder_verified"}`.
-
-        # Raises
-        `ValueError` for invalid params, an unusable name, a missing entry, a
-        name that exists in several families while no encoder selects one, a
-        corrupt file, or one built for other settings.
-        """
-        normalized = normalize_flux2_klein_params(params)
-        identity = self._current_family(params)
-        encoder_id = identity[0] if identity is not None else None
-        source = find_prompt_cache_entry(name, identity[1] if identity is not None else None)
-        metadata, tensor = read_prompt_file_header(source)
-        validate_prompt_file_metadata(metadata, tensor, normalized, encoder_id, source)
-
-        text = metadata.get("prompt", "")
-        embeds = read_prompt_file_tensor(source)
-        with self._lock:
-            self._store_embeds(self._prompt_cache_key(normalized, text), embeds)
-        log.info(
-            "FLUX.2 klein: кэш промпта загружен из %s (создан %s, длина промпта %d символов, "
-            "отпечаток энкодера %s).",
-            source,
-            metadata.get("created_at", "?"),
-            len(text),
-            "сверен" if encoder_id is not None else "не сверялся — локального энкодера нет",
-        )
-        return {
-            # The family the entry actually came from: with no encoder selected
-            # that is the file's own, and the caller must not be told it belongs
-            # to a current family that does not exist.
-            "family": source.parent.name,
-            "name": source.stem,
-            "path": str(source),
-            "prompt": text,
-            "prompt_cached": True,
-            "max_sequence_length": int(normalized["max_sequence_length"]),
-            # The EMBEDDING's dtype, which is the encoder's and not the request's
-            # (`text_encoder_dtype_name`) — it is what the entry was validated
-            # against just above.
-            "dtype": text_encoder_dtype_name(),
-            "created_at": metadata.get("created_at", ""),
-            "encoder_verified": encoder_id is not None,
-        }
-
-    def prompt_cache_export(
-        self, params: dict[str, Any] | None, name: str, path: str
-    ) -> dict[str, Any]:
-        """Copy a library entry of the current family to an arbitrary `.msprompt` path.
-
-        A byte copy, published atomically: the file already carries everything
-        that identifies it, so re-serializing it would only risk changing it.
-        Like `prompt_cache_list` this needs the encoder path alone.
-
-        Unlike a LIBRARY entry, an existing destination is overwritten without a
-        flag: the path comes from the client's own save dialog, which is where
-        the "replace this file?" question belongs, and asking it twice would make
-        the second answer meaningless.
-
-        With no encoder installed the entry is resolved across families, exactly
-        as `prompt_cache_load` does: copying a file out never feeds a generation,
-        so the lookup is the only thing the missing encoder changes.
-
-        Returns `{"family", "name", "path", "size_bytes"}`; `family` is the one
-        the entry was taken FROM.
-
-        # Raises
-        `ValueError` when the name is unusable, the entry is missing or ambiguous,
-        or the destination path is rejected (`require_prompt_file_destination`).
-        """
-        identity = self._current_family(params)
-        source = find_prompt_cache_entry(name, identity[1] if identity is not None else None)
-        family = source.parent.name
-        dest = require_prompt_file_destination(path)
+        request = self._lenient_library_request(params)
+        library = self._require_library(request["prompt_library"])
+        if file not in library.reconcile().entries:
+            raise ValueError(f"Кэша промпта «{file}» нет в библиотеке {library.directory}.")
+        # The bytes copied out must be the library's own file, never a link's target.
+        source = library.confined_entry_path(file)
+        dest = pl.require_entry_destination(path)
         try:
             payload = source.read_bytes()
+            size = pl.publish_bytes_atomically(dest, payload)
         except OSError as exc:
-            raise ValueError(f"Не удалось прочитать кэш промпта {source}: {exc}") from exc
-        size = publish_bytes_atomically(dest, payload)
-        log.info("FLUX.2 klein: кэш промпта «%s» выгружен в %s (%d байт).", source.stem, dest, size)
-        return {"family": family, "name": source.stem, "path": str(dest), "size_bytes": int(size)}
+            raise ValueError(f"Не удалось скопировать кэш промпта {source} в {dest}: {exc}") from exc
+        log.info("FLUX.2 klein: кэш промпта %s выгружен в %s (%d байт).", file, dest, size)
+        return {"library": library.spec.library_id, "file": file, "path": str(dest), "size_bytes": int(size)}
 
-    def prompt_cache_import(
-        self,
-        params: dict[str, Any] | None,
-        path: str,
-        *,
-        name: str | None = None,
-        overwrite: bool = False,
-    ) -> dict[str, Any]:
-        """Copy an outside `.msprompt` file into the library.
+    def prompt_cache_import(self, params: dict[str, Any] | None, path: str) -> dict[str, Any]:
+        """Copy an outside `.msprompt` file into the library it belongs to.
 
-        **The entry lands in the family recorded in the FILE, not in the family
-        currently selected.** An embedding belongs to the encoder that produced
-        it; filing it under the encoder that happens to be selected right now
-        would hide it from the encoder it actually works with, and would put a
-        foreign entry into a listing `prompt_cache_load` reads from. When the two
-        differ the import still succeeds — the file is a valid cache for
-        SOMETHING — and the answer says so (`family_matches: false`) so the
-        client can warn instead of pretending the entry is usable now.
+        A v2 file goes into ITS OWN library (its `library` field; it must be a
+        FLUX.2 klein library), whatever library the request names:
+        `library_matches` says whether the two agree. A v1 file (protocol <= 22)
+        is converted by the migration rules (`classify_v1_entry`): a file made
+        before the RoPE fix, or by an uncensored encoder that cannot be
+        identified, or that cannot be migrated, is REFUSED naming the reason.
+        The tensor bytes are kept verbatim; an entry that is already present is
+        not written again (`already_present`).
 
-        The file is verified as ours (`read_prompt_file_header`) before anything
-        is written; the copy is a byte copy, published atomically, and an
-        existing name is refused unless `overwrite` was asked for.
-
-        `name` defaults to the source file's stem. Both it and the family are
-        sanitized, so a hand-made file cannot place itself outside the library.
-
-        Returns `{"family", "name", "path", "size_bytes", "prompt", "created_at",
-        "current_family", "family_matches"}`.
+        Returns `{"library", "file", "prompt", "name", "library_matches",
+        "already_present", "origin"}`.
 
         # Raises
-        `ValueError` for a rejected source path, a file that is not a
-        `.msprompt`, a file whose metadata names no family, an unusable name, or
-        an existing entry without `overwrite`.
+        `ValueError` for a rejected path, a file that is not a prompt cache, a
+        library that is not FLUX.2's, a refused v1 file, or a failed write.
         """
-        source = require_prompt_file_source(path)
-        metadata, _tensor = read_prompt_file_header(source)
-        file_family = metadata.get("text_encoder_family", "")
-        if not file_family:
-            raise ValueError(
-                f"Файл кэша промпта {source} не указывает семейство энкодера "
-                "(text_encoder_family): неизвестно, куда его положить."
-            )
-        dest = require_free_entry_path(
-            prompt_cache_entry_path(file_family, name if name else source.stem),
-            overwrite=overwrite,
-        )
-        stored_family = dest.parent.name
-
-        # The current family is informational here: an import must work even when
-        # no encoder is configured yet, which is exactly the case where a user is
-        # setting a machine up from someone else's files. A path that names a
-        # broken encoder is caught and treated the same way, for the same reason.
-        try:
-            identity = self._current_family(params)
-        except ValueError:
-            identity = None
-        current_family = identity[1] if identity is not None else ""
-
+        request = self._lenient_library_request(params)
+        source = pl.require_entry_source(path)
+        self._migrate_legacy(request)
         try:
             payload = source.read_bytes()
         except OSError as exc:
             raise ValueError(f"Не удалось прочитать файл кэша промпта {source}: {exc}") from exc
-        size = publish_bytes_atomically(dest, payload)
-        family_matches = bool(current_family) and current_family == stored_family
-        if not family_matches:
-            log.info(
-                "FLUX.2 klein: импортированный кэш промпта положен в семейство «%s», а сейчас "
-                "выбрано «%s» — с текущим энкодером он не подойдёт.",
-                stored_family,
-                current_family or "—",
-            )
+        try:
+            header, _start = pl.parse_payload_header(payload)
+        except ValueError as exc:
+            raise ValueError(f"Файл {source} не является кэшем промпта ManhwaStudio: {exc}.") from exc
+        raw_meta = header.get("__metadata__")
+        marker = raw_meta.get("format") if isinstance(raw_meta, dict) else None
+        if marker == pl.CONTAINER_FORMAT:
+            library_id = str(raw_meta.get("library", ""))
+            if library_id not in FLUX2_LIBRARY_IDS:
+                raise ValueError(f"Файл кэша промпта {source} относится к библиотеке «{library_id}», а не к FLUX.2 klein.")
+            metadata = {str(key): str(value) for key, value in raw_meta.items()}
+            metadata["origin"] = pl.ORIGIN_IMPORTED
+        elif marker == V1_FORMAT:
+            v1_meta, tensor = parse_v1_header(header, source)
+            family = str(v1_meta.get("text_encoder_family", ""))
+            known = known_local_encoders([(request["text_encoder_path"], request["text_encoder_source"]), (v1_meta.get("text_encoder_path", ""), "")])
+            verdict = classify_v1_entry(v1_meta, tensor, known, family=family)
+            if verdict.action != "migrate" or verdict.library_id is None:
+                raise ValueError(f"Файл кэша промпта {source} не импортирован: {verdict.reason}.")
+            library_id = verdict.library_id
+            metadata = convert_v1_metadata(v1_meta, verdict, name=source.stem, migrated_from=f"{family}/{source.name}")
+        else:
+            raise ValueError(f"Файл {source} не является кэшем промпта ManhwaStudio: нет известной метки формата.")
+        library = library_of(library_id)
+        entry, written = library.add_payload(payload, metadata)
+        library_matches = library_id == request["prompt_library"]
+        log.info(
+            "FLUX.2 klein: кэш промпта %s импортирован в библиотеку %s как %s (%s).",
+            source,
+            library_id,
+            entry.file,
+            "новая запись" if written else "уже была",
+        )
         return {
-            "family": stored_family,
-            "name": dest.stem,
-            "path": str(dest),
-            "size_bytes": int(size),
-            "prompt": metadata.get("prompt", ""),
-            "created_at": metadata.get("created_at", ""),
-            "current_family": current_family,
-            "family_matches": family_matches,
+            "library": library_id,
+            "file": entry.file,
+            "prompt": entry.prompt,
+            "name": entry.name,
+            "library_matches": library_matches,
+            "already_present": not written,
+            "origin": entry.origin,
         }
 
-    def _prompt_cached(self, params: dict[str, Any] | None) -> bool:
-        """Whether a READY embedding exists for the combination named by `params`.
+    # ---- the prompt plan ----
+    def _texts_needed(self, normalized: dict[str, Any]) -> list[str]:
+        """The texts a run of `normalized` embeds: the prompt, plus `""` under effective classifier-free guidance.
 
-        Reported by `status` and read leniently, like the rest of it: an empty
-        prompt, a missing path or an unknown enum answers `False` instead of
-        raising, because the UI polls this while the user is still typing.
-
-        The answer comes from `_prompt_cache_key` — the same key a generation
-        looks up — so it can never claim a hit the run would miss. `whole_region`
-        is cleared before normalizing: it cannot change the key, and clearing it
-        keeps `_whole_region_overrides`'s log line out of a polling path.
-
-        Takes NO lock: a `dict` membership test with tuple-of-primitives keys is
-        one atomic C-level operation under the GIL, and `_store_embeds` is the
-        only writer. Waiting for the lock here made a status poll block for the
-        whole of a running generation.
+        A distilled checkpoint never asks for `""`: `_effective_guidance_scale`
+        has already pinned its scale to 1.0, so the encoder is never read for
+        an embedding the denoise would ignore.
         """
-        if not isinstance(params, dict):
-            return False
-        if not str(params.get("prompt", "") or "").strip():
-            return False
+        wanted = [normalized["prompt"]]
+        if self._effective_guidance_scale(normalized) > 1.0 and normalized["prompt"] != "":
+            wanted.append("")
+        return wanted
+
+    def _prompt_plan(self, normalized: dict[str, Any], *, blocking_load: bool) -> PromptPlan:
+        """THE owner of "which embedding serves each text this run needs, and what must be encoded".
+
+        Candidates of a text are the memory embeddings of the request's library
+        (`""` = none) with the exact text and `max_sequence_length`, plus that
+        library's entries with the same keys, minus every candidate whose
+        width the transformer does not accept (`transformer_text_width`);
+        `pl.select_entry` picks one under the request's preference (selected
+        encoder source, precision order). Lock-free: it reads the
+        copy-on-write memory index and the library snapshot (`load`, blocking
+        or not per `blocking_load`). Never migrates.
+        """
+        library_id = normalized.get("prompt_library") or ""
+        library = library_of(library_id) if library_id else None
+        if library is not None:
+            library.load(blocking=blocking_load)
+        pref = pl.Preference(str(normalized.get("text_encoder_source") or ""), tuple(normalized.get("prompt_cache_precision_order") or ()))
+        width = transformer_text_width(str(normalized.get("transformer_path") or ""))
+        msl = int(normalized["max_sequence_length"])
+        remembered = self._memory_index
+        served: dict[str, PromptChoice] = {}
+        to_encode: list[str] = []
+        for text in self._texts_needed(normalized):
+            candidates: list[PromptChoice] = [
+                PromptChoice(text, "memory", item, library_id)
+                for item in remembered.values()
+                if item.library == library_id and item.text == text and item.max_sequence_length == msl and (width is None or item.width is None or item.width == width)
+            ]
+            if library is not None:
+                for entry in library.entries_for(text, msl):
+                    if width is not None and entry.width != width:
+                        log.debug("FLUX.2 klein: запись %s шириной %s не подходит трансформеру (%d).", entry.file, entry.width, width)
+                        continue
+                    candidates.append(PromptChoice(text, "library", entry, library_id))
+            choice = pl.select_entry(
+                candidates,
+                pref,
+                provenance=lambda candidate: candidate.encoder,
+                created=lambda candidate: candidate.entry.created_at,
+                in_memory=lambda candidate: candidate.source == "memory",
+                name=lambda candidate: candidate.entry.file if isinstance(candidate.entry, pl.LibraryEntry) else (candidate.entry.entry.file if candidate.entry.entry is not None else ""),
+            )
+            if choice is None:
+                to_encode.append(text)
+            else:
+                served[text] = choice
+        return PromptPlan(served=served, to_encode=tuple(to_encode))
+
+    def _status_prompt_cache(self, params: dict[str, Any] | None) -> tuple[bool, dict[str, Any] | None]:
+        """`(prompt_cached, prompt_cache_entry)` of `.status`, read leniently.
+
+        An empty prompt, a missing path or an invalid field answers
+        `(False, None)` instead of raising: the UI polls this while the user is
+        still typing. `whole_region` is cleared before normalizing (it cannot
+        change the plan, and clearing it keeps `_whole_region_overrides`'s log
+        line out of a polling path). Never takes the service lock and never
+        migrates.
+        """
+        if not isinstance(params, dict) or not str(params.get("prompt", "") or "").strip():
+            return False, None
         probe = dict(params)
         probe["whole_region"] = False
         try:
             normalized = normalize_flux2_klein_params(probe)
         except ValueError:
-            return False
-        return self._prompt_cache_key(normalized, normalized["prompt"]) in self._prompt_cache
+            return False, None
+        plan = self._prompt_plan(normalized, blocking_load=True)
+        choice = plan.served.get(normalized["prompt"])
+        entry = None if choice is None else _entry_info(choice.entry, self._current_or_none(normalized))
+        return not plan.to_encode, entry
 
-    # ---- phase 2: the prompt ----
-    def _prompt_cache_key(self, normalized: dict[str, Any], text: str) -> tuple[Any, ...]:
-        """Everything that changes an embedding: encoder (its file and weight format), text, length, dtype, fp8.
-
-        Where the encoder ran is deliberately absent — the same encoder computes the same
-        embedding whether it ran on the host or the accelerator, and including it
-        would evict the cache on a step change for nothing.
-
-        The dtype is the ENCODER's (`text_encoder_dtype_name`) because that is
-        what the embedding is made of; the request's `dtype` describes the
-        transformer and the VAE and cannot change a single value in this tensor.
-        """
-        return (
-            normalized["text_encoder_path"],
-            normalized["text_encoder_format"],
-            text,
-            int(normalized["max_sequence_length"]),
-            text_encoder_dtype_name(),
-            bool(normalized["text_encoder_fp8"]),
-        )
+    def _prompt_cached(self, params: dict[str, Any] | None) -> bool:
+        """Whether every text a run of `params` needs is served by memory or the library (`_status_prompt_cache`, lenient)."""
+        return self._status_prompt_cache(params)[0]
 
     def _effective_guidance_scale(self, normalized: dict[str, Any]) -> float:
         """The `guidance_scale` this run will really use — 1.0 on a distilled checkpoint.
@@ -1716,35 +1866,14 @@ class Flux2KleinInpaintService:
             )
         return 1.0
 
-    def _prompts_to_encode(self, normalized: dict[str, Any]) -> list[str]:
-        """Prompt texts the phase still has to run; empty when the cache covers the run."""
-        wanted = [normalized["prompt"]]
-        if self._effective_guidance_scale(normalized) > 1.0:
-            # Classifier-free guidance needs the empty prompt too; encoding it now
-            # is what keeps the pipeline from reaching for an encoder that is gone.
-            # A distilled checkpoint never gets here: `_effective_guidance_scale`
-            # has already pinned the scale to 1.0, so the encoder is not read for
-            # an embedding the denoise would then ignore.
-            wanted.append("")
-        return [
-            text
-            for text in wanted
-            if self._prompt_cache_key(normalized, text) not in self._prompt_cache
-        ]
-
-    def _cached_embeds(self, normalized: dict[str, Any], text: str) -> Any:
-        """Fetch one cached embedding and mark it most-recently used."""
-        key = self._prompt_cache_key(normalized, text)
-        value = self._prompt_cache[key]
-        self._prompt_cache.move_to_end(key)
-        return value
-
-    def _store_embeds(self, key: tuple[Any, ...], value: Any) -> None:
-        """Insert into the LRU prompt cache, evicting the oldest entry when full."""
-        self._prompt_cache[key] = value
-        self._prompt_cache.move_to_end(key)
+    def _store_embeds(self, remembered: MemoryEmbedding, value: Any) -> None:
+        """Insert into the LRU memory cache (caller holds `self._lock`), evicting the oldest entry when full; republishes `_memory_index`."""
+        self._prompt_cache[remembered.key] = value
+        self._prompt_cache.move_to_end(remembered.key)
         while len(self._prompt_cache) > PROMPT_EMBED_CACHE_ENTRIES:
             self._prompt_cache.popitem(last=False)
+        index = {**self._memory_index, remembered.key: remembered}
+        self._memory_index = {key: item for key, item in index.items() if key in self._prompt_cache}
 
     def _ensure_tokenizer_locked(self, tokenizer_dir: Path) -> Any:
         """Return the Qwen tokenizer for `tokenizer_dir`, reading it once per directory.

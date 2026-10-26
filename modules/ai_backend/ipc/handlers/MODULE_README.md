@@ -45,7 +45,7 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
 - `flux_fill.py`: `inpaint.flux_fill` (+ `.unload`, `.status`) — streaming `download` and `generate`
   phases, no preview blob.
 - `flux2_klein.py`: `inpaint.flux2_klein` (+ `.status`, `.unload`,
-  `.component_action` and the six `.prompt_cache.*` methods) — FLUX.2
+  `.component_action` and the four `.prompt_cache.*` methods) — FLUX.2
   klein region editing. Generation streams `load`/`generate` phases (never `download`: by then the
   weights are user-supplied paths) and returns `image_len` + the
   OOM-recovery report (`oom_recovered`, `applied`) and the four step keys in the response header.
@@ -58,13 +58,14 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
   by the service's params normalization, not here.
   `prompt_cache.build` is the second streaming method of the group (same
   `{phase, step, total, label}` frames through the shared `streaming.progress_forwarder`, no blob): it
-  encodes a prompt without generating anything, and reading the text encoder takes tens of seconds,
-  so a
-  silent wait is not acceptable. `prompt_cache.list`/`.save`/`.load`/`.export`/`.import` are plain
-  request/response. Names and paths are forwarded VERBATIM — `_require_non_empty_str` only checks
-  that the field arrived as a non-empty string; what makes a path or a name acceptable is the
-  service's business (`require_prompt_file_source`, `sanitize_name_component`), and duplicating
-  those rules here would give two answers to one question.
+  saves a named preset into the model's prompt library, encoding without generating anything when
+  needed, and reading the text encoder takes tens of seconds, so a silent wait is not acceptable.
+  `prompt_cache.list` / `.export` / `.import` are plain request/response (protocol 23; `.save` /
+  `.load` are gone). The preset `name` (optional, `_optional_str`), entry `file` and `path` are
+  forwarded VERBATIM — `_require_non_empty_str` only checks that a required field arrived as a
+  non-empty string; what makes a path, a file name or a name acceptable is the service's business
+  (`prompt_library.require_entry_source` / `require_entry_file_name` / `normalize_preset_name`),
+  and duplicating those rules here would give two answers to one question.
   `component_action` is the THIRD streaming method of the group and follows the same rule:
   `component` and `action` are forwarded verbatim, because which names are legal and which are
   possible for a component right now is the service's single answer (`ACTIONABLE_COMPONENTS`,

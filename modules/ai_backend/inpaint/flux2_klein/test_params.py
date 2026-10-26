@@ -112,6 +112,9 @@ class NormalizeParamsTests(_TempTreeCase):
         self.assertEqual(
             set(svc.normalize_flux2_klein_params(self.params())),
             {
+                "prompt_library",
+                "text_encoder_source",
+                "prompt_cache_precision_order",
                 "text_encoder_path",
                 "transformer_path",
                 "vae_path",
@@ -300,6 +303,36 @@ class EncoderWeightFormatParamsTests(_TempTreeCase):
 # ---------------------------------------------------------------------------
 # Region validation
 # ---------------------------------------------------------------------------
+class PromptLibraryParamsTests(_TempTreeCase):
+    """Protocol 23: `prompt_library`, `text_encoder_source`, `prompt_cache_precision_order`."""
+
+    def test_absent_fields_mean_no_library_and_no_preference(self) -> None:
+        normalized = svc.normalize_flux2_klein_params(self.params())
+        self.assertEqual((normalized["prompt_library"], normalized["text_encoder_source"], normalized["prompt_cache_precision_order"]), (None, "", ()))
+        self.assertEqual(params_module.prompt_library_fields({"prompt_library": None, "text_encoder_source": None, "prompt_cache_precision_order": None}), (None, "", ()))
+        self.assertEqual(params_module.prompt_library_fields(None), (None, "", ()))
+
+    def test_valid_fields_are_kept(self) -> None:
+        normalized = svc.normalize_flux2_klein_params(self.params(prompt_library="flux2_klein_9b", text_encoder_source="uncensored", prompt_cache_precision_order=["bf16", "q8_0", "fp8"]))
+        self.assertEqual((normalized["prompt_library"], normalized["text_encoder_source"], normalized["prompt_cache_precision_order"]), ("flux2_klein_9b", "uncensored", ("bf16", "q8_0", "fp8")))
+        self.assertEqual(params_module.prompt_library_fields({"text_encoder_source": ""})[1], "", "manual mode may send an empty source")
+
+    def test_a_bad_field_is_refused_by_name(self) -> None:
+        for field, value in (
+            ("prompt_library", "Flux-9B"),
+            ("prompt_library", ""),
+            ("prompt_library", 9),
+            ("prompt_library", "x" * 41),
+            ("text_encoder_source", "Stock"),
+            ("text_encoder_source", 1),
+            ("prompt_cache_precision_order", "bf16"),
+            ("prompt_cache_precision_order", ["bf16", "BF16"]),
+            ("prompt_cache_precision_order", ["bf16", "bf16"]),
+        ):
+            with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, field):
+                svc.normalize_flux2_klein_params(self.params(**{field: value}))
+
+
 class RegionValidationTests(unittest.TestCase):
     def test_accepts_a_valid_region(self) -> None:
         svc.validate_region_size(512, 512)

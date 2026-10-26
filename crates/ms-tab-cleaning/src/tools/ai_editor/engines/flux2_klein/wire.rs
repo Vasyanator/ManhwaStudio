@@ -296,6 +296,8 @@ pub(super) fn parse_flux2_status(header: &Value) -> Flux2Status {
         // Deliberately NOT defaulted to `false`: a backend that does not know about the
         // prompt cache must read as "unknown", never as "your prompt is not cached".
         prompt_cached: header.get("prompt_cached").and_then(Value::as_bool),
+        // `null` and an absent field are the same "no entry"; any object is read tolerantly.
+        prompt_cache_entry: header.get("prompt_cache_entry").and_then(parse_entry_info),
         // Same rule, and it matters more here: `Some(false)` gates the encode buttons and
         // raises a warning, so a backend that never reports the field must not be read as
         // "you have no encoder".
@@ -593,6 +595,21 @@ mod tests {
             parse_flux2_status(&json!({ "text_encoder_available": "yes" })).text_encoder_available,
             None
         );
+    }
+
+    /// Protocol 23: `.status` names the entry the run would use; `null`, an absent field and a
+    /// non-object all read as "no entry".
+    #[test]
+    fn the_status_names_the_prompt_cache_entry_a_run_would_use() {
+        let status = parse_flux2_status(&json!({
+            "prompt_cached": true,
+            "prompt_cache_entry": { "file": "a.msprompt", "encoder_source": "uncensored", "encoder_format": "q8_0", "origin": "built" }
+        }));
+        let entry = status.prompt_cache_entry.expect("the entry is parsed");
+        assert_eq!((entry.file.as_str(), entry.encoder_source.as_str(), entry.encoder_format.as_str()), ("a.msprompt", "uncensored", "q8_0"));
+        for absent in [json!({ "prompt_cache_entry": null }), json!({}), json!({ "prompt_cache_entry": "a.msprompt" })] {
+            assert_eq!(parse_flux2_status(&absent).prompt_cache_entry, None);
+        }
     }
 
     #[test]

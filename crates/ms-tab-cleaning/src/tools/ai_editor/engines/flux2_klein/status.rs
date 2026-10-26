@@ -346,6 +346,11 @@ pub(super) struct Flux2Status {
     /// whose prompt-cache methods do not exist yet. That is NOT the same as `Some(false)`
     /// and must not be shown as "not cached": the honest answer there is "not known".
     pub(super) prompt_cached: Option<bool>,
+    /// The library entry (or memory-only encode) the run would use for the prompt this answer
+    /// was asked about — the backend's selection (protocol 23), shown by the cache line as the
+    /// encoder that made the cache. `None` when the prompt is not served or the backend did
+    /// not report it.
+    pub(super) prompt_cache_entry: Option<PromptLibraryEntry>,
     /// Whether a text encoder is present ON THIS MACHINE for the paths this answer was
     /// asked about. Reported separately from `available`, because a run whose prompt is
     /// already cached needs no encoder at all: `available` stays `true` while this is

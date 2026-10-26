@@ -66,9 +66,10 @@ Selection contract (checked twice, on purpose):
   gets an explanation instead of a request the backend would reject.
 
 Panel layout (`Flux2PanelCtx::draw`, and its ORDER is the design):
-progress bar -> run status -> the PROMPT block (the English field, the one compact line
-about its cache state, and two toggles that unfold the translator and the prompt-cache
-library) -> «Сила изменения» -> the READINESS line -> three sibling collapsible sections,
+progress bar -> run status -> the PROMPT block (the English field, the preset name with
+«Кэшировать» / «Переименовать», the one compact line about its cache state, and two toggles
+that unfold the translator and the prompt library: the shared preset picker, «Экспорт»,
+«Импорт») -> «Сила изменения» -> the READINESS line -> three sibling collapsible sections,
 «Установка модели» / «Память и скорость» / «Для экспертов» -> the mask note -> the shared
 «Постобработка» section (`../shared/postprocess_section.rs`), docked at the bottom.
 Everything a user touches per edit is above the folds; everything set once per machine is
@@ -88,7 +89,8 @@ Submodules (each re-exported into this root with `use <name>::*;`):
 - `ui/`: the parameter panel. `mod.rs` is the body and its ORDER; `install.rs`,
   `components.rs`, `advanced.rs` and `mask_hint.rs` draw the blocks it calls into.
 - `decisions.rs`: the PURE decisions the panel renders — `flux2_readiness_line`,
-  `flux2_prompt_cache_line`, `flux2_run_block_reason`, `region_block_reason` — kept apart
+  `flux2_prompt_cache_line` (+ `flux2_encoder_caption`), `flux2_run_block_reason`,
+  `region_block_reason` — kept apart
   from the drawing so they can be asserted without a frame.
 - `settings.rs`: `Flux2KleinSettings` and everything persisted with it — the dtype
   vocabulary, the two step ids, the one-time migration of the retired memory placement,
@@ -97,8 +99,9 @@ Submodules (each re-exported into this root with `use <name>::*;`):
 - `status.rs`: the `.status` component catalog (`Flux2Status`) and every verdict derived
   from it — `Flux2ModelReadiness`, the merged component rows, the install-fold seed and
   `flux2_pipeline_busy`.
-- `prompt_cache.rs`: the saved `.msprompt` library — its shapes, its operation gates and
-  the whole `.prompt_cache.*` wire block.
+- `prompt_cache.rs`: the FLUX.2 side of the model's shared prompt library — what
+  «Кэшировать» offers (`flux2_cache_button`), the export / import gates and the whole
+  `.prompt_cache.*` wire block (the listing shapes and preset rules are `../shared/`).
 - The memory forecast is NOT a file here: it is `large_models.profiles`, asked through
   `ms_local_ai::large_models::ProfilesQuery` (latest wins, one in flight) and drawn by the
   shared `ai_editor::large_model_resources` widget.
@@ -130,8 +133,8 @@ Key items:
   OWNING variant so a hand-copied file cannot lie about which model its paths describe.
   `normalized()` is the ONLY value ever put on the wire. The prompt token budget is
   NOT among them: `FLUX2_MAX_SEQ` is pinned at 512, which was already the maximum
-  the backend accepts, and the length is part of the prompt-cache key — lowering it
-  invalidated every entry of the saved `.msprompt` library at once.
+  the backend accepts, and the length is part of every library entry's key — lowering it
+  would orphan every saved `.msprompt` entry at once.
 - `Flux2ModelReadiness` / `flux2_model_readiness`: THE answer to "is the model
   installed on this machine", derived from the `.status` presence catalog together
   with `effective_paths` and the source mode. Three-state on purpose: `Unknown` (no
@@ -180,33 +183,25 @@ IPC (`backend_ipc::protocol`):
   `available` stays true while this is false. And it answers `guidance_supported`, whose
   ABSENCE means SUPPORTED — the inverse default of the two above, because that is what
   every backend older than the field reports and what the control did before it existed.
-- GENERATING WITHOUT A TEXT ENCODER is supported and is the reason the prompt-cache
-  library exists: the denoise and the VAE decode never look at the encoder, so a
-  `.msprompt` carried to a machine that never downloaded the 16 GB Qwen3 is enough. The
-  run gate therefore waives the encoder path when `.status` says the prompt is cached,
+- GENERATING WITHOUT A TEXT ENCODER is supported and is the reason the prompt library
+  exists: the denoise and the VAE decode never look at the encoder, so a cached prompt is
+  enough. The run gate waives the encoder path when `.status` says the prompt is served,
   and only then. What the absence costs is stated where it happens: the one line under the
-  prompt takes the warning ("only ready caches work") unless the prompt is already cached,
-  in which case the affirmative wins because the run works either way
-  (`flux2_prompt_cache_line`), a disabled «Кэшировать»/«Сохранить кэш»
-  (the two operations that must ENCODE, refused backend-side anyway), the family shown on
-  every library row (a machine with no encoder has no ACTIVE family, so the listing spans
-  all of them), and a one-off notice after a load whose `encoder_verified` came back
-  false — the file's own metadata was taken on trust because nothing local could compare
-  the fingerprint. Загрузить/Экспорт/Импорт keep working throughout.
-- `.prompt_cache.*` — the prompt-cache LIBRARY, six methods carrying the normalized
-  `params` plus their own fields. `build` is STREAMING (reading the Qwen3 encoder takes
-  far longer than a call may block for) and drives the same progress bar as a generation, which is why the
-  two can never run at once. `list` answers the ACTIVE encoder family (empty when no
-  encoder is installed, and the listing then spans every family) and the saved entries
-  (`name`, its own `family`, `prompt`, `created_at`); `save`/`load` take a `name`; `export` takes a
-  `name` and a `path`; `import` takes a `path` — all of them BESIDE `params` at the top
-  level of the header, which is where the backend reads them from, and never `overwrite`,
-  so a name already taken comes back as an explicit error. The library itself lives
-  backend-side
-  (`prompt_cache/`, one folder per encoder family) — this side works with NAMES and
-  never builds a path into it. An imported file of a foreign family is stored under
-  that family and reported as such; it does not appear in this family's listing and
-  the backend refuses to load it, which is expected and is surfaced as a warning.
+  prompt takes the warning ("only ready caches work") unless the prompt is served, in which
+  case the affirmative wins (`flux2_prompt_cache_line`), and «Кэшировать» is closed (it must
+  ENCODE). The picker, «Экспорт» and «Импорт» keep working throughout.
+- `.prompt_cache.*` (protocol 23) — the model's shared prompt LIBRARY: one per checkpoint
+  (`params.prompt_library` = `Flux2Variant::prompt_library_id`), any encoder variant may
+  serve an entry, a cached text is a NAMED preset, and a run uses it automatically when the
+  typed text matches exactly (the backend's selection: the request's encoder source first —
+  `text_encoder_source`, download mode only — then the most precise format by
+  `prompt_cache_precision_order`, the other source as a fallback). `build` is STREAMING and
+  takes an optional top-level `name` (a rename when the current encoder already serves the
+  text); `list` answers the presets (`texts[{prompt, name, selected, entries}]`, `skipped`,
+  `legacy`); `export` takes `file` + `path`; `import` takes `path` and answers
+  `library_matches` / `already_present`. `.status` names the entry a run would use
+  (`prompt_cache_entry`). This side never builds a path into the library and never re-derives
+  the selection; `save` / `load` are gone.
 - THE MODEL SOURCE IS A MODE (`source_mode`, persisted, defaulting to `manual`): either
   the user's own three paths, or the copy this panel downloads. Exactly one body is drawn
   under the switch at the top of «Установка модели».
@@ -395,7 +390,7 @@ const FLUX2_STRENGTH_MAX: f32 = 1.0;
 /// (`mask_dilate_px`). The feather and colour-match ranges are `ms_region_postprocess`'s.
 const FLUX2_DILATE_MAX: u32 = 64;
 
-/// Horizontal room left for the «Сохранить кэш» button beside the name field, points.
+/// Horizontal room left for «Кэшировать» / «Переименовать» beside the preset name field, points.
 /// The field takes whatever is left, so the button never wraps onto its own line.
 const FLUX2_CACHE_NAME_BUTTON_RESERVE: f32 = 140.0;
 

@@ -16,7 +16,7 @@ holding the `start_*` / `poll_*` pair of every long operation.
 
 The split is by lifetime, not by topic: `mod.rs` answers questions the panel asks on the
 frame it is drawn in (`pipeline_busy`, `model_readiness`, `status_for_current_paths`,
-`prompt_cache_state`, `catalog_snapshot`, `switch_block_reason`), while `actions.rs`
+`prompt_cache_state`, `prompt_cache_status_entry`, `catalog_snapshot`, `switch_block_reason`), while `actions.rs`
 owns work that outlives the frame that started it.
 
 Every one of those accessors is THE way the panel asks its question, never an expression
@@ -39,8 +39,9 @@ poll_x()   -> try_recv, apply the outcome, clear the Receiver
   and folds a change of the weight selection — formats or encoder source
   (`fold_resources_and_formats` over `Flux2WeightSelection`, `note_weight_formats_changed`).
 - `actions.rs`: the per-component load/unload actions, the Hugging Face token field, the
-  prompt translation, the native file pickers, and the six `.prompt_cache.*` jobs. Edit it to
-  add an operation or to change what one does with its answer.
+  prompt translation, the native file pickers, and the `.prompt_cache.*` jobs (build — also a
+  rename — export, import, and the library listing). Edit it to add an operation or to change
+  what one does with its answer.
 
 ## Contracts and invariants
 - **Nothing here blocks the GUI thread.** Every `start_*` hands its work to an
@@ -57,8 +58,10 @@ poll_x()   -> try_recv, apply the outcome, clear the Receiver
   keeps the last answer as a STALE one while the next is asked) and `.prompt_cache.list` are
   re-armed by a flag (`resources.arm()` for the forecast), never issued per keystroke. Events
   that change the machine rather than the question (a finished run, a component action, a cap
-  write, a floor reset, a reconnect, a download, a finished prompt-cache build, a CHANGED
-  prompt-cache listing) go through `invalidate_forecast`. The caps are
+  write, a floor reset, a reconnect, a download, a finished prompt-cache build, a listing that
+  differs from the one held — the first one included, because the first `.list` of a process
+  is what migrates the old caches and `.status` never does — go through `invalidate_forecast`;
+  a finished build and such a listing also re-arm `.status` (whether the prompt is served). The caps are
   sent by the controller's debounced `LimitsWriter`, drained from `poll` (`poll_side_jobs`).
 - **A failed settings write is not success**: the shared `SettingsSaver` (`saver`) drives the
   write; a failure restores `dirty`, shows `saver.error` and retries after `save_retry_delay`

@@ -40,7 +40,11 @@ Key declarations:
   configs (`fixtures/flux2_9b_*.json`, no tensor data) and a stdlib writer that
   turns one recorded header into a header-only GGUF file (a header view
   needs no tensor bytes: `runtime.tensor_container`).
-- `_FakeEmbeds` - a prompt-embedding stand-in for the library tests.
+- `_FakeEmbeds` - a prompt-embedding stand-in for the library tests;
+  `seed_memory` - puts an embedding into a service's memory cache with its
+  provenance (the way an encode would).
+- `_TempTreeCase` also points `prompt_cache.program_root` at `<tmp>/_program`
+  for every test, so no test can touch the real `prompt_cache/`.
 - `_ManagedRunFixture` (+ `_RoomyProbes`, `_FakeRunPipeline`, `_ImageProcessor`,
   `_flat_tables`) - real manager, arbiter, small pool, torch and model classes;
   fake pipeline call, tokenizer, budget probes and transport device.
@@ -66,7 +70,9 @@ import numpy as np
 from PIL import Image
 
 from modules.ai_backend.inpaint import flux2_klein as svc
-from modules.ai_backend.inpaint.flux2_klein import components, hardware
+from modules.ai_backend.inpaint.flux2_klein import components, hardware, prompt_cache
+from modules.ai_backend.inpaint.flux2_klein import service as flux2_service
+from modules.ai_backend.runtime import prompt_library
 from modules.ai_backend.runtime.model_manager import SmallModelManager
 
 
@@ -565,6 +571,12 @@ class _TempTreeCase(unittest.TestCase):
         package_patch = patch.object(components, "installed_klein_package_roots", lambda: components.existing_klein_package_roots(installed))
         package_patch.start()
         self.addCleanup(package_patch.stop)
+        # The prompt library root: a temp program root for EVERY FLUX.2 test, so
+        # no test can ever read, migrate or write the user's real `prompt_cache/`.
+        self.program_root = self.root / "_program"
+        root_patch = patch.object(prompt_cache, "program_root", lambda: self.program_root)
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
         self.paths = _make_model_tree(
             self.root,
             single_file_transformer=self.single_file_transformer,
@@ -592,6 +604,41 @@ class _TempTreeCase(unittest.TestCase):
             json.dumps({"_class_name": "Flux2KleinPipeline", "is_distilled": value}),
             encoding="utf-8",
         )
+
+
+def seed_memory(
+    service: object,
+    params: dict[str, object],
+    *,
+    text: str | None = None,
+    tensor: object = None,
+    encoder: prompt_library.EncoderProvenance | None = None,
+) -> dict[str, object]:
+    """Put `tensor` (default: a `_FakeEmbeds` of `text`) in `service`'s memory cache as an embedding ENCODED in this process.
+
+    `text` defaults to the request's prompt; `encoder` to a provenance with the
+    request's source and format and the fingerprint `"seeded"`. Returns the
+    normalized params.
+    """
+    normalized = svc.normalize_flux2_klein_params(params)
+    text = str(normalized["prompt"]) if text is None else text
+    tensor = _FakeEmbeds(text) if tensor is None else tensor
+    encoder = encoder or prompt_library.EncoderProvenance(str(normalized["text_encoder_source"]), str(normalized["text_encoder_format"]), bool(normalized["text_encoder_fp8"]), "seeded", "seeded")
+    library = str(normalized["prompt_library"] or "")
+    msl = int(normalized["max_sequence_length"])  # type: ignore[arg-type]
+    remembered = flux2_service.MemoryEmbedding(
+        key=flux2_service._memory_key(library, text, msl, encoder, ""),
+        library=library,
+        text=text,
+        max_sequence_length=msl,
+        encoder=encoder,
+        width=flux2_service._tensor_width(tensor),
+        entry=None,
+        created_at=prompt_library.utc_now(),
+    )
+    with service._lock:  # type: ignore[attr-defined]
+        service._store_embeds(remembered, tensor)  # type: ignore[attr-defined]
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +714,9 @@ class _FakeRunPipeline:
         import torch
 
         type(self).encode_calls.append(kwargs)
-        return torch.zeros((1, int(kwargs["max_sequence_length"]), 24)), None
+        # bfloat16, like the real encoder's output (`text_encoder_dtype_name`):
+        # the prompt library stores exactly that dtype.
+        return torch.zeros((1, int(kwargs["max_sequence_length"]), 24), dtype=torch.bfloat16), None
 
     def __call__(self, **kwargs: object) -> object:
         """Record the call, report every effective step, return zero latents of the region's latent size."""

@@ -2,205 +2,155 @@
 File: modules/ai_backend/inpaint/flux2_klein/prompt_cache.py
 
 Purpose:
-The prompt-cache library: the identity of the text encoder an embedding came
-from, the `.msprompt` container that persists one embedding, and the on-disk
-library those containers live in.
+FLUX.2 klein's side of the shared prompt library (`runtime/prompt_library.py`):
+which library a request uses, how the text encoder that produced an embedding
+is identified and described, the embedding width a transformer accepts, and the
+one-time migration of the protocol-<=22 `.msprompt` files (container v1, one
+directory per encoder "family") into the per-model libraries.
 
-Encoding a prompt costs a 16 GB read of the Qwen3 encoder and the resulting
-embedding is ~4 MiB, so embeddings are worth persisting. On-disk entries live in
-`<program root>/prompt_cache/<encoder family>/<name>.msprompt` - a safetensors
-container holding one `prompt_embeds` tensor plus a `__metadata__` map naming the
-encoder. That name is CHECKED on load (`validate_prompt_file_metadata`):
-embeddings of another encoder would load without an error and denoise into
-something the user did not ask for.
+Encoding a prompt costs reading the Qwen3 encoder (up to 16 GB) while the
+embedding is ~12.6 MB (9B) / ~7.9 MB (4B), so embeddings are worth keeping. Any
+encoder variant of a model may serve that model's entries; the request's
+preference ranks them (`runtime.prompt_library.select_entry`), and every entry
+records its provenance so the UI can name it.
 
 Main responsibilities:
-- encoder identity (`text_encoder_fingerprint` with its RoPE salt, `local_encoder_identity`,
-  `encoder_family_name`), for a folder or a GGUF file (whose identity and
-  family never coincide with a folder's);
-- the container format (`prompt_file_metadata`, `read_prompt_file_header`,
-  `validate_prompt_file_metadata`, `write_prompt_file`, `read_prompt_file_tensor`);
-- library paths and listings (`prompt_cache_root`, `prompt_cache_family_dir`,
-  `prompt_cache_entry_path`, `list_prompt_cache_entries`,
-  `list_prompt_cache_families`, `find_prompt_cache_entry`);
-- name sanitization and destination/source validation for import and export.
+- encoder identity: `text_encoder_fingerprint` (RoPE salt; `rope_salt=False`
+  gives the pre-fix identity, used ONLY to recognize pre-fix v1 entries),
+  `encoder_label`, `encoder_provenance` (the request's current encoder);
+- libraries: `flux2_library_spec`, `prompt_cache_root`, `library_of`,
+  `transformer_text_width`;
+- v1: `read_v1_header`, `known_local_encoders`, `classify_v1_entry`,
+  `convert_v1_metadata`, `migrate_legacy_families` / `ensure_legacy_migrated`.
 
 Notes:
-- `program_root` and `write_prompt_file` are replaced by the test suite through
-  this module object; consumers outside this file must reach `write_prompt_file`
-  as `prompt_cache.write_prompt_file(...)` so that one patch reaches them all.
-- torch and safetensors are imported lazily inside the functions that need them.
+- `program_root` is the tests' patch point (through this module object).
+- v1 migration rules (user decisions, protocol 23): an entry proven made before
+  the RoPE fix (its id is the UNSALTED identity of an encoder whose RoPE the
+  loader normalizes) and an unmatched entry of an uncensored encoder (post-fix
+  unprovable) are DELETED; every other entry is written as a v2 file first,
+  verified (header re-read, size) and only then is its v1 file deleted; an
+  emptied family directory is removed; a file that cannot be migrated for any
+  other reason stays where it is and is reported.
+- Migration safety: the root, every family and every file is proven a real
+  directory / regular file strictly inside the root before it is read and again
+  before it is deleted (`prompt_library.require_confined`); a link is reported,
+  never followed. A v1 file is unlinked only after its v2 copy's directory is
+  fsynced (`prompt_library.sync_directory`), and each unlink is fsynced in its
+  family directory.
+- torch is never imported here.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import time
+import re
+import stat
+import threading
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+from ...runtime import prompt_library as pl
 from ...runtime.paths import program_root
+from ...runtime.safetensors_stream import read_safetensors_header
+from . import components
 from .components import (
     _MODEL_CONFIG_MARKER,
+    _config_int,
+    _read_json_object,
     component_dir_for_path,
     is_gguf_file,
-    read_safetensors_header,
     text_encoder_available,
     text_encoder_config_dir,
     text_encoder_rope_kwargs,
+    transformer_config_dir,
 )
-from .params import _to_bool, _to_int, text_encoder_dtype_name
+from .params import SAFETENSORS_FORMAT, GGUF_FORMAT, WEIGHT_FORMAT_ID_PATTERN, text_encoder_dtype_name
 
 log = logging.getLogger(__name__)
 
-#: Prompt embeddings kept between runs. One entry is `[1, <=512, 4096]` at 2
-#: bytes, i.e. ~4 MiB, so eight of them cost ~32 MiB — small enough to keep
-#: always on, bounded so that a session of prompt edits is not a leak.
+#: The v2 library of each tensor width a v1 entry may carry (a Qwen3-4B / Qwen3-8B
+#: encoder stacks three hidden states: 3 x 2560 / 3 x 4096). The ids are the Rust
+#: `Flux2Variant::prompt_library_id` values (directory names: frozen); a Rust test
+#: reads this table, so keep it a one-line literal with double-quoted ids.
+LEGACY_LIBRARY_BY_WIDTH = {7680: "flux2_klein_4b", 12288: "flux2_klein_9b"}
+
+#: Every FLUX.2 klein library id.
+FLUX2_LIBRARY_IDS = frozenset(LEGACY_LIBRARY_BY_WIDTH.values())
+
+#: Prompt embeddings kept in memory between runs. A 9B entry is `[1, 512, 12288]`
+#: bf16, i.e. ~12.6 MB (4B: ~7.9 MB), so eight of them cost up to ~100 MB:
+#: bounded, so that a session of prompt edits is not a leak.
 PROMPT_EMBED_CACHE_ENTRIES = 8
 
-# ---------------------------------------------------------------------------
-# The `.msprompt` prompt-cache file
-# ---------------------------------------------------------------------------
-# A prompt embedding is worth persisting for exactly one reason: producing it
-# costs reading the Qwen3 encoder off disk - tens of seconds, and the bulk of
-# what a fresh prompt costs - while the embedding itself is ~4 MiB. A user who always edits
-# with the same prompt should never have to hold that encoder at all.
-#
-# The container is safetensors — already a dependency, readable by third-party
-# tooling, and its header can be inspected without materializing a tensor, which
-# is what makes the compatibility check below torch-free and cheap.
-
-#: File suffix of a saved prompt cache. Checked on every client-supplied path:
-#: those are untrusted input, and a wrong suffix is far more likely to be a
-#: mis-wired path than a deliberate choice.
-PROMPT_CACHE_SUFFIX = ".msprompt"
-
-#: Library directory, in the program root next to `fonts/`. Layout:
-#: `prompt_cache/<encoder family>/<entry name>.msprompt`. The family level
-#: exists because an embedding is only valid for the encoder that produced it,
-#: so entries of two encoders must never share a listing.
+#: The library root in the program root, next to `fonts/`. Layout:
+#: `prompt_cache/<library id>/<entry>.msprompt` (+ `index.json`); protocol <= 22
+#: left `prompt_cache/<encoder family>/<name>.msprompt` (v1).
 PROMPT_CACHE_DIRNAME = "prompt_cache"
 
-#: Length of the fingerprint fragment appended to a family directory name. Eight
-#: hex characters is 32 bits: enough that two encoders a user actually has
-#: installed will not collide, short enough to keep the directory readable.
-PROMPT_CACHE_FAMILY_HASH_CHARS = 8
-
-#: Characters kept verbatim in a family or entry name. Everything else becomes
-#: `_`. Path separators, `..`, control characters and the Windows-reserved
-#: `<>:"/\|?*` are therefore all removed by construction rather than by a
-#: blacklist that has to stay complete.
-_SAFE_NAME_EXTRA = " ._-()"
-
-#: Longest sanitized name component we write. Well under every filesystem's
-#: limit even after the `.msprompt` suffix and a `.<pid>.part` staging suffix.
-_MAX_NAME_LENGTH = 100
-
-#: `__metadata__` marker. Present and equal, or the file is not ours and is
-#: refused before anything else is looked at.
-PROMPT_CACHE_FORMAT = "manhwastudio.flux2_klein.prompt_cache"
-
-#: Format version. Bumped when the meaning of an existing field changes; a file
-#: from a NEWER version is refused rather than read with today's rules.
-PROMPT_CACHE_VERSION = 1
-
-#: The single tensor a `.msprompt` file carries.
+#: The single tensor an entry carries.
 PROMPT_CACHE_TENSOR = "prompt_embeds"
 
-#: safetensors dtype tokens for the two compute dtypes this service offers,
-#: keyed by the `dtype` param name. The container records the tensor's own
-#: dtype, so the declared one can be cross-checked against it from the header
-#: alone — a hand-edited `__metadata__` cannot make float16 embeddings pass as
-#: bfloat16 ones.
-_PROMPT_CACHE_DTYPE_TOKENS = {"bfloat16": "BF16", "float16": "F16"}
+#: safetensors dtype token of the encoder's dtype (`text_encoder_dtype_name`).
+PROMPT_CACHE_DTYPE_TOKEN = "BF16"
+
+#: `__metadata__["format"]` / version of a v1 entry (read by migration and import only).
+V1_FORMAT = "manhwastudio.flux2_klein.prompt_cache"
+V1_VERSION = 1
+
+#: A v1 family directory name: `<readable>-<8 hex of the encoder fingerprint>`.
+#: Library ids (`[a-z0-9_]`) never contain `-`, so the two never collide.
+LEGACY_FAMILY_PATTERN = re.compile(r"^.+-[0-9a-f]{8}$")
+
+#: The encoder subdirectories of an installed klein package and their source ids
+#: (`ms_sysprobe` external catalog `flux2_klein.rs`: `text_encoder`,
+#: `text_encoder_uncensored`, `text_encoder_gguf`, `text_encoder_uncensored_gguf`).
+_PACKAGE_ENCODER_FOLDERS = (("text_encoder", "stock"), ("text_encoder_uncensored", "uncensored"))
+_PACKAGE_ENCODER_GGUF_DIRS = (("text_encoder_gguf", "stock"), ("text_encoder_uncensored_gguf", "uncensored"))
 
 #: Weight-file suffixes that take part in the text-encoder fingerprint.
 _ENCODER_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
 
 
-def local_encoder_identity(text_encoder_path: str) -> tuple[str, str] | None:
-    """`(fingerprint, family)` of the encoder on disk, or `None` when there is none.
-
-    The library needs an identity to file entries under and to compare a file
-    against; without an encoder on this machine there is no identity to compute,
-    and `None` is that fact rather than a placeholder. Callers must branch on it:
-    `None` means "the file's own metadata is all we know", which is exactly what
-    `validate_prompt_file_metadata` documents as the unverified path.
-
-    # Raises
-    `ValueError` when the path DOES exist but cannot be fingerprinted (no
-    `config.json`, unreadable directory). An encoder that cannot be identified
-    cannot be loaded either, so that stays an error instead of degrading into
-    "no encoder" — degrading it would hide a broken checkout behind a silently
-    weaker check.
-    """
-    if not text_encoder_available({"text_encoder_path": text_encoder_path}):
-        return None
-    encoder_id = text_encoder_fingerprint(text_encoder_path)
-    return encoder_id, encoder_family_name(text_encoder_path, encoder_id)
-
-
 # =====================================================================
-#  The `.msprompt` prompt-cache file
+#  Encoder identity
 # =====================================================================
-def text_encoder_fingerprint(path: str) -> str:
-    """Cheap, stable identity of the Qwen3 encoder a `.msprompt` file was built with.
+def text_encoder_fingerprint(path: str, *, rope_salt: bool = True) -> str:
+    """Cheap, stable identity of the Qwen3 encoder at `path` (a folder, a weights file inside it, or a GGUF file).
 
-    **Why an identity is needed at all.** Embeddings produced by a different
-    encoder have the same shape and the same dtype as ours and load without a
-    murmur — they simply denoise into something the user did not ask for. That
-    is the silent wrong answer this package forbids everywhere else, so a saved
-    file names the encoder it came from and `validate_prompt_file_metadata`
-    refuses a mismatch.
+    **Why an identity.** Embeddings of a different encoder have the same shape
+    and dtype and load without a murmur; the identity is what an entry's
+    provenance and the in-memory key record, so "this encoder made it" is a
+    fact, not a guess.
 
-    **Why not a hash of the weights.** The encoder is ~16 GB. Reading it to
-    answer "may I load this 4 MiB file" would cost more than re-encoding the
-    prompt, i.e. it would defeat the feature. The fingerprint is therefore taken
-    from the METADATA of the directory: the bytes of `config.json` plus the
-    sorted `(file name, size in bytes)` list of its weight files.
-
-    What that catches: another model (a different architecture, hidden size,
-    vocabulary or layer count AS DECLARED ON DISK — all of it lives in
-    `config.json`; the truncation this service applies at LOAD time
-    (`ENCODER_KEEP_LAYERS`) is invisible here, and deliberately so, since it
-    provably does not change the hidden states the embedding is built from),
-    another precision or another shard layout of the same model, a partially
-    downloaded checkout, and a file swapped for one of a different length.
-
-    What it does NOT catch: a fine-tune saved with the identical config and
-    byte-for-byte identical file SIZES, and corruption inside a weight file that
-    preserves its length. Both need the full read this function exists to avoid,
-    and neither happens by accident — a user who deliberately replaces weights
-    in place gets what they asked for.
-
-    `path` may be the encoder directory or a weights file inside it
-    (`component_dir_for_path`), or a llama.cpp GGUF file: its identity is
+    **Why not a hash of the weights.** Reading 16 GB to identify a 12 MB file
+    would defeat the feature. A folder's identity is `sha256(config.json bytes
+    + "\\n<name>\\x00<size>" per weight file, sorted)`; a GGUF file's is
     `sha256(config bytes + "\\ngguf\\x00<file name>\\x00<size>")` over the
-    config found for it (`components.text_encoder_config_dir`), which a bf16
-    folder can never produce (the `gguf` marker), so a quantized encoder's
-    embeddings are never taken for bf16 ones or vice versa.
+    config found for it (`components.text_encoder_config_dir`), so a quantized
+    encoder never shares a folder's identity. It does NOT catch a fine-tune
+    with identical config and file sizes, nor same-length corruption.
 
     **RoPE salt.** When the loader normalizes the config's RoPE base
-    (`components.text_encoder_rope_kwargs` answers `{"rope_theta": v}`: a
-    transformers-v5 config that keeps the base only in `rope_parameters`), the
-    material gains `"\nrope_theta=<repr(float(v))>"` last. Embeddings cached
-    while such an encoder ran with transformers' default base are therefore
-    never served again; every config the normalization leaves alone (the
-    stock encoders, every 4B one) keeps its fingerprint byte for byte.
+    (`components.text_encoder_rope_kwargs` answers `{"rope_theta": v}`), the
+    material gains `"\\nrope_theta=<repr(float(v))>"` last, so embeddings made
+    while such an encoder ran with transformers' default base are never taken
+    for current ones. `rope_salt=False` computes the PRE-FIX identity; only the
+    v1 migration may ask for it.
 
     # Raises
     `ValueError` when `path` does not resolve to a directory carrying a
     `config.json` (or a GGUF file without one found for it), or when its RoPE
-    is refused (`text_encoder_rope_kwargs`) — an encoder that cannot be
-    identified is one that cannot be loaded either, so this is the same error
-    the loader would raise later.
+    is refused — an unidentifiable encoder is an unloadable one.
     """
     import hashlib
 
     gguf_file = Path(path)
     if is_gguf_file(gguf_file):
-        return _gguf_encoder_fingerprint(gguf_file)
+        return _gguf_encoder_fingerprint(gguf_file, rope_salt=rope_salt)
     source = component_dir_for_path(Path(path))
     if not source.is_dir():
         raise ValueError(f"Путь текстового энкодера должен быть каталогом: {source}")
@@ -208,26 +158,18 @@ def text_encoder_fingerprint(path: str) -> str:
     try:
         config_bytes = config.read_bytes()
     except OSError as exc:
-        raise ValueError(
-            f"Не удалось прочитать {config}: {exc}. Без config.json энкодер нельзя ни "
-            "опознать, ни загрузить."
-        ) from exc
-
+        raise ValueError(f"Не удалось прочитать {config}: {exc}. Без config.json энкодер нельзя ни опознать, ни загрузить.") from exc
     digest = hashlib.sha256()
     digest.update(config_bytes)
     try:
-        weights = sorted(
-            (entry.name, entry.stat().st_size)
-            for entry in source.iterdir()
-            if entry.is_file() and entry.suffix.lower() in _ENCODER_WEIGHT_SUFFIXES
-        )
+        weights = sorted((entry.name, entry.stat().st_size) for entry in source.iterdir() if entry.is_file() and entry.suffix.lower() in _ENCODER_WEIGHT_SUFFIXES)
     except OSError as exc:
         raise ValueError(f"Не удалось перечислить файлы энкодера в {source}: {exc}") from exc
     for name, size in weights:
-        # The separator is part of the hashed text so that ("ab", 1) and
-        # ("a", 12) cannot collide into the same byte string.
+        # The separator is hashed so ("ab", 1) and ("a", 12) cannot collide.
         digest.update(f"\n{name}\x00{size}".encode("utf-8"))
-    _update_with_rope_salt(digest, source)
+    if rope_salt:
+        _update_with_rope_salt(digest, source)
     return digest.hexdigest()
 
 
@@ -242,12 +184,11 @@ def _update_with_rope_salt(digest: Any, config_dir: Path) -> None:
         digest.update(f"\nrope_theta={float(rope['rope_theta'])!r}".encode("utf-8"))
 
 
-def _gguf_encoder_fingerprint(gguf_file: Path) -> str:
+def _gguf_encoder_fingerprint(gguf_file: Path, *, rope_salt: bool) -> str:
     """`text_encoder_fingerprint` of a GGUF encoder file (see there).
 
     # Raises
-    `ValueError` when no `config.json` is found for the file or a file cannot
-    be read.
+    `ValueError` when no `config.json` is found for the file or a file cannot be read.
     """
     import hashlib
 
@@ -261,546 +202,495 @@ def _gguf_encoder_fingerprint(gguf_file: Path) -> str:
     digest = hashlib.sha256()
     digest.update(config_bytes)
     digest.update(f"\ngguf\x00{gguf_file.name}\x00{size}".encode("utf-8"))
-    _update_with_rope_salt(digest, config_dir)
+    if rope_salt:
+        _update_with_rope_salt(digest, config_dir)
     return digest.hexdigest()
 
 
-def prompt_file_metadata(
-    normalized: dict[str, Any], text: str, encoder_id: str, family: str
-) -> dict[str, str]:
-    """The `__metadata__` map of a `.msprompt` file. Values are strings; safetensors
-    accepts nothing else.
-
-    It carries everything `validate_prompt_file_metadata` needs to decide whether
-    the embedding may be used, plus the ORIGINAL prompt text — which is the point
-    of the file for the user: loading it must be able to show what was cached.
-
-    `family` is the library subdirectory the entry belongs to. It is written into
-    the file so that IMPORTING one on a machine (or at a moment) where another
-    encoder is selected still files it under its own family instead of losing it
-    among another encoder's entries.
-
-    `dtype` is the ENCODER's (`text_encoder_dtype_name`), not the request's: the
-    field describes the embedding stored in this file, and the request's `dtype`
-    governs the transformer and the VAE, neither of which touched it.
-    """
-    return {
-        "format": PROMPT_CACHE_FORMAT,
-        "format_version": str(PROMPT_CACHE_VERSION),
-        "prompt": str(text),
-        "max_sequence_length": str(int(normalized["max_sequence_length"])),
-        "dtype": text_encoder_dtype_name(),
-        "text_encoder_fp8": "true" if normalized["text_encoder_fp8"] else "false",
-        # Informational only, like the path below: compatibility is the
-        # fingerprint's, which already differs per format (a GGUF file's
-        # identity is not a folder's).
-        "text_encoder_format": str(normalized.get("text_encoder_format") or ""),
-        "text_encoder_id": str(encoder_id),
-        "text_encoder_family": str(family),
-        # Informational only. It is where the encoder lived when the file was
-        # written, which helps a user recognize a file; it is NEVER what
-        # compatibility is decided on, because a path proves nothing about the
-        # weights that sit there now.
-        "text_encoder_path": str(normalized["text_encoder_path"]),
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
+def encoder_label(path: str) -> str:
+    """A human-readable name of the encoder at `path`: a GGUF file's name, else its folder's; a package's generic `text_encoder*` folder is prefixed with the package folder."""
+    source = Path(str(path).rstrip("/\\") or str(path))
+    if is_gguf_file(source):
+        return source.name
+    folder = component_dir_for_path(source)
+    if folder.name.startswith("text_encoder") and folder.parent.name:
+        return f"{folder.parent.name}/{folder.name}"
+    return folder.name
 
 
-def read_prompt_file_header(path: Path) -> tuple[dict[str, str], dict[str, Any]]:
-    """Read a `.msprompt` header: `(metadata, tensor description)`. No tensor is loaded.
+def encoder_provenance(normalized: Mapping[str, Any]) -> pl.EncoderProvenance | None:
+    """The provenance of the request's CURRENT encoder; `None` when no encoder is on this machine.
 
-    Deliberately torch-free and cheap — a file that is not ours, or that was
-    built for another encoder, must be refused without allocating anything and
-    without importing torch.
+    `source` is the request's `text_encoder_source` (`""` in manual mode),
+    `format` its `text_encoder_format` (derived from the container when absent).
 
     # Raises
-    `ValueError` when the file is not a safetensors container, carries no
-    `__metadata__`, is not marked as our format, comes from a newer format
-    version, or does not carry exactly the `prompt_embeds` tensor.
+    `ValueError` when the encoder exists but cannot be identified
+    (`text_encoder_fingerprint`).
     """
-    header = read_safetensors_header(path)
-    raw_meta = header.get("__metadata__")
-    if not isinstance(raw_meta, dict):
-        raise ValueError(_foreign_prompt_file_message(path))
-    metadata = {str(key): str(value) for key, value in raw_meta.items()}
-    if metadata.get("format") != PROMPT_CACHE_FORMAT:
-        raise ValueError(_foreign_prompt_file_message(path))
-    version = _to_int(metadata.get("format_version"), 0)
-    if version <= 0 or version > PROMPT_CACHE_VERSION:
-        raise ValueError(
-            f"Файл кэша промпта {path} версии «{metadata.get('format_version')}» не поддерживается "
-            f"(эта сборка читает версии 1..{PROMPT_CACHE_VERSION}). Обновите ManhwaStudio или "
-            "постройте кэш заново."
-        )
-    tensor = header.get(PROMPT_CACHE_TENSOR)
-    if not isinstance(tensor, dict):
-        raise ValueError(
-            f"В файле кэша промпта {path} нет тензора «{PROMPT_CACHE_TENSOR}»: файл повреждён."
-        )
-    return metadata, tensor
-
-
-def validate_prompt_file_metadata(
-    metadata: dict[str, str],
-    tensor: dict[str, Any],
-    normalized: dict[str, Any],
-    encoder_id: str | None,
-    path: Path,
-) -> None:
-    """Refuse a `.msprompt` file that was not built for the current settings.
-
-    Every field of `_prompt_cache_key` except the prompt text itself has to
-    agree, because the text is what the file DEFINES while the rest is what the
-    caller is about to run with. A disagreement is an explicit refusal naming the
-    field: silently loading foreign embeddings would produce a plausible image
-    that answers a different prompt, computed by a different encoder — a wrong
-    result with no error attached to it.
-
-    The encoder is compared by `text_encoder_fingerprint`, never by path; the
-    tensor's own dtype is compared against the declared one, so an edited
-    `__metadata__` cannot smuggle float16 embeddings into a bfloat16 run.
-
-    **The dtype compared is the ENCODER's** (`text_encoder_dtype_name`), which is
-    now always bfloat16, and NOT the request's `dtype` — that one governs the
-    transformer and the VAE and cannot have changed a value in this tensor. The
-    consequence is deliberate: a `.msprompt` written while the service still ran
-    the encoder at float16 is refused from here on, because its embedding really
-    did come from a different encoder precision. The refusal says so and says to
-    rebuild the entry.
-
-    **`encoder_id=None` means there is no encoder on this machine to compare
-    against** (`local_encoder_identity`), which is the whole point of carrying a
-    `.msprompt` to a machine that never downloaded the 16 GB Qwen3. Only the
-    fingerprint comparison is skipped there — the format marker, the version, the
-    sequence length, the dtype (metadata AND the tensor's own token) and the fp8
-    flag are checked in every case, because none of them needs an encoder. The
-    skip is not silent: it is logged here and reported to the client as
-    `encoder_verified: false`, so "checked" and "taken on trust" are never
-    presented as the same thing.
-
-    # Raises
-    `ValueError` naming the first field that does not match.
-    """
-    wanted_length = int(normalized["max_sequence_length"])
-    file_length = _to_int(metadata.get("max_sequence_length"), 0)
-    if file_length != wanted_length:
-        raise ValueError(
-            f"Файл кэша промпта {path} построен для max_sequence_length={file_length}, "
-            f"а сейчас выбрано {wanted_length}. Эмбеддинги другой длины последовательности "
-            "несовместимы — постройте кэш заново или верните прежнее значение."
-        )
-
-    wanted_dtype = text_encoder_dtype_name()
-    file_dtype = metadata.get("dtype", "")
-    if file_dtype != wanted_dtype:
-        raise ValueError(
-            f"Файл кэша промпта {path} построен для типа данных «{file_dtype}», а текстовый "
-            f"энкодер FLUX.2 klein теперь всегда работает в «{wanted_dtype}»: он выполняется "
-            "на CPU, где float16 приходится считать программно, и это в десятки раз медленнее. "
-            "Эмбеддинги другой точности получены другим энкодером, поэтому запись нужно "
-            "построить заново («Кэшировать») и сохранить под тем же именем."
-        )
-    expected_token = _PROMPT_CACHE_DTYPE_TOKENS.get(wanted_dtype)
-    actual_token = str(tensor.get("dtype", ""))
-    if expected_token is not None and actual_token != expected_token:
-        raise ValueError(
-            f"Файл кэша промпта {path} объявляет тип «{file_dtype}», но хранит тензор "
-            f"{actual_token or '?'} вместо {expected_token}: файл повреждён или изменён вручную."
-        )
-
-    wanted_fp8 = bool(normalized["text_encoder_fp8"])
-    file_fp8 = _to_bool(metadata.get("text_encoder_fp8"), False)
-    if file_fp8 != wanted_fp8:
-        raise ValueError(
-            f"Файл кэша промпта {path} построен "
-            f"{'с' if file_fp8 else 'без'} fp8-квантованием энкодера, а сейчас выбрано "
-            f"{'с' if wanted_fp8 else 'без'} ним."
-        )
-
-    file_encoder = metadata.get("text_encoder_id", "")
-    if encoder_id is None:
-        # Nothing on this machine can produce a fingerprint, so the file's own
-        # identity is all there is. It is still worth logging WHICH encoder the
-        # embedding claims: that line is the only trace connecting a later
-        # generation to the model it was really encoded with.
-        log.info(
-            "FLUX.2 klein: отпечаток энкодера для %s не сверялся — локального энкодера нет; "
-            "файл объявляет энкодер %s (%s).",
-            path,
-            _short_id(file_encoder),
-            metadata.get("text_encoder_family", "—"),
-        )
-        return
-    if file_encoder != encoder_id:
-        raise ValueError(
-            f"Файл кэша промпта {path} построен другим текстовым энкодером "
-            f"(в файле {_short_id(file_encoder)}, сейчас выбран {_short_id(encoder_id)}"
-            f"{_encoder_origin_hint(metadata)}). Эмбеддинги чужого энкодера дали бы не ошибку, "
-            "а неверный результат, поэтому файл отклонён."
-        )
-
-
-def _short_id(value: str) -> str:
-    """First 12 hex characters of a fingerprint, for a user-facing message."""
-    text = str(value or "")
-    return text[:12] if text else "—"
-
-
-def _encoder_origin_hint(metadata: dict[str, str]) -> str:
-    """`, файл собран по пути …` when the file recorded one; empty otherwise."""
-    origin = metadata.get("text_encoder_path", "")
-    return f", файл собран по пути {origin}" if origin else ""
-
-
-def _foreign_prompt_file_message(path: Path) -> str:
-    """The message for a file that is not a `.msprompt` container at all."""
-    return (
-        f"Файл {path} не является кэшем промпта ManhwaStudio: в нём нет метки формата "
-        f"«{PROMPT_CACHE_FORMAT}»."
+    if not text_encoder_available(dict(normalized)):
+        return None
+    path = str(normalized["text_encoder_path"])
+    fmt = str(normalized.get("text_encoder_format") or "")
+    if WEIGHT_FORMAT_ID_PATTERN.fullmatch(fmt) is None:
+        fmt = GGUF_FORMAT if is_gguf_file(Path(path)) else SAFETENSORS_FORMAT
+    return pl.EncoderProvenance(
+        source=str(normalized.get("text_encoder_source") or ""),
+        format=fmt,
+        fp8=bool(normalized.get("text_encoder_fp8")),
+        encoder_id=text_encoder_fingerprint(path),
+        label=encoder_label(path),
     )
 
 
-def require_prompt_file_destination(path: str) -> Path:
-    """Validate a client-supplied SAVE path and return it.
-
-    The path is untrusted input, so it is checked instead of being written to:
-    it must be absolute (a relative one would land in the backend's working
-    directory, which is not a place the user can find), it must carry the
-    `.msprompt` suffix, its parent must already exist as a directory (a save
-    dialog always produces one, so a missing parent means a mis-wired path
-    rather than a folder to create), and it must not name an existing directory.
-
-    # Raises
-    `ValueError` naming what is wrong with the path.
-    """
-    raw = str(path or "").strip()
-    if not raw:
-        raise ValueError("Не задан путь для сохранения кэша промпта.")
-    dest = Path(raw)
-    if not dest.is_absolute():
-        raise ValueError(f"Путь сохранения кэша промпта должен быть абсолютным: {raw}")
-    if dest.suffix.lower() != PROMPT_CACHE_SUFFIX:
-        raise ValueError(
-            f"Кэш промпта сохраняется только в файл «*{PROMPT_CACHE_SUFFIX}», получено: {raw}"
-        )
-    if not dest.name or dest.name == PROMPT_CACHE_SUFFIX:
-        raise ValueError(f"Пустое имя файла кэша промпта: {raw}")
-    if dest.is_dir():
-        raise ValueError(f"Путь сохранения кэша промпта — каталог: {raw}")
-    if not dest.parent.is_dir():
-        raise ValueError(f"Каталог для кэша промпта не найден: {dest.parent}")
-    return dest
-
-
-def require_prompt_file_source(path: str) -> Path:
-    """Validate a client-supplied LOAD path and return it.
-
-    Same suffix rule as the save side — the suffix is the format's name, and a
-    file that does not carry it is not one we wrote — plus the file has to exist
-    and be a regular file.
-
-    # Raises
-    `ValueError` naming what is wrong with the path.
-    """
-    raw = str(path or "").strip()
-    if not raw:
-        raise ValueError("Не задан путь к файлу кэша промпта.")
-    source = Path(raw)
-    if not source.is_absolute():
-        raise ValueError(f"Путь к кэшу промпта должен быть абсолютным: {raw}")
-    if source.suffix.lower() != PROMPT_CACHE_SUFFIX:
-        raise ValueError(
-            f"Кэш промпта читается только из файла «*{PROMPT_CACHE_SUFFIX}», получено: {raw}"
-        )
-    if not source.is_file():
-        raise ValueError(f"Файл кэша промпта не найден: {raw}")
-    return source
-
-
-def publish_bytes_atomically(dest: Path, payload: bytes) -> int:
-    """Write `payload` to `dest` atomically; returns the number of bytes written.
-
-    The publish recipe is this project's (`engines/model_download.py`): the bytes
-    go into a process-private `<name>.<pid>.part` sibling, are flushed and
-    `fsync`ed, the handle is closed, and only then does a single `os.replace`
-    make `dest` appear — so a crash or a full disk can never leave a truncated
-    file where a valid cache used to be. The staging file is removed on any
-    failure. The pid is in the staging name because a second backend process
-    saving the same entry must not write into the same temporary file.
-    """
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    staging = dest.with_name(f"{dest.name}.{os.getpid()}.part")
-    published = False
-    try:
-        with staging.open("wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(staging, dest)
-        published = True
-    finally:
-        if not published:
-            try:
-                staging.unlink()
-            except OSError:
-                log.debug("FLUX.2 klein: не удалось удалить временный файл %s", staging)
-    return len(payload)
-
-
-def write_prompt_file(dest: Path, embeds: Any, metadata: dict[str, str]) -> int:
-    """Serialize one embedding into a `.msprompt` file at `dest`; returns its size.
-
-    `embeds` is the host-resident tensor from `_prompt_cache`. The bytes are
-    built in memory (an entry is ~4 MiB) and published by
-    `publish_bytes_atomically`.
-    """
-    from safetensors.torch import save as safetensors_save
-
-    payload = safetensors_save({PROMPT_CACHE_TENSOR: embeds.contiguous()}, metadata=metadata)
-    return publish_bytes_atomically(dest, payload)
-
-
-def read_prompt_file_tensor(source: Path) -> Any:
-    """Load the `prompt_embeds` tensor of an ALREADY VALIDATED `.msprompt` file.
-
-    Callers must have run `read_prompt_file_header` +
-    `validate_prompt_file_metadata` first: this function imports torch and
-    allocates, and neither should happen for a file that is going to be refused.
-    """
-    from safetensors.torch import load_file
-
-    tensors = load_file(str(source))
-    embeds = tensors.get(PROMPT_CACHE_TENSOR)
-    if embeds is None:
-        raise ValueError(
-            f"В файле кэша промпта {source} нет тензора «{PROMPT_CACHE_TENSOR}»: файл повреждён."
-        )
-    return embeds
+def is_current_encoder(encoder: pl.EncoderProvenance, current: pl.EncoderProvenance | None) -> bool:
+    """Whether `encoder` IS the request's current encoder: same fingerprint and the same fp8 flag."""
+    return current is not None and encoder.encoder_id == current.encoder_id and encoder.fp8 == current.fp8
 
 
 # =====================================================================
-#  The prompt-cache library: prompt_cache/<family>/<name>.msprompt
+#  Libraries
 # =====================================================================
 def prompt_cache_root() -> Path:
-    """The library directory in the program root (`<root>/prompt_cache`).
+    """The library root in the program root (`<root>/prompt_cache`); not created here (only a write creates it).
 
-    The root comes from `runtime.paths.program_root()`, which is this package's
-    single owner of the directory-depth assumption; a local
-    `Path(__file__).parents[N]` here would break the moment this module moves.
-    The directory is NOT created by this function — only a write creates it.
+    The root comes from `runtime.paths.program_root()`, the package's single
+    owner of the directory-depth assumption.
     """
     return program_root() / PROMPT_CACHE_DIRNAME
 
 
-def sanitize_name_component(name: str, *, what: str) -> str:
-    """One filesystem-safe path COMPONENT, or a `ValueError` naming what was wrong.
-
-    Both the family directory and the entry name are built from untrusted text
-    (a user-chosen name, a directory name coming from a user-chosen model path),
-    so the rule is an ALLOW-list rather than a blacklist of dangerous characters:
-    letters, digits and `_SAFE_NAME_EXTRA` survive, everything else — path
-    separators, control characters, the Windows-reserved set — becomes `_`. That
-    makes `..`, `a/../../b` and an absolute path structurally impossible to
-    express, instead of merely unlikely.
-
-    Leading/trailing dots and spaces are stripped as well: a name like `..` or
-    `.` would traverse, and a trailing dot or space is silently dropped by
-    Windows, which would make the stored name differ from the reported one.
-
-    Returns the sanitized component, truncated to `_MAX_NAME_LENGTH`.
+def flux2_library_spec(library_id: str) -> pl.LibrarySpec:
+    """The `LibrarySpec` of a FLUX.2 library: one `prompt_embeds` tensor in the encoder's dtype.
 
     # Raises
-    `ValueError` when nothing usable is left — an empty or dots-only name is a
-    request error, never a silently invented placeholder.
+    `ValueError` for an id outside the library-id pattern.
     """
-    raw = str(name or "")
-    cleaned = "".join(
-        char if (char.isalnum() or char in _SAFE_NAME_EXTRA) else "_" for char in raw
-    )
-    cleaned = cleaned.strip(" .")[:_MAX_NAME_LENGTH].strip(" .")
-    if not cleaned or set(cleaned) <= {"_"}:
-        raise ValueError(
-            f"Недопустимое {what}: «{raw}». Оставьте буквы, цифры, пробел, «.», «_», «-»."
-        )
-    return cleaned
+    return pl.LibrarySpec(pl.require_library_id(library_id), PROMPT_CACHE_TENSOR, text_encoder_dtype_name(), PROMPT_CACHE_DTYPE_TOKEN)
 
 
-def encoder_family_name(text_encoder_path: str, encoder_id: str) -> str:
-    """Library subdirectory for one text encoder: `<readable name>-<short id>`.
+def library_of(library_id: str) -> pl.PromptLibrary:
+    """The process-wide library `prompt_cache/<library_id>`.
 
-    Two halves, each doing a job the other cannot. The readable half is the
-    encoder DIRECTORY's own name (a GGUF encoder's file stem), so a user
-    opening `prompt_cache/` sees which model a folder belongs to. The hash half is the first
-    `PROMPT_CACHE_FAMILY_HASH_CHARS` of `text_encoder_fingerprint`, so two
-    different encoders that happen to live in identically named directories
-    (`.../model/text_encoder` is the common case) cannot pour their entries into
-    one folder — where `load` would then offer embeddings the current encoder did
-    not produce.
-
-    The readable half is sanitized (`sanitize_name_component`), so a model
-    directory named by the user cannot escape the library root. A directory whose
-    name sanitizes to nothing falls back to `encoder`; the hash still keeps the
-    family unique.
+    # Raises
+    `ValueError` for an invalid id.
     """
-    gguf_file = Path(text_encoder_path)
-    # A GGUF encoder is named by its FILE (the quantization is in the name the
-    # user picked); its config folder is shared with the bf16 encoder.
-    source_name = gguf_file.stem if is_gguf_file(gguf_file) else component_dir_for_path(gguf_file).name
-    try:
-        readable = sanitize_name_component(source_name, what="имя каталога энкодера")
-    except ValueError:
-        # A directory name made entirely of separators or exotic characters is
-        # still a legitimate encoder; only its readability is lost.
-        readable = "encoder"
-    return f"{readable}-{str(encoder_id)[:PROMPT_CACHE_FAMILY_HASH_CHARS]}"
+    return pl.library_for(prompt_cache_root(), flux2_library_spec(library_id))
 
 
-def prompt_cache_family_dir(family: str) -> Path:
-    """Directory of one family inside the library. Not created by this call.
+def transformer_text_width(transformer_path: str) -> int | None:
+    """The embedding width the transformer at `transformer_path` accepts (`joint_attention_dim` of its config); `None` when unknown.
 
-    `family` is sanitized again even when it came from a file we wrote: an
-    imported `.msprompt` carries its family in metadata, and that metadata is
-    attacker-controlled input like any other file content.
+    A library entry of another width cannot feed this transformer, so the
+    selection drops it; an unreadable config filters nothing (the run's own
+    guards diagnose it).
     """
-    return prompt_cache_root() / sanitize_name_component(family, what="имя семейства энкодера")
+    if not transformer_path:
+        return None
+    config_dir = transformer_config_dir(str(transformer_path))
+    if config_dir is None:
+        return None
+    return _config_int(_read_json_object(config_dir / _MODEL_CONFIG_MARKER), "joint_attention_dim")
 
 
-def prompt_cache_entry_path(family: str, name: str) -> Path:
-    """Full path of one library entry, with both components sanitized."""
-    safe = sanitize_name_component(name, what="имя кэша промпта")
-    return prompt_cache_family_dir(family) / f"{safe}{PROMPT_CACHE_SUFFIX}"
+# =====================================================================
+#  v1 (protocol <= 22) entries: classification, conversion, migration
+# =====================================================================
+def read_v1_header(path: Path) -> tuple[dict[str, str], dict[str, Any]]:
+    """`(metadata, tensor description)` of a v1 `.msprompt` file. No tensor is loaded.
 
-
-def list_prompt_cache_entries(family: str) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    """List one family's entries: `(entries, skipped)`.
-
-    A directory of caches is a place a user can drop files into, so a single
-    corrupt or foreign file must not take the listing down with it: every file is
-    read through `read_prompt_file_header` and, when that fails, it is reported in
-    `skipped` with the reason instead of raising. Only the header is read, so a
-    listing costs no tensor allocation and no torch import.
-
-    Entries are sorted by name; the family directory not existing yet is an empty
-    listing, not an error. Every entry names its own `family`, so a listing that
-    spans several of them (the machine with no encoder — see
-    `Flux2KleinInpaintService.prompt_cache_list`) stays unambiguous.
+    # Raises
+    `ValueError` when the file is not a safetensors container, is not a v1
+    entry (marker, version) or does not carry the `prompt_embeds` tensor.
     """
-    directory = prompt_cache_family_dir(family)
-    entries: list[dict[str, Any]] = []
-    skipped: list[dict[str, str]] = []
-    if not directory.is_dir():
-        return entries, skipped
-    for path in sorted(directory.glob(f"*{PROMPT_CACHE_SUFFIX}")):
-        if not path.is_file():
+    return parse_v1_header(read_safetensors_header(path), path)
+
+
+def parse_v1_header(header: Mapping[str, Any], path: Path | str) -> tuple[dict[str, str], dict[str, Any]]:
+    """`read_v1_header` over an already parsed header (`path` names the file in messages).
+
+    # Raises
+    As `read_v1_header`.
+    """
+    raw_meta = header.get("__metadata__")
+    if not isinstance(raw_meta, dict) or raw_meta.get("format") != V1_FORMAT:
+        raise ValueError(f"Файл {path} не является кэшем промпта ManhwaStudio версии 1.")
+    metadata = {str(key): str(value) for key, value in raw_meta.items()}
+    if metadata.get("format_version") != str(V1_VERSION):
+        raise ValueError(f"Файл кэша промпта {path}: неподдерживаемая версия «{metadata.get('format_version')}».")
+    tensor = header.get(PROMPT_CACHE_TENSOR)
+    if not isinstance(tensor, dict):
+        raise ValueError(f"В файле кэша промпта {path} нет тензора «{PROMPT_CACHE_TENSOR}»: файл повреждён.")
+    return metadata, dict(tensor)
+
+
+@dataclass(frozen=True)
+class KnownEncoder:
+    """One locally findable encoder identity (`known_local_encoders`).
+
+    `salted`: this fingerprint is the encoder's CURRENT identity (False: its
+    pre-RoPE-fix identity); `needs_rope`: the loader normalizes its RoPE (the
+    two identities differ); `source`: `stock` / `uncensored` for a package
+    encoder, the request's source for the current one, `""` otherwise.
+    """
+
+    salted: bool
+    needs_rope: bool
+    source: str
+    format: str
+    label: str
+
+
+def _package_encoder_paths() -> list[tuple[str, str, str]]:
+    """`(path, source, format)` of every encoder inside the installed klein packages (folders first, then GGUF files)."""
+    found: list[tuple[str, str, str]] = []
+    for root in components.installed_klein_package_roots():
+        for subdir, source in _PACKAGE_ENCODER_FOLDERS:
+            if (root / subdir).is_dir():
+                found.append((str(root / subdir), source, SAFETENSORS_FORMAT))
+        for subdir, source in _PACKAGE_ENCODER_GGUF_DIRS:
+            folder = root / subdir
+            try:
+                files = sorted(path for path in folder.glob("*.gguf") if path.is_file()) if folder.is_dir() else []
+            except OSError as exc:
+                log.debug("FLUX.2 klein: GGUF-энкодеры в %s не перечислены: %s", folder, exc)
+                files = []
+            found.extend((str(path), source, GGUF_FORMAT) for path in files)
+    return found
+
+
+def known_local_encoders(extra: Iterable[tuple[str, str]]) -> dict[str, KnownEncoder]:
+    """Fingerprint -> `KnownEncoder` of every encoder findable on this machine: the installed klein packages, then `extra` `(path, source)` pairs (the request's encoder, recorded v1 paths).
+
+    Both identities are registered (current and, when they differ, the
+    pre-RoPE-fix one); an earlier candidate wins, so a package attribution beats
+    a recorded path. A path that is missing or cannot be identified is skipped
+    (debug log).
+    """
+    known: dict[str, KnownEncoder] = {}
+    candidates = _package_encoder_paths() + [(path, source, "") for path, source in extra if path]
+    for path, source, fmt in candidates:
+        if not Path(path).exists():
             continue
         try:
-            metadata, _tensor = read_prompt_file_header(path)
+            salted = text_encoder_fingerprint(path)
+            unsalted = text_encoder_fingerprint(path, rope_salt=False)
         except ValueError as exc:
-            skipped.append({"name": path.stem, "reason": str(exc)})
+            log.debug("FLUX.2 klein: энкодер %s не опознан при переносе кэшей: %s", path, exc)
+            continue
+        label = encoder_label(path)
+        fmt = fmt or (GGUF_FORMAT if is_gguf_file(Path(path)) else SAFETENSORS_FORMAT)
+        known.setdefault(salted, KnownEncoder(True, salted != unsalted, source, fmt, label))
+        if unsalted != salted:
+            known.setdefault(unsalted, KnownEncoder(False, True, source, fmt, label))
+    return known
+
+
+@dataclass(frozen=True)
+class V1Verdict:
+    """What happens to one v1 entry (`classify_v1_entry`).
+
+    `action`: `migrate` (into `library_id` with `encoder` / `origin`),
+    `delete` (proven pre-RoPE-fix, or uncensored and unprovable), `keep`
+    (cannot be migrated: left in place, reported). `reason` is user-facing.
+    """
+
+    action: Literal["migrate", "delete", "keep"]
+    reason: str
+    library_id: str | None = None
+    encoder: pl.EncoderProvenance | None = None
+    origin: str = ""
+
+
+def classify_v1_entry(metadata: Mapping[str, str], tensor: Mapping[str, Any], known: Mapping[str, KnownEncoder], *, family: str) -> V1Verdict:
+    """THE v1 provenance table (pure).
+
+    - not bfloat16 (declared or the tensor's token), an unknown width, or a bad
+      length -> keep;
+    - the recorded id is the PRE-FIX identity of a known encoder whose RoPE the
+      loader normalizes -> delete (made under the wrong RoPE base);
+    - the recorded id is a known CURRENT identity -> migrate (`migrated_v1`,
+      provenance from that encoder);
+    - no match and the recorded path or the family names an uncensored encoder
+      -> delete (that it was made after the fix cannot be proven);
+    - no match otherwise -> migrate with source `""` (`migrated_v1_unverified`).
+    The format is the v1 `text_encoder_format` when it is a valid id, else the
+    matched encoder's (`bf16` when unmatched).
+    """
+    if metadata.get("dtype") != text_encoder_dtype_name() or tensor.get("dtype") != PROMPT_CACHE_DTYPE_TOKEN:
+        return V1Verdict("keep", f"тип данных {metadata.get('dtype')!r} вместо {text_encoder_dtype_name()!r}: запись надо построить заново")
+    shape = tensor.get("shape")
+    width = shape[-1] if isinstance(shape, list) and shape and isinstance(shape[-1], int) else None
+    library_id = LEGACY_LIBRARY_BY_WIDTH.get(width) if width is not None else None
+    if library_id is None:
+        return V1Verdict("keep", f"неизвестная ширина эмбеддинга {width!r}: модель не определить")
+    try:
+        if int(metadata.get("max_sequence_length", "")) <= 0:
+            raise ValueError
+    except ValueError:
+        return V1Verdict("keep", f"некорректная длина последовательности {metadata.get('max_sequence_length')!r}")
+    recorded_id = metadata.get("text_encoder_id", "")
+    recorded_path = metadata.get("text_encoder_path", "")
+    fp8 = metadata.get("text_encoder_fp8", "false").strip().lower() in ("1", "true", "yes", "on")
+    v1_format = metadata.get("text_encoder_format", "")
+    match = known.get(recorded_id) if recorded_id else None
+    if match is not None and not match.salted:
+        return V1Verdict("delete", "создан до исправления RoPE энкодера: эмбеддинги неверны")
+    if not recorded_id:
+        return V1Verdict("keep", "в записи нет отпечатка энкодера")
+    if match is not None:
+        fmt = v1_format if WEIGHT_FORMAT_ID_PATTERN.fullmatch(v1_format) else match.format
+        return V1Verdict("migrate", "энкодер опознан", library_id, pl.EncoderProvenance(match.source, fmt, fp8, recorded_id, match.label), pl.ORIGIN_MIGRATED_V1)
+    if "uncensored" in f"{recorded_path}\n{family}".lower():
+        return V1Verdict("delete", "расцензуренный энкодер не опознан: нельзя доказать, что запись сделана после исправления RoPE")
+    fmt = v1_format if WEIGHT_FORMAT_ID_PATTERN.fullmatch(v1_format) else SAFETENSORS_FORMAT
+    label = Path(recorded_path.rstrip("/\\")).name if recorded_path.strip("/\\") else family.rsplit("-", 1)[0]
+    return V1Verdict("migrate", "энкодер не найден на этом компьютере", library_id, pl.EncoderProvenance("", fmt, fp8, recorded_id, label), pl.ORIGIN_MIGRATED_V1_UNVERIFIED)
+
+
+def convert_v1_metadata(metadata: Mapping[str, str], verdict: V1Verdict, *, name: str, migrated_from: str) -> dict[str, str]:
+    """The v2 `__metadata__` of a v1 entry that `verdict` migrates (the tensor bytes are kept verbatim by `PromptLibrary.add_payload`).
+
+    `name` becomes the preset name (a v1 entry's file stem was its user-given
+    name); `migrated_from` is recorded as `<family>/<file>`; the v1
+    `text_encoder_path` stays as an informational field.
+
+    # Raises
+    `ValueError` when `verdict` is not a migration.
+    """
+    if verdict.action != "migrate" or verdict.library_id is None or verdict.encoder is None:
+        raise ValueError(f"Запись не переносится: {verdict.reason}")
+    extra = {"migrated_from": migrated_from}
+    if metadata.get("text_encoder_path"):
+        extra["text_encoder_path"] = metadata["text_encoder_path"]
+    return pl.build_metadata(
+        flux2_library_spec(verdict.library_id),
+        prompt=metadata.get("prompt", ""),
+        name=name,
+        max_sequence_length=int(metadata["max_sequence_length"]),
+        encoder=verdict.encoder,
+        origin=verdict.origin,
+        created_at=metadata.get("created_at") or None,
+        extra=extra,
+    )
+
+
+@dataclass(frozen=True)
+class MigrationReport:
+    """The outcome of the v1 migration (`migrate_legacy_families`).
+
+    `migrated`: v1 files now living as v2 entries (v1 file removed);
+    `deleted`: pre-fix / unprovable files removed; `not_migrated`: files left in
+    place, each in `failures` as `(<family>/<file>, reason)`; `directory`: the
+    library root.
+    """
+
+    migrated: int
+    deleted: int
+    not_migrated: int
+    directory: str
+    failures: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def found_anything(self) -> bool:
+        return bool(self.migrated or self.deleted or self.not_migrated)
+
+    def to_wire(self) -> dict[str, Any]:
+        """The `.prompt_cache.list` `legacy` object."""
+        return {"migrated": self.migrated, "deleted": self.deleted, "not_migrated": self.not_migrated, "directory": self.directory}
+
+
+def legacy_family_dirs(root: Path) -> tuple[list[Path], list[tuple[str, str]]]:
+    """`(families, refused)` under the real directory `root`: the v1 family directories, sorted, and the matching names that are refused.
+
+    A name matching `LEGACY_FAMILY_PATTERN` is a family only when it is a real
+    directory strictly inside `root` (`pl.require_confined`: no symbolic link,
+    no reparse point); a matching link or a matching non-directory is refused
+    as `(name, reason)` and never followed. Nothing when `root` does not exist.
+
+    # Raises
+    `pl.UnsafeLibraryPath` when `root` itself exists but is not a real
+    directory.
+    """
+    if not os.path.lexists(root):
+        return [], []
+    pl.require_real_directory(root)
+    families: list[Path] = []
+    refused: list[tuple[str, str]] = []
+    try:
+        names = sorted(item.name for item in os.scandir(root) if LEGACY_FAMILY_PATTERN.fullmatch(item.name))
+    except OSError as exc:
+        log.warning("FLUX.2 klein: каталог старых кэшей промптов %s не перечислен: %s", root, exc)
+        return [], []
+    for name in names:
+        path = root / name
+        try:
+            pl.require_confined(path, root, directory=True)
+        except pl.UnsafeLibraryPath as exc:
+            refused.append((name, str(exc)))
+            continue
+        families.append(path)
+    return families, refused
+
+
+def _family_files(family: Path, root: Path) -> tuple[list[Path], list[tuple[str, str]]]:
+    """`(files, refused)` of one real family directory: its `.msprompt` regular files, sorted, and the `.msprompt` names refused as links.
+
+    Directories and other kinds named `*.msprompt` are ignored; a link is
+    refused as `(<family>/<name>, reason)` and never followed.
+
+    # Raises
+    `OSError` when the directory cannot be listed.
+    """
+    files: list[Path] = []
+    refused: list[tuple[str, str]] = []
+    with os.scandir(family) as scan:
+        items = sorted(scan, key=lambda item: item.name)
+    for item in items:
+        if not item.name.endswith(pl.ENTRY_SUFFIX):
             continue
         try:
-            size = int(path.stat().st_size)
-        except OSError:
-            size = 0
-        entries.append(
-            {
-                "name": path.stem,
-                # The directory the entry really sits in, not the argument: both
-                # go through `sanitize_name_component`, and the stored one is what
-                # a later `load` has to be given.
-                "family": directory.name,
-                "prompt": metadata.get("prompt", ""),
-                "created_at": metadata.get("created_at", ""),
-                "size_bytes": size,
-                "max_sequence_length": _to_int(metadata.get("max_sequence_length"), 0),
-                "dtype": metadata.get("dtype", ""),
-            }
-        )
-    return entries, skipped
+            info = item.stat(follow_symlinks=False)
+        except OSError as exc:
+            refused.append((f"{family.name}/{item.name}", str(exc)))
+            continue
+        if stat.S_ISDIR(info.st_mode) and not pl.is_link_like(info):
+            continue
+        try:
+            files.append(pl.require_confined(family / item.name, root, directory=False))
+        except pl.UnsafeLibraryPath as exc:
+            refused.append((f"{family.name}/{item.name}", str(exc)))
+    return files, refused
 
 
-def list_prompt_cache_families() -> list[str]:
-    """Family directory names present in the library, sorted; empty when there is none.
+def _verify_migrated(library: pl.PromptLibrary, entry: pl.LibraryEntry) -> None:
+    """Re-read the v2 file of `entry` from disk: a valid entry of the same identity and the stat size.
 
-    Only the directory layout is read — no file is opened — because this exists
-    to answer "which families could hold an entry" on a machine where no encoder
-    is installed and the current family is therefore unknown.
+    # Raises
+    `ValueError` when it is not.
+    """
+    path = library.path_of(entry.file)
+    size = path.stat().st_size
+    fresh = pl.parse_entry_header(read_safetensors_header(path), library.spec, file=entry.file, size_bytes=size, mtime_ns=0)
+    if not fresh.same_identity(entry) or size <= 0:
+        raise ValueError(f"перенесённая запись {path} не совпала с исходной")
+
+
+def migrate_legacy_families(root: Path, extra_encoders: Iterable[tuple[str, str]]) -> MigrationReport:
+    """Migrate every v1 family directory under `root` (see the module notes for the rules); idempotent.
+
+    **Containment.** `root` must be a real directory; every family and every
+    file is proven a real directory / regular file strictly inside it
+    (`pl.require_confined`, no symbolic link or reparse point on the way)
+    before it is read, and again right before it is deleted
+    (`pl.remove_confined_file`). A linked root migrates nothing; a linked
+    family or file is never followed and is reported in `failures` /
+    `not_migrated`.
+
+    **Order and durability.** Every migratable entry is written as v2 (the
+    publish fsyncs the library directory), verified, the library directory
+    and the root are fsynced once more (an entry that was already present may
+    have been published by an older build), and only then is its v1 file
+    unlinked and its family directory fsynced. The pre-fix / unprovable files
+    are deleted after that (each unlink fsynced); emptied family directories
+    are removed last (the root fsynced). `extra_encoders` are `(path, source)`
+    pairs beside the installed packages (the request's encoder); the recorded
+    v1 paths are added here.
+    """
+    failures: list[tuple[str, str]] = []
+    try:
+        families, refused = legacy_family_dirs(root)
+    except pl.UnsafeLibraryPath as exc:
+        log.warning("FLUX.2 klein: старые кэши промптов в %s не переносятся: %s", root, exc)
+        return MigrationReport(0, 0, 1, str(root), ((root.name, str(exc)),))
+    failures.extend(refused)
+    found: list[tuple[Path, Path, dict[str, str] | None, dict[str, Any] | None, str]] = []
+    for family in families:
+        try:
+            files, refused_files = _family_files(family, root)
+        except OSError as exc:
+            log.warning("FLUX.2 klein: старые кэши промптов в %s не перечислены: %s", family, exc)
+            continue
+        failures.extend(refused_files)
+        for path in files:
+            try:
+                metadata, tensor = read_v1_header(path)
+                found.append((family, path, metadata, tensor, ""))
+            except ValueError as exc:
+                found.append((family, path, None, None, str(exc)))
+    if not found and not failures:
+        return MigrationReport(0, 0, 0, str(root))
+    recorded = [(metadata.get("text_encoder_path", ""), "") for _family, _path, metadata, _tensor, _error in found if metadata is not None]
+    known = known_local_encoders(list(extra_encoders) + recorded)
+    migrated = deleted = 0
+    to_delete: list[tuple[str, Path, str]] = []
+    for family, path, metadata, tensor, error in found:
+        where = f"{family.name}/{path.name}"
+        if metadata is None or tensor is None:
+            failures.append((where, error))
+            continue
+        verdict = classify_v1_entry(metadata, tensor, known, family=family.name)
+        if verdict.action == "keep":
+            failures.append((where, verdict.reason))
+        elif verdict.action == "delete":
+            to_delete.append((where, path, verdict.reason))
+        else:
+            try:
+                library = library_of(str(verdict.library_id))
+                v2 = convert_v1_metadata(metadata, verdict, name=path.stem, migrated_from=where)
+                entry, _new = library.add_payload(pl.require_confined(path, root, directory=False).read_bytes(), v2)
+                _verify_migrated(library, entry)
+                # The v2 entry must be durable BEFORE its only other copy goes.
+                pl.sync_directory(library.directory)
+                pl.sync_directory(root)
+                pl.remove_confined_file(path, root)
+            except (OSError, ValueError) as exc:
+                log.warning("FLUX.2 klein: старый кэш промпта %s не перенесён: %s", where, exc)
+                failures.append((where, str(exc)))
+                continue
+            migrated += 1
+            log.info("FLUX.2 klein: старый кэш промпта %s перенесён в библиотеку %s как %s (%s).", where, verdict.library_id, entry.file, verdict.reason)
+    for where, path, reason in to_delete:
+        try:
+            pl.remove_confined_file(path, root)
+        except (OSError, ValueError) as exc:
+            log.warning("FLUX.2 klein: старый кэш промпта %s не удалён: %s", where, exc)
+            failures.append((where, str(exc)))
+            continue
+        deleted += 1
+        log.info("FLUX.2 klein: старый кэш промпта %s удалён: %s.", where, reason)
+    for family in families:
+        try:
+            if not any(family.iterdir()):
+                pl.remove_confined_empty_directory(family, root)
+                log.info("FLUX.2 klein: пустой каталог старых кэшей %s удалён.", family)
+        except (OSError, ValueError) as exc:
+            log.debug("FLUX.2 klein: каталог %s не удалён: %s", family, exc)
+    for where, reason in failures:
+        log.warning("FLUX.2 klein: старый кэш промпта %s оставлен на месте: %s", where, reason)
+    return MigrationReport(migrated, deleted, len(failures), str(root), tuple(failures))
+
+
+_MIGRATION_LOCK = threading.Lock()
+_MIGRATION_REPORTS: dict[str, MigrationReport] = {}
+
+
+def ensure_legacy_migrated(extra_encoders: Iterable[tuple[str, str]]) -> MigrationReport:
+    """Run `migrate_legacy_families` over `prompt_cache_root()` once per process (per root) and return its report.
+
+    Called by the library operations (`.list`, `.build`, `.import`, a run that
+    names a library), never by `.status` or `large_models.profiles`.
     """
     root = prompt_cache_root()
-    if not root.is_dir():
-        return []
-    try:
-        return sorted(entry.name for entry in root.iterdir() if entry.is_dir())
-    except OSError as exc:
-        log.debug("FLUX.2 klein: не удалось перечислить библиотеку кэшей промптов (%s)", exc)
-        return []
+    key = os.path.abspath(str(root))
+    with _MIGRATION_LOCK:
+        report = _MIGRATION_REPORTS.get(key)
+        if report is None:
+            report = migrate_legacy_families(root, extra_encoders)
+            _MIGRATION_REPORTS[key] = report
+        return report
 
 
-def find_prompt_cache_entry(name: str, family: str | None) -> Path:
-    """Path of the library entry called `name`, looking it up across families when needed.
-
-    With a `family` this is the plain `prompt_cache_entry_path` and the entry
-    must be there — the current encoder's family is the only listing a
-    generation may load from.
-
-    `family is None` means no encoder is installed, so no family is the current
-    one and the name is searched in ALL of them. An ambiguous name (the same
-    entry name saved under two encoders) is REFUSED naming both families rather
-    than resolved by an arbitrary rule: picking one would feed a generation
-    embeddings from an encoder the user did not choose, which is the silent wrong
-    answer this module refuses everywhere else.
-
-    # Raises
-    `ValueError` when nothing matches, or when several families do.
-    """
-    safe = sanitize_name_component(name, what="имя кэша промпта")
-    if family is not None:
-        path = prompt_cache_entry_path(family, safe)
-        if not path.is_file():
-            raise ValueError(
-                f"Кэш промпта «{path.stem}» не найден в библиотеке семейства «{family}» "
-                f"({path.parent})."
-            )
-        return path
-
-    matches = [
-        candidate
-        for candidate in (
-            prompt_cache_entry_path(known, safe) for known in list_prompt_cache_families()
-        )
-        if candidate.is_file()
-    ]
-    if not matches:
-        raise ValueError(
-            f"Кэш промпта «{safe}» не найден в библиотеке ({prompt_cache_root()}). "
-            "Текстовый энкодер не выбран, поэтому поиск шёл по всем семействам."
-        )
-    if len(matches) > 1:
-        families = ", ".join(f"«{match.parent.name}»" for match in matches)
-        raise ValueError(
-            f"Кэш промпта «{safe}» есть сразу в нескольких семействах ({families}), а текстовый "
-            "энкодер не выбран — неизвестно, какой из них ваш. Выберите энкодер или "
-            "переименуйте одну из записей."
-        )
-    return matches[0]
-
-
-def require_free_entry_path(path: Path, *, overwrite: bool) -> Path:
-    """Refuse an existing entry unless overwriting was asked for explicitly.
-
-    Rebuilding a lost cache costs a 16 GB encoder read the user may have saved it
-    precisely to avoid, so a name collision is a decision, not a detail: without
-    `overwrite` it is a named error telling the caller both options. With
-    `overwrite` the publish is still atomic, so a failed write cannot destroy the
-    entry that is already there.
-
-    # Raises
-    `ValueError` when the entry exists and `overwrite` is false.
-    """
-    if path.exists() and not overwrite:
-        raise ValueError(
-            f"Кэш промпта «{path.stem}» уже существует в этой библиотеке. Выберите другое имя "
-            "или разрешите перезапись (overwrite): восстановление удалённого кэша стоит "
-            "полного чтения текстового энкодера."
-        )
-    return path
+def migration_report() -> MigrationReport | None:
+    """The report of this process's migration of `prompt_cache_root()`, `None` when it has not run."""
+    return _MIGRATION_REPORTS.get(os.path.abspath(str(prompt_cache_root())))

@@ -136,32 +136,31 @@ pub struct Flux2KleinEngine {
     /// answer is about files the user has already typed away from, and the honest verdict
     /// is `Unknown` ([`flux2_status_for_paths`]).
     pub(super) status_paths: Option<Flux2EffectivePaths>,
-    /// The one prompt-cache operation (build / save / load / export / import) that may
-    /// be in flight. All five share the channel because only one can run at a time.
+    /// The one prompt-cache operation (build / rename / export / import) that may be in
+    /// flight. All share the channel because only one can run at a time.
     pub(super) prompt_cache_rx: Option<Receiver<Result<Flux2PromptCacheOutcome, String>>>,
-    /// User-facing outcome of the last prompt-cache operation, shown under the buttons.
+    /// User-facing outcome of the last prompt-cache operation, shown in the library fold.
     pub(super) prompt_cache_status: Option<String>,
-    /// A warning about the LAST prompt-cache operation, shown beside its status line:
-    /// "the imported entry belongs to another encoder family", or "the encoder fingerprint
-    /// of the loaded entry was not compared". Cleared when the next operation starts, so it
-    /// is a remark about a result and never a standing banner.
+    /// A warning about the LAST prompt-cache operation ("the imported entry belongs to another
+    /// model's library"), shown beside its status line. Cleared when the next operation starts,
+    /// so it is a remark about a result and never a standing banner.
     pub(super) prompt_cache_warning: Option<String>,
-    /// The library listing of the current encoder family; `None` until `.list` answers.
-    pub(super) prompt_cache_library: Option<Flux2PromptCacheList>,
-    pub(super) prompt_cache_list_rx: Option<Receiver<Result<Flux2PromptCacheList, String>>>,
+    /// The model's shared library listing (protocol 23); `None` until `.list` answers.
+    pub(super) prompt_cache_library: Option<PromptLibraryListing>,
+    pub(super) prompt_cache_list_rx: Option<Receiver<Result<PromptLibraryListing, String>>>,
     pub(super) prompt_cache_list_error: Option<String>,
-    /// Same one-shot arming as `status_wanted`; re-armed after a save or an import and
-    /// whenever the encoder path changes, since the family — and with it the whole
-    /// listing — follows that path.
+    /// Same one-shot arming as `status_wanted`; re-armed after a build or an import, after a
+    /// catalog job and whenever the encoder changes (`current_encoder` follows it).
     pub(super) prompt_cache_list_wanted: bool,
-    /// Name of the library entry the combo points at. Kept as a NAME rather than an
-    /// index so a refreshed listing cannot silently move the selection to another entry.
-    pub(super) prompt_cache_selected: Option<String>,
-    /// Buffer of the "save under this name" field.
+    /// The preset NAME field beside «Кэшировать»: filled with the typed text's preset name
+    /// ([`sync_preset_name`]), editable, sent as the build's `name` (empty: the default
+    /// derived from the text). Session state.
     pub(super) prompt_cache_name_input: String,
-    /// Entry an export dialog was opened for, captured when the dialog started so a
-    /// selection changed while it was open cannot export the wrong entry.
-    pub(super) prompt_cache_export_name: Option<String>,
+    /// The preset text the name field was last filled for ([`sync_preset_name`]).
+    pub(super) prompt_cache_name_synced_for: Option<String>,
+    /// The library FILE an export dialog was opened for, captured when it started so a prompt
+    /// changed while it is open cannot export another entry.
+    pub(super) prompt_cache_export_file: Option<String>,
     /// The `large_models.profiles` forecast (at most one request in flight, latest wins) and
     /// its one-shot arming, the «Пределы» caps buffer with its debounced writer, and the
     /// learned-floor reset. Armed whenever a parameter changed and, for the geometry, only by
@@ -324,9 +323,9 @@ impl Flux2KleinEngine {
             prompt_cache_list_rx: None,
             prompt_cache_list_error: None,
             prompt_cache_list_wanted: true,
-            prompt_cache_selected: None,
             prompt_cache_name_input: String::new(),
-            prompt_cache_export_name: None,
+            prompt_cache_name_synced_for: None,
+            prompt_cache_export_file: None,
             resources: ResourcesController::new(FLUX2_LARGE_MODEL, FLUX2_LOG_LABEL),
             unload_rx: None,
             unload_status: None,
@@ -517,6 +516,14 @@ impl Flux2KleinEngine {
             self.status_prompt.as_deref(),
             &self.settings.prompt,
         )
+    }
+
+    /// The entry `.status` named for the prompt CURRENTLY in the field (the one a run would
+    /// use), under the same guard as [`Self::prompt_cache_state`]: an answer about another
+    /// prompt names nothing.
+    pub(super) fn prompt_cache_status_entry(&self) -> Option<&PromptLibraryEntry> {
+        self.prompt_cache_state()?;
+        self.status.as_ref()?.prompt_cache_entry.as_ref()
     }
 
     /// The `.status` catalog, but only while it still describes the paths a run would use.
@@ -1035,6 +1042,10 @@ impl AiEngine for Flux2KleinEngine {
         // derived from `status` AND `settings`, so it cannot be computed while both are
         // held by the context.
         let prompt_cache_state = self.prompt_cache_state();
+        // Same reason: the entry `.status` named for the typed prompt (guarded the same way).
+        let prompt_cache_status_entry = self.prompt_cache_status_entry().cloned();
+        // A change of the «Нет» stash owes a save and re-asks nothing.
+        let mut uncached_changed = false;
         // Same reason, and the staleness guard it applies reads `status_paths`, which the
         // destructure below does not hand out: the panel gets the finished verdict.
         let readiness = self.model_readiness();
@@ -1071,8 +1082,8 @@ impl AiEngine for Flux2KleinEngine {
                 prompt_cache_library,
                 prompt_cache_list_rx,
                 prompt_cache_list_error,
-                prompt_cache_selected,
                 prompt_cache_name_input,
+                prompt_cache_name_synced_for,
                 prompt_library_open,
                 install_section_seeded,
                 install_section_open_prev,
@@ -1095,14 +1106,15 @@ impl AiEngine for Flux2KleinEngine {
                 translate_status: translate_status.as_deref(),
                 translate_busy: translate_rx.is_some(),
                 prompt_cache_state,
+                prompt_cache_status_entry: prompt_cache_status_entry.as_ref(),
                 prompt_cache_status: prompt_cache_status.as_deref(),
                 prompt_cache_warning: prompt_cache_warning.as_deref(),
                 prompt_cache_library: prompt_cache_library.as_ref(),
                 prompt_cache_list_error: prompt_cache_list_error.as_deref(),
                 prompt_cache_list_busy: prompt_cache_list_rx.is_some(),
                 prompt_cache_busy: prompt_cache_rx.is_some(),
-                prompt_cache_selected,
                 prompt_cache_name_input,
+                prompt_cache_name_synced_for,
                 prompt_library_open,
                 install_section_seeded,
                 install_section_open_prev,
@@ -1116,6 +1128,7 @@ impl AiEngine for Flux2KleinEngine {
                 ai_backend_available: *ai_backend_available,
                 settings_changed: &mut settings_changed,
                 postprocess_changed: &mut postprocess_changed,
+                uncached_changed: &mut uncached_changed,
                 want_status: &mut want_status,
                 want_forecast: &mut want_forecast,
                 resources_actions: &mut resources_actions,
@@ -1142,6 +1155,9 @@ impl AiEngine for Flux2KleinEngine {
             self.note_settings_changed();
         } else if postprocess_changed {
             self.note_postprocess_changed();
+        } else if uncached_changed {
+            // Only the «Нет» stash moved (it follows the typed text): a save, nothing else.
+            self.dirty = true;
         }
         if want_status {
             self.status_wanted = true;
@@ -1163,14 +1179,19 @@ impl AiEngine for Flux2KleinEngine {
             self.start_translate();
         }
         match prompt_cache_action {
-            Some(Flux2PromptCacheAction::Build) => self.start_prompt_cache_build(),
-            Some(Flux2PromptCacheAction::Save) => self.start_prompt_cache_save(),
-            Some(Flux2PromptCacheAction::Load) => self.start_prompt_cache_load(),
-            // The dialog is opened here and the entry is captured with it, so a selection
+            Some(Flux2PromptCacheAction::Build) => self.start_prompt_cache_build(false),
+            Some(Flux2PromptCacheAction::Rename) => self.start_prompt_cache_build(true),
+            // The dialog is opened here and the entry's file is captured with it, so a prompt
             // changed while it is open cannot redirect the export to another entry.
             Some(Flux2PromptCacheAction::Export) => {
-                self.prompt_cache_export_name = self.prompt_cache_selected.clone();
-                self.start_picker(Flux2PickerPurpose::PromptCacheExport);
+                self.prompt_cache_export_file = self
+                    .prompt_cache_library
+                    .as_ref()
+                    .and_then(|library| library.text_for(&self.settings.prompt))
+                    .map(|text| text.selected.file.clone());
+                if self.prompt_cache_export_file.is_some() {
+                    self.start_picker(Flux2PickerPurpose::PromptCacheExport);
+                }
             }
             Some(Flux2PromptCacheAction::Import) => {
                 self.start_picker(Flux2PickerPurpose::PromptCacheImport);
@@ -1994,39 +2015,17 @@ mod tests {
         // in the middle of a run — and it would have stolen the run's progress bar.
         let mut engine = Flux2KleinEngine::default();
         assert!(!engine.pipeline_busy());
-        let open = flux2_prompt_cache_gates(
-            &cacheable_settings(),
-            Some(true),
-            Some(true),
-            "entry",
-            true,
-            true,
-            engine.pipeline_busy(),
-        );
-        assert!(open.build && open.save && open.load && open.export && open.import);
+        let gates = |busy| flux2_prompt_cache_gates(&cacheable_settings(), None, "", Some(false), Some(true), true, busy);
+        let open = gates(engine.pipeline_busy());
+        assert!(open.build == Flux2CacheButton::Cache && open.import);
 
         // Each of the three long operations closes them, and each on its own.
         let (_run_tx, run_rx) = mpsc::channel();
         engine.session.run_rx = Some(run_rx);
         assert!(engine.pipeline_busy(), "a generation holds the pipeline");
-        let during_run = flux2_prompt_cache_gates(
-            &cacheable_settings(),
-            Some(true),
-            Some(true),
-            "entry",
-            true,
-            true,
-            engine.pipeline_busy(),
-        );
         assert_eq!(
-            during_run,
-            Flux2PromptCacheGates {
-                build: false,
-                save: false,
-                load: false,
-                export: false,
-                import: false
-            }
+            gates(engine.pipeline_busy()),
+            Flux2PromptCacheGates { build: Flux2CacheButton::Closed(Flux2CacheBlock::NotReady), export: false, import: false }
         );
         engine.session.run_rx = None;
 
@@ -2079,24 +2078,10 @@ mod tests {
             "«Обработать» must say the pipeline is busy, not that a path is missing"
         );
         // The prompt-cache controls close on the same rule, on a real receiver.
-        let gates = flux2_prompt_cache_gates(
-            &cacheable_settings(),
-            Some(true),
-            Some(true),
-            "entry",
-            true,
-            true,
-            engine.pipeline_busy(),
-        );
+        let gates = flux2_prompt_cache_gates(&cacheable_settings(), None, "", Some(false), Some(true), true, engine.pipeline_busy());
         assert_eq!(
             gates,
-            Flux2PromptCacheGates {
-                build: false,
-                save: false,
-                load: false,
-                export: false,
-                import: false
-            }
+            Flux2PromptCacheGates { build: Flux2CacheButton::Closed(Flux2CacheBlock::NotReady), export: false, import: false }
         );
         engine.component_action_rx = None;
 

@@ -37,7 +37,8 @@ components                              (-> params, runtime.torch_support, runti
                                              runtime.paths)
 hardware                                (-> runtime.torch_support, runtime.memory_probe,
                                              runtime.torch_device)
-prompt_cache                            (-> components, params, runtime.paths)
+prompt_cache                            (-> components, params, runtime.paths, runtime.prompt_library,
+                                             runtime.safetensors_stream)
 pipeline                                (-> components)
 large_model                             (-> attention, components, conversion, encoder_gguf, params, pipeline,
                                              runtime.large_models, runtime.tensor_container;
@@ -101,8 +102,14 @@ object itself.
   `transformer_block_order`, the encoder's truncation / `model.` prefix / fp8 split), each phase's
   work, the decode fallbacks (`FALLBACK_VAE_TILING`, `FALLBACK_VAE_TILE_LOWERED`), the
   pre-admission refusals (`require_loadable`, `require_loadable_encoder`) and the model names.
-- `prompt_cache.py`: encoder identity (with the RoPE salt), the `.msprompt` container and the
-  on-disk library.
+- `prompt_cache.py`: FLUX.2's side of the shared prompt library (`../../runtime/prompt_library.py`):
+  encoder identity (`text_encoder_fingerprint` with the RoPE salt; `rope_salt=False` = the pre-fix
+  identity, for the migration only), `encoder_label` / `encoder_provenance` / `is_current_encoder`,
+  the libraries (`flux2_library_spec`, `library_of`, `prompt_cache_root`, `transformer_text_width`,
+  `LEGACY_LIBRARY_BY_WIDTH` — a Rust test reads that literal), and the v1 migration
+  (`classify_v1_entry`, `convert_v1_metadata`, `migrate_legacy_families`, `ensure_legacy_migrated`;
+  links are never followed — `legacy_family_dirs` / `_family_files` refuse them — and a v1 file is
+  unlinked only after its v2 copy's directory is fsynced).
 - `attention.py`: the `text_attention_in_mask` contract — the token grid, the joint-sequence layout,
   the early empty-mask refusal, THE device-byte formula of the mask (shared by the run's log and the
   spec's denoise work) and the additive mask itself.
@@ -117,7 +124,9 @@ object itself.
 - `pipeline.py`: what a run does WITH the placed modules — the prompt encode, the warm-up decode,
   the execution-device check, ONE VAE decode attempt with its tiling options, and the residency
   vocabulary / action matrix (`residency_of`, `_component_actions`).
-- `service.py`: `Flux2KleinInpaintService` — the service lock, the prompt cache, the tokenizer /
+- `service.py`: `Flux2KleinInpaintService` — the service lock, the in-memory prompt cache with its
+  provenance (`MemoryEmbedding`), `_prompt_plan` / `PromptPlan` (THE answer to which embedding serves
+  each needed text), the library methods (`prompt_cache_build` / `_list` / `_export` / `_import`), the tokenizer /
   scheduler caches, the manager sessions of a run and of every action (acquired under the lock, pipeline
   before encoder; `LockOrderTests`), `_encoder_need` / `EncoderNeed` (the one decision whether a
   request encodes and whether its forecast counts the encoder: not counted only when not resident
@@ -223,9 +232,9 @@ object itself.
   is a Russian refusal listing what was probed and rejected. The package root also joins the
   tokenizer / scheduler search when a component is GGUF, never the `model_index.json` search
   (klein 4B and klein base 4B share every shape).
-- Prompt cache: a GGUF encoder's fingerprint is `sha256(config bytes + "\ngguf\x00<name>\x00<size>")`
-  and its family is named by the file's stem, so a Q4 cache is never served for bf16; the in-memory
-  key carries the format; `.msprompt` metadata records `text_encoder_format` for display only.
+- Prompt cache: a GGUF encoder's fingerprint is `sha256(config bytes + "\ngguf\x00<name>\x00<size>")`,
+  so a Q4 encoder never shares a folder's identity; an entry records its encoder's format id and the
+  selection ranks it by the request's precision order (`../MODULE_README.md`, prompt library).
 
 ### Text-encoder config kwargs and the RoPE normalization
 - Every `Qwen3Config.from_pretrained` of the encoder and every pre-admission check of its config
@@ -237,8 +246,9 @@ object itself.
   `rope_parameters` without a usable `rope_theta`, or a contradicting top-level value is refused
   naming the file.
 - The prompt-cache fingerprint asks the same decision function and, when it normalizes, appends
-  `"\nrope_theta=<repr(float(base))>"` to the hashed material: caches built under the wrong base
-  are never served again, every other fingerprint (stock 9B, every 4B) is unchanged.
+  `"\nrope_theta=<repr(float(base))>"` to the hashed material: every other fingerprint (stock 9B,
+  every 4B) is unchanged, and v1 entries recorded under the unsalted identity are recognized as
+  pre-fix by the migration and deleted.
 
 ### Monkeypatched symbols must be reached through their defining module
 The test suite replaces module-level attributes to keep the GPU, the filesystem and the memory
@@ -250,7 +260,8 @@ up on the module that defines it:
 | `memory_snapshot`, `_clear_torch_cache`, `_resolve_selected_backend_device` | `hardware` |
 | `_tables_for` (the forecast's cost tables) | `memory` |
 | `_weight_bytes` (the disk size `status` reports), `installed_klein_package_roots` | `components` |
-| `program_root`, `write_prompt_file` | `prompt_cache` |
+| `program_root` | `prompt_cache` (`_TempTreeCase` points it at a temp root for every test) |
+| `serialize_tensor`, `load_tensor` | `../../runtime/prompt_library` |
 | `build_text_attention_mask` | `attention` |
 | `is_torch_available` | `components` AND `hardware` — TWO bindings, see below |
 
@@ -259,7 +270,7 @@ up on the module that defines it:
 code path; a test patches the module whose path it exercises, or both.
 
 Therefore a module that consumes one of these from ANOTHER module writes
-`hardware.memory_snapshot(...)`, `memory._tables_for(...)`, `prompt_cache.write_prompt_file(...)`,
+`hardware.memory_snapshot(...)`, `memory._tables_for(...)`, `components.installed_klein_package_roots()`,
 `attention.build_text_attention_mask(...)` — never `from .hardware import memory_snapshot`; and
 tests patch the OWNER module, never the `flux2_klein` package (a re-export is a separate binding).
 
@@ -316,7 +327,10 @@ which is what makes `assertLogs(svc.log)` capture records of the submodules.
   (`_run_locked`, `_load_pipeline_locked`, `_denoise`, `_encode_prompts_locked`,
   `_component_action_locked`); what a phase DOES with the modules (encode, warm-up, decode,
   device check) is `pipeline.py`.
-- To change the prompt-cache file format or the library layout, see `prompt_cache.py`.
+- To change the prompt library's container, index, file names or the selection rule, see
+  `../../runtime/prompt_library.py` (model-agnostic); FLUX.2's library ids, encoder provenance,
+  width filter or the v1 migration, `prompt_cache.py`; what a run / `.status` / the forecast take from
+  the library, `service._prompt_plan`.
 - The latent-mask dilation, the colour match and the composite are not here: the backend answers
   the RAW decode and the Rust host post-processes it (`crates/ms-region-postprocess`). The wire
   codecs (region, L8 mask, solid-mask check, PNG answer) are `../region_imaging.py` (shared with

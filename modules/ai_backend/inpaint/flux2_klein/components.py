@@ -742,8 +742,8 @@ def text_encoder_available(paths: dict[str, Any]) -> bool:
     map; only `text_encoder_path` is read. The answer is `False` both for an
     empty path and for one that does not exist, because those are the same
     situation from the run's point of view: nothing here can encode a prompt.
-    A `.msprompt` file loaded into the cache is what makes a run possible
-    anyway — see `normalize_flux2_klein_params`.
+    A prompt-library entry for the exact text (`runtime.prompt_library`) is what
+    makes a run possible anyway — see `normalize_flux2_klein_params`.
 
     It says nothing about whether the directory is a USABLE encoder; that is
     `text_encoder_fingerprint`'s job, and it is asked only when this returns
@@ -760,12 +760,13 @@ def require_text_encoder(normalized: dict[str, Any], *, what: str) -> None:
     must ENCODE — called both early (before a run reads 18 GB of transformer it
     would have to throw away) and at the encode itself
     (`_encode_prompts_locked`, which cannot be reached any other way). `what`
-    names the operation in the message. A SAVE needs the encoder for its identity
-    rather than for an encode and refuses with its own wording, in
-    `Flux2KleinInpaintService._require_current_family`.
+    names the operation in the message. A library BUILD needs the encoder for the
+    entry's provenance even when the text is already cached, and refuses through
+    this same function.
 
     The message states BOTH ways out on purpose: the user either points the
-    settings at an encoder, or loads a ready `.msprompt` for this exact prompt.
+    settings at an encoder, or picks (or imports) a prompt-library preset with
+    this exact text.
     Naming only the first would tell a user who cannot download 16 GB that the
     feature is closed to them, when it is not.
 
@@ -778,8 +779,8 @@ def require_text_encoder(normalized: dict[str, Any], *, what: str) -> None:
     where = f" (путь не найден: {configured})" if configured else ""
     raise ValueError(
         f"Текстовый энкодер недоступен{where}, а {what} требует кодирования промпта. "
-        "Либо укажите каталог текстового энкодера в настройках, либо загрузите готовый кэш "
-        "промпта для этого текста (inpaint.flux2_klein.prompt_cache.load) — с ним генерация "
+        "Либо укажите текстовый энкодер в настройках, либо выберите в библиотеке промптов закэшированный "
+        "пресет с этим текстом (или импортируйте файл .msprompt) — с ним генерация "
         "энкодер не читает."
     )
 

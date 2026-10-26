@@ -133,8 +133,22 @@ from __future__ import annotations
 # 22: `inpaint.flux2_klein.download.check` / `.start` are removed (the app's
 # model catalog downloads every FLUX.2 klein weight, 4B and 9B; the old names
 # are unknown methods). No other wire change.
+# 23: FLUX.2 klein prompt library: one library per model
+# (`prompt_cache/<library id>/`, container v2 `manhwastudio.prompt_cache` +
+# `index.json`) of NAMED presets, served on an exact prompt match by any
+# encoder variant; new optional `inpaint.flux2_klein*` params `prompt_library`,
+# `text_encoder_source`, `prompt_cache_precision_order`; `.status` gains
+# `prompt_cache_entry` (EntryInfo or null) and its `prompt_cached` covers memory
+# and library; `.prompt_cache.build` takes optional `name` and answers
+# {prompt, name, encoded, written, renamed, prompt_cached, device};
+# `.prompt_cache.list` answers {library, directory, texts, skipped,
+# text_encoder_available, legacy}; `.prompt_cache.export` takes `file`;
+# `.prompt_cache.import` answers {library, file, prompt, name, library_matches,
+# already_present, origin}; `.prompt_cache.save` / `.load` are removed; v1
+# entries are migrated once (pre-RoPE-fix and unprovable uncensored ones are
+# deleted).
 # ============================================================================
-PROTOCOL_VERSION = 22
+PROTOCOL_VERSION = 23
 
 # ============================================================================
 # FRAME SIZE GUARDS
@@ -246,14 +260,13 @@ METHOD_INPAINT_FLUX2_KLEIN_UNLOAD = "inpaint.flux2_klein.unload"
 # encoder takes tens of seconds, and it claims the same single progress bar a generation
 # does, so the two can never run at once.
 METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION = "inpaint.flux2_klein.component_action"
-# Prompt-cache library: a prompt embedding costs a 16 GB encoder read to produce
-# and ~4 MiB to keep, so it can be built without generating, stored in
-# `<program root>/prompt_cache/<encoder family>/<name>.msprompt`, listed, loaded
-# back, and moved in and out of that library.
+# Prompt library (v23): a prompt embedding costs an encoder read of up to 16 GB
+# to produce and ~12 MB to keep, so it is saved as a named preset in the
+# model's library `<program root>/prompt_cache/<library id>/` (`build`), which
+# a run reads by exact prompt text; `list` / `export` / `import` browse and move
+# entries. The v22 `.save` / `.load` are gone.
 METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD = "inpaint.flux2_klein.prompt_cache.build"
 METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST = "inpaint.flux2_klein.prompt_cache.list"
-METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE = "inpaint.flux2_klein.prompt_cache.save"
-METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD = "inpaint.flux2_klein.prompt_cache.load"
 METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT = "inpaint.flux2_klein.prompt_cache.export"
 METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT = "inpaint.flux2_klein.prompt_cache.import"
 # FLUX.3 Image Klein region editing (`ipc/handlers/flux3_klein.py`, PROTOCOL.md
@@ -343,8 +356,6 @@ ALL_METHODS = frozenset(
         METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST,
-        METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE,
-        METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT,
         METHOD_INPAINT_FLUX3_KLEIN,

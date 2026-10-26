@@ -21,7 +21,11 @@ Main responsibilities:
   or the id derived from the container when the request names none;
 - `text_encoder_dtype_name` - the ONE place that answers what dtype the
   text encoder runs in; it is deliberately NOT the request's
-  `dtype`, which governs the transformer and the VAE alone.
+  `dtype`, which governs the transformer and the VAE alone;
+- `prompt_library_fields` - the prompt-library fields of the wire (protocol
+  23): the library id, the selected encoder source and the precision order,
+  validated without touching any path (`.list` / `.export` / `.import` read
+  them before a transformer is configured).
 
 Key functions:
 - normalize_flux2_klein_params()
@@ -29,6 +33,7 @@ Key functions:
 - validate_region_size()
 - effective_steps(), _lenient_paths(), encoder_on_cpu()
 - derived_format(), derived_encoder_format(), _weight_formats()
+- prompt_library_fields()
 - text_encoder_dtype_name()
 
 Notes:
@@ -121,6 +126,11 @@ GGUF_FORMAT = "gguf"
 #: are opaque to the backend (module notes).
 WEIGHT_FORMAT_ID_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
 
+#: Shape of `prompt_library` (a library id: a directory name, Rust
+#: `Flux2Variant::prompt_library_id`) and of `text_encoder_source` (protocol 23).
+PROMPT_LIBRARY_ID_PATTERN = re.compile(r"^[a-z0-9_]{1,40}$")
+ENCODER_SOURCE_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
+
 
 # =====================================================================
 #  The text encoder's dtype
@@ -154,10 +164,10 @@ def text_encoder_dtype_name() -> str:
     stays in `VALID_DTYPES`.
 
     Everything that describes an EMBEDDING rather than a run reports this value:
-    `_encoder_key`, `_prompt_cache_key` and the `.msprompt` metadata. A
-    `.msprompt` written earlier under `float16` therefore no longer validates —
-    correctly, because its embedding really did come from a different encoder
-    precision — and `validate_prompt_file_metadata` says so by name.
+    `_encoder_key`, the library spec (`prompt_cache.flux2_library_spec`) and
+    the `.msprompt` metadata. A v1 `.msprompt` written earlier under `float16`
+    is therefore never migrated (`prompt_cache.classify_v1_entry`): its
+    embedding really did come from a different encoder precision.
     """
     return TEXT_ENCODER_DTYPE
 
@@ -194,6 +204,9 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
     for the encoder; an absent or missing encoder derives `SAFETENSORS_FORMAT`
     (`derived_encoder_format`), since nothing is loaded from it.
 
+    **Prompt library** (protocol 23): `prompt_library`, `text_encoder_source`
+    and `prompt_cache_precision_order` (`prompt_library_fields`).
+
     `whole_region=True` is a MODE, not a hint, and it settles
     `text_attention_in_mask` -> False on the caller's behalf; see
     `_whole_region_overrides` for why it is not meaningful there. The mask is
@@ -206,7 +219,8 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
     `ValueError` when the transformer or VAE path is empty or absent, when an
     enum value is not one of `VALID_DTYPES` / `VALID_VRAM_STEPS` /
     `VALID_RAM_STEPS`, when a weight-format field breaks its contract
-    (`_weight_formats`), or when a retired field (`RETIRED_FIELDS`) is
+    (`_weight_formats`), when a prompt-library field breaks its contract
+    (`prompt_library_fields`), or when a retired field (`RETIRED_FIELDS`) is
     present, naming it and its replacement.
     """
     merged: dict[str, Any] = {}
@@ -240,6 +254,7 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
         )
 
     whole_region = _to_bool(merged.get("whole_region"), False)
+    prompt_library, text_encoder_source, precision_order = prompt_library_fields(merged)
 
     normalized: dict[str, Any] = {
         "text_encoder_path": text_encoder_path,
@@ -290,6 +305,13 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
         # exactly as it did. A no-op under `whole_region`, which therefore forces
         # it off (`_whole_region_overrides`).
         "text_attention_in_mask": _to_bool(merged.get("text_attention_in_mask"), False),
+        # The prompt library (protocol 23, `prompt_library_fields`): the
+        # model's library id (`None` = memory only), the selected encoder
+        # source (`""` = unknown, manual mode) and the precision ids, most
+        # precise first (the selection rule's preference).
+        "prompt_library": prompt_library,
+        "text_encoder_source": text_encoder_source,
+        "prompt_cache_precision_order": precision_order,
     }
     if whole_region:
         normalized.update(_whole_region_overrides(normalized))
@@ -492,6 +514,45 @@ def _weight_formats(
             f"не совпадает с «{path_field}» ({path})"
         )
     return selected, tuple(entries)
+
+
+def prompt_library_fields(params: Mapping[str, Any] | None) -> tuple[str | None, str, tuple[str, ...]]:
+    """`(prompt_library, text_encoder_source, prompt_cache_precision_order)` of a raw params object (protocol 23).
+
+    - `prompt_library`: the model's library id (`PROMPT_LIBRARY_ID_PATTERN`);
+      absent or `null` = no library (memory only: the calibration tool, tests);
+    - `text_encoder_source`: the selected encoder source id
+      (`ENCODER_SOURCE_PATTERN`); absent, `null` or `""` = unknown (manual mode);
+    - `prompt_cache_precision_order`: a list of distinct precision ids
+      (`WEIGHT_FORMAT_ID_PATTERN`), most precise first; absent or `null` = `()`.
+    All three are opaque to the backend beyond their shape (Rust owns them).
+    Reads no path, so it is valid before any component is configured.
+
+    # Raises
+    `ValueError` naming the field that breaks its contract.
+    """
+    merged = params or {}
+    raw_library = merged.get("prompt_library")
+    library: str | None = None
+    if raw_library is not None:
+        if not isinstance(raw_library, str) or PROMPT_LIBRARY_ID_PATTERN.fullmatch(raw_library) is None:
+            raise ValueError(f"FLUX.2 klein: поле «prompt_library» должно быть идентификатором библиотеки (1–40 символов a-z, 0-9, «_»), получено {raw_library!r}")
+        library = raw_library
+    raw_source = merged.get("text_encoder_source")
+    source = ""
+    if raw_source is not None and raw_source != "":
+        if not isinstance(raw_source, str) or ENCODER_SOURCE_PATTERN.fullmatch(raw_source) is None:
+            raise ValueError(f"FLUX.2 klein: поле «text_encoder_source» должно быть идентификатором источника (1–32 символа a-z, 0-9, «_»), получено {raw_source!r}")
+        source = raw_source
+    raw_order = merged.get("prompt_cache_precision_order")
+    order: tuple[str, ...] = ()
+    if raw_order is not None:
+        if not isinstance(raw_order, list):
+            raise ValueError(f"FLUX.2 klein: поле «prompt_cache_precision_order» должно быть списком идентификаторов, получено {raw_order!r}")
+        order = tuple(_format_id(item, f"prompt_cache_precision_order[{index}]") for index, item in enumerate(raw_order))
+        if len(set(order)) != len(order):
+            raise ValueError(f"FLUX.2 klein: в «prompt_cache_precision_order» есть повторы: {list(order)!r}")
+    return library, source, order
 
 
 def _refuse_retired_fields(params: dict[str, Any]) -> None:

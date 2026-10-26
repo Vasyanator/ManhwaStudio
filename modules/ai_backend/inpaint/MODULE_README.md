@@ -405,7 +405,7 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   keeps its RoPE base only in `rope_parameters` (the uncensored 9B encoder's) gets the base as a
   `rope_theta` kwarg, because the pinned transformers reads only the top-level field and would
   silently use its default; such an encoder's prompt-cache fingerprint is salted with that base
-  (`prompt_cache.py`), so embeddings cached under the wrong base are never served again.
+  (`prompt_cache.py`), and the v1 migration deletes entries recorded under the unsalted identity.
 - **A weights FILE may stand in for its component folder** (`component_dir_for_path`). Neither
   `AutoencoderKLFlux2` nor the Qwen3 encoder has a single-file loader in diffusers 0.39, and a user
   picking a model naturally selects `diffusion_pytorch_model.safetensors` rather than the directory
@@ -457,100 +457,88 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   - The decode owns `torch.no_grad()` (it is not inside `pipeline.__call__`) and decodes on the
     VAE's own device; `_require_execution_device` checks the denoise call computes where the
     transformer was placed.
-- **The prompt-embedding cache is always on** (`_prompt_cache`, LRU, `PROMPT_EMBED_CACHE_ENTRIES`).
-  It is keyed by encoder path + text + `max_sequence_length` + the ENCODER's dtype (always
-  bfloat16, `text_encoder_dtype_name`, never the request's `dtype`) + fp8 — not by where it ran, since
-  the same encoder produces the same embedding wherever it ran. A mask edit, a new seed or a
-  repeated prompt therefore skips the prompt phase entirely; a miss costs a full 16 GB read from
-  disk, which is why that phase reports its own `phase:"load"` progress steps (7-9). Entries
-  live on the HOST so the cache never pins device memory, and `unload()` keeps them: they are
-  megabytes of embeddings, not weights.
-- **The prompt cache is also a LIBRARY on disk** (`prompt_cache.build` / `.list` / `.save` /
-  `.load` / `.export` / `.import`). The point is to stop holding 16 GB of encoder for a prompt
-  the user always types anyway: `build` encodes a prompt into the in-memory LRU **without
-  generating anything** and lets the encoder go again, `save` writes that entry to disk, and
-  `load` puts it back into the same LRU on a machine where the encoder was never read at all.
-  - **One key, one cache.** Generation, `build`, `load` and `status.prompt_cached` all go through
-    `_prompt_cache_key` and the same `_prompt_cache`. A second key would report hits the run then
-    misses.
-  - **The text encoder is OPTIONAL when the prompt is cached.** That is the point of the file
-    format: a `.msprompt` carried to a machine where the 16 GB Qwen3 was never downloaded must
-    still generate, and physically it can — the four denoising steps and the VAE decode never
-    look at the encoder, and `_prompts_to_encode()` returns an empty list on a full hit.
-    Therefore `text_encoder_path` is the ONE path `normalize_flux2_klein_params` does not
-    require, an empty path and one that is not on disk mean the same thing
-    (`text_encoder_available` — the second is what a settings file carried from another machine
-    looks like), and the absence becomes an error only where an encode is unavoidable:
-    `_encode_prompts_locked` (the invariant, reachable from every encoding path) plus an early
-    copy of the same check in `inpaint_image_bytes` and `prompt_cache_build`, so a doomed run
-    does not first read 18 GB of transformer. The refusal (`require_text_encoder`) names BOTH
-    ways out — configure an encoder, or load a ready cache for this prompt. A path that EXISTS
-    but cannot be fingerprinted stays a hard error: degrading a broken checkout into "no
-    encoder" would hide it behind a silently weaker check.
-    - **What is still checked without an encoder.** Everything that does not need one: the
-      format marker, the format version, `max_sequence_length`, the dtype (metadata AND the
-      tensor's own dtype token) and the fp8 flag. Only the fingerprint comparison is skipped,
-      it is logged, and the answer carries `encoder_verified: false` — "checked" and "taken on
-      trust" must never reach the client as the same thing.
-    - **The library without a current family.** `encoder_family_name` needs the encoder, so with
-      none installed there is no current family: `prompt_cache.list` then lists EVERY family
-      (each entry names its own `family`, top-level `family` is empty = none active, `directory`
-      is the library root), and `load`/`export` resolve a name across families
-      (`find_prompt_cache_entry`). A name that exists in two families is REFUSED naming both,
-      never resolved by an arbitrary rule. No second naming scheme was introduced — the family
-      is the one already recorded in each file. `save` is the exception that still REQUIRES the
-      encoder: the entry it writes must name the encoder that produced it.
-    - **`status`** reports `text_encoder_available` beside `available`; `available` is not false
-      merely because the encoder is missing when `prompt_cached` is true. Only the ENCODER is
-      waived that way: the Qwen tokenizer is a real pipeline component (`service._pipeline_for`
-      builds the pipeline with one and `_require_component_dir` raises without it), so it stays
-      required in every case — measured on the reference host, where the encoder-less run still
-      emitted the "Загрузка токенизатора" load step.
-    - **The forecast follows.** With no encoder installed `forecast_memory` zeroes the `encode`
-      and `encode_standalone` phases (neither can run there), and `large_model_profiles` answers
-      `encoder: null`, so the forecast and the guard get a lower number from the same planner.
-    - **When the forecast counts the encoder** has one owner, `service._encoder_need`
-      (`EncoderNeed.counted`): it is left out ONLY when it is not resident (its handle holds no
-      byte) AND every prompt the run needs is cached; a resident encoder is counted over a cached
-      prompt too. The run asks the same helper (`EncoderNeed.encodes`) whether it plans the
-      encoder's combined ceiling. Neither reading waits for the service lock.
-  - **Layout:** `<program root>/prompt_cache/<encoder family>/<name>.msprompt`, the root taken
-    from `runtime.paths.program_root()`. The family level exists because an embedding is only
-    valid for the encoder that produced it; two encoders must never share a listing. A family
-    name is `<encoder directory name>-<first 8 hex of the fingerprint>` — readable so a human can
-    see whose folder it is, hashed so that the two `text_encoder/` folders every checkout ships
-    cannot merge. Both the family and the entry name pass `sanitize_name_component`, an
-    ALLOW-list, so nothing a user or a file can say composes a path outside the library.
-  - **File format `.msprompt`:** a safetensors container with one `prompt_embeds` tensor and a
-    `__metadata__` map (format marker + version, the ORIGINAL prompt text, `max_sequence_length`,
-    dtype, fp8 flag, `text_encoder_id`, `text_encoder_family`, `text_encoder_path` (informational)
-    and `created_at`). safetensors because the dependency is already here, third-party tools can
-    read it, and its header can be parsed without materializing a tensor — which is what makes
-    every refusal below torch-free and free of allocation (`read_prompt_file_header`).
-  - **Encoder identity is checked, and checked CHEAPLY.** `text_encoder_fingerprint` is a SHA-256
-    of the encoder's `config.json` plus the sorted `(file name, size)` list of its weight files —
-    never a hash of the 16 GB itself, which would cost more than re-encoding the prompt. It
-    catches another model, another precision, another shard layout and a partial download; it
-    does not catch a fine-tune with an identical config and identical file sizes. Embeddings of a
-    foreign encoder load without an error and denoise into something else entirely, so
-    `validate_prompt_file_metadata` refuses a mismatch by name — encoder, sequence length, dtype,
-    fp8, and the tensor's own dtype token against the declared one.
-  - **`import` files an entry under the family recorded IN THE FILE**, not under the selected
-    encoder: filing it under the current one would hide it from the encoder it actually works
-    with. A family mismatch is therefore not an import error — the answer carries
-    `family_matches: false` for the client to warn about. `load` of a foreign entry stays a hard
-    refusal: importing files a cache away, loading feeds a generation.
-  - **A name collision is a decision.** `save`/`import` refuse an existing name unless
-    `overwrite` was passed, because rebuilding a lost entry costs the encoder read it was saved
-    to avoid. Every write is atomic (`publish_bytes_atomically`: `<name>.<pid>.part` +
-    `fsync` + `os.replace`), the same recipe as `../engines/model_download.py`.
-  - **A `build` admits ONLY the encoder handle**; its admission is the guard (the
-    `encode_standalone` phase of `memory.forecast_memory` is that handle's forecast alone).
-  - `build` releases the encoder afterwards (that is the point of the button), EXCEPT when its
-    handle already held bytes when the call arrived — that one belongs to the previous run and the
-    steps decide its fate.
-  - A corrupt or foreign file in a family directory does not break `list`: it is reported in
-    `skipped` with its reason. Users can and do drop files there by hand.
+- **The prompt-embedding cache is always on in memory** (`_prompt_cache`, LRU,
+  `PROMPT_EMBED_CACHE_ENTRIES`; a 9B entry is ~12.6 MB). Its key is (library, text,
+  `max_sequence_length`, encoder fingerprint, precision id, origin file or `encoded`); its
+  provenance (`MemoryEmbedding`) sits in a copy-on-write index the lock-free plan reads. Not keyed by
+  where the encoder ran. Entries live on the HOST and `unload()` keeps them.
+- **The prompt LIBRARY (protocol 23)** is the model-agnostic `runtime/prompt_library.py`, one library
+  per MODEL: `<program root>/prompt_cache/<library id>/` with `params.prompt_library` =
+  `flux2_klein_9b` / `flux2_klein_4b` (Rust `Flux2Variant::prompt_library_id`, directory names,
+  frozen). Any encoder variant of the model may serve its entries.
+  - **One owner of "is this text served": `service._prompt_plan`.** Per text the run needs (the
+    prompt, plus `""` under effective classifier-free guidance — `_texts_needed`) the candidates are
+    memory and library entries with the EXACT text (the backend-normalized `strip()`ed text, case and
+    inner whitespace significant) and length, minus every candidate whose width the transformer does
+    not accept (`joint_attention_dim`, `prompt_cache.transformer_text_width`), ranked by
+    `prompt_library.select_entry`: the request's `text_encoder_source` first, then its
+    `prompt_cache_precision_order` (Rust-owned; `fp8` = an fp8-quantized encode), memory before a
+    file, newer, file name. The run (planned once under the lock, after the migration),
+    `.status` (`prompt_cached` = every needed text served, `prompt_cache_entry` = the prompt's
+    choice as `EntryInfo`), `_encoder_need` and the forecast all derive from it, so status and run
+    cannot diverge (the guidance `""` text included).
+  - **The run reads a chosen file lazily** (`_serve_locked`: «Промпт взят из кэша»; the tensor then
+    stays in memory). A file that vanished or changed since the plan (`LibraryEntryGone`) re-plans
+    once; a text still unserved is encoded when an encoder is available, else the run is refused
+    naming the file.
+  - **The text encoder is OPTIONAL when every text is served.** `text_encoder_path` is the ONE path
+    `normalize_flux2_klein_params` does not require; an empty path and one not on disk mean the same
+    (`text_encoder_available`). The absence is an error only where an encode is unavoidable
+    (`_encode_prompts_locked`, plus early copies in `inpaint_image_bytes` and `prompt_cache_build`,
+    before 18 GB of transformer are read). `status.available` is not false over a missing encoder
+    when `prompt_cached`; the Qwen tokenizer stays required (the pipeline is built with one). An
+    encoder that EXISTS but cannot be fingerprinted is a hard error.
+  - **When the forecast counts the encoder** has one owner, `service._encoder_need`
+    (`EncoderNeed.counted`): left out ONLY when its handle holds no byte AND the plan serves every
+    text; neither reading waits for the service lock.
+  - **Presets.** A preset is the library's entries of one exact text; its NAME lives in every
+    entry's metadata (display name = newest non-empty). `.prompt_cache.build {params, name}`
+    («Кэшировать») writes, for every text the run needs, an entry of the CURRENT encoder (same
+    fingerprint and fp8) unless one exists, reusing an embedding this process encoded with that
+    encoder, else encoding through the encoder handle alone (no pipeline; the encoder is released
+    afterwards unless it was resident already). An empty `name` keeps the preset's name (a new
+    preset gets the first ~40 characters of the text); a different name RENAMES the preset — a
+    torch-free header rewrite of all its entries, no encode (there is no separate rename method).
+    It needs the encoder (an entry must name the encoder that made it). Generation encodes stay
+    memory-only.
+  - **`.list`** (lenient: no transformer / VAE needed) answers the presets newest first, `""` never
+    listed, each with its entries at the request's length ranked by the same rule and the first as
+    `selected`; every `EntryInfo` carries `current_encoder`, `encoder_source`, `encoder_format`,
+    `encoder_fp8`, so the client decides «Кэшировать» (disabled when a more precise entry of the same
+    source or an entry of the current encoder exists) without asking again. Also `skipped` files and
+    the `legacy` migration report.
+  - **`.export {params, file, path}`** copies one entry atomically; **`.import {params, path}`**
+    files a v2 file under ITS OWN library (`library_matches` says whether it is the requested one;
+    a non-FLUX.2 library is refused) and converts a v1 file by the migration rules (a pre-fix or
+    unprovable one is refused by name). Writes are deterministic (`entry_file_name`), so build,
+    import and migration are idempotent (`already_present`).
+  - **Container v2** (`manhwastudio.prompt_cache`, version 2): one `prompt_embeds` bf16 tensor
+    (`text_encoder_dtype_name`) and `__metadata__` = library, name, prompt, length, dtype, encoder
+    `source` / `format` / `fp8` / `id` / `label`, `created_at`, `origin`
+    (`built` / `imported` / `migrated_v1` / `migrated_v1_unverified`), plus informational
+    `text_encoder_path` / `migrated_from`. The file is the truth; `index.json` is a rebuildable
+    cache; a corrupt or foreign file is `skipped`, never fatal and never deleted.
+  - **Encoder identity** (`prompt_cache.text_encoder_fingerprint`): SHA-256 of `config.json` plus
+    the sorted `(file name, size)` of the weight files (a GGUF file: config + `gguf` marker + name +
+    size), salted with the RoPE base when the loader normalizes it — metadata only, never a hash of
+    the weights. `text_encoder_path` in a file is informational, never a compatibility input.
+  - **v1 migration** (`prompt_cache.migrate_legacy_families`, once per process, triggered by
+    `.list` / `.build` / `.import` / a run that names a library — never by `.status` or the
+    forecast). v1 family directories (`<name>-<8 hex>`) are classified against every locally
+    findable encoder (the installed klein packages' `text_encoder*` folders and GGUF files, the
+    request's encoder, the recorded paths), salted AND unsalted: an entry whose id is the UNSALTED
+    identity of a RoPE-normalized encoder (made before the fix) and an unmatched entry of an
+    uncensored encoder (post-fix unprovable) are DELETED; the others become v2 entries of the
+    library their tensor width names (`LEGACY_LIBRARY_BY_WIDTH`), each written and re-verified
+    before its v1 file is deleted; an emptied family directory is removed; a float16, unknown-width
+    or unreadable file stays where it is (`not_migrated`). **Containment:** the root, every family
+    and every file must be a real directory / regular file strictly inside the root
+    (`prompt_library.require_confined`, `lstat`, no symbolic link or reparse point); a linked root
+    migrates nothing, a linked family or file is reported in `not_migrated` and never followed —
+    the same rule guards every library rewrite, replace and the export source. **Durability:** the
+    v2 publish fsyncs its directory, the library directory and the root are fsynced again, and only
+    then is the v1 file unlinked and its family directory fsynced (`prompt_library.sync_directory`,
+    a no-op off POSIX like `ms_atomic_file::sync_directory`); a failed fsync keeps the v1 file.
 - **Resources are the large-model manager's** (`runtime/large_models/MODULE_README.md`): where every
   byte of both handles lives in every phase, the forecast, the admission guard (no host OOM, device
   never above `total - reserve`), the degrade ladder and the between-runs state. FLUX.2 contributes
@@ -870,20 +858,15 @@ no network wait, no inference. Everything is a strict no-op off ROCm.
   are shared, so do not re-implement them here. WHICH files a model fetches is its own module's
   manifest (`flux3_download.manifest_entries`), never a hard-coded shard name. Keep every wire
   literal in step with `ipc/PROTOCOL.md`.
-- To change the prompt phase, see `_prompt_embeds_locked` / `_encode_prompts_locked` (the encoder
-  session) / `_encode_prompt_phase`, and `_prompt_cache_key` for what invalidates a cached embedding.
-- To change the prompt-cache LIBRARY, see the `prompt_cache_*` methods of the service
-  (`prompt_cache_build` / `_list` / `_save` / `_load` / `_export` / `_import`) and, one layer
-  below them, `prompt_cache_root` / `encoder_family_name` / `sanitize_name_component` /
-  `prompt_cache_entry_path` / `list_prompt_cache_entries`. To change the FILE, see
-  `prompt_file_metadata`, `read_prompt_file_header`, `validate_prompt_file_metadata` and
-  `write_prompt_file`; bump `PROMPT_CACHE_VERSION` when an existing field changes meaning, and
-  never widen `validate_prompt_file_metadata` into a "load it and see" path. To change what
-  identifies an encoder, see `text_encoder_fingerprint` — and keep it metadata-only. To change
-  what an ABSENT encoder makes possible, see `text_encoder_available` / `require_text_encoder` /
-  `local_encoder_identity` and `find_prompt_cache_entry`; `text_encoder_path` inside a file's
-  metadata stays informational and must never become a compatibility input — on another machine
-  it points nowhere.
+- To change the prompt phase, see `_prompt_embeds_locked` / `_serve_locked` / `_encode_prompts_locked`
+  (the encoder session) / `_encode_prompt_phase`, and `_prompt_plan` for which embedding serves a text.
+- To change the prompt LIBRARY, see the service's `prompt_cache_build` / `_list` / `_export` /
+  `_import`; FLUX.2's library ids, encoder provenance, width filter and the v1 migration are
+  `flux2_klein/prompt_cache.py`; the container, index, file names and the selection rule are
+  `../runtime/prompt_library.py` (model-agnostic: a FLUX.3 library reuses it with its own id). To
+  change what identifies an encoder, see `text_encoder_fingerprint` — and keep it metadata-only. To
+  change what an ABSENT encoder makes possible, see `text_encoder_available` /
+  `require_text_encoder`.
 - To change the load ORDER or the warm-up, see `_run_locked` (pipeline session, then the encoder
   session, then the denoise and decode phases) and `_load_pipeline_locked` (the cold-load steps 1-6
   and `_warmup_locked`). The `phase:"load"` step numbers live in the `LOAD_STEP_*` constants and

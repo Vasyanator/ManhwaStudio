@@ -31,12 +31,14 @@ Main items:
 - `Flux2Variant`: which FLUX.2 klein checkpoint an «ИИ-редактор области» engine works with
   (9B / 4B). It keys the package directory (`flux2_klein_dir`, `flux2_klein_vae_dir`; every
   weight path inside it is the model catalog's `flux2_klein_weights_path`), the engine's
-  settings file below, the engine id and the `{variant}` size token; its PRESENTATION (picker
+  settings file below, the engine id, the prompt-cache library id (`prompt_library_id`) and the
+  `{variant}` size token; its PRESENTATION (picker
   caption) is the `Flux2VariantPresentation` extension trait in
   `crates/ms-tab-cleaning/src/tools/ai_editor/engines/flux2_klein/variant_presentation.rs`.
 - `flux2_weight_format` (module): `Flux2WeightFormat` / `Flux2WeightAxis` /
   `Flux2EncoderSource`, the ONE list of FLUX.2 klein weight formats (bf16 + GGUF quants), the
-  encoder sources (stock / uncensored) and which formats each variant offers per axis and source.
+  encoder sources (stock / uncensored), which formats each variant offers per axis and source,
+  and the prompt cache's precision order (`flux2_prompt_cache_precision_order` / `_rank`).
 - `AiRuntime`: selected AI runtime (`backend`/`native`) recorded under `General.ai_runtime`.
 - `OrtLoadGuard` / `OrtLoadDecision` / `ort_load_decision` / `ort_load_scope_key` /
   `read_ort_load_guard`: per-scope ONNX Runtime SIGILL load-guard model and its pure
@@ -172,7 +174,7 @@ pub mod version_format;
 // here, next to `Flux2Variant` which keys the offer, because both the engine settings (above)
 // and the pinned catalog in `ms-sysprobe` (below the UI, above this crate) need the one list.
 pub mod flux2_weight_format;
-pub use flux2_weight_format::{Flux2EncoderSource, Flux2WeightAxis, Flux2WeightFormat};
+pub use flux2_weight_format::{Flux2EncoderSource, Flux2WeightAxis, Flux2WeightFormat, flux2_prompt_cache_precision_order, flux2_prompt_cache_precision_rank};
 
 use crate::bubble_status::default_bubble_status_rules_value;
 use anyhow::{Context, Result};
@@ -1172,6 +1174,21 @@ impl Flux2Variant {
     pub fn engine_id(self) -> &'static str {
         match self {
             Self::Klein9B => "flux2_klein",
+            Self::Klein4B => "flux2_klein_4b",
+        }
+    }
+
+    /// The id of this variant's prompt-cache LIBRARY, sent as `params.prompt_library`
+    /// (protocol 23). One library per checkpoint: every encoder variant of the model (stock or
+    /// uncensored, any weight format) may serve an entry of it.
+    ///
+    /// FROZEN: it is the backend's directory name under `prompt_cache/` (a persistence key,
+    /// matched by `^[a-z0-9_]{1,40}$`) and the target of the v1 migration's width table
+    /// (`LEGACY_LIBRARY_BY_WIDTH` in `modules/ai_backend/inpaint/flux2_klein/prompt_cache.py`).
+    #[must_use]
+    pub fn prompt_library_id(self) -> &'static str {
+        match self {
+            Self::Klein9B => "flux2_klein_9b",
             Self::Klein4B => "flux2_klein_4b",
         }
     }
@@ -3281,6 +3298,36 @@ mod tests {
         assert_ne!(a.engine_id(), b.engine_id());
         assert_ne!(a.settings_file_name(), b.settings_file_name());
         assert_ne!(a.dir_name(), b.dir_name());
+    }
+
+    /// The prompt-library ids are backend directory names (persistence keys): frozen,
+    /// distinct, and inside the backend's `^[a-z0-9_]{1,40}$` pattern.
+    #[test]
+    fn the_prompt_library_ids_are_frozen() {
+        assert_eq!(Flux2Variant::Klein9B.prompt_library_id(), "flux2_klein_9b");
+        assert_eq!(Flux2Variant::Klein4B.prompt_library_id(), "flux2_klein_4b");
+        for variant in Flux2Variant::all() {
+            let id = variant.prompt_library_id();
+            assert!(!id.is_empty() && id.len() <= 40, "{id}");
+            assert!(id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'), "{id}");
+        }
+    }
+
+    /// Drift guard: the backend's v1 migration maps an entry's tensor width onto a library id
+    /// (`LEGACY_LIBRARY_BY_WIDTH`), so a renamed `prompt_library_id` must fail here rather
+    /// than migrate old entries into a library nothing lists.
+    #[test]
+    fn the_backend_legacy_width_table_names_every_prompt_library_id() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modules/ai_backend/inpaint/flux2_klein/prompt_cache.py");
+        let source = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let Some(start) = source.find("LEGACY_LIBRARY_BY_WIDTH") else {
+            panic!("{} declares no LEGACY_LIBRARY_BY_WIDTH table", path.display());
+        };
+        let table = source[start..].split_once('}').map_or("", |(head, _)| head);
+        for variant in Flux2Variant::all() {
+            let quoted = format!("\"{}\"", variant.prompt_library_id());
+            assert!(table.contains(&quoted), "LEGACY_LIBRARY_BY_WIDTH does not name {quoted}");
+        }
     }
 
     /// An absent variant field is what every settings file written before the 4B engine

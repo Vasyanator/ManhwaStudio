@@ -11,7 +11,9 @@ load/save pair that moves the whole struct through a worker thread.
 
 Main responsibilities:
 - own `Flux2KleinSettings`, its defaults, its clamping (`normalized`) and the JSON
-  body it puts on the wire (`params`); the «Постобработка» values are the shared
+  body it puts on the wire (`params`, which also names the variant's shared prompt library,
+  the precision order and — download mode only — the encoder source; the persisted «Нет»
+  stash `uncached_prompt` never travels); the «Постобработка» values are the shared
   `ms_region_postprocess::PostprocessSettings`, embedded FLATTENED (`postprocess`) so the
   file keeps its historic flat keys, and they never reach the wire (the host applies them);
 - own the dtype vocabulary and the persisted step ids (`step_choice`);
@@ -54,7 +56,7 @@ submodules' re-exported items. `normalized()` is the ONLY value ever put on the 
 */
 
 use super::*;
-use ms_config::{Flux2EncoderSource, Flux2WeightAxis, Flux2WeightFormat};
+use ms_config::{Flux2EncoderSource, Flux2WeightAxis, Flux2WeightFormat, flux2_prompt_cache_precision_order};
 use ms_sysprobe::ai_models::external::{ExternalModelStatus, external_model_status};
 use ms_sysprobe::ai_models::external_catalog::{Flux2SpecRole, flux2_klein_spec_role, flux2_klein_transformer_layout, flux2_klein_weights_path};
 
@@ -409,6 +411,10 @@ pub(super) struct Flux2KleinSettings {
     pub(super) prompt: String,
     /// The optional user-language prompt the translator reads from.
     pub(super) source_prompt: String,
+    /// The «Нет» row of the prompt-library picker: the last prompt no preset of the library
+    /// holds, kept so that choosing a preset and then «Нет» brings the user's own text back
+    /// (`track_uncached`). Persisted, never sent (`params` leaves it out); absent reads as empty.
+    pub(super) uncached_prompt: String,
     /// Whether the translate-into-English row is shown at all.
     pub(super) translate_prompt: bool,
     /// `MtService::key()` of the machine translator used by that row.
@@ -489,6 +495,7 @@ impl Default for Flux2KleinSettings {
             // so the default is the job this tool exists for.
             prompt: FLUX2_DEFAULT_PROMPT.to_string(),
             source_prompt: String::new(),
+            uncached_prompt: String::new(),
             translate_prompt: false,
             mt_service: MtService::Google.key().to_string(),
             source_lang: "auto".to_string(),
@@ -555,6 +562,7 @@ impl Flux2KleinSettings {
             installed_formats: self.installed_formats.clone(),
             prompt: self.prompt.trim().to_string(),
             source_prompt: self.source_prompt.clone(),
+            uncached_prompt: self.uncached_prompt.clone(),
             translate_prompt: self.translate_prompt,
             mt_service: MtService::from_key(&self.mt_service)
                 .unwrap_or(MtService::Google)
@@ -827,7 +835,18 @@ impl Flux2KleinSettings {
             // Pinned, not a setting: see `FLUX2_MAX_SEQ`. The field stays on the wire
             // because the backend still reads it.
             "max_sequence_length": FLUX2_MAX_SEQ,
+            // Protocol 23: the model's shared prompt-cache library, and the precision order its
+            // entries are preferred in (Rust owns it; the backend treats the ids as opaque).
+            "prompt_library": self.variant().prompt_library_id(),
+            "prompt_cache_precision_order": flux2_prompt_cache_precision_order(),
         });
+        // The encoder SOURCE is known only in download mode (the catalog names the files);
+        // a hand-picked encoder has none, and the backend then records and prefers none.
+        if self.source_mode() == Flux2SourceMode::Download
+            && let Some(map) = params.as_object_mut()
+        {
+            map.insert("text_encoder_source".to_string(), json!(self.encoder_source().wire()));
+        }
         // The weight formats (protocol 21, D5) travel only while their settings are in
         // effect: download mode, either variant. Manual mode sends nothing of them (the
         // backend then derives each format from the file's container).
@@ -1680,13 +1699,14 @@ mod tests {
         // options, the two step axes with the large-model manager and «Энкодер на CPU» with
         // the encoder placement, the two local colour-match values with the local match, the
         // two weight formats with the GGUF quants (the encoder source stays the historic
-        // `uncensored_text_encoder` bool, no new key); a
+        // `uncensored_text_encoder` bool, no new key), the «Нет» stash with the shared prompt
+        // library; a
         // document without any of them still loads (`#[serde(default)]`). The runtime
         // `installed_formats` is never written (`serde(skip)`).
         assert_eq!(
             added,
-            ["color_match_local_pct", "color_match_scale_px", "encoder_on_cpu", "ram_step", "text_attention_in_mask", "text_encoder_format", "transformer_format", "variant", "vram_step"],
-            "only the variant, the run option, the two step axes, the encoder placement, the local colour match and the two weight formats were added"
+            ["color_match_local_pct", "color_match_scale_px", "encoder_on_cpu", "ram_step", "text_attention_in_mask", "text_encoder_format", "transformer_format", "uncached_prompt", "variant", "vram_step"],
+            "only the variant, the run option, the two step axes, the encoder placement, the local colour match, the two weight formats and the «Нет» stash were added"
         );
         for retired in ["placement", "low_cpu_mem_usage", "vae_slicing", "unload_transformer_before_vae", "unload_text_encoder_after_encode"] {
             assert!(!object.contains_key(retired), "the retired `{retired}` must not be written back");
@@ -2103,5 +2123,46 @@ mod tests {
             }
         }
         assert_eq!(spec(Flux2WeightAxis::TextEncoder, Flux2EncoderSource::Uncensored, Flux2WeightFormat::Q5KM, Flux2TransformerLayout::Primary), None);
+    }
+
+    /// Protocol 23: every `params` names the variant's shared prompt library and the precision
+    /// order; the encoder source travels in download mode only (a hand-picked encoder has none),
+    /// and the «Нет» stash never travels.
+    #[test]
+    fn params_carry_the_prompt_library_fields_and_never_the_stash() {
+        for variant in Flux2Variant::all() {
+            let manual = Flux2KleinSettings {
+                variant: variant.wire().to_string(),
+                uncached_prompt: "my own text".to_string(),
+                ..runnable_settings()
+            }
+            .normalized();
+            let params = manual.to_params(false);
+            assert_eq!(params["prompt_library"], json!(variant.prompt_library_id()));
+            assert_eq!(params["prompt_cache_precision_order"], json!(flux2_prompt_cache_precision_order()));
+            assert!(params.get("text_encoder_source").is_none(), "manual mode names no source");
+            assert!(!params.to_string().contains("my own text"), "the stash is never sent");
+            assert_eq!(manual.to_profiles_params(true)["prompt_library"], json!(variant.prompt_library_id()));
+        }
+        let download = Flux2KleinSettings {
+            source_mode: Flux2SourceMode::Download.wire().to_string(),
+            uncensored_text_encoder: true,
+            ..runnable_settings()
+        }
+        .normalized();
+        assert_eq!(download.to_params(false)["text_encoder_source"], json!("uncensored"));
+        let four_b = Flux2KleinSettings { variant: Flux2Variant::Klein4B.wire().to_string(), ..download };
+        assert_eq!(four_b.normalized().to_params(false)["text_encoder_source"], json!("stock"), "4B offers the stock encoder only");
+    }
+
+    /// The «Нет» stash round-trips through the settings file, and a file written before it
+    /// existed loads with an empty one.
+    #[test]
+    fn the_uncached_prompt_round_trips_and_defaults_to_empty() {
+        let settings = Flux2KleinSettings { uncached_prompt: "  spaced text \n".to_string(), ..runnable_settings() };
+        let document = serde_json::to_value(&settings).expect("serialize the settings");
+        assert_eq!(loaded_settings(&document).uncached_prompt, "  spaced text \n", "kept verbatim");
+        let old = loaded_settings(&json!({ "prompt": "a prompt" }));
+        assert!(old.uncached_prompt.is_empty());
     }
 }

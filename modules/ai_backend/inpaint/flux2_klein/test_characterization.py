@@ -304,6 +304,7 @@ class StatusWireContract(_TempTreeCase):
             "loaded": bool,
             "device": str,
             "prompt_cached": bool,
+            "prompt_cache_entry": type(None),
             "text_encoder_available": bool,
             "guidance_supported": bool,
         }

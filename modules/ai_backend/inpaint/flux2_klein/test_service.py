@@ -54,7 +54,7 @@ from modules.ai_backend.inpaint import region_imaging
 from modules.ai_backend.inpaint.flux2_klein import components, hardware, large_model
 from modules.ai_backend.runtime.model_manager import SmallModelManager
 
-from ._test_fixtures import _FakeEmbeds, _ManagedRunFixture, _TempTreeCase, _png_bytes, _write_bfl_gguf_transformer
+from ._test_fixtures import _ManagedRunFixture, _TempTreeCase, _png_bytes, _write_bfl_gguf_transformer, seed_memory
 
 try:
     import torch
@@ -310,9 +310,9 @@ class InpaintRunTests(_RunCase):
 
     def test_a_negative_prompt_of_another_length_is_refused(self) -> None:
         self.declare_distilled(None)
-        normalized = svc.normalize_flux2_klein_params(self.params(prompt="a cat", guidance_scale=4.0, text_attention_in_mask=True))
-        self.service._prompt_cache[self.service._prompt_cache_key(normalized, "a cat")] = torch.zeros((1, 512, 24))
-        self.service._prompt_cache[self.service._prompt_cache_key(normalized, "")] = torch.zeros((1, 256, 24))
+        params = self.params(prompt="a cat", guidance_scale=4.0, text_attention_in_mask=True)
+        seed_memory(self.service, params, tensor=torch.zeros((1, 512, 24)))
+        seed_memory(self.service, params, text="", tensor=torch.zeros((1, 256, 24)))
         with self.assertRaisesRegex(ValueError, "негативного"):
             self._run(guidance_scale=4.0, text_attention_in_mask=True)
 
@@ -389,7 +389,7 @@ class ComponentByteProgressTests(_RunCase):
         self._assert_complete(self._file_frames(svc.LOAD_STEP_TEXT_ENCODER), "text_encoder")
         self.service.unload()
         self.frames.clear()
-        self.service.prompt_cache_build(self.params(prompt="a cat"), progress_callback=self._progress)
+        self.service.prompt_cache_build(self.params(prompt="a cat", prompt_library="flux2_klein_9b"), progress_callback=self._progress)
         self._assert_complete(self._file_frames(svc.LOAD_STEP_TEXT_ENCODER), "text_encoder")
 
     def test_an_encoder_read_inside_the_encode_phase_streams_on_the_current_step(self) -> None:
@@ -791,8 +791,8 @@ class LargeModelProfilesTests(_RunCase):
     # The encoder rule, all four combinations: the encoder is left out ONLY when
     # every prompt is cached AND its handle holds no byte.
     def _cache_prompt(self) -> None:
-        normalized = svc.normalize_flux2_klein_params(self.params(prompt="a cat"))
-        self.service._prompt_cache[self.service._prompt_cache_key(normalized, "a cat")] = object()
+        # The tiny transformer's text width (24): the plan drops any other width.
+        seed_memory(self.service, self.params(prompt="a cat"), tensor=torch.zeros((1, 512, 24)))
 
     def _make_encoder_resident(self) -> None:
         self.service.component_action(self.params(), component="text_encoder", action="load")
@@ -852,6 +852,7 @@ class LargeModelProfilesTests(_RunCase):
             self.assertIn("host_baseline", answer["encoder"]["forecast"])
 
     def test_the_profiles_never_wait_for_the_service_lock(self) -> None:
+        self._cache_prompt()
         held, done = threading.Event(), threading.Event()
 
         def hold() -> None:
@@ -864,7 +865,6 @@ class LargeModelProfilesTests(_RunCase):
         self.addCleanup(holder.join)
         self.addCleanup(done.set)
         self.assertTrue(held.wait(5))
-        self._cache_prompt()
         answer, calls = self._profiles()
         self.assertIsNone(answer["encoder"])
 
@@ -1039,10 +1039,7 @@ class StatusTests(_TempTreeCase):
 
     def _cache(self, params: dict[str, object]) -> None:
         """Put a stand-in embedding under the key a run would look up."""
-        normalized = svc.normalize_flux2_klein_params(params)
-        self.service._prompt_cache[
-            self.service._prompt_cache_key(normalized, normalized["prompt"])
-        ] = _FakeEmbeds(str(normalized["prompt"]))
+        seed_memory(self.service, params)
 
     def test_a_missing_encoder_is_reported_as_its_own_flag(self) -> None:
         out = self.service.status(self._without_encoder(prompt="a cat"))

@@ -6,12 +6,10 @@ Methods hosted here:
     inpaint.flux2_klein.status    — component availability + residency.
     inpaint.flux2_klein.unload    — drop the loaded pipeline.
     inpaint.flux2_klein.component_action — one per-component residency action, streaming.
-    inpaint.flux2_klein.prompt_cache.build  — encode the prompt only, streaming.
-    inpaint.flux2_klein.prompt_cache.list   — library entries of this encoder.
-    inpaint.flux2_klein.prompt_cache.save   — store the cached prompt by name.
-    inpaint.flux2_klein.prompt_cache.load   — put a stored entry back in the cache.
-    inpaint.flux2_klein.prompt_cache.export — copy an entry to any `.msprompt` path.
-    inpaint.flux2_klein.prompt_cache.import — copy a `.msprompt` file into the library.
+    inpaint.flux2_klein.prompt_cache.build  — save the prompt as a named preset in the model's library (encodes when needed), streaming.
+    inpaint.flux2_klein.prompt_cache.list   — the presets of the model's library.
+    inpaint.flux2_klein.prompt_cache.export — copy an entry (by file) to any `.msprompt` path.
+    inpaint.flux2_klein.prompt_cache.import — copy a `.msprompt` file into its library.
 
 No method here downloads weights: every FLUX.2 klein download (4B and 9B) is
 owned by the application's model catalog (Rust `ms_sysprobe::ai_models`).
@@ -59,8 +57,6 @@ from ..protocol import (
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST,
-    METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD,
-    METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE,
     METHOD_INPAINT_FLUX2_KLEIN_STATUS,
     METHOD_INPAINT_FLUX2_KLEIN_UNLOAD,
 )
@@ -108,10 +104,11 @@ def _split_request_blob(
 def _require_non_empty_str(header: dict[str, Any], field: str) -> str:
     """Read a required non-empty string header field.
 
-    The value itself is NOT validated here: a path or a cache name is untrusted
-    input and the service is the single owner of what makes one acceptable
-    (`require_prompt_file_source`, `sanitize_name_component`). This layer only
-    guarantees the field arrived and is a string.
+    The value itself is NOT validated here: a path or an entry file name is
+    untrusted input and the service is the single owner of what makes one
+    acceptable (`prompt_library.require_entry_source`,
+    `require_entry_file_name`). This layer only guarantees the field arrived
+    and is a string.
     """
     value = header.get(field)
     if not isinstance(value, str) or not value.strip():
@@ -254,17 +251,33 @@ register(METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION, _handle_inpaint_flux2_klei
 # ---------------------------------------------------------------------------
 # Prompt-cache library
 # ---------------------------------------------------------------------------
+def _optional_str(header: dict[str, Any], field: str) -> str | None:
+    """An optional string header field: `None` when absent or `null`, else the string (any content; the service judges it).
+
+    # Raises
+    `ValueError` when present and not a string.
+    """
+    value = header.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"Field '{field}' must be a string when present.")
+    return value
+
+
 def _handle_prompt_cache_build(
     ctx: HandlerContext,
     header: dict[str, Any],
     blob: bytes,
     cancel_event: threading.Event,
 ) -> tuple[dict[str, Any], bytes]:
-    """Encode the prompt into the in-memory cache; no image is produced.
+    """Save the prompt as a named preset of the model's library; no image is produced.
 
-    Streams the same `phase:"load"` frames as a generation — reading the text
-    encoder takes tens of seconds and a silent wait is not acceptable — but only the
-    prompt phase's steps occur, because no pipeline is built.
+    `name` is optional (absent / empty: keep the preset's name, or derive one).
+    Streams the same `phase:"load"` frames as a generation when it encodes —
+    reading the text encoder takes tens of seconds and a silent wait is not
+    acceptable — but only the prompt phase's steps occur, because no pipeline
+    is built.
 
     Cancellation follows the shared inpaint contract: checked before the call and
     after it returns, never inside the encoder read.
@@ -272,9 +285,10 @@ def _handle_prompt_cache_build(
     if cancel_event.is_set():
         raise Interrupted("inpaint.flux2_klein.prompt_cache.build canceled before start.")
     params_raw = require_params(header)
+    name = _optional_str(header, "name")
     try:
         result = ctx.state.flux2_klein_inpaint.prompt_cache_build(
-            params_raw, progress_callback=progress_forwarder(ctx, METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD)
+            params_raw, name=name, progress_callback=progress_forwarder(ctx, METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD)
         )
     except (ValueError, FileNotFoundError):
         raise
@@ -297,46 +311,12 @@ def _handle_prompt_cache_list(
     blob: bytes,
     cancel_event: threading.Event,
 ) -> tuple[dict[str, Any], bytes]:
-    """List the library entries of the encoder named in `params`."""
+    """List the presets of the library named in `params.prompt_library`."""
     params_raw = require_params(header)
     return dict(ctx.state.flux2_klein_inpaint.prompt_cache_list(params_raw)), b""
 
 
 register(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST, _handle_prompt_cache_list)
-
-
-def _handle_prompt_cache_save(
-    ctx: HandlerContext,
-    header: dict[str, Any],
-    blob: bytes,
-    cancel_event: threading.Event,
-) -> tuple[dict[str, Any], bytes]:
-    """Store the cached prompt under `name`; `overwrite` must be explicit."""
-    params_raw = require_params(header)
-    name = _require_non_empty_str(header, "name")
-    overwrite = bool(header.get("overwrite", False))
-    result = ctx.state.flux2_klein_inpaint.prompt_cache_save(
-        params_raw, name, overwrite=overwrite
-    )
-    return dict(result), b""
-
-
-register(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE, _handle_prompt_cache_save)
-
-
-def _handle_prompt_cache_load(
-    ctx: HandlerContext,
-    header: dict[str, Any],
-    blob: bytes,
-    cancel_event: threading.Event,
-) -> tuple[dict[str, Any], bytes]:
-    """Load a library entry of the current family back into the cache."""
-    params_raw = require_params(header)
-    name = _require_non_empty_str(header, "name")
-    return dict(ctx.state.flux2_klein_inpaint.prompt_cache_load(params_raw, name)), b""
-
-
-register(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD, _handle_prompt_cache_load)
 
 
 def _handle_prompt_cache_export(
@@ -345,11 +325,11 @@ def _handle_prompt_cache_export(
     blob: bytes,
     cancel_event: threading.Event,
 ) -> tuple[dict[str, Any], bytes]:
-    """Copy a library entry to the `.msprompt` path in `path`."""
+    """Copy the library entry `file` to the `.msprompt` path in `path`."""
     params_raw = require_params(header)
-    name = _require_non_empty_str(header, "name")
+    file = _require_non_empty_str(header, "file")
     path = _require_non_empty_str(header, "path")
-    result = ctx.state.flux2_klein_inpaint.prompt_cache_export(params_raw, name, path)
+    result = ctx.state.flux2_klein_inpaint.prompt_cache_export(params_raw, file, path)
     return dict(result), b""
 
 
@@ -362,25 +342,16 @@ def _handle_prompt_cache_import(
     blob: bytes,
     cancel_event: threading.Event,
 ) -> tuple[dict[str, Any], bytes]:
-    """Copy a `.msprompt` file into the library.
+    """Copy a `.msprompt` file into the library it belongs to.
 
-    `name` is optional (the file's own stem is used); `family_matches` in the
-    answer tells the client whether the imported entry belongs to the encoder
-    that is selected right now — the import itself never fails over that, because
-    the file is filed under ITS OWN family and would otherwise be lost.
+    `library_matches` in the answer tells the client whether that library is
+    the one the request names; the import never fails over that, because the
+    file is filed under ITS OWN library and would otherwise be lost.
     """
     params_raw = require_params(header)
     path = _require_non_empty_str(header, "path")
-    name_raw = header.get("name")
-    if name_raw is not None and not isinstance(name_raw, str):
-        raise ValueError("Field 'name' must be a string when present.")
-    name = name_raw.strip() if isinstance(name_raw, str) and name_raw.strip() else None
-    overwrite = bool(header.get("overwrite", False))
-    result = ctx.state.flux2_klein_inpaint.prompt_cache_import(
-        params_raw, path, name=name, overwrite=overwrite
-    )
+    result = ctx.state.flux2_klein_inpaint.prompt_cache_import(params_raw, path)
     return dict(result), b""
 
 
 register(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT, _handle_prompt_cache_import)
-

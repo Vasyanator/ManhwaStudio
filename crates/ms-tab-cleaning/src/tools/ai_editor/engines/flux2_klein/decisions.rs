@@ -9,7 +9,8 @@ disk. They live apart from the drawing precisely so the answers can be asserted 
 frame, which is what the tests at the end of this file do.
 
 Main responsibilities:
-- decide the at-most-one line under the prompt field (`flux2_prompt_cache_line`);
+- decide the at-most-one line under the prompt field (`flux2_prompt_cache_line`) and name the
+  encoder a cache entry was made by (`flux2_encoder_caption`);
 - decide whether the `guidance_scale` control is live at all (`flux2_guidance_supported`);
 - decide whether the «Внимание только к маске» run option is live
   (`flux2_text_attention_block_reason`);
@@ -32,7 +33,8 @@ Key structures:
 - `Flux2PromptCacheLine`, `Flux2ReadinessLine`, `Flux2LineTone`, `Flux2MemorySummary`
 
 Key functions:
-- `flux2_prompt_cache_line()`, `flux2_guidance_supported()`, `flux2_readiness_line()`
+- `flux2_prompt_cache_line()`, `flux2_encoder_caption()`, `flux2_guidance_supported()`,
+  `flux2_readiness_line()`
 - `flux2_text_attention_block_reason()`
 - `flux2_catalog_bundle()`, `flux2_gated_repos_missing()`, `flux2_catalog_bundle_missing()`,
   `flux2_catalog_job_running()`,
@@ -53,14 +55,15 @@ use super::*;
 ///
 /// A separate decision from the drawing because it is a PRIORITY rule, not a formatting
 /// one: three facts compete for one line and only the most consequential may take it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Flux2PromptCacheLine {
-    /// Nothing is claimed. The answer is outstanding, which is not information — the old
-    /// «Состояние кэша промпта пока неизвестно.» line said only that the panel had asked.
+    /// Nothing is claimed. The answer is outstanding, which is not information.
     Silent,
-    /// The embeddings of this prompt are held: the next run skips the encoder read entirely.
-    Cached,
-    /// They are not: the next run pays for them.
+    /// The prompt is served from the cache: the next run skips the encoder read entirely.
+    /// `encoder` names the encoder that made the entry in use (`None` when no entry was
+    /// reported); `memory` says the embeddings are only in the backend's memory, not saved.
+    Cached { encoder: Option<String>, memory: bool },
+    /// It is not: the next run pays for the encoder.
     NotCached,
     /// This machine has NO text encoder, so nothing can be encoded here and only ready
     /// caches work. It outranks "not cached", which would read as a delay the user could
@@ -70,28 +73,69 @@ pub(super) enum Flux2PromptCacheLine {
 
 /// Decides which single line the prompt block shows about the cache.
 ///
-/// Both inputs are the project's three-state `Option<bool>`, where `None` is "not known"
-/// and never `false`. The priority is what the user can DO next:
-/// - a cached prompt wins outright, because with the embeddings held the run works whether
-///   an encoder exists or not — that is the whole point of the library;
-/// - otherwise a missing encoder wins, because it changes what is POSSIBLE rather than
-///   what something costs;
+/// `prompt_cached` / `text_encoder_available` are the project's three-state answers (`None` =
+/// not known, never `false`); `status_entry` is the entry the last `.status` named for the
+/// prompt, `listing_hit` the selected entry of the typed text's preset in the library listing.
+/// The priority is what the user can DO next:
+/// - a served prompt wins outright, because the run then works whether an encoder exists or
+///   not; the fresh `.status` entry names its encoder first (it also covers a memory-only
+///   encode), the listing's selection second;
+/// - while `.status` has not answered about this text, a preset of it in the listing is
+///   already a fact the line reports;
+/// - otherwise a missing encoder wins, because it changes what is POSSIBLE rather than what
+///   something costs;
 /// - "not cached" is left, and an outstanding answer says nothing at all.
 #[must_use]
 pub(super) fn flux2_prompt_cache_line(
+    listing_hit: Option<&PromptLibraryEntry>,
+    status_entry: Option<&PromptLibraryEntry>,
     prompt_cached: Option<bool>,
     text_encoder_available: Option<bool>,
 ) -> Flux2PromptCacheLine {
-    if prompt_cached == Some(true) {
-        return Flux2PromptCacheLine::Cached;
-    }
-    if text_encoder_available == Some(false) {
-        return Flux2PromptCacheLine::NoEncoder;
-    }
+    let cached = |entry: Option<&PromptLibraryEntry>| Flux2PromptCacheLine::Cached {
+        encoder: entry.map(flux2_encoder_caption).filter(|caption| !caption.is_empty()),
+        memory: entry.is_some_and(PromptLibraryEntry::is_memory_only),
+    };
+    let uncached = if text_encoder_available == Some(false) { Flux2PromptCacheLine::NoEncoder } else { Flux2PromptCacheLine::NotCached };
     match prompt_cached {
-        // Handled above; spelled out so the match stays exhaustive over the three states.
-        Some(true) | None => Flux2PromptCacheLine::Silent,
-        Some(false) => Flux2PromptCacheLine::NotCached,
+        Some(true) => cached(status_entry.or(listing_hit)),
+        Some(false) => uncached,
+        None if listing_hit.is_some() => cached(listing_hit),
+        None if text_encoder_available == Some(false) => Flux2PromptCacheLine::NoEncoder,
+        None => Flux2PromptCacheLine::Silent,
+    }
+}
+
+/// The localized name of the encoder that made a library entry: its source («стандартный» /
+/// «расцензуренный») and precision (the format's technical token — `bf16` / `f16` / a GGUF
+/// quant — or fp8). An entry of unknown source (a manual-mode encoder, a migration that could
+/// not prove one) is named by the backend's `encoder_label`; an unknown format id is shown
+/// verbatim. Empty only when the entry says nothing at all.
+#[must_use]
+pub(super) fn flux2_encoder_caption(entry: &PromptLibraryEntry) -> String {
+    let source = Flux2EncoderSource::from_wire(&entry.encoder_source);
+    let source_caption = source.map(|source| match source {
+        Flux2EncoderSource::Stock => t!("cleaning.tools.flux2_klein.encoder_source_stock").to_string(),
+        Flux2EncoderSource::Uncensored => t!("cleaning.tools.flux2_klein.encoder_source_uncensored").to_string(),
+    });
+    let format = entry.encoder_format.as_str();
+    let precision = if entry.encoder_fp8 {
+        Some(t!("cleaning.tools.flux2_klein.encoder_precision_fp8").to_string())
+    } else if let Some(known) = Flux2WeightFormat::from_wire(format) {
+        // The unquantized token depends on the source (`bf16` stock, `f16` uncensored); an
+        // unknown source reads as the stock spelling.
+        Some(flux2_encoder_format_token(source.unwrap_or_default(), known).to_string())
+    } else if format == ms_config::flux2_weight_format::FLUX2_PROMPT_PRECISION_GGUF {
+        Some(t!("cleaning.tools.flux2_klein.encoder_precision_gguf").to_string())
+    } else {
+        (!format.is_empty()).then(|| format.to_string())
+    };
+    let name = source_caption.or_else(|| (!entry.encoder_label.is_empty()).then(|| entry.encoder_label.clone()));
+    match (name, precision) {
+        (Some(name), Some(precision)) => tf!("cleaning.tools.flux2_klein.encoder_caption", source = name, format = precision),
+        (Some(name), None) => name,
+        (None, Some(precision)) => precision,
+        (None, None) => String::new(),
     }
 }
 
@@ -727,48 +771,80 @@ mod tests {
     }
 
     /// The line under the prompt field has room for exactly ONE fact and three compete for
-    /// it, so the priority is a rule and not a formatting accident. A cached prompt wins
+    /// it, so the priority is a rule and not a formatting accident. A served prompt wins
     /// outright — the run works with no encoder at all, which is what the library is for —
     /// and only after that does a missing encoder outrank «не кэширован», because it says
     /// the run cannot start rather than that it will be slow.
     #[test]
     fn the_prompt_line_reports_the_most_consequential_state_and_stays_silent_when_unsure() {
-        // Nothing has answered: an outstanding query is not information. The old
-        // «Состояние кэша промпта пока неизвестно.» line said only that the panel had asked.
+        let line = |prompt_cached, encoder| flux2_prompt_cache_line(None, None, prompt_cached, encoder);
+        let plain_cached = Flux2PromptCacheLine::Cached { encoder: None, memory: false };
+        assert_eq!(line(None, None), Flux2PromptCacheLine::Silent);
+        assert_eq!(line(Some(true), None), plain_cached);
+        assert_eq!(line(Some(false), None), Flux2PromptCacheLine::NotCached);
+        // A served prompt survives a machine with no encoder — the run gate waives the encoder
+        // on exactly this.
+        assert_eq!(line(Some(true), Some(false)), plain_cached);
+        // Without the embeddings AND without an encoder nothing can be produced here.
+        assert_eq!(line(Some(false), Some(false)), Flux2PromptCacheLine::NoEncoder);
+        assert_eq!(line(None, Some(false)), Flux2PromptCacheLine::NoEncoder);
+    }
+
+    /// The line names the encoder of the entry in use: the fresh `.status` entry first, the
+    /// listing's selection while `.status` has not answered about this text, and a memory-only
+    /// encode says it is not saved. A `.status` that says NOT served outranks the listing.
+    #[test]
+    fn the_prompt_line_names_the_encoder_of_the_entry_in_use() {
+        let entry = |source: &str, format: &str, origin: &str| PromptLibraryEntry {
+            file: "a.msprompt".to_string(),
+            encoder_source: source.to_string(),
+            encoder_format: format.to_string(),
+            origin: origin.to_string(),
+            ..PromptLibraryEntry::default()
+        };
+        let listed = entry("stock", "bf16", "built");
+        let fresh = entry("uncensored", "q8_0", "memory");
+        let caption = |entry: &PromptLibraryEntry| Some(flux2_encoder_caption(entry));
         assert_eq!(
-            flux2_prompt_cache_line(None, None),
-            Flux2PromptCacheLine::Silent
+            flux2_prompt_cache_line(Some(&listed), Some(&fresh), Some(true), None),
+            Flux2PromptCacheLine::Cached { encoder: caption(&fresh), memory: true }
         );
         assert_eq!(
-            flux2_prompt_cache_line(Some(true), None),
-            Flux2PromptCacheLine::Cached
+            flux2_prompt_cache_line(Some(&listed), None, Some(true), None),
+            Flux2PromptCacheLine::Cached { encoder: caption(&listed), memory: false }
         );
         assert_eq!(
-            flux2_prompt_cache_line(Some(false), None),
-            Flux2PromptCacheLine::NotCached
+            flux2_prompt_cache_line(Some(&listed), None, None, Some(false)),
+            Flux2PromptCacheLine::Cached { encoder: caption(&listed), memory: false },
+            "a preset of the typed text is a fact before `.status` answers"
         );
-        // A cached prompt survives a machine with no encoder — that is the whole point of
-        // a carried `.msprompt`, and the run gate waives the encoder on exactly this.
-        assert_eq!(
-            flux2_prompt_cache_line(Some(true), Some(false)),
-            Flux2PromptCacheLine::Cached
-        );
-        // Without the embeddings AND without an encoder nothing can be produced here, so
-        // that outranks the cache state — including an unanswered one.
-        assert_eq!(
-            flux2_prompt_cache_line(Some(false), Some(false)),
-            Flux2PromptCacheLine::NoEncoder
-        );
-        assert_eq!(
-            flux2_prompt_cache_line(None, Some(false)),
-            Flux2PromptCacheLine::NoEncoder
-        );
-        // "Not known" is never `false`: an encoder that has not been reported on must not
-        // raise the warning that closes the two encode-only library buttons.
-        assert_eq!(
-            flux2_prompt_cache_line(Some(false), None),
-            Flux2PromptCacheLine::NotCached
-        );
+        assert_eq!(flux2_prompt_cache_line(Some(&listed), None, Some(false), None), Flux2PromptCacheLine::NotCached);
+    }
+
+    /// Every caption names the source and the precision it can; the unquantized token follows
+    /// the source, fp8 and the unnamed GGUF have their own, and an unknown source falls back to
+    /// the backend's label. The rendered text depends on the active catalog, so the BRANCHES
+    /// are asserted through the same macros.
+    #[test]
+    fn an_encoder_caption_names_the_source_and_the_precision() {
+        let entry = |source: &str, format: &str, fp8: bool, label: &str| PromptLibraryEntry {
+            encoder_source: source.to_string(),
+            encoder_format: format.to_string(),
+            encoder_fp8: fp8,
+            encoder_label: label.to_string(),
+            ..PromptLibraryEntry::default()
+        };
+        let stock = t!("cleaning.tools.flux2_klein.encoder_source_stock");
+        let uncensored = t!("cleaning.tools.flux2_klein.encoder_source_uncensored");
+        let caption = |source: &str, format: &str| tf!("cleaning.tools.flux2_klein.encoder_caption", source = source, format = format);
+        assert_eq!(flux2_encoder_caption(&entry("stock", "bf16", false, "")), caption(stock, "bf16"));
+        assert_eq!(flux2_encoder_caption(&entry("uncensored", "bf16", false, "")), caption(uncensored, "f16"));
+        assert_eq!(flux2_encoder_caption(&entry("uncensored", "q8_0", false, "")), caption(uncensored, "Q8_0"));
+        assert_eq!(flux2_encoder_caption(&entry("stock", "bf16", true, "")), caption(stock, t!("cleaning.tools.flux2_klein.encoder_precision_fp8")));
+        assert_eq!(flux2_encoder_caption(&entry("", "gguf", false, "my-encoder.gguf")), caption("my-encoder.gguf", t!("cleaning.tools.flux2_klein.encoder_precision_gguf")));
+        assert_eq!(flux2_encoder_caption(&entry("", "", false, "qwen3")), "qwen3");
+        assert_eq!(flux2_encoder_caption(&entry("", "f32", false, "")), "f32");
+        assert_eq!(flux2_encoder_caption(&entry("", "", false, "")), "");
     }
 
     /// The always-visible readiness line is the panel's ONE report of the model verdict.

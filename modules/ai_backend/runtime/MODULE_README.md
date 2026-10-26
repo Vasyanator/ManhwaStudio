@@ -103,6 +103,28 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   meta-module filler (`fill_module_from_safetensors` -> `FillReport`, `MissingWeightsError`,
   `LEAVE_ON_META`, `TensorWrite`). Stdlib only; torch is imported lazily by `read_tensor` and the
   filler.
+- `prompt_library.py`: the model-agnostic prompt-embedding LIBRARY — one directory per model
+  (`<root>/<library id>/`, id `^[a-z0-9_]{1,40}$`), one `.msprompt` per embedding (container v2:
+  marker `manhwastudio.prompt_cache`, the file's `__metadata__` is the truth: library, preset `name`,
+  prompt, length, dtype, encoder provenance `source`/`format`/`fp8`/`id`/`label`, `created_at`,
+  `origin`), deterministic file names (`entry_file_name`), a rebuildable `index.json` (files win: a
+  lost/foreign/newer index is rebuilt, a corrupt file is `skipped`, never deleted), THE selection
+  rule (`select_entry`: preferred source, then precision order, memory, newest, name),
+  `PromptLibrary` (lazy load reconciling on a directory-mtime change, an immutable lock-free
+  `LibrarySnapshot`, `write_entry` / `add_payload` / `rename_text`, `read_tensor` raising
+  `LibraryEntryGone`), the per-directory registry `library_for`, `publish_bytes_atomically` and the
+  export/import path checks. THE preset-name rule is the explicit `NAME_REMOVED_RANGES` table
+  (no Unicode category lookup), mirrored by the Rust client and pinned for both by
+  `fixtures/preset_name_normalization.json`. THE containment rule of every rewrite, replace and
+  delete is `require_confined` (`UnsafeLibraryPath`: no symbolic link / reparse point on the way,
+  strictly inside the real root; a linked `.msprompt` is `skipped`, a linked library or root
+  directory is not listed and not written); `remove_confined_file` /
+  `remove_confined_empty_directory` delete under it. Durability: every publish fsyncs its
+  directory after the replace and every removal after the unlink (`sync_directory`: the POSIX-only
+  policy of `ms_atomic_file::sync_directory`, a no-op on Windows). Stdlib + `safetensors_stream`; `safetensors.torch` lazily
+  (`serialize_tensor` / `load_tensor`, the tests' patch points). `test_prompt_library.py`: its tests.
+  Model specifics (library ids, encoder identity, width checks, v1 migration) stay in the model
+  package (`inpaint/flux2_klein/prompt_cache.py`).
 - `gguf_stream.py`: model-agnostic GGUF header parsing — `read_gguf_header` -> `GgufHeader`
   (version 2/3, alignment, data start, spans in file order, scalar/string metadata, names of
   zero-element tensors), `is_gguf_file`, `ggml_type_name`, ceiling `MAX_GGUF_HEADER_BYTES`; every
