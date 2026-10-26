@@ -17,10 +17,24 @@ Key items:
   checking, missing, partial, installed, downloading with byte progress, status probe
   unavailable).
 - `DownloadNotice`: the outcome of the last finished download of a bundle (cancelled /
-  failed), shown NEXT TO the state, never instead of it.
+  failed / refused by a gated repository), shown NEXT TO the state, never instead of it.
 - `OcrModelPanelSnapshot`: what a panel's download block needs for one bundle in one frame
-  (aggregated state, bytes still to download, notice, and the OTHER bundle's download that
-  blocks this one, if any).
+  (aggregated state, bytes still to download — a `Partial` spec counts only what it lacks —,
+  notice, the OTHER bundle's download that blocks this one, if any, and the `RepoAccessLine`s
+  of its gated repositories).
+- Gated Hugging Face repositories (`ExternalSource::HuggingFace { gated: true }`): the
+  controller checks access (`ms_sysprobe::ai_models::hf_access::hf_repo_access`, injected as
+  `AccessCheck`) on a worker for every gated repository a shown bundle still needs (a spec
+  probed `Missing` / `Partial`; an installed spec never), once per repository and token value
+  (the repository is `ExternalModelSpec::gated_repo`, the catalog's one owner of it);
+  `poll` compares the cached token (a fingerprint, never a copy) and a change drops every
+  answer AND every `DownloadNotice::Access`, so the shown repositories are checked again and no
+  refusal of the old token stays on screen. An `Unreachable` answer is not kept: it is asked
+  again `UNREACHABLE_RECHECK` after it arrived (the per-frame `probe_unknown` compares one
+  instant) and as soon as any job ends. A download re-checks the repositories of its pending
+  specs before ANY transfer, with the job's cancel flag, and ends with `DownloadNotice::Access`
+  on a definite refusal (`HfAccess::refuses_download`); an `Unreachable` answer does not stop
+  it (the transfer decides). The Download button is never disabled by an access answer.
 - `OcrModelDownloadController`: one status worker (stat-only, per-spec probes) plus at most one
   job thread at a time — a DOWNLOAD (the bundle's not-installed specs, sequentially) or a
   VERIFY (`start_verify`: hashes every file of every spec against its pin, deleting damaged
@@ -42,6 +56,7 @@ Key items:
   snapshot" — used by the panel block AND (through `download_label_for_statuses`, the same
   aggregation over probe answers) by the "model is not downloaded" errors, so an error names
   exactly the button the user sees.
+- `access_status_key`: the one `HfAccess` -> i18n key mapping (panel lines and errors).
 - `external_error_message`: the typed `ExternalModelError` -> localized text mapping
   (`ExternalModelError::Display` is English diagnostic text: it goes to the log only, and
   no English detail — OS error text, HTTP detail — is interpolated into the message).
@@ -66,10 +81,12 @@ Notes:
   with the process loses nothing that a resume cannot recover.
 - How the user learns about such an interruption (tab rebuild, crash): the next
   controller's first probe finds the staged bytes and reports `Partial`, whose status line
-  says the download was interrupted, next to the Resume button. No process-global state is
+  says part of the model is on disk, next to the "download the rest" button. No process-global state is
   kept for it: the on-disk staging is the durable record, and it also covers a crash.
-- The worker bodies are injected as plain function pointers (`Jobs`, `Adoption`) so the
-  state machine is unit-tested with fakes and no filesystem or network.
+- The worker bodies are injected as plain function pointers (`Jobs`, `Adoption`,
+  `AccessCheck`) so the state machine is unit-tested with fakes and no filesystem or network.
+- An access check thread is detached like a download thread; its answer carries the token
+  fingerprint it ran under and is dropped when the token changed meanwhile.
 - The once-per-process adoption record (`AUTO_ADOPT_ATTEMPTED`, spec ids) is the one piece of
   process-global state here: a tab rebuild creates a new controller, and re-hashing ~16 GB on
   every rebuild after a refused adoption is exactly what it prevents. Tests inject their own.
@@ -87,7 +104,14 @@ use ms_sysprobe::ai_models::external::{
     adopt_external_model, download_external_model, external_model_status, unmarked_files_present, verify_external_model,
 };
 use ms_sysprobe::ai_models::external_catalog::all_specs;
+use ms_sysprobe::ai_models::hf_access::{HfAccess, hf_repo_access};
 use ms_thread::{self as thread, JoinHandle};
+use web_time::{Duration, Instant};
+
+/// How long an `Unreachable` access answer is shown before the shown repository is asked
+/// again (a job's end asks at once). Long enough that a panel left open on a dead network
+/// sends one small request a minute, never one per frame.
+const UNREACHABLE_RECHECK: Duration = Duration::from_secs(60);
 
 /// What a panel knows about one external model spec, or — aggregated — one bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,8 +122,9 @@ pub enum OcrModelDownloadState {
     Checking,
     /// Nothing usable is installed for this spec.
     Missing,
-    /// An unfinished (cancelled, failed or interrupted) download of this spec left
-    /// `bytes_present` bytes on disk; a resume continues from them.
+    /// Part of this spec is on disk (`bytes_present` bytes): an unfinished (cancelled, failed
+    /// or interrupted) download, or some files found without any completion marker; a
+    /// download keeps what hashes to its pin and fetches only the rest.
     Partial { bytes_present: u64 },
     /// Completely downloaded and verified (completion marker matches).
     Installed,
@@ -136,6 +161,14 @@ pub enum DownloadNotice {
     /// The user cancelled an automatic adoption (it is not retried automatically in this
     /// process; a download keeps the matching files).
     AdoptCancelled,
+    /// The download stopped because the gated Hugging Face repository `repo_id` refused access
+    /// (`access` is never `Granted`); nothing of that repository was transferred.
+    Access {
+        /// The refusing repository, `owner/name`.
+        repo_id: &'static str,
+        /// Why it refused.
+        access: HfAccess,
+    },
 }
 
 impl DownloadNotice {
@@ -144,9 +177,25 @@ impl DownloadNotice {
     pub fn is_verify(&self) -> bool {
         match self {
             Self::VerifyIntact | Self::VerifyRemoved { .. } | Self::VerifyCancelled => true,
-            Self::Cancelled | Self::Failed(_) | Self::AdoptMismatch { .. } | Self::AdoptFailed(_) | Self::AdoptCancelled => false,
+            Self::Cancelled
+            | Self::Failed(_)
+            | Self::AdoptMismatch { .. }
+            | Self::AdoptFailed(_)
+            | Self::AdoptCancelled
+            | Self::Access { .. } => false,
         }
     }
+}
+
+/// The access state of one gated Hugging Face repository that a bundle still needs (one of its
+/// specs is probed and not installed); see [`OcrModelPanelSnapshot::access`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoAccessLine {
+    /// The repository, `owner/name`.
+    pub repo_id: &'static str,
+    /// The answer of the last access check made with the current token, or `None` while that
+    /// check is queued or running.
+    pub access: Option<HfAccess>,
 }
 
 /// What the one running job of the controller does.
@@ -182,12 +231,17 @@ pub struct OcrModelPanelSnapshot {
     pub bundle_key: String,
     /// The aggregated install / download state of the bundle.
     pub state: OcrModelDownloadState,
-    /// Bytes a download would transfer: the totals of the bundle's specs not installed.
+    /// Bytes a download would transfer: the totals of the bundle's specs not installed, minus
+    /// what a `Partial` probe found already on disk (see `aggregate_bundle`).
     pub missing_bytes: u64,
     /// The outcome of its last unsuccessful download, if any (never while installed).
     pub notice: Option<DownloadNotice>,
     /// Another bundle's running download, which disables this bundle's download button.
     pub other_download: Option<OtherDownload>,
+    /// The gated Hugging Face repositories of the bundle's specs that are probed and not
+    /// installed, once each in bundle order, with their access state (granted ones included;
+    /// the panel draws only the others). Empty while this bundle's own job runs.
+    pub access: Vec<RepoAccessLine>,
 }
 
 /// Stable key of a download bundle: its spec ids in order, joined with `+`. A one-spec
@@ -238,6 +292,51 @@ pub(crate) struct Adoption {
     pub(crate) adopt: AdoptJob,
 }
 
+/// Blocking access check of one gated Hugging Face repository (`owner/name`) with the current
+/// token and a cancel flag (a download's own flag; a never-set one for the controller's own
+/// checks) (worker thread only).
+pub(crate) type AccessProbe = fn(&str, &AtomicBool) -> HfAccess;
+/// Non-blocking read of the current Hugging Face token (empty = none); called on the GUI
+/// thread once per `poll`, so it must be a cache read.
+pub(crate) type TokenReader = fn() -> String;
+
+/// The access-check seam: the probe the controller runs on a worker for a gated repository a
+/// shown bundle still needs (and the download thread runs before any transfer), and the token
+/// reader whose change invalidates every answer.
+#[derive(Clone, Copy)]
+pub(crate) struct AccessCheck {
+    pub(crate) probe: AccessProbe,
+    pub(crate) token: TokenReader,
+}
+
+/// A fingerprint of a token value, so the controller can tell a token change without keeping
+/// a second copy of the secret (the value only ever lives in `ms_sysprobe::hf_token`'s cache).
+fn token_fingerprint(token: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    // `DefaultHasher::new()` uses fixed keys: equal tokens always give equal fingerprints
+    // within the process, which is all the comparison needs.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// What the controller knows about one gated repository under the current token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepoAccessState {
+    /// A check is running on a worker.
+    Checking,
+    /// The answer of the finished check, and when it arrived (an `Unreachable` one expires,
+    /// see [`UNREACHABLE_RECHECK`]).
+    Known { access: HfAccess, at: Instant },
+}
+
+impl RepoAccessState {
+    /// Whether this is an `Unreachable` answer (never kept for good).
+    fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Known { access: HfAccess::Unreachable { .. }, .. })
+    }
+}
+
 /// Spec ids an automatic adoption was started for in this process (D9: at most once each,
 /// whatever its outcome); see the file header for why this is process-global.
 static AUTO_ADOPT_ATTEMPTED: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
@@ -269,6 +368,16 @@ fn real_adopt_job(
     progress: &mut dyn FnMut(&ExternalDownloadProgress),
 ) -> Result<PathBuf, ExternalModelError> {
     adopt_external_model(&config::side_models_dir(), spec, cancel, progress)
+}
+
+/// Production access check: `ms_sysprobe`'s Hub probe with the cached token.
+fn real_access_probe(repo_id: &str, cancel: &AtomicBool) -> HfAccess {
+    hf_repo_access(repo_id, cancel)
+}
+
+/// Production token reader: the cached Hugging Face token (never the OS secret store).
+fn real_token_reader() -> String {
+    ms_sysprobe::hf_token::hf_token()
 }
 
 /// Production verify job under `ms_config::side_models_dir()`.
@@ -304,6 +413,10 @@ enum WorkerEvent {
     /// An automatic adoption of `specs` (the adoptable specs of bundle `key`) ended: the first
     /// failure, or `Ok` when every spec was adopted.
     AdoptFinished { key: String, specs: Vec<&'static ExternalModelSpec>, result: Result<(), ExternalModelError> },
+    /// An access check of `repo_id`, started under the token with fingerprint `token`,
+    /// answered `access`; `proactive` for the controller's own check (counted in
+    /// `pending_access`), `false` for the download thread's re-check.
+    Access { repo_id: &'static str, token: u64, access: HfAccess, proactive: bool },
 }
 
 /// The one running job: its kind, bundle, cancel switch and coalesced progress slot.
@@ -315,6 +428,9 @@ struct ActiveDownload {
     progress: Arc<Mutex<Option<ExternalDownloadProgress>>>,
     /// The last progress applied by `poll` (the initial estimate until the first report).
     latest: ExternalDownloadProgress,
+    /// Fingerprint of the token the job started under: an access refusal it reports is kept
+    /// only while that token is still the current one.
+    token: u64,
     /// Kept only to detach explicitly on drop (see the file header).
     thread: Option<JoinHandle<()>>,
 }
@@ -353,6 +469,18 @@ pub struct OcrModelDownloadController {
     adopt_decided: Vec<Vec<&'static ExternalModelSpec>>,
     /// The once-per-process adoption record ([`AUTO_ADOPT_ATTEMPTED`] in production).
     auto_adopt_attempted: &'static Mutex<BTreeSet<&'static str>>,
+    /// The access-check seam (production: the Hub probe and the cached token).
+    access_check: AccessCheck,
+    /// Access per gated repository id under the token with fingerprint `access_token`;
+    /// cleared when the token changes, so every shown repository is checked again.
+    access: HashMap<&'static str, RepoAccessState>,
+    /// Fingerprint of the token the `access` answers belong to.
+    access_token: u64,
+    /// Access checks started and not answered yet (drives `is_active`).
+    pending_access: usize,
+    /// Age after which an `Unreachable` answer is asked again ([`UNREACHABLE_RECHECK`];
+    /// tests shorten it).
+    unreachable_recheck: Duration,
     /// Probed state per spec id (never `Downloading`: the active download owns that).
     states: HashMap<&'static str, OcrModelDownloadState>,
     /// Outcome of the last unsuccessful download per bundle key (see [`DownloadNotice`]).
@@ -371,6 +499,7 @@ impl std::fmt::Debug for OcrModelDownloadController {
         f.debug_struct("OcrModelDownloadController")
             .field("states", &self.states)
             .field("pending_probes", &self.pending_probes)
+            .field("access", &self.access)
             .field("downloading", &self.download.as_ref().map(|active| active.key.as_str()))
             .finish_non_exhaustive()
     }
@@ -390,20 +519,27 @@ impl OcrModelDownloadController {
         Self::with_parts(
             Jobs { status: real_status_probe, download: real_download_job, verify: real_verify_job },
             Adoption { unmarked: real_unmarked_probe, adopt: real_adopt_job },
+            AccessCheck { probe: real_access_probe, token: real_token_reader },
             &AUTO_ADOPT_ATTEMPTED,
         )
     }
 
     /// Creates the controller over the given worker bodies, with automatic adoption disabled
-    /// (nothing is ever adoptable); for the tests of the download / verify state machine.
+    /// (nothing is ever adoptable) and every repository granted without a token; for the tests
+    /// of the download / verify state machine.
     #[cfg(test)]
     pub(crate) fn with_jobs(jobs: Jobs) -> Self {
-        Self::with_parts(jobs, fakes::NO_ADOPTION, Box::leak(Box::new(Mutex::new(BTreeSet::new()))))
+        Self::with_parts(jobs, fakes::NO_ADOPTION, fakes::GRANTED_ACCESS, Box::leak(Box::new(Mutex::new(BTreeSet::new()))))
     }
 
-    /// Creates the controller over the given worker bodies, adoption bodies and adoption
-    /// record.
-    pub(crate) fn with_parts(jobs: Jobs, adoption: Adoption, auto_adopt_attempted: &'static Mutex<BTreeSet<&'static str>>) -> Self {
+    /// Creates the controller over the given worker bodies, adoption bodies, access-check seam
+    /// and adoption record.
+    pub(crate) fn with_parts(
+        jobs: Jobs,
+        adoption: Adoption,
+        access_check: AccessCheck,
+        auto_adopt_attempted: &'static Mutex<BTreeSet<&'static str>>,
+    ) -> Self {
         let (status_tx, status_rx) = mpsc::channel::<StatusCommand>();
         let (evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
         let worker_tx = evt_tx.clone();
@@ -416,6 +552,11 @@ impl OcrModelDownloadController {
             adopt_watch: Vec::new(),
             adopt_decided: Vec::new(),
             auto_adopt_attempted,
+            access_check,
+            access: HashMap::new(),
+            access_token: token_fingerprint(&(access_check.token)()),
+            pending_access: 0,
+            unreachable_recheck: UNREACHABLE_RECHECK,
             states: HashMap::new(),
             notices: HashMap::new(),
             status_tx,
@@ -454,10 +595,78 @@ impl OcrModelDownloadController {
         self.watch_for_adoption(specs);
     }
 
+    /// Starts an access check on a worker for every gated Hugging Face repository that a spec
+    /// of `specs` downloads from while it is probed `Missing` / `Partial`, unless that
+    /// repository already has an answer (or a running check) under the current token; an
+    /// `Unreachable` answer counts only while younger than `unreachable_recheck`. A spec of the
+    /// running job is skipped (the job checks its repositories itself), an installed spec is
+    /// never checked. Allocates nothing when there is nothing to start, so the per-frame
+    /// [`Self::probe_unknown`] calls it.
+    fn check_access(&mut self, specs: &[&'static ExternalModelSpec]) {
+        for spec in specs {
+            let Some(repo_id) = spec.gated_repo() else { continue };
+            let needs_download = matches!(self.states.get(spec.id), Some(OcrModelDownloadState::Missing | OcrModelDownloadState::Partial { .. }));
+            let answered = match self.access.get(repo_id) {
+                None => false,
+                Some(RepoAccessState::Checking) => true,
+                Some(RepoAccessState::Known { access: HfAccess::Unreachable { .. }, at }) => at.elapsed() < self.unreachable_recheck,
+                Some(RepoAccessState::Known { .. }) => true,
+            };
+            if !needs_download || answered || self.download.as_ref().is_some_and(|active| active.contains(spec.id)) {
+                continue;
+            }
+            self.start_access_check(repo_id);
+        }
+    }
+
+    /// Drops every `Unreachable` answer, so the shown repositories are asked again at once
+    /// (called when a job ends: the network may be back, and the job's own answer is no
+    /// fresher than a new check).
+    fn forget_unreachable_answers(&mut self) {
+        self.access.retain(|_repo_id, state| !state.is_unreachable());
+    }
+
+    /// Runs the access check of `repo_id` on a new, detached thread (a short request: at most
+    /// the probe's own small retry budget) and marks the repository `Checking`.
+    fn start_access_check(&mut self, repo_id: &'static str) {
+        let probe = self.access_check.probe;
+        let token = self.access_token;
+        let evt_tx = self.evt_tx.clone();
+        // The handle is dropped on purpose: like a download thread, the check is detached and
+        // a controller dropped meanwhile simply never reads its answer.
+        drop(thread::spawn(move || {
+            // The controller's own check is short and has no Cancel button of its own.
+            let access = probe(repo_id, &AtomicBool::new(false));
+            if evt_tx.send(WorkerEvent::Access { repo_id, token, access, proactive: true }).is_err() {
+                ms_log::runtime_log::log_info(format!("[ocr-model] access check of '{repo_id}' answered after its controller was dropped"));
+            }
+        }));
+        self.access.insert(repo_id, RepoAccessState::Checking);
+        self.pending_access = self.pending_access.saturating_add(1);
+    }
+
+    /// Re-reads the token; when it changed, drops every access answer so the shown
+    /// repositories are checked again with the new one, and every `DownloadNotice::Access`
+    /// (a refusal of the old token must not hide the new answer). Returns `true` when it
+    /// changed.
+    fn sync_access_token(&mut self) -> bool {
+        let token = token_fingerprint(&(self.access_check.token)());
+        if token == self.access_token {
+            return false;
+        }
+        ms_log::runtime_log::log_info("[ocr-model] Hugging Face token changed: repository access is checked again");
+        self.access_token = token;
+        self.access.clear();
+        self.notices.retain(|_key, notice| !matches!(notice, DownloadNotice::Access { .. }));
+        true
+    }
+
     /// Probes the specs of a bundle that were never probed in this session (opening a panel
     /// on, or switching to, a model), and registers the bundle for the automatic-adoption
     /// check: once every spec of it is probed, a [`Self::poll`] adopts the specs that read
-    /// `Missing` with all files present but unmarked, unless this process already tried.
+    /// `Missing` with all files present but unmarked, unless this process already tried. Also
+    /// starts the access check of every gated repository the bundle still needs (once per
+    /// repository and token, see `check_access`).
     ///
     /// Meant to be called every frame: when every spec is probed and the bundle is watched or
     /// already decided, it allocates nothing and sends nothing.
@@ -469,6 +678,7 @@ impl OcrModelDownloadController {
             }
         }
         self.watch_for_adoption(specs);
+        self.check_access(specs);
     }
 
     /// Registers a non-empty bundle for the automatic-adoption check unless it is watched or
@@ -512,6 +722,11 @@ impl OcrModelDownloadController {
             return;
         }
         self.notices.remove(&key);
+        // The job re-checks access under the token of this moment; answers of an older token
+        // are dropped first so the job's answers are the ones kept.
+        self.sync_access_token();
+        let token = self.access_token;
+        let access_probe = self.access_check.probe;
         let specs = specs.to_vec();
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Mutex::new(None::<ExternalDownloadProgress>));
@@ -542,7 +757,16 @@ impl OcrModelDownloadController {
                     ms_log::runtime_log::log_info(format!("[ocr-model] '{}' installed after its controller was dropped", spec.id));
                 }
             };
-            let result = run_bundle_download(jobs, &thread_specs, &thread_cancel, &mut report, &mut installed);
+            let access_tx = evt_tx.clone();
+            let mut access_seen = |repo_id: &'static str, access: &HfAccess| {
+                let answer = WorkerEvent::Access { repo_id, token, access: access.clone(), proactive: false };
+                // Best effort, like `installed`: a dropped controller has no access lines.
+                if access_tx.send(answer).is_err() {
+                    ms_log::runtime_log::log_info(format!("[ocr-model] access of '{repo_id}' checked after its controller was dropped"));
+                }
+            };
+            let result =
+                run_bundle_download(jobs, access_probe, &thread_specs, &thread_cancel, &mut report, &mut installed, &mut access_seen);
             if let Err(err) = &result {
                 ms_log::runtime_log::log_error(format!("[ocr-model] download of '{thread_key}' ended: {err}"));
             } else {
@@ -554,7 +778,7 @@ impl OcrModelDownloadController {
             }
         });
         let latest = initial_progress(&specs, &self.states);
-        self.download = Some(ActiveDownload { kind: JobKind::Download, specs, key, cancel, progress, latest, thread: Some(handle) });
+        self.download = Some(ActiveDownload { kind: JobKind::Download, specs, key, cancel, progress, latest, token, thread: Some(handle) });
     }
 
     /// Starts verifying the bundle `specs` on a new thread (hashing every file of every spec
@@ -611,7 +835,8 @@ impl OcrModelDownloadController {
             }
         });
         let latest = verify_initial_progress(&specs);
-        self.download = Some(ActiveDownload { kind: JobKind::Verify, specs, key, cancel, progress, latest, thread: Some(handle) });
+        let token = self.access_token;
+        self.download = Some(ActiveDownload { kind: JobKind::Verify, specs, key, cancel, progress, latest, token, thread: Some(handle) });
     }
 
     /// Asks the running job (download or verify, if any) to stop at its next chunk; once the
@@ -625,7 +850,7 @@ impl OcrModelDownloadController {
     /// Applies worker events and the latest download progress. Returns `true` when any
     /// state changed (the caller may repaint).
     pub fn poll(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.sync_access_token();
         loop {
             match self.evt_rx.try_recv() {
                 Ok(WorkerEvent::Status { spec_id, status, adoptable }) => {
@@ -647,13 +872,33 @@ impl OcrModelDownloadController {
                 Ok(WorkerEvent::SpecInstalled { spec_id }) => {
                     changed |= self.set_state(spec_id, OcrModelDownloadState::Installed);
                 }
+                Ok(WorkerEvent::Access { repo_id, token, access, proactive }) => {
+                    if proactive {
+                        self.pending_access = self.pending_access.saturating_sub(1);
+                    }
+                    // An answer made with an older token describes that token: dropped (the
+                    // repository is checked again with the current one).
+                    if token == self.access_token {
+                        self.access.insert(repo_id, RepoAccessState::Known { access, at: Instant::now() });
+                        changed = true;
+                    }
+                }
                 Ok(WorkerEvent::DownloadFinished { key, specs, result }) => {
                     // The thread has sent its last message and is returning: dropping the
                     // handle detaches a thread that is already done.
-                    if self.download.as_ref().is_some_and(|active| active.key == key) {
+                    let job_token = self.download.as_ref().filter(|active| active.key == key).map(|active| active.token);
+                    if job_token.is_some() {
                         self.download = None;
                     }
                     changed = true;
+                    // A 401 / 403 met mid-transfer is reported only through the result: it is
+                    // the repository's current answer too (while the job's token is current).
+                    self.forget_unreachable_answers();
+                    if let Err(ExternalModelError::AccessDenied { repo_id, access }) = &result
+                        && job_token == Some(self.access_token)
+                    {
+                        self.access.insert(repo_id, RepoAccessState::Known { access: access.clone(), at: Instant::now() });
+                    }
                     match notice_from_download_result(result) {
                         None => {
                             self.notices.remove(&key);
@@ -675,6 +920,7 @@ impl OcrModelDownloadController {
                         self.download = None;
                     }
                     changed = true;
+                    self.forget_unreachable_answers();
                     let notice = match result {
                         Ok(0) => DownloadNotice::VerifyIntact,
                         Ok(files) => DownloadNotice::VerifyRemoved { files },
@@ -697,6 +943,7 @@ impl OcrModelDownloadController {
                         self.download = None;
                     }
                     changed = true;
+                    self.forget_unreachable_answers();
                     let notice = match result {
                         Ok(()) => None,
                         Err(ExternalModelError::Cancelled) => Some(DownloadNotice::AdoptCancelled),
@@ -833,7 +1080,8 @@ impl OcrModelDownloadController {
             }
         });
         let latest = adopt_initial_progress(&specs);
-        self.download = Some(ActiveDownload { kind: JobKind::Adopt, specs, key, cancel, progress, latest, thread: Some(handle) });
+        let token = self.access_token;
+        self.download = Some(ActiveDownload { kind: JobKind::Adopt, specs, key, cancel, progress, latest, token, thread: Some(handle) });
     }
 
     /// The state of the spec with id `spec_id`: `Downloading` / `Verifying` while a running
@@ -868,14 +1116,36 @@ impl OcrModelDownloadController {
         // the answer to "are the installed files intact" and stays.
         let notice =
             self.notices.get(&key).filter(|notice| notice.is_verify() || state != OcrModelDownloadState::Installed).cloned();
-        OcrModelPanelSnapshot { bundle_key: key, state, missing_bytes, notice, other_download }
+        let own_job_runs = self.download.as_ref().is_some_and(|active| active.key == key);
+        let access = if own_job_runs { Vec::new() } else { self.access_lines(specs) };
+        OcrModelPanelSnapshot { bundle_key: key, state, missing_bytes, notice, other_download, access }
     }
 
-    /// `true` while a job runs or a status probe is unanswered: the GUI keeps
-    /// repainting so `poll` sees the result.
+    /// The access lines of `specs`: each gated repository of a spec probed `Missing` /
+    /// `Partial`, once, in bundle order, with its answer under the current token (`None`
+    /// while unchecked or checking).
+    fn access_lines(&self, specs: &[&'static ExternalModelSpec]) -> Vec<RepoAccessLine> {
+        let mut lines: Vec<RepoAccessLine> = Vec::new();
+        for spec in specs {
+            let Some(repo_id) = spec.gated_repo() else { continue };
+            let needs_download = matches!(self.states.get(spec.id), Some(OcrModelDownloadState::Missing | OcrModelDownloadState::Partial { .. }));
+            if !needs_download || lines.iter().any(|line| line.repo_id == repo_id) {
+                continue;
+            }
+            let access = match self.access.get(repo_id) {
+                Some(RepoAccessState::Known { access, .. }) => Some(access.clone()),
+                Some(RepoAccessState::Checking) | None => None,
+            };
+            lines.push(RepoAccessLine { repo_id, access });
+        }
+        lines
+    }
+
+    /// `true` while a job runs, a status probe or an access check is unanswered: the GUI
+    /// keeps repainting so `poll` sees the result.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.download.is_some() || self.pending_probes > 0
+        self.download.is_some() || self.pending_probes > 0 || self.pending_access > 0
     }
 
     fn set_state(&mut self, spec_id: &'static str, state: OcrModelDownloadState) -> bool {
@@ -939,23 +1209,55 @@ fn status_worker_loop(commands: &Receiver<StatusCommand>, events: &Sender<Worker
     }
 }
 
-/// The body of the download thread: probes every spec of the bundle, downloads the ones not
-/// installed in order and maps each spec's progress onto the bundle (file index and byte
-/// counters continue across specs; the totals are those of the specs downloaded). `installed`
-/// is told about every spec that finished. Stops at the first error, and before the next spec
-/// once `cancel` is set. Blocking: the download thread only.
+/// The body of the download thread: probes every spec of the bundle, checks access to every
+/// gated repository the specs not installed download from (each once, through `access` with
+/// `cancel`; `access_seen` is told every answer; only a definite refusal stops the job, an
+/// `Unreachable` answer lets the transfer decide), then downloads those specs in order and maps each
+/// spec's progress onto the bundle (file index and byte counters continue across specs; the
+/// totals are those of the specs downloaded). `installed` is told about every spec that
+/// finished. Stops at the first error, and before the next spec once `cancel` is set.
+/// Blocking: the download thread only.
 ///
 /// # Errors
-/// The first spec's `ExternalModelError`; `Cancelled` when `cancel` was set between specs.
+/// `AccessDenied` for the first definitely refusing repository, before any download call; the
+/// first spec's `ExternalModelError`; `Cancelled` when `cancel` was set between steps (an
+/// access check included).
 fn run_bundle_download(
     jobs: Jobs,
+    access: AccessProbe,
     specs: &[&'static ExternalModelSpec],
     cancel: &AtomicBool,
     report: &mut dyn FnMut(&ExternalDownloadProgress),
     installed: &mut dyn FnMut(&'static ExternalModelSpec),
+    access_seen: &mut dyn FnMut(&'static str, &HfAccess),
 ) -> Result<(), ExternalModelError> {
     let pending: Vec<&'static ExternalModelSpec> =
         specs.iter().copied().filter(|spec| (jobs.status)(spec) != ExternalModelStatus::Installed).collect();
+    // Access first, for the whole bundle: a refusal must end the job before ANY transfer, not
+    // after an open repository's spec already downloaded gigabytes.
+    let mut checked: Vec<&'static str> = Vec::new();
+    for repo_id in pending.iter().filter_map(|spec| spec.gated_repo()) {
+        if checked.contains(&repo_id) {
+            continue;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ExternalModelError::Cancelled);
+        }
+        checked.push(repo_id);
+        let answer = access(repo_id, cancel);
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ExternalModelError::Cancelled);
+        }
+        access_seen(repo_id, &answer);
+        if answer.refuses_download() {
+            return Err(ExternalModelError::AccessDenied { repo_id, access: answer });
+        }
+        if let HfAccess::Unreachable { detail } = &answer {
+            ms_log::runtime_log::log_warn(format!(
+                "[ocr-model] access check of '{repo_id}' failed, downloading anyway (the transfer reports a real refusal): {detail}"
+            ));
+        }
+    }
     let file_count = pending.iter().map(|spec| spec.files.len()).sum::<usize>();
     let total_bytes = pending.iter().fold(0_u64, |total, spec| total.saturating_add(spec.total_bytes()));
     let mut files_before = 0_usize;
@@ -1123,15 +1425,26 @@ fn state_from_status(status: ExternalModelStatus) -> OcrModelDownloadState {
 }
 
 /// Aggregates the per-spec states of a bundle into the bundle's state and the bytes a
-/// download would transfer (the totals of the specs not installed). Priority: the first
+/// download would transfer: per spec not installed, its total minus the `bytes_present` of a
+/// `Partial` probe (an estimate — the download hashes what is present and may fetch a file
+/// again). Priority: the first
 /// `Unavailable` reason, a `Downloading` / `Verifying` report, `Unknown`, `Checking`; then `Installed`
 /// when every spec is; then `Partial` with the bytes of every partial spec; else `Missing`.
 /// An empty bundle is `Installed` with nothing to download.
 fn aggregate_bundle(entries: &[(&ExternalModelSpec, OcrModelDownloadState)]) -> (OcrModelDownloadState, u64) {
-    let missing_bytes = entries
-        .iter()
-        .filter(|(_, state)| *state != OcrModelDownloadState::Installed)
-        .fold(0_u64, |total, (spec, _)| total.saturating_add(spec.total_bytes()));
+    let missing_bytes = entries.iter().fold(0_u64, |total, (spec, state)| {
+        let remaining = match state {
+            OcrModelDownloadState::Installed => 0,
+            OcrModelDownloadState::Partial { bytes_present } => spec.total_bytes().saturating_sub(*bytes_present),
+            OcrModelDownloadState::Unknown
+            | OcrModelDownloadState::Checking
+            | OcrModelDownloadState::Missing
+            | OcrModelDownloadState::Downloading(_)
+            | OcrModelDownloadState::Verifying(_)
+            | OcrModelDownloadState::Unavailable(_) => spec.total_bytes(),
+        };
+        total.saturating_add(remaining)
+    });
     let states = || entries.iter().map(|(_, state)| state);
     if let Some(reason) =
         states().find_map(|state| if let OcrModelDownloadState::Unavailable(reason) = state { Some(reason.clone()) } else { None })
@@ -1162,12 +1475,13 @@ fn aggregate_bundle(entries: &[(&ExternalModelSpec, OcrModelDownloadState)]) -> 
 }
 
 /// The notice a finished download leaves: `None` on success (the bundle is installed), a
-/// user cancel is `Cancelled` (not a failure), anything else is `Failed` with the
-/// localized reason.
+/// user cancel is `Cancelled` (not a failure), a refused gated repository is `Access`,
+/// anything else is `Failed` with the localized reason.
 fn notice_from_download_result(result: Result<(), ExternalModelError>) -> Option<DownloadNotice> {
     match result {
         Ok(()) => None,
         Err(ExternalModelError::Cancelled) => Some(DownloadNotice::Cancelled),
+        Err(ExternalModelError::AccessDenied { repo_id, access }) => Some(DownloadNotice::Access { repo_id, access }),
         Err(err) => Some(DownloadNotice::Failed(external_error_message(&err))),
     }
 }
@@ -1184,6 +1498,23 @@ fn external_error_key(err: &ExternalModelError) -> &'static str {
         ExternalModelError::HashMismatch { .. } => "translation.ocr_model.hash_mismatch_error",
         ExternalModelError::InvalidSpec(_) => "translation.ocr_model.invalid_spec_error",
         ExternalModelError::Unsupported => "translation.ocr_model.unsupported_error",
+        // `Granted` never travels in a refusal; should it, the neutral "could not be checked"
+        // text is the least wrong one (the next download checks again).
+        ExternalModelError::AccessDenied { access, .. } => access_status_key(access).unwrap_or("translation.ocr_model.access_unreachable_status"),
+    }
+}
+
+/// The i18n key (taking `{repo}`) that explains a refused access state, `None` for `Granted`
+/// (nothing to explain). Shared by the panel's access lines and the error mapping.
+#[must_use]
+pub(crate) fn access_status_key(access: &HfAccess) -> Option<&'static str> {
+    match access {
+        HfAccess::Granted => None,
+        HfAccess::NoToken => Some("translation.ocr_model.access_no_token_status"),
+        HfAccess::TokenRejected => Some("translation.ocr_model.access_token_rejected_status"),
+        HfAccess::TermsNotAccepted => Some("translation.ocr_model.access_terms_status"),
+        HfAccess::RepoNotFound => Some("translation.ocr_model.access_not_found_status"),
+        HfAccess::Unreachable { .. } => Some("translation.ocr_model.access_unreachable_status"),
     }
 }
 
@@ -1205,6 +1536,9 @@ pub(crate) fn external_error_message(err: &ExternalModelError) -> String {
         ExternalModelError::Http { file, .. }
         | ExternalModelError::SizeMismatch { file, .. }
         | ExternalModelError::HashMismatch { file, .. } => ms_i18n::interpolate(template, &[("file", file)]),
+        // The repository id is a language-neutral identifier; the `Unreachable` detail is
+        // English diagnostic text and stays in the log.
+        ExternalModelError::AccessDenied { repo_id, .. } => ms_i18n::interpolate(template, &[("repo", repo_id)]),
     }
 }
 
@@ -1213,14 +1547,10 @@ pub(crate) fn download_button_label(missing_bytes: u64) -> String {
     tf!("translation.ocr_model.download_button", size = format_bytes(missing_bytes))
 }
 
-/// Caption of the "Resume download (done of total)" button with `bytes_present` bytes of
-/// `missing_bytes` already on disk.
-fn resume_button_label(bytes_present: u64, missing_bytes: u64) -> String {
-    tf!(
-        "translation.ocr_model.resume_button",
-        done = format_bytes(bytes_present),
-        total = format_bytes(missing_bytes)
-    )
+/// Caption of the "Download the rest (size)" button of a partly present bundle, with
+/// `missing_bytes` still to transfer.
+fn resume_button_label(missing_bytes: u64) -> String {
+    tf!("translation.ocr_model.download_rest_button", size = format_bytes(missing_bytes))
 }
 
 /// The caption of the download button a panel shows for `snapshot`, or `None` when its state
@@ -1236,7 +1566,7 @@ pub fn offered_download_label(snapshot: &OcrModelPanelSnapshot) -> Option<String
 fn offered_label(state: &OcrModelDownloadState, missing_bytes: u64) -> Option<String> {
     match state {
         OcrModelDownloadState::Missing => Some(download_button_label(missing_bytes)),
-        OcrModelDownloadState::Partial { bytes_present } => Some(resume_button_label(*bytes_present, missing_bytes)),
+        OcrModelDownloadState::Partial { .. } => Some(resume_button_label(missing_bytes)),
         OcrModelDownloadState::Unknown
         | OcrModelDownloadState::Checking
         | OcrModelDownloadState::Installed
@@ -1321,8 +1651,8 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 pub(crate) mod fakes {
     use super::{
-        Adoption, ExternalDownloadProgress, ExternalModelError, ExternalModelSpec, ExternalModelStatus, HashMap, VerifyReport,
-        adopt_initial_progress, initial_progress, verify_initial_progress,
+        AccessCheck, Adoption, ExternalDownloadProgress, ExternalModelError, ExternalModelSpec, ExternalModelStatus, HashMap, HfAccess,
+        VerifyReport, adopt_initial_progress, initial_progress, verify_initial_progress,
     };
     use ms_sysprobe::ai_models::external::{DirLayout, ExternalFile, ExternalSource};
     use std::path::PathBuf;
@@ -1334,7 +1664,7 @@ pub(crate) mod fakes {
     /// A two-file spec that exists only in tests.
     pub(crate) static FAKE_SPEC: ExternalModelSpec = ExternalModelSpec {
         id: "fake_model",
-        source: ExternalSource::HuggingFace { repo_id: "owner/name", revision: "0" },
+        source: ExternalSource::HuggingFace { repo_id: "owner/name", revision: "0", gated: false },
         dir: "Fake",
         layout: DirLayout::Exclusive,
         files: &FAKE_FILES,
@@ -1342,7 +1672,7 @@ pub(crate) mod fakes {
     /// A second spec, to exercise "another model is downloading" and bundles.
     pub(crate) static OTHER_SPEC: ExternalModelSpec = ExternalModelSpec {
         id: "other_model",
-        source: ExternalSource::HuggingFace { repo_id: "owner/other", revision: "0" },
+        source: ExternalSource::HuggingFace { repo_id: "owner/other", revision: "0", gated: false },
         dir: "Other",
         layout: DirLayout::Exclusive,
         files: &FAKE_FILES,
@@ -1479,6 +1809,17 @@ pub(crate) mod fakes {
         Err(ExternalModelError::Cancelled)
     }
 
+    /// Every repository granted, no token stored: access checks never refuse.
+    pub(crate) const GRANTED_ACCESS: AccessCheck = AccessCheck { probe: always_granted, token: no_token };
+
+    pub(crate) fn always_granted(_repo_id: &str, _cancel: &AtomicBool) -> HfAccess {
+        HfAccess::Granted
+    }
+
+    pub(crate) fn no_token() -> String {
+        String::new()
+    }
+
     /// Automatic adoption off: nothing is ever "present but unmarked".
     pub(crate) const NO_ADOPTION: Adoption = Adoption { unmarked: never_unmarked, adopt: adoption_disabled };
 
@@ -1555,11 +1896,14 @@ pub(crate) mod fakes {
 #[cfg(test)]
 mod tests {
     use super::fakes::{
-        FAKE_SPEC, OTHER_SPEC, PARTIAL_BYTES, THIRD_SPEC, adopt_waits_for_cancel, always_unmarked, busy_failure, complete_download,
-        damaged_verify, hash_failure, installed_probe, intact_verify, missing_probe, ok_adopt, ok_download, other_installed_probe,
-        partial_probe, third_fails, third_mismatches_adopt, verify_waits_for_cancel, waits_for_cancel,
+        FAKE_SPEC, GRANTED_ACCESS, OTHER_SPEC, PARTIAL_BYTES, THIRD_SPEC, adopt_waits_for_cancel, always_granted, always_unmarked,
+        busy_failure, complete_download, damaged_verify, hash_failure, installed_probe, intact_verify, missing_probe, ok_adopt,
+        ok_download, other_installed_probe, partial_probe, third_fails, third_mismatches_adopt, verify_waits_for_cancel,
+        waits_for_cancel,
     };
     use super::*;
+    use ms_sysprobe::ai_models::external::ExternalSource;
+    use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
 
     const FAKE: &[&ExternalModelSpec] = &[&FAKE_SPEC];
@@ -1639,8 +1983,9 @@ mod tests {
         let snapshot = controller.panel_snapshot(FAKE);
         assert_eq!(snapshot.state, OcrModelDownloadState::Partial { bytes_present: PARTIAL_BYTES });
         assert_eq!(snapshot.notice, Some(DownloadNotice::Cancelled));
+        assert_eq!(snapshot.missing_bytes, FAKE_SPEC.total_bytes() - PARTIAL_BYTES, "only what is not on disk");
         let shown = offered_download_label(&snapshot).expect("a Partial state offers a button");
-        assert_eq!(shown, resume_button_label(PARTIAL_BYTES, FAKE_SPEC.total_bytes()));
+        assert_eq!(shown, resume_button_label(FAKE_SPEC.total_bytes() - PARTIAL_BYTES));
         assert_eq!(download_label_for_statuses(&[(&FAKE_SPEC, partial_probe(&FAKE_SPEC))]), shown);
         // A later download clears the notice.
         controller.start_download(FAKE);
@@ -1712,7 +2057,7 @@ mod tests {
         let mut installed = Vec::new();
         let cancel = AtomicBool::new(false);
         let specs: &[&'static ExternalModelSpec] = &[&FAKE_SPEC, &OTHER_SPEC, &THIRD_SPEC];
-        let result = run_bundle_download(jobs, specs, &cancel, &mut |p| reports.push(*p), &mut |spec| installed.push(spec.id));
+        let result = run_bundle_download(jobs, always_granted, specs, &cancel, &mut |p| reports.push(*p), &mut |spec| installed.push(spec.id), &mut |_, _| {});
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(installed, [FAKE_SPEC.id, THIRD_SPEC.id]);
         let total = FAKE_SPEC.total_bytes() + THIRD_SPEC.total_bytes();
@@ -1731,14 +2076,14 @@ mod tests {
         let mut installed = Vec::new();
         let jobs = Jobs { status: missing_probe, download: third_fails, verify: intact_verify };
         let specs: &[&'static ExternalModelSpec] = &[&FAKE_SPEC, &THIRD_SPEC, &OTHER_SPEC];
-        let result = run_bundle_download(jobs, specs, &cancel, &mut |_| {}, &mut |spec| installed.push(spec.id));
+        let result = run_bundle_download(jobs, always_granted, specs, &cancel, &mut |_| {}, &mut |spec| installed.push(spec.id), &mut |_, _| {});
         assert!(matches!(result, Err(ExternalModelError::HashMismatch { .. })), "{result:?}");
         assert_eq!(installed, [FAKE_SPEC.id]);
 
         cancel.store(true, Ordering::Relaxed);
         installed.clear();
         let jobs = Jobs { status: missing_probe, download: complete_download, verify: intact_verify };
-        let result = run_bundle_download(jobs, BUNDLE, &cancel, &mut |_| {}, &mut |spec| installed.push(spec.id));
+        let result = run_bundle_download(jobs, always_granted, BUNDLE, &cancel, &mut |_| {}, &mut |spec| installed.push(spec.id), &mut |_, _| {});
         assert!(matches!(result, Err(ExternalModelError::Cancelled)), "{result:?}");
         assert!(installed.is_empty());
     }
@@ -1783,9 +2128,10 @@ mod tests {
         let one_installed = [(&FAKE_SPEC, OcrModelDownloadState::Installed), missing(&THIRD_SPEC)];
         assert_eq!(aggregate_bundle(&one_installed), (OcrModelDownloadState::Missing, 30));
         let partials = [(&FAKE_SPEC, partial(10)), (&THIRD_SPEC, partial(5))];
-        assert_eq!(aggregate_bundle(&partials), (partial(15), 180));
+        // A partial spec costs only what it lacks.
+        assert_eq!(aggregate_bundle(&partials), (partial(15), 165));
         let mixed = [(&FAKE_SPEC, partial(10)), missing(&THIRD_SPEC)];
-        assert_eq!(aggregate_bundle(&mixed), (partial(10), 180));
+        assert_eq!(aggregate_bundle(&mixed), (partial(10), 170));
         let checking = [(&FAKE_SPEC, OcrModelDownloadState::Checking), (&THIRD_SPEC, OcrModelDownloadState::Installed)];
         assert_eq!(aggregate_bundle(&checking).0, OcrModelDownloadState::Checking);
         let unknown = [(&FAKE_SPEC, OcrModelDownloadState::Checking), (&THIRD_SPEC, OcrModelDownloadState::Unknown)];
@@ -1801,7 +2147,7 @@ mod tests {
         );
         assert_eq!(
             download_label_for_statuses(&[(&FAKE_SPEC, ExternalModelStatus::Partial { bytes_present: 9 }), (&THIRD_SPEC, ExternalModelStatus::Missing)]),
-            resume_button_label(9, 180)
+            resume_button_label(171)
         );
     }
 
@@ -1900,6 +2246,7 @@ mod tests {
         OcrModelDownloadController::with_parts(
             Jobs { status, download: ok_download, verify: intact_verify },
             Adoption { unmarked: always_unmarked, adopt },
+            GRANTED_ACCESS,
             record,
         )
     }
@@ -1980,6 +2327,7 @@ mod tests {
         let mut controller = OcrModelDownloadController::with_parts(
             Jobs { status: missing_probe, download: ok_download, verify: intact_verify },
             Adoption { unmarked: unmarked_after_reprobe, adopt: ok_adopt },
+            GRANTED_ACCESS,
             fresh_record(),
         );
         controller.probe_unknown(BUNDLE);
@@ -2068,11 +2416,300 @@ mod tests {
         assert!(installed.is_empty());
     }
 
+    static GATED_FILES: [ms_sysprobe::ai_models::external::ExternalFile; 1] =
+        [ms_sysprobe::ai_models::external::ExternalFile::direct("g.bin", 20, "00")];
+    /// A spec from a gated repository.
+    static GATED_SPEC: ExternalModelSpec = ExternalModelSpec {
+        id: "gated_model",
+        source: ExternalSource::HuggingFace { repo_id: "owner/gated", revision: "0", gated: true },
+        dir: "Gated",
+        layout: ms_sysprobe::ai_models::external::DirLayout::Shared,
+        files: &GATED_FILES,
+    };
+    /// A second spec from the same gated repository (one check covers both).
+    static GATED_TWIN_SPEC: ExternalModelSpec = ExternalModelSpec {
+        id: "gated_twin_model",
+        source: ExternalSource::HuggingFace { repo_id: "owner/gated", revision: "0", gated: true },
+        dir: "Gated",
+        layout: ms_sysprobe::ai_models::external::DirLayout::Shared,
+        files: &GATED_FILES,
+    };
+    /// An open spec, then the two gated ones.
+    const GATED_BUNDLE: &[&ExternalModelSpec] = &[&FAKE_SPEC, &GATED_SPEC, &GATED_TWIN_SPEC];
+
+    /// Shows `specs` frame by frame (`probe_unknown` + `poll`, as a panel does) until nothing
+    /// is pending even after one more `probe_unknown` (which may start an access check).
+    fn show_until_settled(controller: &mut OcrModelDownloadController, specs: &[&'static ExternalModelSpec]) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "controller did not settle: {controller:?}");
+            controller.probe_unknown(specs);
+            controller.poll();
+            if !controller.is_active() {
+                controller.probe_unknown(specs);
+                if !controller.is_active() {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn line(access: Option<HfAccess>) -> Vec<RepoAccessLine> {
+        vec![RepoAccessLine { repo_id: "owner/gated", access }]
+    }
+
+    fn fixed_token() -> String {
+        "token-a".to_owned()
+    }
+
+    static ONCE_CHECKS: AtomicUsize = AtomicUsize::new(0);
+
+    fn once_probe(_repo_id: &str, _cancel: &AtomicBool) -> HfAccess {
+        ONCE_CHECKS.fetch_add(1, Ordering::SeqCst);
+        HfAccess::NoToken
+    }
+
+    /// A shown bundle's gated repository is checked once per token, however many frames show
+    /// it and however many of its specs come from that repository; the open spec has no line.
+    #[test]
+    fn a_gated_repository_is_checked_once_per_token() {
+        let mut controller = OcrModelDownloadController::with_parts(
+            Jobs { status: missing_probe, download: ok_download, verify: intact_verify },
+            super::fakes::NO_ADOPTION,
+            AccessCheck { probe: once_probe, token: fixed_token },
+            fresh_record(),
+        );
+        show_until_settled(&mut controller, GATED_BUNDLE);
+        for _frame in 0..5 {
+            controller.probe_unknown(GATED_BUNDLE);
+            controller.poll();
+        }
+        assert!(!controller.is_active());
+        assert_eq!(ONCE_CHECKS.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.panel_snapshot(GATED_BUNDLE).access, line(Some(HfAccess::NoToken)));
+        // Another bundle holding the same repository reuses the answer.
+        show_until_settled(&mut controller, &[&GATED_TWIN_SPEC]);
+        assert_eq!(ONCE_CHECKS.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.panel_snapshot(&[&GATED_TWIN_SPEC]).access, line(Some(HfAccess::NoToken)));
+    }
+
+    static ROTATING_TOKEN: AtomicUsize = AtomicUsize::new(0);
+    static ROTATING_CHECKS: AtomicUsize = AtomicUsize::new(0);
+
+    fn rotating_token() -> String {
+        format!("token-{}", ROTATING_TOKEN.load(Ordering::SeqCst))
+    }
+
+    /// Answers by token: the first token is rejected, any later one is granted.
+    fn rotating_probe(_repo_id: &str, _cancel: &AtomicBool) -> HfAccess {
+        ROTATING_CHECKS.fetch_add(1, Ordering::SeqCst);
+        if ROTATING_TOKEN.load(Ordering::SeqCst) == 0 { HfAccess::TokenRejected } else { HfAccess::Granted }
+    }
+
+    /// A token change drops the answers and checks the shown repository again.
+    #[test]
+    fn a_token_change_checks_the_repository_again() {
+        ROTATING_TOKEN.store(0, Ordering::SeqCst);
+        let mut controller = OcrModelDownloadController::with_parts(
+            Jobs { status: missing_probe, download: ok_download, verify: intact_verify },
+            super::fakes::NO_ADOPTION,
+            AccessCheck { probe: rotating_probe, token: rotating_token },
+            fresh_record(),
+        );
+        show_until_settled(&mut controller, &[&GATED_SPEC]);
+        assert_eq!(ROTATING_CHECKS.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.panel_snapshot(&[&GATED_SPEC]).access, line(Some(HfAccess::TokenRejected)));
+
+        ROTATING_TOKEN.store(1, Ordering::SeqCst);
+        assert!(controller.poll(), "a token change is a change");
+        assert_eq!(controller.panel_snapshot(&[&GATED_SPEC]).access, line(None), "old answer dropped");
+        show_until_settled(&mut controller, &[&GATED_SPEC]);
+        assert_eq!(ROTATING_CHECKS.load(Ordering::SeqCst), 2);
+        assert_eq!(controller.panel_snapshot(&[&GATED_SPEC]).access, line(Some(HfAccess::Granted)));
+    }
+
+    static DENIED_CHECKS: AtomicUsize = AtomicUsize::new(0);
+    static DENIED_DOWNLOADS: AtomicUsize = AtomicUsize::new(0);
+
+    fn denied_probe(_repo_id: &str, _cancel: &AtomicBool) -> HfAccess {
+        DENIED_CHECKS.fetch_add(1, Ordering::SeqCst);
+        HfAccess::TermsNotAccepted
+    }
+
+    fn counted_download(
+        spec: &'static ExternalModelSpec,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&ExternalDownloadProgress),
+    ) -> Result<PathBuf, ExternalModelError> {
+        DENIED_DOWNLOADS.fetch_add(1, Ordering::SeqCst);
+        complete_download(spec, cancel, progress)
+    }
+
+    /// `start_download` re-checks access before anything else: a refusal ends the job with an
+    /// `Access` notice and no download call, even for the open spec listed first.
+    #[test]
+    fn a_download_rechecks_access_and_a_refusal_downloads_nothing() {
+        let mut controller = OcrModelDownloadController::with_parts(
+            Jobs { status: missing_probe, download: counted_download, verify: intact_verify },
+            super::fakes::NO_ADOPTION,
+            AccessCheck { probe: denied_probe, token: fixed_token },
+            fresh_record(),
+        );
+        controller.start_download(GATED_BUNDLE);
+        poll_until(&mut controller, |c| !c.is_active());
+        let snapshot = controller.panel_snapshot(GATED_BUNDLE);
+        assert_eq!(snapshot.notice, Some(DownloadNotice::Access { repo_id: "owner/gated", access: HfAccess::TermsNotAccepted }));
+        assert_eq!(DENIED_DOWNLOADS.load(Ordering::SeqCst), 0, "nothing was downloaded");
+        assert_eq!(DENIED_CHECKS.load(Ordering::SeqCst), 1, "one check for the two specs of one repository");
+        // The job's answer is the repository's current answer: the shown bundle needs no new check.
+        show_until_settled(&mut controller, GATED_BUNDLE);
+        assert_eq!(DENIED_CHECKS.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.panel_snapshot(GATED_BUNDLE).access, line(Some(HfAccess::TermsNotAccepted)));
+
+        // The thread body directly: the refusal comes before the open spec's download.
+        let mut installed = Vec::new();
+        let mut seen = Vec::new();
+        let jobs = Jobs { status: missing_probe, download: complete_download, verify: intact_verify };
+        let result = run_bundle_download(
+            jobs,
+            |_, _| HfAccess::NoToken,
+            GATED_BUNDLE,
+            &AtomicBool::new(false),
+            &mut |_| {},
+            &mut |spec| installed.push(spec.id),
+            &mut |repo, access| seen.push((repo, access.clone())),
+        );
+        assert!(matches!(result, Err(ExternalModelError::AccessDenied { repo_id: "owner/gated", access: HfAccess::NoToken })), "{result:?}");
+        assert!(installed.is_empty());
+        assert_eq!(seen, [("owner/gated", HfAccess::NoToken)]);
+    }
+
+    /// The thread body with an unanswered check: not a refusal, every pending spec downloads.
+    #[test]
+    fn an_unreachable_check_does_not_stop_a_bundle_download() {
+        let mut installed = Vec::new();
+        let mut seen = Vec::new();
+        let jobs = Jobs { status: missing_probe, download: complete_download, verify: intact_verify };
+        let result = run_bundle_download(
+            jobs,
+            |_, _| HfAccess::Unreachable { detail: "offline".to_owned() },
+            GATED_BUNDLE,
+            &AtomicBool::new(false),
+            &mut |_| {},
+            &mut |spec| installed.push(spec.id),
+            &mut |repo, access| seen.push((repo, access.clone())),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(installed, ["fake_model", "gated_model", "gated_twin_model"]);
+        assert_eq!(seen.len(), 1, "one check per repository");
+    }
+
+    static TOKEN_SWAP: AtomicUsize = AtomicUsize::new(0);
+
+    fn token_swap_token() -> String {
+        format!("swap-{}", TOKEN_SWAP.load(Ordering::SeqCst))
+    }
+
+    /// No token at first, granted once a token is stored.
+    fn token_swap_probe(_repo_id: &str, _cancel: &AtomicBool) -> HfAccess {
+        if TOKEN_SWAP.load(Ordering::SeqCst) == 0 { HfAccess::NoToken } else { HfAccess::Granted }
+    }
+
+    /// A refused download's notice belongs to the token it ran under: storing a new token
+    /// drops it, and the fresh answer (granted) is what the panel sees — no stale refusal.
+    #[test]
+    fn a_token_change_drops_an_access_refusal_notice() {
+        TOKEN_SWAP.store(0, Ordering::SeqCst);
+        let mut controller = OcrModelDownloadController::with_parts(
+            Jobs { status: missing_probe, download: ok_download, verify: intact_verify },
+            super::fakes::NO_ADOPTION,
+            AccessCheck { probe: token_swap_probe, token: token_swap_token },
+            fresh_record(),
+        );
+        controller.start_download(&[&GATED_SPEC]);
+        poll_until(&mut controller, |c| !c.is_active());
+        assert_eq!(controller.panel_snapshot(&[&GATED_SPEC]).notice, Some(DownloadNotice::Access { repo_id: "owner/gated", access: HfAccess::NoToken }));
+
+        TOKEN_SWAP.store(1, Ordering::SeqCst);
+        assert!(controller.poll(), "a token change is a change");
+        assert_eq!(controller.panel_snapshot(&[&GATED_SPEC]).notice, None, "the old token's refusal is dropped");
+        show_until_settled(&mut controller, &[&GATED_SPEC]);
+        let snapshot = controller.panel_snapshot(&[&GATED_SPEC]);
+        assert_eq!(snapshot.notice, None);
+        assert_eq!(snapshot.access, line(Some(HfAccess::Granted)));
+    }
+
+    static UNREACHABLE_CHECKS: AtomicUsize = AtomicUsize::new(0);
+
+    fn unreachable_probe(_repo_id: &str, _cancel: &AtomicBool) -> HfAccess {
+        UNREACHABLE_CHECKS.fetch_add(1, Ordering::SeqCst);
+        HfAccess::Unreachable { detail: "offline".to_owned() }
+    }
+
+    /// An `Unreachable` answer is shown, not kept: frames within the re-check delay reuse it,
+    /// an older one is asked again, and any job's end asks again at once.
+    #[test]
+    fn an_unreachable_answer_is_asked_again_after_the_delay_and_after_a_job() {
+        let mut controller = OcrModelDownloadController::with_parts(
+            Jobs { status: missing_probe, download: ok_download, verify: intact_verify },
+            super::fakes::NO_ADOPTION,
+            AccessCheck { probe: unreachable_probe, token: fixed_token },
+            fresh_record(),
+        );
+        show_until_settled(&mut controller, &[&GATED_SPEC]);
+        for _frame in 0..5 {
+            controller.probe_unknown(&[&GATED_SPEC]);
+            controller.poll();
+        }
+        assert_eq!(UNREACHABLE_CHECKS.load(Ordering::SeqCst), 1, "no per-frame storm");
+        assert!(matches!(controller.panel_snapshot(&[&GATED_SPEC]).access.as_slice(), [RepoAccessLine { access: Some(HfAccess::Unreachable { .. }), .. }]));
+
+        // Past the delay: one new check.
+        controller.unreachable_recheck = Duration::ZERO;
+        controller.probe_unknown(&[&GATED_SPEC]);
+        controller.unreachable_recheck = UNREACHABLE_RECHECK;
+        poll_until(&mut controller, |c| !c.is_active());
+        assert_eq!(UNREACHABLE_CHECKS.load(Ordering::SeqCst), 2);
+
+        // A finished job forgets the answer: the shown repository is asked again.
+        controller.start_verify(&[&GATED_SPEC]);
+        poll_until(&mut controller, |c| !c.is_active());
+        show_until_settled(&mut controller, &[&GATED_SPEC]);
+        assert_eq!(UNREACHABLE_CHECKS.load(Ordering::SeqCst), 3);
+    }
+
+    static INSTALLED_CHECKS: AtomicUsize = AtomicUsize::new(0);
+
+    fn installed_counting_probe(_repo_id: &str, _cancel: &AtomicBool) -> HfAccess {
+        INSTALLED_CHECKS.fetch_add(1, Ordering::SeqCst);
+        HfAccess::NoToken
+    }
+
+    /// An installed gated spec needs nothing from its repository: no check, no line; nor does
+    /// a granted download of an installed bundle ask.
+    #[test]
+    fn an_installed_gated_spec_is_not_checked() {
+        let mut controller = OcrModelDownloadController::with_parts(
+            Jobs { status: installed_probe, download: ok_download, verify: intact_verify },
+            super::fakes::NO_ADOPTION,
+            AccessCheck { probe: installed_counting_probe, token: fixed_token },
+            fresh_record(),
+        );
+        show_until_settled(&mut controller, GATED_BUNDLE);
+        assert_eq!(INSTALLED_CHECKS.load(Ordering::SeqCst), 0);
+        assert!(controller.panel_snapshot(GATED_BUNDLE).access.is_empty());
+        controller.start_download(GATED_BUNDLE);
+        poll_until(&mut controller, |c| !c.is_active());
+        assert_eq!(INSTALLED_CHECKS.load(Ordering::SeqCst), 0, "nothing pending, nothing checked");
+        assert_eq!(controller.panel_snapshot(GATED_BUNDLE).notice, None);
+    }
+
     /// L1: no English diagnostic detail reaches the user-facing text.
     #[test]
     fn every_error_variant_maps_to_its_own_key_without_english_detail() {
         const DETAIL: &str = "english-diagnostic-detail";
-        let cases: [(ExternalModelError, &str); 9] = [
+        let cases: [(ExternalModelError, &str); 11] = [
             (ExternalModelError::NotDownloaded { dir: PathBuf::from("d") }, "translation.ocr_model.not_downloaded_status"),
             (ExternalModelError::Busy { id: "x" }, "translation.ocr_model.busy_error"),
             (ExternalModelError::Cancelled, "translation.ocr_model.cancelled_status"),
@@ -2088,6 +2725,14 @@ mod tests {
             ),
             (ExternalModelError::InvalidSpec(DETAIL.to_owned()), "translation.ocr_model.invalid_spec_error"),
             (ExternalModelError::Unsupported, "translation.ocr_model.unsupported_error"),
+            (
+                ExternalModelError::AccessDenied { repo_id: "owner/gated", access: HfAccess::TermsNotAccepted },
+                "translation.ocr_model.access_terms_status",
+            ),
+            (
+                ExternalModelError::AccessDenied { repo_id: "owner/gated", access: HfAccess::Unreachable { detail: DETAIL.to_owned() } },
+                "translation.ocr_model.access_unreachable_status",
+            ),
         ];
         for (err, key) in &cases {
             assert_eq!(external_error_key(err), *key, "{err:?}");

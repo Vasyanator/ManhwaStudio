@@ -418,7 +418,7 @@ impl RateEstimator {
 /// `step`/`total` stay the overall byte count across the whole plan), or the single file a
 /// model LOAD is reading from disk (while `step`/`total` count the load's components).
 ///
-/// Optional on the wire (`dev-docs/flux2_model_download.md` §4) and therefore optional
+/// Optional on the wire (`ipc/PROTOCOL.md`, `download.start` frames) and therefore optional
 /// here: a preparation frame carries no file at all, and rendering it as a bar stuck at
 /// zero would tell the user a transfer had stalled when nothing had started.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -706,7 +706,7 @@ pub(in crate::tools::ai_editor::engines) fn parse_degraded(header: &Value) -> Op
 ///
 /// The four required fields are the shape every streaming method of these engines has
 /// always used. `file` is the SECOND level a model download adds
-/// (`dev-docs/flux2_model_download.md` §4): optional on the wire, `None` here for every
+/// (`ipc/PROTOCOL.md`, `download.start` frames): optional on the wire, `None` here for every
 /// operation that does not publish it, so a consumer that predates it is unaffected.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(in crate::tools::ai_editor::engines) struct ProgressFrame {

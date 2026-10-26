@@ -138,7 +138,7 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **Machine translation through your own browser** — Google, DeepL and Yandex can each be switched to «Through my browser» in the machine translation panel: the translation is then done on the service's regular website in your own Chrome, Edge, Yandex Browser or Brave by the ManhwaStudio browser extension, which helps when a service limits or blocks the program's requests. The panel installs and updates the extension in one click and shows the three steps to load it in the browser (open the extensions page, turn on Developer mode, «Load unpacked» this folder), whether a browser is connected and which one. If the website shows a check, the panel asks you to solve it in its tab and the translation continues; «Stop» still works. Only one running ManhwaStudio window works with the extension at a time; another window says so. «Built-in requests» stays the default.
 - **Composition presets in the Translation tab** — the «Parameters» tab of the Composition panel has a preset picker: save the current parameters (sorting and the MiniJinja template included) as a named preset, then rename, update or delete it. Presets are shared by all titles, the selected preset is remembered per title, and you see at once when the parameters differ from the preset. Two built-in presets ship: «Translation export» and «AI translation»; they can be edited and reset to their factory values, and their names follow the interface language.
 - **Title type setting** — Settings › Ribbon and bubbles has a new «Title type» row (Pages / Webtoon), separate from the layout preset. NeuroLate's automatic comic type and the default re-pagination of the PDF export follow it, and a change applies at once, without reopening the title.
-- **Compact FLUX.2 klein 4B weights (GGUF)** — in the area AI editor, choose Q8_0 / Q6_K / Q5_K_M / Q4_K_M separately for the transformer and for the text encoder: from about 2.6 GB + 2.5 GB instead of 7.8 GB + 8 GB on disk and in memory, at the cost of slower generation steps. The memory and speed panel shows both choices. GGUF files picked by hand from another folder work too, as long as the regular 4B model is installed.
+- **Compact FLUX.2 klein weights (GGUF)** — in the area AI editor, choose Q8_0 / Q6_K / Q5_K_M / Q4_K_M separately for the transformer and for the text encoder, for klein 4B and 9B (the 9B uncensored encoder too, in Q8_0 / Q6_K / Q4_K_M): for 4B from about 2.6 GB + 2.5 GB instead of 7.8 GB + 8 GB on disk and in memory, at the cost of slower generation steps. The memory and speed panel shows both choices. GGUF files picked by hand from another folder work too, as long as the regular 4B model is installed.
 
 ### Improvements
 - **Stop for the text detector** — a running text detection over several pages can now be stopped: the page being processed is finished and applied, then the run stops.
@@ -155,7 +155,7 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **FLUX.2 klein memory forecast counts the text encoder** — the RAM and VRAM figures now include the text encoder whenever the run needs it or it is already loaded; it is left out only when every prompt is cached and the encoder is not loaded.
 
 ### Behaviour changes
-- **FLUX.2 klein 4B is downloaded by the app itself** — pinned files with checksums; a model you already downloaded is checked once and kept, nothing is downloaded again.
+- **FLUX.2 klein 4B and 9B are downloaded by the app itself** — pinned files with checksums; a model you already downloaded is checked once and kept, nothing is downloaded again (a 9B transformer saved as a diffusers folder is kept as well). For the gated 9B repositories the panel says exactly what is missing — a Hugging Face token, a rejected token or the terms on the model page — with a link to the page.
 
 ### Fixes
 - **Saving the text detector's mask** — «Save selection» in the text detector panel of the Translation tab now saves the mask exactly as you see it, including what you painted or erased with the mask brush; before, those edits were lost.
@@ -192,6 +192,7 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 # ManhwaStudio — Список изменений
 
 Выпущенные блоки (`## N — ГГГГ-ММ-ДД`) идут от старых к новым, последний выпуск внизу; новые записи добавляются под «Не выпущено».
+- **Uncensored text encoder of FLUX.2 klein 9B** — it now encodes prompts with its real positional settings (they were read wrongly from its configuration); prompts cached with it are encoded again once.
 
 ## 325 — 2026-10-18
 
@@ -329,7 +330,7 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **Машинный перевод через ваш браузер** — Google, DeepL и Яндекс можно по отдельности переключить в режим «Через мой браузер» в панели машинного перевода: тогда переводит расширение ManhwaStudio на обычном сайте сервиса в вашем Chrome, Edge, Яндекс Браузере или Brave — это помогает, когда сервис ограничивает или блокирует запросы программы. Панель устанавливает и обновляет расширение в один клик и показывает три шага, чтобы загрузить его в браузер (открыть страницу расширений, включить режим разработчика, «Загрузить распакованное расширение» из этой папки), а также подключён ли браузер и какой. Если сайт покажет проверку, панель попросит пройти её на его вкладке, и перевод продолжится; «Стоп» по-прежнему работает. С расширением одновременно работает только одно запущенное окно ManhwaStudio — другое окно сообщит об этом. По умолчанию остаются «Встроенные запросы».
 - **Пресеты компоновки во вкладке перевода** — в панели «Компоновка» на вкладке «Параметры» появился выбор пресета: текущие параметры (включая сортировку и шаблон MiniJinja) можно сохранить как именованный пресет, переименовать, обновить и удалить. Пресеты общие для всех тайтлов, а выбранный пресет запоминается для каждого тайтла; если параметры изменены относительно пресета, это видно сразу. Есть два встроенных пресета: «Экспорт перевода» и «Перевод через ИИ»; их можно изменить и вернуть к заводским значениям, а названия следуют языку интерфейса.
 - **Настройка «Тип тайтла»** — в Настройках › «Лента и пузыри» появилась строка «Тип тайтла» (Страницы / Вебтун), отдельная от пресета раскладки. По ней работают автоматический тип комикса в распознавании NeuroLate и перенарезка по умолчанию при экспорте в PDF; изменение действует сразу, без повторного открытия тайтла.
-- **Компактные веса FLUX.2 klein 4B (GGUF)** — в ИИ-редакторе области можно отдельно выбрать Q8_0 / Q6_K / Q5_K_M / Q4_K_M для трансформера и для текстового энкодера: от ~2,6 ГБ + 2,5 ГБ вместо 7,8 ГБ + 8 ГБ на диске и в памяти, ценой более медленного шага генерации. Панель памяти и скорости показывает оба выбора. GGUF-файлы, выбранные вручную из другой папки, тоже работают, если обычная модель 4B установлена.
+- **Компактные веса FLUX.2 klein (GGUF)** — в ИИ-редакторе области можно отдельно выбрать Q8_0 / Q6_K / Q5_K_M / Q4_K_M для трансформера и для текстового энкодера, у klein 4B и 9B (у расцензуренного энкодера 9B — Q8_0 / Q6_K / Q4_K_M): у 4B от ~2,6 ГБ + 2,5 ГБ вместо 7,8 ГБ + 8 ГБ на диске и в памяти, ценой более медленного шага генерации. Панель памяти и скорости показывает оба выбора. GGUF-файлы, выбранные вручную из другой папки, тоже работают, если обычная модель 4B установлена.
 
 ### Улучшения
 - **Остановка детектора текста** — запущенную детекцию текста по нескольким страницам теперь можно остановить: обрабатываемая страница доделывается и применяется, после чего запуск прекращается.
@@ -346,7 +347,7 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **Прогноз памяти FLUX.2 klein учитывает текстовый энкодер** — цифры ОЗУ и видеопамяти включают энкодер, если он нужен прогону или уже загружен; он не учитывается, только когда все промпты в кэше и энкодер не загружен.
 
 ### Изменения поведения
-- **FLUX.2 klein 4B скачивает само приложение** — закреплённые файлы с контрольными суммами; уже скачанная модель один раз проверяется и остаётся, повторной загрузки нет.
+- **FLUX.2 klein 4B и 9B скачивает само приложение** — закреплённые файлы с контрольными суммами; уже скачанная модель один раз проверяется и остаётся, повторной загрузки нет (трансформер 9B, сохранённый папкой diffusers, тоже остаётся). Для закрытых репозиториев 9B панель прямо говорит, чего не хватает — токена Hugging Face, действующего токена или принятых условий на странице модели — и даёт ссылку на страницу.
 
 ### Исправления
 - **Сохранение маски детектора текста** — «Сохранить выделение» в панели детектора текста во вкладке перевода теперь сохраняет маску ровно такой, какой вы её видите, вместе с тем, что нарисовано или стёрто кистью маски; раньше эти правки терялись.
@@ -377,3 +378,4 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **Восстановление окружения Python** — в окружениях от старых версий больше не остаются два конфликтующих пакета OpenCV: лишний удаляется, нужный переустанавливается; сообщение проверки теперь говорит «отсутствуют или устарели пакеты».
 - **Бабблы-картинки** — вставка картинки из буфера обмена или выбор файла картинки для баббла больше не подвешивает окно на время сохранения, а прерванное сохранение не оставляет повреждённый файл.
 - **Окно «Новый проект»** — выпадающие списки и ползунок потоков загрузки реагируют на колесо мыши, как во всём приложении, не прокручивая панель.
+- **Расцензуренный текстовый энкодер FLUX.2 klein 9B** — теперь кодирует промпты с правильными настройками позиций (раньше они неверно читались из его конфигурации); закэшированные с ним промпты один раз кодируются заново.

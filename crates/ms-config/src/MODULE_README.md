@@ -81,8 +81,12 @@ that defines the type.
   logging, no reference to any other item of this crate.
 - `flux2_weight_format.rs`: `Flux2WeightFormat` (bf16 + GGUF `Q8_0` / `Q6_K` / `Q5_K_M` /
   `Q4_K_M`; frozen wire ids `bf16` / `q8_0` / …, the llama.cpp `quant_token`, `is_gguf`) and
-  `Flux2WeightAxis` (transformer / text encoder): the ONE list of FLUX.2 klein weight formats
-  for both axes, with `offered_for(variant, axis)` (4B: all five on both axes; 9B: bf16 only).
+  `Flux2WeightAxis` (transformer / text encoder) and `Flux2EncoderSource` (stock / uncensored;
+  frozen wire ids, `offered_for(variant)`: 9B both, 4B stock only; `unquantized_token`
+  `bf16` / `f16`): the ONE list of FLUX.2 klein weight formats for both axes, with
+  `offered_for(variant, axis, source)` (transformer and stock encoder: all five for both
+  variants; 9B uncensored encoder: no `Q5_K_M`; 4B uncensored: empty) and `closest_offered`
+  (keep, else the next smaller offered quant, else bf16) for a source switch.
   The files of each offered format are pinned in `ms_sysprobe::ai_models::external_catalog`;
   the Python backend lists no quants (the ids are opaque to it).
 - `app_tab.rs`: `AppTab` — the editor tab set. `ALL` + `key()` (the persistence contract) and
@@ -225,7 +229,8 @@ binary that installs a UI locale). Those crates enable `test-support` from their
   Its `DocKind` is inferred from the file name (`settings.json` → `ProjectSettings`, else
   `UserConfig`) unless `JsonConfig::with_kind` names it.
 - **Persisted spellings are frozen.** `AppTab::key()`, `Flux2Variant::wire()` /
-  `dir_name()` / `settings_file_name()`, `Flux2WeightFormat::wire()`, `MemoryProfile::as_config_str()`,
+  `dir_name()` / `settings_file_name()`, `Flux2WeightFormat::wire()`,
+  `Flux2EncoderSource::wire()`, `MemoryProfile::as_config_str()`,
   `StorageMode::as_config_str()` (A11), `TorchFlavour::as_token()`, the `GfxArch` spelling and the
   `bubble_status` field names are on disk in users' documents. They are byte-stable across
   releases AND across UI languages, and are never localized
@@ -272,11 +277,14 @@ binary that installs a UI locale). Those crates enable `test-support` from their
 - A new bubble status condition or border kind: `bubble_status.rs` for the model, and
   `crates/ms-widgets/src/bubble_status.rs` if it also needs to be drawn.
 - A new FLUX.2 variant fact: the single `impl Flux2Variant` in `lib.rs` if it keys a PATH, a
-  persisted document, an id or a capability gate — one block, so a new difference cannot drift
-  across two mapping tables. If it is PRESENTATION (a caption, a repository id), it belongs to
+  persisted document or an id — one block, so a new difference cannot drift across two mapping
+  tables; what a variant OFFERS (encoder sources, weight formats) is `flux2_weight_format.rs`,
+  and which repositories are gated is catalog data (`ExternalSource::HuggingFace::gated`). If
+  it is PRESENTATION (a caption), it belongs to
   the `Flux2VariantPresentation` extension trait in
   `crates/ms-tab-cleaning/src/tools/ai_editor/engines/flux2_klein/variant_presentation.rs`
-  instead: this crate is below the UI and the engine is the only consumer. Who downloads a
-  variant is `Flux2Variant::downloads_from_catalog` (4B: the pinned catalog; 9B: the backend).
+  instead: this crate is below the UI and the engine is the only consumer. Both variants'
+  files come from the pinned catalog; `dir_name()` is mirrored by the backend's
+  `inpaint/flux2_klein/components.py` (guarded by a test in `lib.rs`).
 - A new FLUX.2 klein weight format or a change of which variant offers it:
   `flux2_weight_format.rs`, then its pinned spec in `ms_sysprobe::ai_models::external_catalog`.

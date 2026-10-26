@@ -19,7 +19,7 @@ Main responsibilities:
 - delegate each block to the submodule that owns it;
 - in «Память и скорость», hand the shared widget the transformer format and draw the
   encoder's format rows under it (`draw_encoder_formats`) while the weight formats are in
-  effect (4B in download mode); 9B passes none.
+  effect (download mode, either variant); manual mode passes none.
 
 Key structures:
 - `Flux2PanelCtx`
@@ -29,8 +29,8 @@ Key functions:
 - `draw_flux2_progress_section()`, `draw_flux2_run_options()`: the pinned parts
 
 Submodules:
-- `install.rs`: the source-mode switch, the model paths and the whole download block (the
-  Hugging Face one of 9B, the catalog one with the two weight-format pickers of 4B).
+- `install.rs`: the source-mode switch, the model paths and the catalog download block
+  (encoder source toggle, the two weight-format pickers, the token row, the bundle).
 - `components.rs`: the merged component list (the memory steps are the shared
   `ai_editor::large_model_resources` widget, drawn by `draw_memory_section`).
 - `advanced.rs`: «Для экспертов».
@@ -110,10 +110,9 @@ pub(super) fn draw_flux2_run_options(ui: &mut egui::Ui, text_attention_in_mask: 
 /// picker, start a translation) travel back to the engine as plain flags rather than as
 /// work done from inside a widget closure.
 pub(super) struct Flux2PanelCtx<'a> {
-    /// Which checkpoint this panel belongs to. It decides the two honest differences
-    /// between the two engines' bodies — whether the uncensored-encoder toggle exists at
-    /// all, and whether a Hugging Face token is needed to download the model — and names
-    /// the repository the download block reports on.
+    /// Which checkpoint this panel belongs to. The bodies of the two engines differ only by
+    /// what the variant offers (the uncensored-encoder toggle, the manual encoder FILE
+    /// button) and by its catalog bundle (whether a gated repository needs the token row).
     pub(super) variant: Flux2Variant,
     pub(super) settings: &'a mut Flux2KleinSettings,
     pub(super) status: Option<&'a Flux2Status>,
@@ -167,13 +166,12 @@ pub(super) struct Flux2PanelCtx<'a> {
     pub(super) hf_token_status: Option<&'a str>,
     /// A secret-store save or delete is in flight; both buttons are closed meanwhile.
     pub(super) hf_token_busy: bool,
-    pub(super) download_check: Option<&'a Flux2DownloadCheck>,
-    pub(super) download_check_error: Option<&'a str>,
-    pub(super) download_check_busy: bool,
-    /// A `.download.start` is in flight. Separate from `pipeline_busy` because this is
-    /// what decides whether the block offers «Скачать» or «Отмена».
-    pub(super) download_busy: bool,
-    pub(super) download_status: Option<&'a str>,
+    /// The gated repositories of the current bundle not known to be installed
+    /// ([`flux2_gated_repos_missing`]); the token row is drawn while it is non-empty.
+    pub(super) gated_repos: &'a [&'static str],
+    /// The line a source switch left under the uncensored toggle — see
+    /// [`Flux2KleinEngine::encoder_format_notice`]. Written by the toggle directly.
+    pub(super) encoder_format_notice: &'a mut Option<String>,
     pub(super) ai_backend_available: bool,
     /// Set when a control changed a persisted value (a save is owed, the forecast re-armed).
     pub(super) settings_changed: &'a mut bool,
@@ -198,13 +196,11 @@ pub(super) struct Flux2PanelCtx<'a> {
     pub(super) picker_requested: &'a mut Option<Flux2PickerPurpose>,
     /// The one secret-store control the user pressed this frame, if any.
     pub(super) hf_token_action: &'a mut Option<HfTokenAction>,
-    /// The one download control the user pressed this frame, if any.
-    pub(super) download_action: &'a mut Option<HfDownloadAction>,
     /// The catalog download block's state for the bundle the selection needed when the frame
-    /// began (4B in download mode, [`Flux2KleinEngine::catalog_snapshot`]); `None` otherwise.
+    /// began (download mode, [`Flux2KleinEngine::catalog_snapshot`]); `None` otherwise.
     pub(super) catalog_snapshot: Option<&'a OcrModelPanelSnapshot>,
     /// The catalog bundle is known to be incomplete: the readiness line says so
-    /// ([`flux2_readiness_line`]). Always `false` for 9B and in manual mode.
+    /// ([`flux2_readiness_line`]). Always `false` in manual mode.
     pub(super) bundle_missing: bool,
     /// The catalog download block's click this frame (download / verify / cancel).
     pub(super) catalog_action: &'a mut ModelDownloadAction,
@@ -776,19 +772,13 @@ impl Flux2PanelCtx<'_> {
         let component_actions_enabled = self.ai_backend_available && !self.pipeline_busy;
         let status = self.status;
         let status_error = self.status_error;
-        let pipeline_busy = self.pipeline_busy;
-        let ai_backend_available = self.ai_backend_available;
         let hf_token_action = &mut *self.hf_token_action;
-        let download_action = &mut *self.download_action;
         let hf_token_state = self.hf_token_state;
         let hf_token_input = &mut *self.hf_token_input;
         let hf_token_status = self.hf_token_status;
         let hf_token_busy = self.hf_token_busy;
-        let download_check = self.download_check;
-        let download_check_error = self.download_check_error;
-        let download_check_busy = self.download_check_busy;
-        let download_busy = self.download_busy;
-        let download_status = self.download_status;
+        let gated_repos = self.gated_repos;
+        let encoder_format_notice = &mut *self.encoder_format_notice;
         let catalog_snapshot = self.catalog_snapshot;
         let catalog_action = &mut *self.catalog_action;
 
@@ -840,10 +830,12 @@ impl Flux2PanelCtx<'_> {
                 match settings.source_mode() {
                     Flux2SourceMode::Manual => {
                         // A GGUF text encoder is a single FILE, so a variant that offers GGUF
-                        // encoder formats (4B) gets a file button beside the folder one; the
-                        // 9B row keeps its folder button alone.
+                        // encoder formats (both do) gets a file button beside the folder one.
                         let mut encoder_buttons = Vec::with_capacity(2);
-                        if Flux2WeightFormat::offered_for(variant, Flux2WeightAxis::TextEncoder).iter().any(|format| format.is_gguf()) {
+                        let gguf_encoders = Flux2EncoderSource::offered_for(variant)
+                            .iter()
+                            .any(|&source| Flux2WeightFormat::offered_for(variant, Flux2WeightAxis::TextEncoder, source).iter().any(|format| format.is_gguf()));
+                        if gguf_encoders {
                             encoder_buttons.push((
                                 "📄",
                                 t!("cleaning.tools.flux2_klein.browse_file_tooltip"),
@@ -914,39 +906,24 @@ impl Flux2PanelCtx<'_> {
                             picker_requested,
                         );
                     }
-                    // A catalog variant (4B) downloads through the app itself: the two weight
-                    // formats and one pinned bundle, no token and no backend download.
-                    Flux2SourceMode::Download if settings.weight_formats_in_effect() => draw_catalog_download_block(
+                    // Both variants download through the app's catalog: the encoder source,
+                    // the two weight formats, the token row while a gated spec is missing and
+                    // one pinned bundle. The three manual rows are NOT drawn here: in this mode
+                    // the paths are derived, and an editable field whose value nothing reads is
+                    // a lie; the derived destinations are shown read-only inside the block.
+                    Flux2SourceMode::Download => draw_catalog_download_block(
                         ui,
                         settings,
-                        Flux2CatalogDownloadView { snapshot: catalog_snapshot, status },
-                        changed,
-                        catalog_action,
-                    ),
-                    // The three manual rows are NOT drawn here: in this mode the paths are
-                    // derived, and an editable field whose value nothing reads is a lie.
-                    // The derived destinations are shown read-only inside the block.
-                    Flux2SourceMode::Download => draw_download_block(
-                        ui,
-                        settings,
-                        Flux2DownloadView {
-                            variant,
+                        Flux2CatalogDownloadView {
+                            snapshot: catalog_snapshot,
+                            status,
+                            gated_repos,
                             token_state: hf_token_state,
                             token_input: hf_token_input,
                             token_status: hf_token_status,
                             token_busy: hf_token_busy,
-                            check: download_check,
-                            check_error: download_check_error,
-                            check_busy: download_check_busy,
-                            download_busy,
-                            download_status,
-                            ai_backend_available,
-                            pipeline_busy,
-                            status,
                         },
-                        changed,
-                        hf_token_action,
-                        download_action,
+                        Flux2CatalogDownloadOut { changed, action: catalog_action, hf_token_action, encoder_format_notice },
                     ),
                 }
 
@@ -982,7 +959,7 @@ impl Flux2PanelCtx<'_> {
     /// is already on the readiness line above. The widget writes the step pair into a copy
     /// that is stored back here, and every other action travels to the engine.
     ///
-    /// While the weight formats are in effect (4B in download mode) the widget also gets the
+    /// While the weight formats are in effect (download mode) the widget also gets the
     /// transformer format (its format rows; a picked row is written into the setting) and the
     /// encoder's format rows are drawn right under it (`draw_encoder_formats`); a pick on
     /// either raises `settings_changed`, which saves it and re-arms the status, the forecast
@@ -999,9 +976,9 @@ impl Flux2PanelCtx<'_> {
             false,
             |ui| {
                 let mut choice = settings.step_choice();
-                // Weight formats exist only while they are in effect (4B in download mode):
-                // then the transformer's format rows come from the widget and the encoder's
-                // right under it; elsewhere FLUX.2 has one format and draws no rows.
+                // Weight formats exist only while they are in effect (download mode): then
+                // the transformer's format rows come from the widget and the encoder's right
+                // under it; manual mode draws no rows.
                 let formats = settings.weight_formats_in_effect();
                 // Copied out before `reborrow` hands the view to the widget.
                 let profiles = resources.profiles;

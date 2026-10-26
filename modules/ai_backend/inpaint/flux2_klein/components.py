@@ -21,10 +21,11 @@ Main responsibilities:
 - text-encoder availability (`text_encoder_available`, `require_text_encoder`);
 - the config of a GGUF component (`find_text_encoder_config_dir`,
   `text_encoder_config_dir`, the GGUF branch of `find_transformer_config_dir`):
-  probed beside the file, then in the installed 4B package
-  (`installed_4b_package_root`, `FLUX2_KLEIN_4B_DIR_NAME`), each candidate
-  checked against the file's header (`_search_gguf_config`); the package root
-  also joins the tokenizer / scheduler search for a GGUF component;
+  probed beside the file, then in every installed klein package
+  (`installed_klein_package_roots`, `KLEIN_PACKAGE_DIR_NAMES`), each candidate
+  checked against the file's header (`_search_gguf_config`; a package only
+  under the strict match, which is what tells a 9B file from a 4B one); the
+  package roots also join the tokenizer / scheduler search for a GGUF component;
 - the encoder<->transformer width contract (`TEXT_ENCODER_OUT_LAYER_INDICES`,
   `TEXT_ENCODER_OUT_LAYERS`, `transformer_config_dir`,
   `require_encoder_transformer_compatible`) — the one check that tells a 9B
@@ -32,8 +33,12 @@ Main responsibilities:
 - what the checkpoint's own `model_index.json` declares about guidance
   distillation (`model_index_search_roots`, `checkpoint_is_distilled`) — a
   tri-state, because a hand-assembled component folder declares nothing;
-- the text encoder's truncation to the layers the pipeline actually reads
-  (`ENCODER_KEEP_LAYERS`, `text_encoder_truncation_kwargs`);
+- the text encoder's config kwargs (`text_encoder_config_kwargs`, the one
+  entry every encoder config load goes through): the truncation to the layers
+  the pipeline actually reads (`ENCODER_KEEP_LAYERS`,
+  `text_encoder_truncation_kwargs`) and the RoPE normalization of a
+  transformers-v5 config (`text_encoder_rope_kwargs`, also the prompt-cache
+  fingerprint's salt);
 - the VAE's own tiling threshold (`vae_tile_threshold_pixels`,
   `VAE_TILE_THRESHOLD_FALLBACK_PIXELS`) — the pixel side above which diffusers
   actually decodes tiled, which is what the memory forecast must know before it
@@ -52,7 +57,7 @@ Notes:
 - No torch import: this module answers questions about the filesystem only
   (GGUF headers through the torch-free `runtime.tensor_container`; the `gguf`
   package's key and tensor names are imported lazily).
-- `installed_4b_package_root` is replaced by the test suite through this
+- `installed_klein_package_roots` is replaced by the test suite through this
   module object (no test may see the machine's real `side_models/`).
 """
 
@@ -61,6 +66,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -80,11 +86,16 @@ from .params import MAX_REGION_PIXELS
 
 log = logging.getLogger(__name__)
 
-#: Directory under `side_models/` that holds the installed FLUX.2 klein 4B
-#: package (the Rust catalog downloads it there: `ms_config::Flux2Variant::Klein4B`'s
-#: `dir_name`). A GGUF component kept OUTSIDE that package borrows its config,
-#: tokenizer and scheduler from it (`installed_4b_package_root`).
-FLUX2_KLEIN_4B_DIR_NAME = "FLUX.2-klein-4B"
+#: Directories under `side_models/` that hold the installed FLUX.2 klein
+#: packages, 4B first (the Rust catalog downloads them there: every
+#: `ms_config::Flux2Variant::dir_name`; a Rust test reads this file and requires
+#: each name, so the two cannot drift). A GGUF component kept OUTSIDE a package
+#: borrows its config, tokenizer and scheduler from them
+#: (`installed_klein_package_roots`): the config only from the package whose
+#: config strictly matches the file's header, the tokenizer and scheduler from
+#: the first one (the two packages pin byte-identical tokenizer and scheduler
+#: files).
+KLEIN_PACKAGE_DIR_NAMES = ("FLUX.2-klein-4B", "FLUX.2-klein-9B")
 
 #: Subdirectory of a klein package holding the text encoder's `config.json`.
 _TEXT_ENCODER_SUBDIR = "text_encoder"
@@ -190,11 +201,12 @@ def component_search_roots(normalized_or_paths: Mapping[str, Any], *, package_fa
     the repository root.
 
     When `package_fallback` and the text encoder or the transformer is a GGUF
-    file (kept anywhere, e.g. a user's own model folder), the installed 4B
-    package root (`installed_4b_package_root`) is appended LAST: a GGUF file
-    carries no tokenizer or scheduler, and the 4B package is the model those
-    files were made from. Safetensors / folder paths never get it, so 9B and
-    bf16 discovery is unchanged.
+    file (kept anywhere, e.g. a user's own model folder), every installed klein
+    package root (`installed_klein_package_roots`, 4B then 9B) is appended
+    LAST: a GGUF file carries no tokenizer or scheduler, and both packages pin
+    the same tokenizer and scheduler files, so whichever is found first is the
+    right one for either variant. Safetensors / folder paths never get them,
+    so bf16 discovery is unchanged.
     """
     roots: list[Path] = []
     for key in ("text_encoder_path", "transformer_path", "vae_path"):
@@ -207,10 +219,10 @@ def component_search_roots(normalized_or_paths: Mapping[str, Any], *, package_fa
             if root not in roots:
                 roots.append(root)
     if package_fallback and _has_gguf_component(normalized_or_paths):
-        package = installed_4b_package_root()
-        if package not in roots:
-            log.debug("FLUX.2 klein: GGUF-компонент — в поиск токенизатора и планировщика добавлен пакет %s", package)
-            roots.append(package)
+        for package in installed_klein_package_roots():
+            if package not in roots:
+                log.debug("FLUX.2 klein: GGUF-компонент — в поиск токенизатора и планировщика добавлен пакет %s", package)
+                roots.append(package)
     return roots
 
 
@@ -219,13 +231,32 @@ def _has_gguf_component(paths: Mapping[str, Any]) -> bool:
     return any(is_gguf_file(Path(raw)) for raw in (str(paths.get(key) or "").strip() for key in ("text_encoder_path", "transformer_path")) if raw)
 
 
-def installed_4b_package_root() -> Path:
-    """`<side_models>/FLUX.2-klein-4B`: the installed 4B package (it may not exist).
+def installed_klein_package_roots() -> list[Path]:
+    """The installed klein packages under `<side_models>`, in `KLEIN_PACKAGE_DIR_NAMES` order (existing ones only).
 
     Replaced by the test suite through this module object, so every caller
     looks it up here at call time.
     """
-    return side_models_root() / FLUX2_KLEIN_4B_DIR_NAME
+    return existing_klein_package_roots(side_models_root())
+
+
+def existing_klein_package_roots(parent: Path) -> list[Path]:
+    """`parent / <name>` for every `KLEIN_PACKAGE_DIR_NAMES` entry that is a directory, in that order.
+
+    An unreadable entry counts as absent (logged at DEBUG): the fallback is a
+    convenience search, and the refusal that follows names what was probed.
+    """
+    roots: list[Path] = []
+    for name in KLEIN_PACKAGE_DIR_NAMES:
+        candidate = parent / name
+        try:
+            present = candidate.is_dir()
+        except OSError as exc:
+            log.debug("FLUX.2 klein: не удалось проверить пакет %s (%s)", candidate, exc)
+            continue
+        if present:
+            roots.append(candidate)
+    return roots
 
 
 def is_gguf_file(path: Path) -> bool:
@@ -389,7 +420,7 @@ def find_transformer_config_dir(source: Path) -> Path | None:
     `_missing_transformer_config_message`).
 
     A GGUF `source` goes through `_search_gguf_config` instead: the same probes
-    plus the installed 4B package's `transformer/`, each candidate checked
+    plus every installed klein package's `transformer/`, each candidate checked
     against the file's header (`_gguf_transformer_mismatch`).
     """
     if is_gguf_file(source):
@@ -424,14 +455,17 @@ def gguf_config_candidates(source: Path, subdir: str) -> list[tuple[Path, bool]]
     """`(directory, is_package_fallback)` probed for the config of the GGUF file `source`, in order.
 
     The file's directory and its parent (`<root>/<subdir>`, then `<root>`,
-    as `component_probe_order`), then the installed 4B package's
-    `<subdir>` (`installed_4b_package_root`), unless already probed. Pure path
-    arithmetic.
+    as `component_probe_order`), then every installed klein package's
+    `<subdir>` (`installed_klein_package_roots`, 4B then 9B), unless already
+    probed. A package candidate is matched strictly, so a 9B file skips the 4B
+    package's config (block counts and widths differ) and lands on the 9B one.
+    Path arithmetic plus the package directories' existence.
     """
     order = [(candidate, False) for candidate in component_probe_order(transformer_config_roots(source), subdir)]
-    fallback = installed_4b_package_root() / subdir
-    if all(candidate != fallback for candidate, _ in order):
-        order.append((fallback, True))
+    for package in installed_klein_package_roots():
+        fallback = package / subdir
+        if all(candidate != fallback for candidate, _ in order):
+            order.append((fallback, True))
     return order
 
 
@@ -483,7 +517,7 @@ def _search_gguf_config(source: Path, subdir: str, mismatch: _Mismatch) -> GgufC
             log.info("FLUX.2 klein: конфиг %s не подходит к GGUF %s: %s", config_path, source.name, reason)
             rejected.append((candidate, reason))
             continue
-        origin = " (из установленного пакета FLUX.2 klein 4B)" if strict else ""
+        origin = f" (из установленного пакета {candidate.parent.name})" if strict else ""
         # DEBUG: the probe runs several times per request (guards, refusals,
         # identity); the module build logs the config it really uses at INFO.
         log.debug("FLUX.2 klein: для GGUF %s взят конфиг %s%s", source.name, config_path, origin)
@@ -498,7 +532,7 @@ def _missing_gguf_config_message(source: Path, component: str, search: GgufConfi
     return (
         f"Не найден config.json {component} для GGUF-файла {source.name}: GGUF не содержит "
         "конфигурации модели, а подобрать её по весам нельзя.\n"
-        "Что сделать: установите пакет FLUX.2 klein 4B («Установка модели»), либо положите "
+        "Что сделать: установите пакет FLUX.2 klein (4B или 9B) той же модели («Установка модели»), либо положите "
         f"config.json {component} ОТ ЭТОЙ ЖЕ модели как «{source.parent / expected_subdir / _MODEL_CONFIG_MARKER}».\n"
         f"Просмотрены каталоги: {', '.join(str(path) for path in search.probed)}"
         f"{rejected_text}"
@@ -586,7 +620,7 @@ def find_text_encoder_config_dir(gguf_file: Path) -> Path:
     """The directory of the Qwen3 `config.json` that describes the GGUF text encoder `gguf_file`.
 
     Probes `<dir>/text_encoder`, `<dir>`, `<parent>/text_encoder`, `<parent>`
-    of the file, then the installed 4B package's `text_encoder/`, accepting the
+    of the file, then every installed klein package's `text_encoder/`, accepting the
     first config consistent with the file's header (`_gguf_encoder_mismatch`).
 
     # Raises
@@ -1139,6 +1173,92 @@ def text_encoder_truncation_kwargs(
         ", ".join(str(index) for index in TEXT_ENCODER_OUT_LAYER_INDICES),
     )
     return kwargs
+
+
+#: The one `rope_parameters.rope_type` the RoPE normalization accepts: plain
+#: RoPE, whose only parameter is the base `rope_theta`.
+_ROPE_TYPE_DEFAULT = "default"
+
+
+def text_encoder_rope_kwargs(encoder_dir: Path) -> dict[str, float]:
+    """`{"rope_theta": <base>}` when `encoder_dir/config.json` keeps its RoPE base only in a transformers-v5 `rope_parameters`, else `{}`.
+
+    **Why.** transformers 5 writes the RoPE base as
+    `rope_parameters = {"rope_type": "default", "rope_theta": ...}` and drops
+    the top-level `rope_theta`; the pinned transformers 4.57 reads ONLY the
+    top-level field and silently falls back to its default base (10 000 for
+    Qwen3 instead of the model's 1 000 000), which is a silently wrong encoder
+    (the uncensored 9B encoder's config is such a file). Passing the base as a
+    loader kwarg restores the model's own value.
+
+    Branches, every one explicit:
+    - no readable config, no `rope_parameters` (or `null`): `{}`, nothing to
+      normalize (an unreadable config is diagnosed by the loader);
+    - `rope_parameters` with `rope_type == "default"` and a positive numeric
+      `rope_theta`: `{"rope_theta": float(value)}` when the config has no
+      top-level `rope_theta`, `{}` when it has the SAME one;
+    - anything else is REFUSED naming the file: another `rope_type` (yarn,
+      dynamic, ...: 4.57 would read its scaling from `rope_scaling`, not from
+      here, so it would run unscaled), a `rope_parameters` that is not an
+      object or carries no usable `rope_theta`, a top-level `rope_theta` that
+      contradicts it.
+
+    Pure (no logging): the prompt-cache fingerprint salts its identity with
+    this answer on every request, and the loader path logs through
+    `text_encoder_config_kwargs`.
+
+    # Raises
+    `ValueError` for every refused branch above.
+    """
+    config_path = encoder_dir / _MODEL_CONFIG_MARKER
+    data = _read_json_object(config_path)
+    if data is None:
+        return {}
+    parameters = data.get("rope_parameters")
+    if parameters is None:
+        return {}
+    if not isinstance(parameters, dict):
+        raise ValueError(f"Текстовый энкодер: в {config_path} поле rope_parameters не является объектом ({parameters!r}); такой конфиг не поддерживается.")
+    rope_type = parameters.get("rope_type")
+    if rope_type != _ROPE_TYPE_DEFAULT:
+        raise ValueError(
+            f"Текстовый энкодер: {config_path} объявляет rope_parameters.rope_type = {rope_type!r}, "
+            f"а поддерживается только {_ROPE_TYPE_DEFAULT!r} — модель с другим RoPE запустилась бы "
+            "без него и выдала бы неверные эмбеддинги. Возьмите текстовый энкодер из каталога модели FLUX.2 klein."
+        )
+    theta = parameters.get("rope_theta")
+    if isinstance(theta, bool) or not isinstance(theta, (int, float)) or not math.isfinite(theta) or theta <= 0:
+        raise ValueError(f"Текстовый энкодер: в {config_path} rope_parameters не содержит положительного rope_theta ({theta!r}).")
+    base = float(theta)
+    if "rope_theta" in data:
+        declared = data.get("rope_theta")
+        if isinstance(declared, bool) or not isinstance(declared, (int, float)) or float(declared) != base:
+            raise ValueError(f"Текстовый энкодер: {config_path} объявляет rope_theta = {declared!r}, а rope_parameters.rope_theta = {theta!r}; конфиг противоречит сам себе.")
+        return {}
+    return {"rope_theta": base}
+
+
+def text_encoder_config_kwargs(encoder_dir: Path, keep_layers: int = ENCODER_KEEP_LAYERS) -> dict[str, Any]:
+    """Every loader kwarg of the text encoder's `config.json`: the truncation (`text_encoder_truncation_kwargs`) plus the RoPE normalization (`text_encoder_rope_kwargs`).
+
+    The ONE entry for building or validating the encoder's config: every
+    `Qwen3Config.from_pretrained` of the encoder and every pre-admission check
+    goes through it, so a load can never get the truncation without the RoPE
+    fix or the other way round. Logs at INFO when it normalizes the RoPE base.
+
+    # Raises
+    `ValueError` as either of the two functions.
+    """
+    kwargs = text_encoder_truncation_kwargs(encoder_dir, keep_layers)
+    rope = text_encoder_rope_kwargs(encoder_dir)
+    if rope:
+        log.info(
+            "FLUX.2 klein: %s хранит базу RoPE только в rope_parameters (формат transformers 5) — "
+            "передаётся rope_theta = %s, иначе transformers взял бы базу по умолчанию.",
+            encoder_dir / _MODEL_CONFIG_MARKER,
+            rope["rope_theta"],
+        )
+    return {**kwargs, **rope}
 
 
 def _weight_bytes(path: str) -> int:

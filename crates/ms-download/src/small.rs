@@ -54,7 +54,8 @@ enum Attempt {
 /// # Errors
 /// `Cancelled`; `SizeMismatch` when the announced or received size passes `req.max_bytes`
 /// (`expected` = the cap) or the received bytes pass the announced size; `Http` for a
-/// permanent failure or once the retries are exhausted.
+/// permanent failure (`status` = the HTTP status of a permanent answer) or once the retries
+/// are exhausted (`status: None`).
 pub fn fetch_small(
     fetcher: &dyn RangeFetcher,
     retry: &RetryPolicy<'_>,
@@ -77,7 +78,7 @@ pub fn fetch_small(
         }
         failures = failures.saturating_add(1);
         if failures > retry.max_retries {
-            return Err(DownloadError::Http { detail: format!("{detail} (gave up after {} retries without progress)", retry.max_retries) });
+            return Err(DownloadError::Http { detail: format!("{detail} (gave up after {} retries without progress)", retry.max_retries), status: None });
         }
         let delay = retry.delay_for(failures, retry_after);
         ms_log::runtime_log::log_warn(format!(
@@ -107,7 +108,7 @@ fn attempt(
     let response = match fetcher.fetch(req.url, offset) {
         Ok(response) => response,
         Err(FetchError::Transient { detail, retry_after }) => return Ok(Attempt::Transient { detail, retry_after }),
-        Err(FetchError::Permanent { detail }) => return Err(DownloadError::Http { detail }),
+        Err(FetchError::Permanent { detail, status }) => return Err(DownloadError::Http { detail, status }),
         Err(FetchError::RangeNotSatisfiable { total: remote }) => {
             if remote == Some(offset) {
                 return Ok(Attempt::Done);

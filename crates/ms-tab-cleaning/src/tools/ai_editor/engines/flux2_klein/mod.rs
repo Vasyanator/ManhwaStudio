@@ -26,23 +26,22 @@ LATENT mask: that layer grown by `mask_dilate_px` (cv2-exact ellipse,
 pixels outside the PAINTED mask byte-identical whatever the model did there.
 
 TWO ENGINES, ONE IMPLEMENTATION (`Flux2Variant`, declared in `ms-config`, which owns every
-fact that keys a path, a persisted document, an id or a capability gate; its caption and
-repository id are this module's own `variant_presentation.rs`):
-FLUX.2 klein 9B and FLUX.2 klein 4B are separate entries of the picker
-built from this same module, parameterized by the variant. The variant keys the model
-directory, the three derived component paths, the engine id, the picker caption, the
-settings FILE (9B keeps `flux2_klein_settings.json` unchanged) and the `variant` field the
-two `.download.*` methods carry; nothing else on the wire changes, because every other
-method is already keyed by the three component paths. The 4B model is ungated and
-apache-2.0, so its download block draws no Hugging Face token row, and no uncensored text
-encoder is published for it, so that toggle is not drawn and the flag is forced off before
-it can reach a path or the wire. The 4B package is pinned in the Rust catalog instead of
-being fetched by the backend: its download block offers the two weight formats
-(«Веса трансформера» / «Веса текстового энкодера», bf16 or a GGUF quant) and ONE pinned
-bundle download through the engine's `OcrModelDownloadController` (which also adopts an
-existing unmarked download once). The backend keeps ONE pipeline and ONE text encoder
-resident, keyed by those paths, so selecting the other variant unloads the previous one —
-the panel says so and this side orchestrates nothing.
+fact that keys a path, a persisted document or an id; what a variant offers is
+`ms_config::flux2_weight_format`; its caption is this module's own
+`variant_presentation.rs`): FLUX.2 klein 9B and FLUX.2 klein 4B are separate entries of the
+picker built from this same module, parameterized by the variant. The variant keys the model
+directory, the derived component paths, the engine id, the picker caption and the settings
+FILE (9B keeps `flux2_klein_settings.json` unchanged); nothing else on the wire changes,
+because every method is keyed by the three component paths. BOTH packages are pinned in the
+app's catalog (`external_catalog::flux2_klein_package_specs`): the download block offers the
+two weight formats («Веса трансформера» / «Веса текстового энкодера», bf16 or a GGUF quant),
+for 9B the encoder SOURCE («Расцензуренный энкодер»; 4B offers only the stock encoder, so the
+toggle is not drawn there and the flag is inert), the Hugging Face token row while a gated
+spec of the bundle (BFL 9B, the uncensored encoder) is not installed, and ONE pinned bundle
+download through the engine's `OcrModelDownloadController` (which also adopts an existing
+unmarked download once — the backend's former 9B download included). The backend keeps ONE
+pipeline and ONE text encoder resident, keyed by those paths, so selecting the other variant
+unloads the previous one — the panel says so and this side orchestrates nothing.
 
 Working modes are DERIVED from the painted mask, not chosen: there is no switch and no
 persisted field, and `mask_for_run` is the only place the decision is made.
@@ -84,8 +83,8 @@ the user: a fold he has moved by hand is never forced again — see `flux2_insta
 Submodules (each re-exported into this root with `use <name>::*;`):
 - `engine/`: the engine itself. `mod.rs` holds `Flux2KleinEngine`, its `AiEngine` impl and
   the polling that keeps its derived state current; `actions.rs` holds the `start_*` /
-  `poll_*` pair of every long operation (component actions, the HF token, the download,
-  the translator, the pickers and the prompt-cache jobs).
+  `poll_*` pair of every long operation (component actions, the HF token, the translator,
+  the pickers and the prompt-cache jobs); the catalog download is the engine's controller.
 - `ui/`: the parameter panel. `mod.rs` is the body and its ORDER; `install.rs`,
   `components.rs`, `advanced.rs` and `mask_hint.rs` draw the blocks it calls into.
 - `decisions.rs`: the PURE decisions the panel renders — `flux2_readiness_line`,
@@ -98,8 +97,6 @@ Submodules (each re-exported into this root with `use <name>::*;`):
 - `status.rs`: the `.status` component catalog (`Flux2Status`) and every verdict derived
   from it — `Flux2ModelReadiness`, the merged component rows, the install-fold seed and
   `flux2_pipeline_busy`.
-- `download.rs`: the `.download.check` / `.download.start` half of «Установка модели» — the
-  per-repository verdicts, the transfer plan and the encoder toggle's path repointing.
 - `prompt_cache.rs`: the saved `.msprompt` library — its shapes, its operation gates and
   the whole `.prompt_cache.*` wire block.
 - The memory forecast is NOT a file here: it is `large_models.profiles`, asked through
@@ -110,15 +107,15 @@ Submodules (each re-exported into this root with `use <name>::*;`):
 - `session.rs`: the run channel and the pickers.
 - `wire.rs`: the generation run (including the latent-mask dilation), the `.status` and
   `.component_action` calls and the image/mask blob encoding.
-- The MODEL-AGNOSTIC parts are not files here: the progress state of all four long
+- The MODEL-AGNOSTIC parts are not files here: the progress state of all three long
   operations with its generation guard, rate window, frame parser and streaming call, the
-  Hugging Face check/plan/token/download vocabulary and its drawing, the settings-file
+  Hugging Face token controls and their drawing, the settings-file
   quarantine and save backoff, and `mask_for_run` are `../shared/` (`use super::shared::*`),
   and the forecast / caps / learned-floor state is `ai_editor::large_model_resources`'
   `ResourcesController`.
 - `variant_presentation.rs`: the `Flux2VariantPresentation` extension trait — the picker
-  caption and the Hugging Face repository of a variant, which belong to this module rather
-  than to the configuration crate that declares the enum.
+  caption of a variant, which belongs to this module rather than to the configuration crate
+  that declares the enum.
 - `test_support.rs`: `cfg(test)` only — the fixtures every `mod tests` here is built from.
 
 Key items:
@@ -218,22 +215,12 @@ IPC (`backend_ipc::protocol`):
   `config::flux2_klein_dir(variant)` and the encoder toggle and the manual fields are never read
   or written, so a hand-built model tree survives a download and flipping back restores it
   exactly. That is why a finished download does not write its paths into the settings.
-- `.download.check` / `.download.start` — the model download from Hugging Face. `check` is
-  one-shot and answers a per-repository access verdict (`ok` / `no_token` / `invalid_token` /
-  `not_accepted` / `not_found` / `network_error`, each with the backend's own `message`) plus a
-  NULLABLE `plan` of total/missing bytes with a `plan_error` companion — an absent plan means
-  the size is NOT KNOWN and forbids both a size and a completion state, whatever the states
-  say, because a zero-valued plan reads as "nothing left to download"; `start` is STREAMING and claims the same progress bar as a
-  generation, with `step`/`total` as OVERALL BYTES and three OPTIONAL fields
-  (`file_step`/`file_total`/`file_label`) for the file in flight. Both carry `hf_token`,
-  `uncensored` and `variant` as their own top-level request fields — never inside `params`.
-  `variant` is `"9b"` (the default when absent) or `"4b"`, `check` ECHOES it back so a stale
-  answer is detectable, and `"4b"` with `uncensored = true` is refused backend-side, which
-  is why the UI never offers that combination. The token is the
-  process-wide `ms_sysprobe::hf_token` global (OS secret store, service `"ManhwaStudio Hugging Face"`),
-  is NOT a setting of this engine, and must never be logged. A finished download writes its
-  answered paths only to LOG a disagreement with the derived ones. The wire contract is
-  `dev-docs/flux2_model_download.md`.
+- THE DOWNLOAD is not a backend method (the backend's `.download.*` were retired at protocol
+  22): in download mode the engine's `OcrModelDownloadController` fetches the pinned catalog
+  bundle of the selection (`flux2_catalog_bundle`), checks Hugging Face access to its gated
+  repositories in Rust (`ms_sysprobe::ai_models::hf_access`) and adopts files already on disk.
+  The token is the process-wide `ms_sysprobe::hf_token` global (OS secret store), is NOT a
+  setting of this engine, and must never be logged; this panel only edits it (the token row).
 - `.component_action` — STREAMING, one per-component load / unload / move / warm-up.
   Header: `component`, `action` and the normalized `params`; the answer repeats the
   `.status` `components` block as it stands after the action. It claims the SAME progress
@@ -266,17 +253,16 @@ Contracts:
   terminal "the bar is done" — is dropped. A cancel and a moved frame both retire the
   current generation and cancel the request behind it. The bar lives in this engine's own
   panel: there is no shared progress vocabulary between engines
-  (`dev-docs/region_edit_v2_plan.md` §13.2 D13). FOUR operations claim it — a generation,
-  `.prompt_cache.build`, `.component_action` and `.download.start` — and every gate that means
-  "wait for the current operation" reads `flux2_pipeline_busy` over all four rather than one
-  receiver. The RUN gate reads `non_run_pipeline_busy` instead — the same rule with the
-  generation taken out, so a run cannot report itself as the reason it cannot start while the
-  other three genuinely block one. The bar has a SECOND level, published only by the download:
-  `step`/`total` stay the overall counter and `file_step`/`file_total`/`file_label` are
-  optional, so a frame without them renders the overall bar alone rather than a second bar
-  frozen at zero. The transfer SPEED and the remaining TIME are derived here from those
-  frames — no wire field carries either — by `RateEstimator`, over the overall counter
-  only, and are absent rather than wrong until the window is wide enough to mean something.
+  (`dev-docs/region_edit_v2_plan.md` §13.2 D13). THREE operations claim it — a generation,
+  `.prompt_cache.build` and `.component_action` — and every gate that means "wait for the
+  current operation" reads `flux2_pipeline_busy` over all three rather than one receiver.
+  The RUN gate reads `non_run_pipeline_busy` instead — the same rule with the generation
+  taken out, so a run cannot report itself as the reason it cannot start while the other two
+  genuinely block one. The bar has an optional SECOND level (`file_step`/`file_total`/
+  `file_label`, a checkpoint read of a load), so a frame without them renders the overall
+  bar alone rather than a second bar frozen at zero; its read SPEED is derived here from
+  those frames by the shared `RateEstimator`. The catalog download has its own progress in
+  its block (`draw_ocr_model_download`).
 - The prompt sent to the backend is the ENGLISH field. The optional second field plus
   the Google/Yandex/DeepL picker only fill it in, reusing the translation tab's own
   dispatcher (`translate_texts_via_translator`, paced by the same process-wide MT request
@@ -313,12 +299,12 @@ use ms_region_postprocess::{PostprocessSettings, dilate_ellipse};
 use ms_backend_ipc as backend_ipc;
 use ms_canvas::OverlayRectPx;
 use ms_config as config;
-use ms_config::{Flux2Variant, Flux2WeightAxis, Flux2WeightFormat};
-// The catalog package of a variant that downloads from the Rust catalog (4B): its pinned specs
-// per weight format, and the explicit-download controller and panel block shared with the
-// Translation tab (the SDXL engine is the other cleaning consumer).
+use ms_config::{Flux2EncoderSource, Flux2Variant, Flux2WeightAxis, Flux2WeightFormat};
+// The catalog package of both variants: its pinned specs per weight format and encoder source,
+// and the explicit-download controller and panel block shared with the Translation tab (the
+// SDXL engine is the other cleaning consumer).
 use ms_sysprobe::ai_models::external::ExternalModelSpec;
-use ms_sysprobe::ai_models::external_catalog::{flux2_klein_package_specs, flux2_klein_spec};
+use ms_sysprobe::ai_models::external_catalog::{Flux2TransformerLayout, flux2_klein_package_specs, flux2_klein_spec};
 use ms_tab_translation::ocr_model_download::{JobKind, OcrModelDownloadController, OcrModelDownloadState, OcrModelPanelSnapshot, bundle_key};
 use ms_tab_translation::panels::ocr_model_download::{ModelDownloadAction, draw_ocr_model_download};
 use crate::tools::base::RegionEditToolBase;
@@ -333,7 +319,7 @@ use crate::tools::ai_editor::large_model_resources::{ResourcesAction, ResourcesC
 use super::shared::*;
 use ms_tab_translation::machine_translation::{MtService, translate_texts_via_translator};
 use ms_tab_translation::panels::machine_translation::{MT_SOURCE_LANGUAGES, MtLanguage};
-use ms_widgets::{HfAccessHint, SeedSpinBox, WheelComboBox, WheelSlider};
+use ms_widgets::{SeedSpinBox, WheelComboBox, WheelSlider};
 use eframe::egui;
 use egui::Color32;
 // The wire PNG encoders, shared by `wire.rs` (through its `use super::*`) and the tests.
@@ -346,8 +332,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use web_time::{Duration, Instant};
 
-// The caption and the model repository of a `Flux2Variant` — the enum's presentation half,
-// which an extension trait supplies because the enum itself is declared in `ms-config`.
+// The picker caption of a `Flux2Variant` — the enum's presentation half, which an extension
+// trait supplies because the enum itself is declared in `ms-config`.
 mod variant_presentation;
 use variant_presentation::*;
 // Persisted parameters, the wire vocabulary they are spelled in, and their file IO.
@@ -356,9 +342,6 @@ use settings::*;
 // The `.status` component catalog and every verdict derived from it.
 mod status;
 use status::*;
-// The model-installation pre-flight check and the download call itself.
-mod download;
-use download::*;
 // The saved `.msprompt` library, its gates and the `.prompt_cache.*` wire block.
 mod prompt_cache;
 use prompt_cache::*;

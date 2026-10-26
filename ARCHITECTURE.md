@@ -519,16 +519,18 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   download is explicit (never implicit on use), resumable and cancellable. The main model repo is
   unpinned (size + server identity, LFS sha256 when announced). Third-party models — Baberu OCR,
   the PaddleOCR-VL variants, EasyOCR (one shared dir, detector stored once), Surya, the SDXL configs,
-  the one curated SDXL inpaint repo and FLUX.2 klein 4B (the BFL package plus the GGUF transformer
-  and Qwen3 encoder quants; existing unmarked files are adopted by hash, never re-downloaded)
-  — come from the pinned external catalog
+  the one curated SDXL inpaint repo and FLUX.2 klein 4B and 9B (the BFL packages, the GGUF
+  transformer and Qwen3 encoder quants, the 9B uncensored encoder; existing unmarked files are
+  adopted by hash, never re-downloaded) — come from the pinned external catalog
   (`ai_models::external_catalog`: source, commit/URL, per-file size + sha256; regenerated with
   `tools/model_pins/`), the one owner of those facts. Rust sends the backend absolute paths and the
   backend loads them offline only (`local_files_only`, no library downloads); EasyOCR / Surya
-  library versions are pinned to match the catalog. The backend itself still downloads only FLUX
-  (FLUX.2 klein 9B, FLUX.3 klein, FLUX.1 Fill), watermark and Reline weights, through
+  library versions are pinned to match the catalog. Gated Hugging Face repositories get an
+  access preflight (`ai_models::hf_access`: no token / token rejected / terms not accepted) before
+  any transfer, and a 401/403 maps to the same typed answer. The backend itself still downloads
+  only FLUX.3 klein and FLUX.1 Fill, watermark and Reline weights, through
   `engines/model_download.py` (same network rules).
-- **GGUF weights.** FLUX.2 klein 4B's transformer and text encoder may be GGUF files (format ids
+- **GGUF weights.** FLUX.2 klein's (4B and 9B) transformer and text encoder may be GGUF files (format ids
   from `ms_config::Flux2WeightFormat`, opaque to the backend, which reads the quant from the file).
   Every weight file goes through ONE container seam (`runtime/tensor_container`: safetensors or
   GGUF, header `runtime/gguf_stream`); quantized tensors stay quantized in memory as uint8 rows and

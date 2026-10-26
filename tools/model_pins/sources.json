@@ -428,6 +428,80 @@
       "note": "ms_sysprobe external_catalog FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_* (one per ms_config::Flux2WeightFormat GGUF quant)"
     },
     {
+      "id": "flux2-klein-9b/black-forest-labs/FLUX.2-klein-9B",
+      "kind": "hf_repo",
+      "repo": "black-forest-labs/FLUX.2-klein-9B",
+      "revision": "92196c8e11f7b6cf2b7493e037d8c5345c559216",
+      "paths": [
+        "LICENSE.md",
+        "model_index.json",
+        "scheduler/scheduler_config.json",
+        "tokenizer/added_tokens.json",
+        "tokenizer/chat_template.jinja",
+        "tokenizer/merges.txt",
+        "tokenizer/special_tokens_map.json",
+        "tokenizer/tokenizer.json",
+        "tokenizer/tokenizer_config.json",
+        "tokenizer/vocab.json",
+        "vae/config.json",
+        "vae/diffusion_pytorch_model.safetensors",
+        "transformer/config.json",
+        "text_encoder/config.json",
+        "text_encoder/generation_config.json",
+        "flux-2-klein-9b.safetensors",
+        "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+        "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+        "transformer/diffusion_pytorch_model.safetensors.index.json",
+        "text_encoder/model-00001-of-00004.safetensors",
+        "text_encoder/model-00002-of-00004.safetensors",
+        "text_encoder/model-00003-of-00004.safetensors",
+        "text_encoder/model-00004-of-00004.safetensors",
+        "text_encoder/model.safetensors.index.json"
+      ],
+      "note": "ms_sysprobe external_catalog FLUX2_KLEIN_9B_BASE + _TEXT_ENCODER_CONFIG (text_encoder/config.json + generation_config.json) + _TRANSFORMER_BF16 (BFL single file) + _TRANSFORMER_BF16_DIFFUSERS (adopt-only legacy shards) + _TEXT_ENCODER_BF16. GATED repository: reading it needs a Hugging Face token (HF_TOKEN) of an account that accepted the model's terms; compute_pins.py sends no token yet, so this row fails until it does (the current pins were read from the tree API with a token)"
+    },
+    {
+      "id": "flux2-klein-9b/unsloth/FLUX.2-klein-9B-GGUF",
+      "kind": "hf_repo",
+      "repo": "unsloth/FLUX.2-klein-9B-GGUF",
+      "revision": "fde8634245fe6b749a221c25b34672b5b8fbd079",
+      "paths": [
+        "flux-2-klein-9b-Q8_0.gguf",
+        "flux-2-klein-9b-Q6_K.gguf",
+        "flux-2-klein-9b-Q5_K_M.gguf",
+        "flux-2-klein-9b-Q4_K_M.gguf"
+      ],
+      "note": "ms_sysprobe external_catalog FLUX2_KLEIN_9B_TRANSFORMER_GGUF_* (one per ms_config::Flux2WeightFormat GGUF quant)"
+    },
+    {
+      "id": "flux2-klein-9b/unsloth/Qwen3-8B-GGUF",
+      "kind": "hf_repo",
+      "repo": "unsloth/Qwen3-8B-GGUF",
+      "revision": "a6adef130ffb23ddaf1a62fec9dced968c9bc482",
+      "paths": [
+        "Qwen3-8B-Q8_0.gguf",
+        "Qwen3-8B-Q6_K.gguf",
+        "Qwen3-8B-Q5_K_M.gguf",
+        "Qwen3-8B-Q4_K_M.gguf"
+      ],
+      "note": "ms_sysprobe external_catalog FLUX2_KLEIN_9B_TEXT_ENCODER_GGUF_* (one per ms_config::Flux2WeightFormat GGUF quant)"
+    },
+    {
+      "id": "flux2-klein-9b/ponpoke/flux2-klein-9b-uncensored-text-encoder",
+      "kind": "hf_repo",
+      "repo": "ponpoke/flux2-klein-9b-uncensored-text-encoder",
+      "revision": "fba36e796aac081246708dd30392a401ba44922e",
+      "paths": [
+        "model.safetensors",
+        "config.json",
+        "generation_config.json",
+        "flux2-klein-9b-uncensored-q8_0.gguf",
+        "flux2-klein-9b-uncensored-q6_k.gguf",
+        "flux2-klein-9b-uncensored-q4_k_m.gguf"
+      ],
+      "note": "ms_sysprobe external_catalog FLUX2_KLEIN_9B_TEXT_ENCODER_UNCENSORED_BF16 (F16 weights + the two configs; no tokenizer, the official one is used) + _UNCENSORED_GGUF_* (the publisher ships no Q5_K_M, ms_config::Flux2WeightFormat::offered_for). GATED repository: reading it needs a Hugging Face token (HF_TOKEN) of an account that accepted the model's terms; compute_pins.py sends no token yet, so this row fails until it does (the current pins were read from the tree API with a token)"
+    },
+    {
       "id": "lama-mpe/main-repo",
       "kind": "hf_repo",
       "repo": "Vasyanator2/ManhwaStudio_AI_Models",

@@ -61,7 +61,7 @@ pub(super) enum Flux2RunPoll {
 #[derive(Default)]
 pub(super) struct Flux2SessionState {
     pub(super) run_rx: Option<Receiver<Flux2JobResult>>,
-    /// Cancelled operations (runs, downloads) whose workers have not ended yet; while one is
+    /// Cancelled runs whose workers have not ended yet; while one is
     /// running nothing new starts on the backend's pipeline (`Flux2KleinEngine::pipeline_busy`).
     pub(super) abandoned: AbandonedJobs,
 }
@@ -226,7 +226,8 @@ const FLUX2_TEXT_ENCODER_FILE_EXTENSIONS: &[&str] = &["gguf"];
 pub(super) enum Flux2PickerPurpose {
     TextEncoderDir,
     /// A GGUF text encoder FILE in manual mode (the bf16 encoder is a folder,
-    /// `TextEncoderDir`); its tokenizer and config come from the 4B package around it.
+    /// `TextEncoderDir`); its tokenizer and config come from the FLUX.2 klein package around
+    /// it (or an installed package of the same variant, the backend's fallback).
     TextEncoderFile,
     TransformerFile,
     TransformerDir,

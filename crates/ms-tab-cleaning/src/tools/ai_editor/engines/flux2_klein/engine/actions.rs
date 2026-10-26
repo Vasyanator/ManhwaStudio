@@ -8,12 +8,9 @@ the channel it answers on, and nothing in between runs on the GUI thread.
 
 Main responsibilities:
 - the per-component load/unload actions (`start_component_action`, `poll_component_action`);
-- the Hugging Face token, which travels in the request and never into the settings file
-  (the shared `HfTokenControl`, drained by `poll_hf_token`);
-- the backend model download (9B only; a catalog variant is refused locally,
-  `refuse_backend_download`): the pre-flight check, the transfer, its cancellation, and the
-  derivation it applies when it finishes (`start_download_check` .. `apply_download_outcome`);
-  the catalog download of 4B is the engine's `OcrModelDownloadController`, driven from
+- the Hugging Face token field, whose value goes only into the OS secret store and never
+  into the settings file (the shared `HfTokenControl`, drained by `poll_hf_token`); the
+  catalog download that uses it is the engine's `OcrModelDownloadController`, driven from
   `mod.rs`;
 - the prompt translation (`start_translate`, `poll_translate`) and the non-blocking file
   dialogs (`start_picker`, `poll_picker`);
@@ -25,11 +22,10 @@ Key functions:
 
 Notes:
 A second inherent `impl Flux2KleinEngine` block; the state these methods move is declared
-in `mod.rs` beside the struct. All four operations here share ONE progress bar and claim
-it by GENERATION, so a write from a retired job is dropped — see
-`../../shared/stream_progress.rs`. The
-gate that means "wait for the current operation" is `pipeline_busy`, in `mod.rs`, and it
-reads all four channels at once.
+in `mod.rs` beside the struct. The component actions and the prompt-cache build share ONE
+progress bar with the run and claim it by GENERATION, so a write from a retired job is
+dropped — see `../../shared/stream_progress.rs`. The gate that means "wait for the current
+operation" is `pipeline_busy`, in `mod.rs`, and it reads all three channels at once.
 */
 
 use super::*;
@@ -127,235 +123,10 @@ impl Flux2KleinEngine {
 
     /// Drains the secret-store operation of the token field (the shared `HfTokenControl`).
     ///
-    /// A finished operation also drops the last access check: it was computed for the
-    /// PREVIOUS token and would otherwise keep claiming access the new one may not have.
+    /// Nothing else is reset here: the catalog controller notices a changed token by itself
+    /// and re-checks the gated repositories' access.
     pub(super) fn poll_hf_token(&mut self) {
-        if self.hf_token.poll(FLUX2_LOG_LABEL) {
-            self.download_check = None;
-            self.download_check_error = None;
-        }
-    }
-
-    /// Starts the one-shot `.download.check` on a worker thread.
-    ///
-    /// The token is read from the process-wide cache rather than from the field: the field
-    /// holds what the user is TYPING, while the check must ask about what is actually
-    /// stored — otherwise a typo that was never saved would report access the download
-    /// then cannot use.
-    pub(super) fn start_download_check(&mut self) {
-        if self.download_check_rx.is_some() || self.pipeline_busy() || self.refuse_backend_download("check") {
-            return;
-        }
-        let uncensored = self.settings.uncensored_encoder_active();
-        let header = flux2_download_header(&ms_sysprobe::hf_token::hf_token(), uncensored, self.variant);
-        let (tx, rx) = mpsc::channel();
-        self.download_check_rx = Some(rx);
-        self.download_check_error = None;
-        thread::spawn(move || {
-            // Stamped on the worker, from the value that actually travelled: the answer
-            // describes THAT toggle, whatever the user flips while it is in flight.
-            let answer = check_flux2_download(header).map(|mut check| {
-                check.question.uncensored = uncensored;
-                check
-            });
-            let _ = tx.send(answer);
-        });
-    }
-
-
-    /// Drains the access-check channel.
-    ///
-    /// A `variant` ECHO that disagrees with this engine's checkpoint is REPORTED, not
-    /// dropped: the answer prices a different download, and silently discarding it would
-    /// leave «Скачать» dead with nothing on screen to explain it. This is never the other
-    /// engine's in-flight answer — the channel is created per engine instance by
-    /// [`Self::start_download_check`] and only that instance's worker ever writes to it —
-    /// so the only thing a mismatch can mean is a backend that answered about a checkpoint
-    /// nobody asked for, typically one too old to know the field at all.
-    pub(super) fn poll_download_check(&mut self) {
-        let Some(rx) = self.download_check_rx.as_ref() else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(Ok(check)) => {
-                self.download_check_rx = None;
-                self.download_check_error = None;
-                if let Some(message) = download_check_variant_mismatch(&check, self.variant) {
-                    ms_log::runtime_log::log_warn(format!(
-                        "[cleaning] FLUX.2 klein download access check answered about variant {}, but {} was requested; the answer is discarded",
-                        check.question.variant.wire(),
-                        self.variant.wire()
-                    ));
-                    // The previous answer, if any, described THIS variant and is still
-                    // true, so it is left in place; only the failed refresh is reported.
-                    self.download_check_error = Some(message);
-                    return;
-                }
-                // The technical half goes to the log with the repository it belongs to:
-                // the row on screen carries the localized state, and `network_error` has
-                // no localizable content at all. The request's token is not in scope here
-                // and must never enter this line.
-                for repo in &check.repos {
-                    if repo.state != Some(HfDownloadState::Ok) {
-                        ms_log::runtime_log::log_warn(format!(
-                            "[cleaning] FLUX.2 klein download access check: repo {}, state {}, message: {}",
-                            repo.repo, repo.state_wire, repo.message
-                        ));
-                    }
-                }
-                // A missing plan is its own diagnosis and a different failure from a
-                // refused repository: access succeeded and the LISTING did not.
-                if check.plan.is_none() {
-                    ms_log::runtime_log::log_warn(format!(
-                        "[cleaning] FLUX.2 klein download access check returned no plan; the download size is unknown. Reason: {}",
-                        check.plan_error
-                    ));
-                }
-                self.download_check = Some(check);
-            }
-            Ok(Err(err)) => {
-                self.download_check_rx = None;
-                self.download_check_error = Some(err);
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.download_check_rx = None;
-                self.download_check_error =
-                    Some(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string());
-            }
-            Err(TryRecvError::Empty) => {}
-        }
-    }
-
-    /// Starts the streaming `.download.start` on a worker thread.
-    ///
-    /// Claims the shared progress bar here, on the GUI thread, exactly as a generation and
-    /// a `.prompt_cache.build` do: that is what lets a cancel retire it and what makes the
-    /// four operations mutually exclusive.
-    pub(super) fn start_download(&mut self) {
-        if self.pipeline_busy() || self.refuse_backend_download("start") {
-            return;
-        }
-        let header = flux2_download_header(
-            &ms_sysprobe::hf_token::hf_token(),
-            self.settings.uncensored_encoder_active(),
-            self.variant,
-        );
-        let claim = begin_progress_generation(&self.progress);
-        let progress = Arc::clone(&self.progress);
-        let (tx, rx) = mpsc::channel();
-        self.download_rx = Some(rx);
-        self.download_status =
-            Some(t!("cleaning.tools.flux2_klein.download.running_status").to_string());
-        thread::spawn(move || {
-            let _ = tx.send(run_flux2_download(header, &progress, &claim));
-        });
-    }
-
-    /// Whether this variant must NOT use the backend's `.download.*` (its package comes from
-    /// the Rust catalog: the panel draws the catalog block instead, and since protocol 21 the
-    /// backend refuses `variant = "4b"`). Unreachable from the UI; a refused call is logged,
-    /// never sent.
-    fn refuse_backend_download(&self, method: &str) -> bool {
-        if !self.variant.downloads_from_catalog() {
-            return false;
-        }
-        ms_log::runtime_log::log_warn(format!(
-            "[cleaning] FLUX.2 klein {}: .download.{method} refused locally; this variant downloads from the app's catalog",
-            self.variant.wire()
-        ));
-        true
-    }
-
-    /// Abandons the download in flight: its answer is discarded, its progress generation is
-    /// retired so it can neither move nor stop the bar of whatever runs next, and the
-    /// backend is told to stop instead of pulling gigabytes nobody will keep.
-    ///
-    /// Files already published on disk stay — they are complete and were renamed
-    /// atomically, so a re-run resumes at file granularity.
-    pub(super) fn cancel_download(&mut self) {
-        let Some(rx) = self.download_rx.take() else {
-            return;
-        };
-        // Kept until the worker ends: the backend stops at its next chunk, and nothing may
-        // start on the pipeline before it has (`pipeline_busy`).
-        self.session.abandoned.push(rx);
-        retire_progress_generation(&self.progress, FLUX2_LOG_LABEL);
-        self.download_status =
-            Some(t!("cleaning.tools.flux2_klein.download.cancelled_status").to_string());
-    }
-
-    /// Drains the download channel and CONFIGURES THE ENGINE from a finished download.
-    ///
-    /// The three answered paths are written into the settings and the file is marked dirty,
-    /// so the user does not then hand-pick paths for files the tool has just placed. Only
-    /// non-empty paths are written: a partial answer must not blank a path the user set by
-    /// hand. `.status`, the forecast and the prompt-cache listing are all re-armed, because
-    /// new model paths change every one of their answers.
-    pub(super) fn poll_download(&mut self) {
-        let Some(rx) = self.download_rx.as_ref() else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(Ok(outcome)) => {
-                self.download_rx = None;
-                self.apply_download_outcome(&outcome);
-            }
-            Ok(Err(err)) => {
-                self.download_rx = None;
-                ms_log::runtime_log::log_warn(format!(
-                    "[cleaning] FLUX.2 klein model download failed: {err}"
-                ));
-                self.download_status =
-                    Some(tf!("cleaning.tools.flux2_klein.download.error", err = err));
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.download_rx = None;
-                self.download_status =
-                    Some(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string());
-            }
-            Err(TryRecvError::Empty) => {}
-        }
-    }
-
-    /// Writes a finished download's paths into the settings and re-arms every query whose
-    /// answer the new files invalidate.
-    pub(super) fn apply_download_outcome(&mut self, outcome: &Flux2DownloadOutcome) {
-        // The answer's paths are NOT written into the settings. In download mode the three
-        // effective paths are derived from the models directory and the encoder toggle
-        // (`Flux2KleinSettings::effective_paths`), so the engine is already configured and
-        // stays configured; the manual fields belong to the OTHER mode and hold a
-        // configuration the user can switch back to. Writing here would silently destroy a
-        // hand-built model tree, which is exactly what a download must not cost.
-        //
-        // They are still worth comparing: the backend put the files somewhere, and if that
-        // is not where this side derives them from, the two halves have drifted and the
-        // engine would look for a model that is not there. That is a bug report, not a
-        // reason to adopt the backend's answer.
-        let derived = self.settings.effective_paths();
-        for (component, derived, answered) in [
-            ("transformer", &derived.transformer, &outcome.transformer_path),
-            ("text_encoder", &derived.text_encoder, &outcome.text_encoder_path),
-            ("vae", &derived.vae, &outcome.vae_path),
-        ] {
-            if !answered.is_empty() && answered != derived {
-                ms_log::runtime_log::log_warn(format!(
-                    "[cleaning] FLUX.2 klein download placed {component} at {answered}, but this build derives it from {derived}. The two halves disagree about the model layout."
-                ));
-            }
-        }
-        // The files on disk changed, so what the backend reports about them did too — and
-        // the forecast question is the SAME (the derived paths did not move), so it is
-        // invalidated rather than merely re-armed.
-        self.status_wanted = true;
-        self.invalidate_forecast();
-        self.prompt_cache_list_wanted = true;
-        // The plan is spent: the missing bytes it named are on disk now.
-        self.download_check = None;
-        self.download_status = Some(tf!(
-            "cleaning.tools.flux2_klein.download.done_status",
-            size = format_gib(outcome.downloaded_bytes),
-            skipped = outcome.skipped_files
-        ));
+        self.hf_token.poll(FLUX2_LOG_LABEL);
     }
 
     /// Drains the prompt-translation channel into the English prompt field.
@@ -777,83 +548,12 @@ impl Flux2KleinEngine {
 mod tests {
     use super::*;
 
-    /// A check answer about ANOTHER checkpoint is reported, never dropped in silence.
-    ///
-    /// The staleness filter alone would hide it and leave «Скачать» dead with nothing on
-    /// screen — the exact failure the panel cannot recover from. This channel is created per
-    /// engine instance, so a mismatch is never the other engine's in-flight answer; it is a
-    /// backend that answered about a checkpoint nobody asked for.
+    /// The token is a CREDENTIAL: the field's buffer reaches no settings file, no `params`
+    /// and no persisted document at all (the catalog download reads it from the OS secret
+    /// store).
     #[test]
-    fn a_check_answer_about_another_checkpoint_is_reported_and_leaves_the_old_one_alone() {
-        // The assertion below reads a UI string, and `t!` / `tf!` / `ms_i18n::lookup`
-        // answer against the PROCESS-GLOBAL active catalog: with none installed they
-        // degrade to the bare key. Install the reference catalog under the shared lock
-        // (the catalog slot is one `ArcSwap`, so tests must serialize on it).
-        let _locale_guard = ms_config::locale_store::GLOBAL_LOCALE_LOCK.lock().expect("locale lock");
-        let en = ms_i18n::LocaleTag::parse("en").expect("en tag is valid");
-        ms_i18n::set_locale(&en).expect("en catalog installs");
-        let previous = Flux2DownloadCheck {
-            question: Flux2CheckQuestion { variant: Flux2Variant::Klein9B, ..Flux2CheckQuestion::default() },
-            plan_error: "the previous, correct answer".to_string(),
-            ..Flux2DownloadCheck::default()
-        };
-        let (tx, rx) = mpsc::channel();
-        let mut engine = Flux2KleinEngine {
-            download_check: Some(previous.clone()),
-            download_check_rx: Some(rx),
-            ..Flux2KleinEngine::default()
-        };
-        tx.send(Ok(Flux2DownloadCheck {
-            question: Flux2CheckQuestion { variant: Flux2Variant::Klein4B, ..Flux2CheckQuestion::default() },
-            ..Flux2DownloadCheck::default()
-        }))
-        .expect("the receiver is alive");
-        engine.poll_download_check();
-
-        assert!(engine.download_check_rx.is_none(), "the one-shot query is over either way");
-        assert_eq!(
-            engine.download_check.as_ref(),
-            Some(&previous),
-            "the previous answer described THIS checkpoint and is still true"
-        );
-        let error = engine
-            .download_check_error
-            .as_deref()
-            .expect("the disagreement must reach the user");
-        assert!(error.contains("4b") && error.contains("9b"), "{error}");
-    }
-
-    /// The agreeing case, so the guard above cannot silently reject everything.
-    #[test]
-    fn a_check_answer_about_this_checkpoint_is_stored() {
-        let answer = Flux2DownloadCheck {
-            question: Flux2CheckQuestion { variant: Flux2Variant::Klein9B, ..Flux2CheckQuestion::default() },
-            ..Flux2DownloadCheck::default()
-        };
-        let (tx, rx) = mpsc::channel();
-        let mut engine = Flux2KleinEngine {
-            download_check_rx: Some(rx),
-            ..Flux2KleinEngine::default()
-        };
-        tx.send(Ok(answer.clone())).expect("the receiver is alive");
-        engine.poll_download_check();
-        assert_eq!(engine.download_check.as_ref(), Some(&answer));
-        assert!(engine.download_check_error.is_none());
-    }
-
-    /// The token is a CREDENTIAL: it travels as a per-call request field and reaches no
-    /// settings file, no `params` and no persisted document at all.
-    #[test]
-    fn the_token_travels_in_the_request_and_never_into_the_settings() {
+    fn the_token_never_reaches_the_settings_or_the_params() {
         const SECRET: &str = "hf_a_token_that_must_never_be_persisted";
-
-        let header = flux2_download_header(SECRET, true, Flux2Variant::Klein9B);
-        assert_eq!(header["hf_token"], json!(SECRET));
-        assert_eq!(header["uncensored"], json!(true));
-        assert!(
-            header.get("params").is_none(),
-            "the token must not travel inside `params`"
-        );
 
         // A fully configured engine, serialized exactly as `save_flux2_settings` writes it.
         let engine = Flux2KleinEngine {
@@ -878,129 +578,6 @@ mod tests {
                 .to_string()
                 .contains(SECRET),
             "no request `params` may contain the token"
-        );
-    }
-
-    /// What a finished download does NOW: it configures the engine by DERIVATION, not by
-    /// writing paths into the settings.
-    ///
-    /// This replaces the original contract's "a finished download writes its three paths
-    /// into the settings". That rule was safe while the paths block and the download block
-    /// were both always visible; with the two modes it became destructive, because the
-    /// manual fields hold a configuration the user switches back to. Derivation configures
-    /// the engine continuously instead of once, so the write-back is gone — and the
-    /// answered paths are kept only to detect DRIFT between the two halves.
-    #[test]
-    fn a_finished_download_configures_the_engine_by_derivation() {
-        let outcome = parse_flux2_download_outcome(&json!({
-            "paths": {
-                "transformer": " /models/FLUX.2-klein-9B/transformer ",
-                "text_encoder": "/models/FLUX.2-klein-9B/text_encoder_uncensored",
-                "vae": "/models/FLUX.2-klein-9B/vae"
-            },
-            "downloaded_bytes": 40_000_000_000u64,
-            "skipped_files": 4
-        }));
-        assert_eq!(outcome.transformer_path, "/models/FLUX.2-klein-9B/transformer");
-        assert_eq!(outcome.downloaded_bytes, 40_000_000_000);
-        assert_eq!(outcome.skipped_files, 4);
-
-        let mut engine = Flux2KleinEngine {
-            settings: Flux2KleinSettings {
-                source_mode: Flux2SourceMode::Download.wire().to_string(),
-                uncensored_text_encoder: true,
-                ..Flux2KleinSettings::default()
-            },
-            settings_loaded: true,
-            dirty: false,
-            ..Flux2KleinEngine::default()
-        };
-        let before = engine.settings.clone();
-        engine.apply_download_outcome(&outcome);
-
-        // No field of the settings was touched at all — not even a path that happened to
-        // be empty, which the old write-back would have filled in.
-        assert_eq!(
-            serde_json::to_value(&engine.settings).expect("serialize"),
-            serde_json::to_value(&before).expect("serialize"),
-            "a finished download must not write into the settings"
-        );
-        assert!(!engine.dirty);
-
-        // The engine is nevertheless configured: the derived paths point at the files the
-        // download just placed, and they follow the encoder toggle.
-        let paths = engine.settings.effective_paths();
-        assert_eq!(
-            paths.text_encoder,
-            config::flux2_klein_text_encoder_dir(Flux2Variant::Klein9B, true).to_string_lossy()
-        );
-        assert_eq!(
-            paths.transformer,
-            config::flux2_klein_transformer_dir(Flux2Variant::Klein9B).to_string_lossy()
-        );
-        assert_eq!(paths.vae, config::flux2_klein_vae_dir(Flux2Variant::Klein9B).to_string_lossy());
-
-        // Everything the new files invalidate is re-armed, and the spent plan is dropped.
-        assert!(engine.status_wanted && engine.resources.wanted);
-        assert!(engine.prompt_cache_list_wanted);
-        assert!(engine.download_check.is_none());
-
-        // A partial answer is not a reason to write anything either.
-        let partial = parse_flux2_download_outcome(&json!({
-            "paths": { "transformer": "/models/new-transformer" }
-        }));
-        engine.apply_download_outcome(&partial);
-        assert_eq!(
-            serde_json::to_value(&engine.settings).expect("serialize"),
-            serde_json::to_value(&before).expect("serialize")
-        );
-    }
-
-    /// A finished download must not touch the manual fields. This is the destructive case
-    /// the derivation exists to prevent: a hand-built tree the user switches back to.
-    #[test]
-    fn a_finished_download_leaves_the_manual_paths_untouched() {
-        let outcome = parse_flux2_download_outcome(&json!({
-            "paths": {
-                "transformer": "/models/FLUX.2-klein-9B/transformer",
-                "text_encoder": "/models/FLUX.2-klein-9B/text_encoder_uncensored",
-                "vae": "/models/FLUX.2-klein-9B/vae"
-            },
-            "downloaded_bytes": 40_000_000_000u64,
-            "skipped_files": 4
-        }));
-        let hand_made = Flux2KleinSettings {
-            source_mode: Flux2SourceMode::Download.wire().to_string(),
-            text_encoder_path: "/home/u/sd_models/qwen3-uncensored".to_string(),
-            transformer_path: "/home/u/sd_models/flux2.safetensors".to_string(),
-            vae_path: "/home/u/sd_models/vae".to_string(),
-            ..runnable_settings()
-        };
-        let mut engine = Flux2KleinEngine {
-            settings: hand_made.clone(),
-            settings_loaded: true,
-            dirty: false,
-            ..Flux2KleinEngine::default()
-        };
-        engine.apply_download_outcome(&outcome);
-
-        assert_eq!(
-            engine.settings.text_encoder_path, hand_made.text_encoder_path,
-            "a download must never overwrite a hand-built encoder path"
-        );
-        assert_eq!(engine.settings.transformer_path, hand_made.transformer_path);
-        assert_eq!(engine.settings.vae_path, hand_made.vae_path);
-        assert!(!engine.dirty, "nothing was written, so nothing needs saving");
-
-        // Switching back to the manual mode restores exactly the user's configuration.
-        engine.settings.source_mode = Flux2SourceMode::Manual.wire().to_string();
-        assert_eq!(
-            engine.settings.effective_paths(),
-            Flux2EffectivePaths {
-                text_encoder: "/home/u/sd_models/qwen3-uncensored".to_string(),
-                transformer: "/home/u/sd_models/flux2.safetensors".to_string(),
-                vae: "/home/u/sd_models/vae".to_string(),
-            }
         );
     }
 

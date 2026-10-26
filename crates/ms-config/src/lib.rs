@@ -29,12 +29,14 @@ Main items:
   download fills (mirrors the backend's `flux3_download.model_root`) and that engine's
   settings file.
 - `Flux2Variant`: which FLUX.2 klein checkpoint an «ИИ-редактор области» engine works with
-  (9B / 4B). It keys the model directory, the three component directories, the engine's
-  settings file below, the engine id and the two capability gates; its PRESENTATION (picker
-  caption, Hugging Face repository) is the `Flux2VariantPresentation` extension trait in
+  (9B / 4B). It keys the package directory (`flux2_klein_dir`, `flux2_klein_vae_dir`; every
+  weight path inside it is the model catalog's `flux2_klein_weights_path`), the engine's
+  settings file below, the engine id and the `{variant}` size token; its PRESENTATION (picker
+  caption) is the `Flux2VariantPresentation` extension trait in
   `crates/ms-tab-cleaning/src/tools/ai_editor/engines/flux2_klein/variant_presentation.rs`.
-- `flux2_weight_format` (module): `Flux2WeightFormat` / `Flux2WeightAxis`, the ONE list of
-  FLUX.2 klein weight formats (bf16 + GGUF quants) and which ones each variant offers per axis.
+- `flux2_weight_format` (module): `Flux2WeightFormat` / `Flux2WeightAxis` /
+  `Flux2EncoderSource`, the ONE list of FLUX.2 klein weight formats (bf16 + GGUF quants), the
+  encoder sources (stock / uncensored) and which formats each variant offers per axis and source.
 - `AiRuntime`: selected AI runtime (`backend`/`native`) recorded under `General.ai_runtime`.
 - `OrtLoadGuard` / `OrtLoadDecision` / `ort_load_decision` / `ort_load_scope_key` /
   `read_ort_load_guard`: per-scope ONNX Runtime SIGILL load-guard model and its pure
@@ -170,7 +172,7 @@ pub mod version_format;
 // here, next to `Flux2Variant` which keys the offer, because both the engine settings (above)
 // and the pinned catalog in `ms-sysprobe` (below the UI, above this crate) need the one list.
 pub mod flux2_weight_format;
-pub use flux2_weight_format::{Flux2WeightAxis, Flux2WeightFormat};
+pub use flux2_weight_format::{Flux2EncoderSource, Flux2WeightAxis, Flux2WeightFormat};
 
 use crate::bubble_status::default_bubble_status_rules_value;
 use anyhow::{Context, Result};
@@ -1065,16 +1067,16 @@ pub fn flux_fill_components_dir() -> PathBuf {
 ///
 /// The two variants are separate ENGINES in the picker sharing one implementation, and
 /// this is the key that parameterizes it: it names the model directory under
-/// [`side_models_dir`], the engine's own settings file, and the token the download
-/// methods carry on the wire (`"9b"` / `"4b"`).
+/// [`side_models_dir`], the engine's own settings file and its persisted `variant` token
+/// (`"9b"` / `"4b"`).
 ///
 /// It lives here because those are runtime PATH decisions, which belong in this file
-/// (`src/MODULE_README.md`), together with the facts that key an id or a capability
-/// GATE and are therefore needed wherever the enum travels: [`Self::engine_id`],
-/// [`Self::supports_uncensored_encoder`] and [`Self::requires_hf_token`]. Its
-/// PRESENTATION — the localized picker caption and the Hugging Face repository the
-/// download names — belongs to the single crate that consumes it and is supplied there
-/// by the `Flux2VariantPresentation` extension trait
+/// (`src/MODULE_README.md`), together with the facts that key an id and are therefore needed
+/// wherever the enum travels ([`Self::engine_id`], [`Self::size_token`]). Which encoder
+/// sources and weight formats a variant offers is [`Flux2EncoderSource::offered_for`] /
+/// [`Flux2WeightFormat::offered_for`]. Its PRESENTATION — the localized picker caption —
+/// belongs to the single crate that consumes it and is supplied there by the
+/// `Flux2VariantPresentation` extension trait
 /// (`crates/ms-tab-cleaning/src/tools/ai_editor/engines/flux2_klein/variant_presentation.rs`),
 /// because an inherent `impl` is only legal in the defining crate. Either way there is
 /// exactly ONE enum and no mapping table that could drift from it.
@@ -1118,11 +1120,12 @@ impl Flux2Variant {
         }
     }
 
-    /// Name of this variant's model directory under [`side_models_dir`]. For
-    /// [`Self::Klein9B`] it mirrors the repository name the backend downloads from and must
-    /// not drift from `modules/ai_backend/inpaint/flux2_download.py`; for [`Self::Klein4B`]
-    /// every pinned catalog spec lives under it (`ms_sysprobe::ai_models::external_catalog`,
-    /// whose tests check the prefix).
+    /// Name of this variant's model directory under [`side_models_dir`]. FROZEN: installed
+    /// packages live there. Both variants come from the pinned catalog, and every catalog
+    /// spec of a variant lives under it (`ms_sysprobe::ai_models::external_catalog`, whose
+    /// tests check the prefix). The backend spells both names too
+    /// (`modules/ai_backend/inpaint/flux2_klein/components.py`, its package fallback); a test
+    /// here guards that mirror.
     #[must_use]
     pub fn dir_name(self) -> &'static str {
         match self {
@@ -1140,6 +1143,17 @@ impl Flux2Variant {
         match self {
             Self::Klein9B => "flux2_klein_settings.json",
             Self::Klein4B => "flux2_klein_4b_settings.json",
+        }
+    }
+
+    /// The model-size token shown in variant-neutral UI text (`"9B"` / `"4B"`), substituted
+    /// into a `{variant}` placeholder. A technical literal, never localized
+    /// (`dev-docs/i18n_exclusions.md`).
+    #[must_use]
+    pub fn size_token(self) -> &'static str {
+        match self {
+            Self::Klein9B => "9B",
+            Self::Klein4B => "4B",
         }
     }
 
@@ -1161,97 +1175,24 @@ impl Flux2Variant {
             Self::Klein4B => "flux2_klein_4b",
         }
     }
-
-    /// Whether an UNCENSORED text encoder is published for this variant.
-    ///
-    /// Only the 9B one has it (`ponpoke/flux2-klein-9b-uncensored-text-encoder`). For the
-    /// 4B model the toggle is not drawn at all and the flag is forced off before it can
-    /// reach a path or the wire ([`Flux2KleinSettings::normalized`]) — the backend refuses
-    /// `variant = "4b"` together with `uncensored = true`, and offering a control that
-    /// produces a refusal is worse than not offering it.
-    #[must_use]
-    pub fn supports_uncensored_encoder(self) -> bool {
-        match self {
-            Self::Klein9B => true,
-            Self::Klein4B => false,
-        }
-    }
-
-    /// Whether downloading this variant needs a Hugging Face access token.
-    ///
-    /// The 9B repository is GATED (licence `other`), so without an accepted token the
-    /// download cannot even be priced. The 4B one is apache-2.0 and ungated: the token
-    /// block is not drawn for it, and the empty token the request still carries is legal.
-    #[must_use]
-    pub fn requires_hf_token(self) -> bool {
-        match self {
-            Self::Klein9B => true,
-            Self::Klein4B => false,
-        }
-    }
-
-    /// Whether this variant's files come from the application's pinned external catalog
-    /// (`ms_sysprobe::ai_models::external_catalog::flux2_klein_package_specs`) instead of the
-    /// backend's Hugging Face download.
-    ///
-    /// The 4B package (BFL bf16 files plus the GGUF quants of `Flux2WeightFormat`) is pinned
-    /// there and the backend refuses to download it; the gated 9B one keeps the backend
-    /// download.
-    #[must_use]
-    pub fn downloads_from_catalog(self) -> bool {
-        match self {
-            Self::Klein9B => false,
-            Self::Klein4B => true,
-        }
-    }
 }
 
-/// FLUX.2 klein: root of the diffusers tree the panel's Hugging Face download fills
-/// (`transformer/`, `text_encoder/`, `text_encoder_uncensored/`, `tokenizer/`, `vae/`,
-/// `scheduler/`).
-///
-/// The backend creates and populates it for [`Flux2Variant::Klein9B`]; the pinned catalog
-/// does for [`Flux2Variant::Klein4B`] ([`Flux2Variant::downloads_from_catalog`], which adds
-/// the `transformer_gguf/` and `text_encoder_gguf/` folders). This side needs the path because the
-/// «Расцензуренный энкодер» toggle repoints `text_encoder_path` between the two encoder
-/// directories with no download at all when both are already on disk.
+/// FLUX.2 klein: the package root of `variant` under [`side_models_dir`], which the app's
+/// pinned model catalog fills for both variants (`ms_sysprobe::ai_models::external_catalog`,
+/// `flux2_klein_package_specs`: the BFL base files, the bf16 weights, the GGUF quants under
+/// `transformer_gguf/` / `text_encoder*_gguf/`, and for 9B the uncensored encoder). Where each
+/// weight component lives inside it is the catalog's answer (`flux2_klein_weights_path`); this
+/// side names only the root and the VAE folder, which has no weight format.
 #[must_use]
 pub fn flux2_klein_dir(variant: Flux2Variant) -> PathBuf {
     side_models_dir().join(variant.dir_name())
 }
 
-/// Directory of the FLUX.2 klein transformer the download fills.
-///
-/// The subdirectory name mirrors `TRANSFORMER_SUBDIR` in
-/// `modules/ai_backend/inpaint/flux2_download.py`; the two must not drift.
-#[must_use]
-pub fn flux2_klein_transformer_dir(variant: Flux2Variant) -> PathBuf {
-    flux2_klein_dir(variant).join("transformer")
-}
-
-/// Directory of the FLUX.2 klein VAE the download fills.
-///
-/// The subdirectory name mirrors `VAE_SUBDIR` in
-/// `modules/ai_backend/inpaint/flux2_download.py`; the two must not drift.
+/// Directory of the FLUX.2 klein VAE inside the package (`vae/`, part of the catalog's base
+/// spec of the variant, whose tests check this folder name against its pinned files).
 #[must_use]
 pub fn flux2_klein_vae_dir(variant: Flux2Variant) -> PathBuf {
     flux2_klein_dir(variant).join("vae")
-}
-
-/// Directory of the FLUX.2 klein text encoder the toggle selects.
-///
-/// `uncensored` picks `text_encoder_uncensored/` over the official `text_encoder/`.
-/// Both may sit on disk at once, which is what lets the toggle switch between them
-/// without transferring anything. Only [`Flux2Variant::Klein9B`] has an uncensored
-/// encoder published for it; the caller is what keeps `uncensored` false for the other
-/// variant (`Flux2Variant::supports_uncensored_encoder`).
-#[must_use]
-pub fn flux2_klein_text_encoder_dir(variant: Flux2Variant, uncensored: bool) -> PathBuf {
-    flux2_klein_dir(variant).join(if uncensored {
-        "text_encoder_uncensored"
-    } else {
-        "text_encoder"
-    })
 }
 
 /// FLUX.3 klein: root of the model package the «ИИ-редактор области» download fills
@@ -3352,33 +3293,40 @@ mod tests {
         assert_eq!(Flux2Variant::from_wire(" 4b "), Flux2Variant::Klein4B);
     }
 
-    /// The uncensored encoder and the access token are the two capabilities the panel
-    /// gates a control on, so a wrong answer here draws a control that cannot work.
+    /// The size token is substituted into `{variant}` placeholders of variant-neutral UI
+    /// text; both must be distinct and match the directory names' spelling.
     #[test]
-    fn only_the_9b_variant_has_an_uncensored_encoder_and_a_gated_repository() {
-        assert!(Flux2Variant::Klein9B.supports_uncensored_encoder());
-        assert!(!Flux2Variant::Klein4B.supports_uncensored_encoder());
-        assert!(Flux2Variant::Klein9B.requires_hf_token());
-        assert!(!Flux2Variant::Klein4B.requires_hf_token());
-        assert!(!Flux2Variant::Klein9B.downloads_from_catalog());
-        assert!(Flux2Variant::Klein4B.downloads_from_catalog());
+    fn variant_size_tokens_are_frozen() {
+        assert_eq!(Flux2Variant::Klein9B.size_token(), "9B");
+        assert_eq!(Flux2Variant::Klein4B.size_token(), "4B");
+        for variant in Flux2Variant::all() {
+            assert!(variant.dir_name().ends_with(variant.size_token()));
+        }
     }
 
-    /// Each variant's three model paths must live under ITS OWN directory: a shared one
-    /// would make the two engines overwrite each other's download.
+    /// Drift guard: the backend's package fallback (`components.py`) spells every variant
+    /// directory by hand, so a renamed `dir_name` must fail here rather than in the field.
+    #[test]
+    fn backend_components_spell_every_variant_dir_name() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modules/ai_backend/inpaint/flux2_klein/components.py");
+        let source = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        for variant in Flux2Variant::all() {
+            let quoted = format!("\"{}\"", variant.dir_name());
+            assert!(source.contains(&quoted), "{} does not spell {quoted}", path.display());
+        }
+    }
+
+    /// Each variant's package and VAE directory must live under ITS OWN directory: a shared
+    /// one would make the two engines overwrite each other's download.
     #[test]
     fn the_derived_paths_are_variant_specific() {
         for variant in Flux2Variant::all() {
             let root = flux2_klein_dir(variant);
             assert!(root.ends_with(variant.dir_name()));
-            assert!(flux2_klein_transformer_dir(variant).starts_with(&root));
+            assert!(root.starts_with(side_models_dir()));
             assert!(flux2_klein_vae_dir(variant).starts_with(&root));
-            assert!(flux2_klein_text_encoder_dir(variant, false).starts_with(&root));
         }
-        assert_ne!(
-            flux2_klein_transformer_dir(Flux2Variant::Klein9B),
-            flux2_klein_transformer_dir(Flux2Variant::Klein4B),
-        );
+        assert_ne!(flux2_klein_dir(Flux2Variant::Klein9B), flux2_klein_dir(Flux2Variant::Klein4B));
         assert_ne!(
             flux2_klein_settings_path(Flux2Variant::Klein9B),
             flux2_klein_settings_path(Flux2Variant::Klein4B),

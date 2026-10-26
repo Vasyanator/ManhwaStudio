@@ -34,18 +34,17 @@ never work started from inside a widget closure.
 - `mod.rs`: `Flux2PanelCtx` and the panel body, plus the two pinned parts. Edit it to move a
   control between blocks or to change the order of the panel.
 - `install.rs`: the source-mode switch, the editable model-path rows and their pickers,
-  the derived paths of the download mode, the FLUX.2 half of the Hugging Face download
-  block of 9B (heading, repository line, the token-row conditions, the encoder toggle), and
-  the CATALOG download block of 4B (`draw_catalog_download_block`: «Веса трансформера» /
-  «Веса текстового энкодера» as `WheelComboBox`es whose rows carry the size and a ✓ when
-  installed, the derived paths, and one bundle block through the shared
-  `draw_ocr_model_download`, drawn only while its snapshot matches the current bundle). The token row and the check / plan /
-  download controls themselves are the shared `draw_hf_token_row` / `draw_hf_download_controls`
-  (`../../shared/hf_download_ui.rs`), and so is `gated_button`, the gated-action button with
-  its mandatory disabled tooltip that the component list and the prompt-cache controls use.
-  The token row carries the step-by-step access hint (`ms_widgets::HfAccessHint`) naming the
-  variant's model repository and, while «Расцензуренный энкодер» is in effect, the gated
-  encoder repository (`Flux2VariantPresentation::uncensored_encoder_repo`).
+  the derived paths of the download mode, and the CATALOG download block of both variants
+  (`draw_catalog_download_block`): the «Расцензуренный энкодер» toggle where the variant offers
+  that source (a switch that changes the stored encoder format leaves one line under it),
+  «Веса трансформера» / «Веса текстового энкодера» as `WheelComboBox`es whose rows carry the
+  real dtype or quant, the size and a ✓ when installed, the derived paths, the Hugging Face
+  token row (the shared `draw_hf_token_row`) while a gated spec of the bundle is not
+  installed, and one bundle block through the shared `draw_ocr_model_download` — which itself
+  draws the per-repository access lines with their repository links, so this file draws no
+  second list — drawn only while its snapshot matches the current bundle. `gated_button`, the
+  gated-action button with its mandatory disabled tooltip that the component list and the
+  prompt-cache controls use, is the shared `../../shared/hf_download_ui.rs`.
 - `components.rs`: the merged
   component list — one row per component carrying presence, size, residency and the
   backend's own action buttons.
@@ -71,7 +70,8 @@ never work started from inside a widget closure.
 - **No literal user-visible strings.** Every caption, hover and message goes through
   `t!` / `tf!` / `tp!` under `cleaning.tools.flux2_klein.*` (the download block's own
   sentences under `cleaning.tools.flux2_klein.download.*`; the shared parts it draws use
-  `cleaning.tools.hf_download.*` and `cleaning.tools.engine_progress.*`). A widget whose `Id` comes from a localized
+  `cleaning.tools.hf_download.*`, `cleaning.tools.engine_progress.*` and the catalog block's
+  `translation.ocr_model.*`). A widget whose `Id` comes from a localized
   caption carries a stable `id_salt`, or switching language resets its state.
 - **`egui::Slider`, `egui::ComboBox` and `egui::DragValue` are forbidden** in product UI;
   use the `Wheel*` widgets. See `egui-docs/04-widgets.md` §0.2.
@@ -87,18 +87,15 @@ never work started from inside a widget closure.
   untouched while it is closed.
 - **A backend literal this build does not know degrades to "not known"**, with the literal
   on hover, and offers no action. It is never guessed into one of the known states.
-- **The two FLUX.2 klein engines draw the SAME body**, differing where
-  `Flux2PanelCtx::variant` says a capability is absent or the settings say the weight formats
-  are in effect (4B in download mode: the catalog block instead of the Hugging Face one, the
-  format rows of «Память и скорость», the fp8 gate; in manual mode the encoder FILE button
-  where GGUF encoder formats exist). The 9B differences are OMISSIONS in `install.rs`: no Hugging Face token row for an ungated repository
-  (`requires_hf_token`), no uncensored-encoder toggle where no such encoder is published
-  (`supports_uncensored_encoder`). A control the backend would refuse is not drawn disabled
-  — it is not drawn. The token row has ONE exception, because omitting it is otherwise a
-  dead end: when the check itself blames the token (`download_check_blames_token`) the row
-  comes back with a line explaining why, since `crate::hf_token` has no other UI surface
-  anywhere in the application. The engine wraps the whole body in one `push_id(variant.wire())`, so
-  the two instances never share a fold, a text cursor or a popup state.
+- **The two FLUX.2 klein engines draw the SAME body**, differing only where the variant offers
+  something the other does not (the uncensored-encoder toggle: `Flux2EncoderSource::offered_for`)
+  and by their catalog bundle (the token row exists while a GATED spec of it is not installed:
+  9B's BFL repository and the uncensored encoder; 4B's repositories are open). A control that
+  could only select files nothing publishes is not drawn disabled — it is not drawn. The
+  weight-format rows of «Память и скорость», the fp8 gate and the catalog block follow download
+  mode for both; in manual mode the encoder FILE button is offered where GGUF encoder formats
+  exist. The engine wraps the whole body in one `push_id(variant.wire())`, so the two instances
+  never share a fold, a text cursor or a popup state.
 - «Установка модели» is the only section built from `CollapsingState` rather than
   `RegionEditToolBase::draw_region_editor_collapsible_section`, because it must be
   openable from outside itself; the one-shot opening yields to a fold the user has moved
@@ -106,8 +103,8 @@ never work started from inside a widget closure.
 
 ## Editing map
 - To move a control between sections, or to change what the panel contains: `mod.rs`.
-- To change a model path row, the source-mode switch or anything about the download:
-  `install.rs`.
+- To change a model path row, the source-mode switch, the encoder toggle or anything about
+  the download block: `install.rs`.
 - To change a component row: `components.rs`. To change the memory steps, the per-step rows,
   the forecast line or «Пределы»: `../../../large_model_resources/` (shared with every
   large-model engine).

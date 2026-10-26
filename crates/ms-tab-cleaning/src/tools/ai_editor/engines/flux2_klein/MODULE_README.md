@@ -4,7 +4,7 @@
 The FLUX.2 klein engine of the «ИИ-редактор области» tool: one implementation of
 `region_edit_v2::engine::AiEngine`. It owns everything model-specific — the persisted
 parameters, the two memory steps and their large-model forecast, the prompt-cache library, the
-model download, the per-component residency, the request/response wire contracts, the
+model download (the app's catalog), the per-component residency, the request/response wire contracts, the
 OOM recovery, the worker threads and its own progress bar — and nothing host-specific:
 the on-canvas frame, the painted mask stack and the pending result belong to the host.
 
@@ -14,35 +14,33 @@ rest of the tree sees one flat `flux2_klein::*` namespace.
 
 TWO ENGINES, ONE IMPLEMENTATION. `config::Flux2Variant` (`Klein9B` / `Klein4B`) is the
 parameter, and `all_engines` builds one `Flux2KleinEngine::new(variant)` per value. The
-variant keys the engine id, the picker caption, the model directory, the three derived
-component paths, the settings FILE, and the `variant` field the two `.download.*` methods
-carry. It is fixed at construction and never changes for an instance. The enum itself and
-every fact that keys a PATH, a persisted document, an id or a capability gate (`wire`,
-`from_wire`, `dir_name`, `settings_file_name`, `engine_id`, `all`,
-`supports_uncensored_encoder`, `requires_hf_token`) are declared in ONE inherent `impl` in
-the `ms-config` crate (`crate::config`), because runtime path decisions belong there and the
-enum keys five path functions. Its PRESENTATION — the localized picker caption and the
-Hugging Face repository the download names — lives HERE, in `variant_presentation.rs`, as the
-`Flux2VariantPresentation` extension trait: this module is its only consumer, and a caption
-and a repository id have no business in the bottom configuration crate. It is a trait rather
-than a second inherent block because an inherent `impl` may only be written in the crate that
-DEFINES the type.
+variant keys the engine id, the picker caption, the model directory, the derived component
+paths and the settings FILE. It is fixed at construction and never changes for an instance.
+The enum itself and every fact that keys a PATH, a persisted document or an id (`wire`,
+`from_wire`, `dir_name`, `settings_file_name`, `engine_id`, `size_token`, `all`) are declared in
+ONE inherent `impl` in the `ms-config` crate (`crate::config`); what a variant OFFERS (encoder
+sources, weight formats per component and source) is `ms_config::flux2_weight_format`; which
+repositories are gated is catalog data. Its PRESENTATION — the localized picker caption —
+lives HERE, in `variant_presentation.rs`, as the `Flux2VariantPresentation` extension trait (an
+inherent `impl` may only be written in the crate that DEFINES the type).
 
-The 4B checkpoint differs in exactly two user-visible ways, both OMISSIONS: its repository
-is ungated (apache-2.0), so the download block draws no Hugging Face token row, and no
-uncensored text encoder is published for it, so that toggle is not drawn — and
-`normalized()` forces the flag off, because the backend refuses `variant = "4b"` with
-`uncensored = true`. Both omissions have a recovery: the staleness rule compares the
-EFFECTIVE toggle (`uncensored_encoder_active`), so a document carrying the inert flag still
-accepts its own check answer, and a check that nevertheless blames the token brings the
-token row back with a line explaining why — `hf_token` has no other UI surface, so hiding
-it unconditionally would strand the user.
+BOTH PACKAGES COME FROM THE APP'S CATALOG (`ms_sysprobe::ai_models::external_catalog`,
+`flux2_klein_package_specs`); the backend downloads nothing for FLUX.2 (its `.download.*` were
+retired at protocol 22). The variants differ only by what they offer: 9B has the uncensored
+text encoder (`Flux2EncoderSource::Uncensored`, persisted as the historic bool
+`uncensored_text_encoder`; its own formats lack `Q5_K_M`) and gated repositories (BFL 9B,
+ponpoke), so its panel draws the «Расцензуренный энкодер» toggle and — while a gated spec of
+the bundle is not installed — the Hugging Face token row; 4B offers the stock encoder only and
+its repositories are open, so neither is drawn and the flag is inert (`encoder_source`). The
+9B bf16 transformer is the BFL single file, unless the probe found an install of the backend's
+former download (diffusers `transformer/`), which is then used through the catalog's adopt-only
+legacy spec (`flux2_klein_transformer_layout`, runtime `installed_formats.transformer_layout`).
 
-Everything else, on screen and on the wire, is identical: every other method is keyed by
-the three component paths, and the prompt-cache family is fingerprinted backend-side from
-the encoder, so 4B gets its own family without a wire change. The one wire addition is 4B's
-own: its package comes from the Rust catalog, so in download mode it may run GGUF weights and
-sends the selected weight formats with their candidates (see "Contracts and invariants").
+Everything else, on screen and on the wire, is identical: every method is keyed by the three
+component paths, and the prompt-cache family is fingerprinted backend-side from the encoder,
+so each variant and source gets its own family without a wire change. In download mode both
+variants send the selected weight formats with their candidates (see "Contracts and
+invariants").
 
 Only ONE variant is resident at a time — the backend holds one pipeline and one text
 encoder, keyed by those paths — so selecting the other engine unloads this one. This side
@@ -91,22 +89,23 @@ Queries the panel arms are one-shot and independent of the run: `.status`
 (`status.rs` + `wire.rs`), the memory forecast `large_models.profiles`
 (the engine's `ResourcesController` from `../../large_model_resources/`: one request in
 flight, latest wins, plus the debounced cap writer and the floor reset), `.prompt_cache.list`
-(`prompt_cache.rs`) and `.download.check` (`download.rs` over `../shared/hf_download.rs`).
+(`prompt_cache.rs`). The catalog download is the engine's `OcrModelDownloadController`
+(status probes, the download / verify job with its gated-repository access check, the
+automatic adoption of files already on disk), polled from `AiEngine::poll`.
 The forecast is drawn by the shared widget `../../large_model_resources/` (steps, per-step
 rows, floor, «Пределы»).
 
 MODEL-AGNOSTIC PARTS LIVE IN `../shared/` (`use super::shared::*` in `mod.rs`): the progress
-state of all four long operations and its streaming call, the Hugging Face check / plan /
-token / download vocabulary and its drawing, the settings-file quarantine and save backoff,
-and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its question
-(`Flux2CheckQuestion`), its settings document and migration, its sentences.
+state of all three long operations and its streaming call, the Hugging Face token controls
+and their drawing, the settings-file quarantine and save backoff, and `mask_for_run`. What
+stays here is what is FLUX.2's own: its headers, its settings document and migration, its
+sentences.
 
 ## Files and submodules
 - `mod.rs`: the module root — the header, the `mod`/`use` wiring and the shared constants.
   Edit it to add a submodule or a constant several files share, and nothing else.
 - `variant_presentation.rs`: the `Flux2VariantPresentation` extension trait — the picker
-  caption and the Hugging Face repository of a `config::Flux2Variant`. Edit it to change
-  either; every OTHER fact of the enum is in `ms-config`.
+  caption of a `config::Flux2Variant`. Every OTHER fact of the enum is in `ms-config`.
 - `engine/`: the engine. `mod.rs` holds `Flux2KleinEngine`, its `AiEngine` impl and the
   polling that keeps its derived state current; `actions.rs` holds the `start_*`/`poll_*`
   pair of every long operation. See `engine/MODULE_README.md`.
@@ -117,18 +116,23 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
   `flux2_prompt_cache_line`, `flux2_guidance_supported`, `flux2_run_block_reason`,
   `region_block_reason`, the catalog bundle of the selection and its state
   (`flux2_catalog_bundle`, `flux2_catalog_bundle_missing`, `flux2_catalog_job_running`), the
+  gated repositories still missing (`flux2_gated_repos_missing`: what draws the token row), the
   engine-picker block of a running catalog job (`flux2_catalog_switch_block_reason`) and the
-  weight-format row captions (`flux2_weight_format_label` / `_hint`) — with the line/tone types
+  weight-format row captions (`flux2_weight_format_label` / `_hint`, `flux2_encoder_format_token`)
+  — with the line/tone types
   they answer in. Edit it to change what a
   line or a refusal SAYS, or which control the backend's answer closes.
 - `settings.rs`: `Flux2KleinSettings`, its defaults, `normalized()`, `params()`, the
   dtype vocabulary, the two step ids (`step_choice` / `set_step_choice`), the one-time
   migration of the retired placement (`legacy_memory_steps`, the one owner of the placement ->
   step-pair table; an untouched default document goes to «Авто» / «Авто»),
-  `Flux2SourceMode`, the persisted `variant` and `effective_paths`, the two weight formats
+  `Flux2SourceMode`, the persisted `variant` and `effective_paths`, the encoder source
+  (`encoder_source` over the historic `uncensored_text_encoder` bool; `set_encoder_source` maps
+  the encoder format through `closest_offered`), the two weight formats
   (`transformer_format` / `text_encoder_format`: `ms_config::Flux2WeightFormat` wire ids, absent
-  reads as `bf16`, unknown or not offered normalizes to `bf16`; `weight_format`,
-  `format_candidates`, the runtime-only `installed_formats` and its worker probe
+  reads as `bf16`, unknown or not offered for the source normalizes to `bf16`; `weight_format`,
+  `weight_selection`, `format_candidates`, the runtime-only `installed_formats` — per component
+  and source, plus the bf16 transformer layout — and its worker probe
   `probe_flux2_installed_formats`), «Энкодер на CPU»
   (`encoder_on_cpu`, default on — also for a file without the field — and sent in every
   `params`, the forecast's included), «Постобработка» (`postprocess`: the shared
@@ -144,14 +148,6 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
   `flux2_status_for_paths`, the merged `flux2_component_rows`, `flux2_install_seed`,
   `flux2_pipeline_busy`. Edit it to change what a catalog MEANS; the parsers that build
   one live in `wire.rs`.
-- `download.rs`: the FLUX.2 half of `.download.check` / `.download.start` — the request
-  header (`flux2_download_header`), what an answer is about (`Flux2CheckQuestion`;
-  `Flux2DownloadCheck` = the shared `HfDownloadCheck<Flux2CheckQuestion>`),
-  `download_check_matches_selection` (stale over the encoder toggle AND the variant),
-  `download_check_variant_mismatch` (a disagreeing echo is REPORTED, not hidden),
-  `flux2_text_encoder_path_after_toggle`, and the outcome parse. The verdict vocabulary,
-  `hf_download_readiness` and `download_check_blames_token` (what reopens the token row on the
-  ungated checkpoint) are `../shared/hf_download.rs`.
 - `prompt_cache.rs`: the `.msprompt` library — entry/listing/load shapes,
   `flux2_prompt_cache_gates`, `prompt_cache_state_for`, and the six `.prompt_cache.*`
   calls with their parsers.
@@ -180,46 +176,54 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
   it is never copied.
 
 ## Contracts and invariants
-- **The GUI thread never blocks.** Every function in `wire.rs`, `download.rs`,
+- **The GUI thread never blocks.** Every function in `wire.rs`,
   `prompt_cache.rs`, `engine/actions.rs` and the IO in `settings.rs` and `session.rs`
   runs on an `ms_thread::spawn` worker; `AiEngine::poll` only drains channels.
 - **`normalized()` is the only value that reaches the wire** (`settings.rs`), and
   `effective_paths` is the ONE answer to which three model paths a call uses. Both are
   variant-aware: the derived paths sit under the variant's own model directory, and a
   refused `variant`/`uncensored` pairing is normalized away before it can travel.
-- **Weight formats (protocol 21) exist only for a catalog variant in download mode**
-  (`weight_formats_in_effect`: `Flux2Variant::downloads_from_catalog`, i.e. 4B). There the
-  derived transformer / encoder paths come from `external_catalog::flux2_klein_weights_path` per
-  selected format — for bf16 the very folders the 9B rule derives, so an install made before the
-  formats existed stays valid — and `params` gain `transformer_format` / `transformer_formats` and
-  `text_encoder_format` / `text_encoder_formats` (`[{id, path}]`, best quality first: the formats
-  whose catalog files are installed plus the selected one, whose `path` equals the component's
-  `*_path`). Manual mode and 9B send none of the four (a picked `.gguf` path travels as-is and the
-  backend derives its format). "Installed" is runtime state carried IN the settings value
-  (`installed_formats`, `serde(skip)`) because every request builder receives that value and some
-  run on the GUI thread, which must not stat the disk; the engine fills it from
-  `probe_flux2_installed_formats` on a worker. Until it does, each list holds the selected format
-  alone.
+- **Weight formats (protocol 21) are in effect in download mode, both variants**
+  (`weight_formats_in_effect`). There the derived transformer / encoder paths come from
+  `external_catalog::flux2_klein_weights_path` per selected format, encoder source and probed
+  bf16 transformer layout — for bf16 the very folders (or the 9B single file) an existing
+  install has, so it stays valid — and `params` gain `transformer_format` / `transformer_formats`
+  and `text_encoder_format` / `text_encoder_formats` (`[{id, path}]`, best quality first: the
+  formats of the current source whose catalog files are installed plus the selected one, whose
+  `path` equals the component's `*_path`). Manual mode sends none of the four (a picked `.gguf`
+  path travels as-is and the backend derives its format). "Installed" is runtime state carried
+  IN the settings value (`installed_formats`, `serde(skip)`) because every request builder
+  receives that value and some run on the GUI thread, which must not stat the disk; the engine
+  fills it from `probe_flux2_installed_formats` on a worker. Until it does, each list holds the
+  selected format alone and the 9B bf16 transformer path is the single file (`Primary`); a
+  probe that finds the legacy layout moves that path and re-asks `.status`.
+- **The encoder source is a typed axis** (`ms_config::Flux2EncoderSource`): the toggle is drawn
+  only where the variant offers more than one source; a switch stores the bool and maps the
+  stored encoder format with `closest_offered` (Q5_K_M -> Q4_K_M on the uncensored encoder),
+  saying so in one line under the toggle (`encoder_format_notice`).
 - **A GGUF encoder excludes fp8 (D8)**: while a GGUF encoder format is in effect `normalized()`
   sends `text_encoder_fp8 = false`; the stored choice is kept. A manual-mode `.gguf` encoder with
   fp8 is refused by the backend by name (Rust does not guess a format from a file name).
-- **4B never uses the backend download** (`download.rs`; `start_download*` refuse a catalog
-  variant locally): its package comes from the Rust catalog (`flux2_klein_package_specs`) and the
-  backend refuses `.download.*` with `variant = "4b"`. The engine owns an
-  `OcrModelDownloadController` for it (`downloads`, `None` for 9B) and drives it from `poll`
-  every frame (`poll_catalog_bundle`): it probes the bundle of the SELECTED formats
+- **Both variants download through the app's catalog** (no backend method): the engine owns an
+  `OcrModelDownloadController` (`downloads`; `None` only in a test build, where its automatic
+  adoption could hash and mark the developer's real model files) and drives it from `poll`
+  every frame (`poll_catalog_bundle`): it probes the bundle of the SELECTED source and formats
   (`flux2_catalog_bundle`, empty outside download mode), which also triggers the one-time
-  automatic adoption of an unmarked existing download; the panel draws that bundle through the
-  shared `draw_ocr_model_download` only while its snapshot still describes the current selection.
-  The end of a controller job (download / verify / adoption) re-runs the installed-formats probe
-  and re-asks `.status`, the forecast and the prompt-cache listing. A changed format saves the
-  setting and re-arms the status, the forecast and the bundle probe
-  (`fold_resources_and_formats`). The readiness LINE says when the bundle is incomplete
+  automatic adoption of an unmarked existing download (the backend's former 9B download
+  included); the panel draws that bundle through the shared `draw_ocr_model_download` (which
+  also draws the per-repository access lines of its gated sources) only while its snapshot
+  still describes the current selection. The token row is drawn while a gated spec of the bundle
+  is not seen installed (`flux2_gated_repos_missing`); the controller notices a changed token
+  itself. The end of a controller job (download / verify / adoption) re-runs the
+  installed-formats probe and re-asks `.status`, the forecast and the prompt-cache listing. A
+  changed selection (format or source) saves the setting and re-arms the status, the forecast,
+  the installed formats and the bundle probe (`fold_resources_and_formats` over
+  `Flux2WeightSelection`). The readiness LINE says when the bundle is incomplete
   (`Flux2ReadinessLine::BundleMissing`); the RUN gate stays the `.status` readiness.
-- **Format rows on both axes** («Память и скорость», 4B in download mode): the shared widget gets
+- **Format rows on both axes** («Память и скорость», download mode): the shared widget gets
   `Some(&mut transformer_format)` (its rows and a format suggestion) and
   `draw_encoder_formats` draws the encoder's rows under it; the forecast request keeps
-  `format: None`, so the backend plans the format the params select. 9B passes none.
+  `format: None`, so the backend plans the format the params select. Manual mode passes none.
 - **The memory steps are the user's and the wire always carries them** (`vram_step` /
   `ram_step` in every `params`; none of the retired placement fields ever does). A run never
   rewrites them: after a memory failure the backend degrades the run and learns a floor,
@@ -259,10 +263,10 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
   The forecast takes no reference (the engine learns of the marks only at
   `start`), so for a marked run the backend's pre-load guard counts a little more than
   the forecast on screen — the reference's condition tokens.
-- **One progress bar, claimed by generation** (`../shared/stream_progress.rs`): four operations — a run,
-  `.prompt_cache.build`, `.component_action`, `.download.start` — share it, and a write
-  from a retired generation is dropped. Gates that mean "wait for the current operation"
-  read `flux2_pipeline_busy` over all four.
+- **One progress bar, claimed by generation** (`../shared/stream_progress.rs`): three operations — a run,
+  `.prompt_cache.build`, `.component_action` — share it, and a write from a retired
+  generation is dropped. Gates that mean "wait for the current operation" read
+  `flux2_pipeline_busy` over all three. The catalog download has its own progress.
 - **`Flux2ModelReadiness` is three-state on purpose** (`status.rs`): `Unknown` never
   blocks a run, and a catalog counts only while it still describes the configured paths.
 - **An ABSENT `guidance_supported` means SUPPORTED** (`status.rs`, `wire.rs`,
@@ -277,8 +281,8 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
   come back on a checkpoint that is not distilled.
 - **`FLUX2_MAX_SEQ` (wire.rs) is part of the prompt-cache key.** Lowering it invalidates
   every saved `.msprompt` entry at once.
-- **The HF token never enters the settings file** and must never be logged
-  (`download.rs`).
+- **The HF token never enters the settings file** and must never be logged; this module only
+  edits it (the token row, `HfTokenControl`).
 - Layering: only `ui/` may draw, and it decides nothing a test would want to assert —
   the verdicts come from `decisions.rs` and the state belongs to `engine/`. No file here
   reaches another through a `super::sibling::` path, so none depends on another's private
@@ -291,22 +295,23 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
 - To add or change a persisted parameter, see `settings.rs`, then the `ui/` file that
   draws it.
 - To add a CHECKPOINT, or any fact that differs between the checkpoints, see
-  `config::Flux2Variant` in `crates/ms-config/src/lib.rs` — identity, paths and the capability
-  gates are all in that one `impl` — and `variant_presentation.rs` here for its caption and
-  repository id; `all_engines` then picks it up without a new module.
-- To change what differs between the checkpoints on screen, see `ui/install.rs` — the token row
-  and the uncensored toggle are `if variant.…()` omissions there; the catalog download block of
-  4B is `draw_catalog_download_block` (chosen by `weight_formats_in_effect` in `ui/mod.rs`), the
-  format rows of «Память и скорость» are `draw_memory_section`, the fp8 gate is `ui/advanced.rs`
-  and the manual encoder FILE button is offered where the variant has GGUF encoder formats.
+  `config::Flux2Variant` in `crates/ms-config/src/lib.rs` (identity, paths),
+  `ms_config::flux2_weight_format` (what it offers), its pinned specs in
+  `external_catalog/flux2_klein.rs`, and `variant_presentation.rs` here for its caption;
+  `all_engines` then picks it up without a new module.
+- To change what differs between the checkpoints on screen, see `ui/install.rs` — the
+  uncensored toggle follows `Flux2EncoderSource::offered_for`, the token row the gated specs of
+  the bundle (`draw_catalog_download_block`); the format rows of «Память и скорость» are
+  `draw_memory_section`, the fp8 gate is `ui/advanced.rs` and the manual encoder FILE button is
+  offered where the variant has GGUF encoder formats.
 - To change when the catalog bundle is probed, re-probed or downloaded, see
   `poll_catalog_bundle`, `note_weight_formats_changed` and `apply_catalog_action` in
   `engine/mod.rs`.
 - To change what the readiness line, the prompt-cache line or a run refusal SAYS, see
   `decisions.rs`; to change what a `.status` answer MEANS, see `status.rs`; to change how
   either LOOKS, see `ui/`.
-- To change a request or response shape, see `wire.rs`, `download.rs` or
-  `prompt_cache.rs` — the file that owns that method family. A change to the run blob
+- To change a request or response shape, see `wire.rs` or `prompt_cache.rs` — the file that
+  owns that method family. A change to the run blob
   (`flux2_run_request`) is a protocol change: the Python split is `_split_request_blob` in
   `modules/ai_backend/ipc/handlers/flux2_klein.py`, and `PROTOCOL_VERSION` is bumped on
   both sides.

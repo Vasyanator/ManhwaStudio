@@ -132,7 +132,10 @@ use serde_json::{Map, Value, json};
 /// `file_component` (`transformer` = DiT, `text_encoder`, `vae` = AE).
 /// Load byte frames of both klein models: at most one per 0.2 s per read, plus
 /// one 100% frame.
-pub const PROTOCOL_VERSION: u32 = 21;
+/// 22: `inpaint.flux2_klein.download.check` / `.start` are removed (the app's model catalog
+/// downloads every FLUX.2 klein weight, 4B and 9B; the backend answers the old names as unknown
+/// methods). No other wire change.
+pub const PROTOCOL_VERSION: u32 = 22;
 
 // ============================================================================
 // FRAME SIZE GUARDS
@@ -269,40 +272,6 @@ pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT: &str =
 /// listing and cannot be loaded. One-shot.
 pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT: &str =
     "inpaint.flux2_klein.prompt_cache.import";
-/// Checks Hugging Face access to the FLUX.2 klein repositories and prices the
-/// download, without transferring anything. One-shot.
-///
-/// Request header: `hf_token` (a string, possibly empty), `uncensored` (bool —
-/// whether the uncensored text-encoder repository is needed as well) and `variant`
-/// (`"9b"`, the default when absent, or `"4b"` — which checkpoint is meant). The
-/// token is NEVER logged on either side. `"4b"` together with `uncensored = true` is
-/// refused: no uncensored encoder is published for that checkpoint.
-///
-/// The answer carries `repos`, one entry per repository the toggle actually needs,
-/// each `{ "state": … }` where the state is one of `ok` / `no_token` /
-/// `invalid_token` / `not_accepted` / `not_found` / `network_error`, plus `plan`
-/// with `total_bytes`, `missing_bytes` and `missing_files` computed from the same
-/// listing, plus `variant` ECHOED back so a stale answer about the other checkpoint
-/// is detectable. The pinned wire contract is `dev-docs/flux2_model_download.md` §3.
-pub const METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK: &str = "inpaint.flux2_klein.download.check";
-/// Downloads the FLUX.2 klein model files into the requested variant's own directory
-/// (`side_models/FLUX.2-klein-9B/` or `side_models/FLUX.2-klein-4B/`).
-///
-/// STREAMING, the same envelope as `.prompt_cache.build`, so it claims the same
-/// single progress bar and can never run beside a generation. Request header:
-/// `hf_token`, `uncensored` and `variant`, as for `.download.check`.
-///
-/// Progress frames keep the usual `phase` / `step` / `total` / `label` — where
-/// `step` and `total` are OVERALL BYTES across the whole plan, which keeps every
-/// existing single-level consumer correct — and ADD three OPTIONAL fields for the
-/// file in flight: `file_step`, `file_total` and `file_label`. A frame that omits
-/// them (a preparation phase) is legal and renders as the overall bar alone.
-///
-/// The answer carries `paths` (`transformer` / `text_encoder` / `vae`),
-/// `downloaded_bytes` and `skipped_files`; the tool writes those three paths into
-/// its settings, so a finished download leaves a configured engine. The pinned wire
-/// contract is `dev-docs/flux2_model_download.md` §4.
-pub const METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START: &str = "inpaint.flux2_klein.download.start";
 /// FLUX.3 klein region edit (streaming, mid-run cancel). Request header: `image_len`,
 /// `mask_len`, `reference_lens` (0..9 integers) and `params`; the blob is
 /// `region.png ++ mask.png ++ reference_0.png ++ …` (mask L8 of the region size; the lengths
@@ -319,9 +288,11 @@ pub const METHOD_INPAINT_FLUX3_KLEIN_STATUS: &str = "inpaint.flux3_klein.status"
 pub const METHOD_INPAINT_FLUX3_KLEIN_UNLOAD: &str = "inpaint.flux3_klein.unload";
 /// Checks Hugging Face access to the gated FLUX.3 klein repository and prices the download of
 /// one weight format, without transferring anything. Request header: `hf_token`, `format`
-/// (`bf16` / `fp8r` / `nvfp4`, default `fp8r`). The answer: `format` (echo), `repos`
-/// (one `{state, message}`), `plan` (nullable) and `plan_error`, as for
-/// [`METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK`].
+/// (`bf16` / `fp8r` / `nvfp4`, default `fp8r`). The answer: `format` (echo), `repos` (one
+/// `{state, message}`, the state one of `ok` / `no_token` / `invalid_token` / `not_accepted` /
+/// `not_found` / `network_error`), `plan` (`{total_bytes, missing_bytes, missing_files}`, or
+/// `null` when it could not be computed) and `plan_error` (why a `null` plan is null after access
+/// succeeded; empty otherwise). The token is never logged on either side.
 pub const METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_CHECK: &str = "inpaint.flux3_klein.download.check";
 /// Downloads one weight format of the FLUX.3 klein package into `side_models/FLUX.3-image-klein/`
 /// (streaming two-level byte progress, cancel inside the transfer). Request header: `hf_token`,

@@ -13,8 +13,10 @@ It serves BOTH model variants (klein 9B and klein 4B) and carries no variant fie
 driven by the three user-supplied paths (block and layer counts are read from the files). The one
 place the variants are told apart is `components.require_encoder_transformer_compatible`, which
 refuses a MIXED pair before any weight is read — see the FLUX.2 klein sections of
-`../MODULE_README.md`. The tiny real models of the tests exercise both; real 4B GGUF files are
-checked by the opt-in `test_real_gguf_header.py` / `test_real_gguf_encoder_header.py`.
+`../MODULE_README.md`. The tiny real models of the tests exercise both; the recorded 9B GGUF
+headers (`fixtures/flux2_9b_gguf_headers.json`) pin the 9B transformer and uncensored encoder
+layouts without weights; real 4B / 9B GGUF files are checked by the opt-in
+`test_real_gguf_header.py` / `test_real_gguf_encoder_header.py`.
 
 **This file documents the LAYOUT only.** The domain contracts — mask semantics, run order, the
 request's step pair and the refused placement wire, the decode fallbacks, per-component residency,
@@ -84,9 +86,12 @@ object itself.
   `model.diffusion_model.` prefix refusal.
 - `components.py`: the five components AS FILES ON DISK — search roots and probe order, tokenizer
   and scheduler discovery, header reading, the fp8-scaled refusal, the transformer-config contract,
-  the config of a GGUF component (beside it, else the installed 4B package, checked against the
-  file's header: `_search_gguf_config`, `find_text_encoder_config_dir`), text-encoder availability, the encoder<->transformer width contract, the encoder truncation
-  (`ENCODER_KEEP_LAYERS`, `text_encoder_truncation_kwargs`), `checkpoint_is_distilled`, the disk
+  the config of a GGUF component (beside it, else the installed klein packages
+  `KLEIN_PACKAGE_DIR_NAMES`, checked against the file's header: `_search_gguf_config`,
+  `find_text_encoder_config_dir`), text-encoder availability, the encoder<->transformer width
+  contract, the encoder config kwargs (`text_encoder_config_kwargs` = the truncation
+  `ENCODER_KEEP_LAYERS` / `text_encoder_truncation_kwargs` + the RoPE normalization
+  `text_encoder_rope_kwargs`), `checkpoint_is_distilled`, the disk
   sizes `status` reports, the VAE tiling threshold and the `components` map of `status`.
 - `large_model.py`: the `LargeModelSpec`s (`pipeline_spec(dtype)`, `encoder_spec(fp8)`,
   `register_specs`), their options (`PipelineOptions`, `EncoderOptions`, `request_shape`), the
@@ -96,7 +101,8 @@ object itself.
   `transformer_block_order`, the encoder's truncation / `model.` prefix / fp8 split), each phase's
   work, the decode fallbacks (`FALLBACK_VAE_TILING`, `FALLBACK_VAE_TILE_LOWERED`), the
   pre-admission refusals (`require_loadable`, `require_loadable_encoder`) and the model names.
-- `prompt_cache.py`: encoder identity, the `.msprompt` container and the on-disk library.
+- `prompt_cache.py`: encoder identity (with the RoPE salt), the `.msprompt` container and the
+  on-disk library.
 - `attention.py`: the `text_attention_in_mask` contract — the token grid, the joint-sequence layout,
   the early empty-mask refusal, THE device-byte formula of the mask (shared by the run's log and the
   spec's denoise work) and the additive mask itself.
@@ -123,20 +129,29 @@ object itself.
   `_effective_guidance_scale`.
 - `fixtures/forecast_golden.json`: the golden `forecast_memory` snapshot of
   `test_characterization.py`, one case per step pair (regenerate with its `--write-golden`).
+- `fixtures/flux2_9b_gguf_headers.json`: recorded headers (names, GGUF dims, ggml types,
+  metadata; no tensor data) of the klein 9B GGUF files — full tensor lists for the unsloth 9B
+  Q4_K_M transformer and the uncensored Q8_0 encoder, metadata and type histograms for the
+  rest; `fixtures/flux2_9b_{transformer,text_encoder,uncensored_text_encoder}_config.json`: the
+  pinned 9B configs (the uncensored one is the transformers-v5 file with `rope_parameters`).
+  Read through `_test_fixtures.load_9b_header_fixture` / `load_9b_config`;
+  `write_header_only_gguf` turns a recorded header into a header-only GGUF.
 - `_test_fixtures.py`: shared test fixtures — the model tree (header-only weights, or tiny REAL
   models with `real_weights=True`), `_TempTreeCase`, `_FakeEmbeds`, and `_ManagedRunFixture` (a
   service over a REAL manager on the CPU; only the pipeline call, the tokenizer, the budget probes
   and the transport's device are faked), and the GGUF writers (`_write_tiny_gguf`,
   `_write_bfl_gguf_transformer`: the tiny real transformer as a BFL-layout GGUF plus the
-  diffusers state dict it must load as).
+  diffusers state dict it must load as), the 9B fixture loaders and the header-only GGUF writer.
 - `test_*.py`: one per module; `test_characterization.py` holds the CONTRACT tests of the wire (and
   the GOLDEN forecast), `test_runtime_extraction.py` pins what FLUX.2 keeps seeing of names
-  that live in `../../runtime/`, `test_real_gguf_header.py` is the opt-in check of real 4B GGUF
-  transformer files (skips unless `side_models/FLUX.2-klein-4B/transformer_gguf/*.gguf` exists or
-  `MS_FLUX2_KLEIN_GGUF_FILES` names files), `test_real_gguf_encoder_header.py` the same for Qwen3
-  GGUF encoders (`text_encoder_gguf/*.gguf` or `MS_FLUX2_KLEIN_GGUF_ENCODER_FILES`; a Q8_0 file is
-  also checked row by row against the package's bf16 encoder), `test_encoder_gguf.py` the name
-  bridge and the tiny real Qwen3 GGUF through the manager. Torch / diffusers / transformers tests skip without them; no GPU,
+  that live in `../../runtime/`, `test_real_gguf_header.py` is the opt-in check of real GGUF
+  transformer files (skips unless `side_models/FLUX.2-klein-{4B,9B}/transformer_gguf/*.gguf`
+  exists or `MS_FLUX2_KLEIN_GGUF_FILES` names files), `test_real_gguf_encoder_header.py` the same
+  for Qwen3 GGUF encoders (`<package>/{text_encoder_gguf,text_encoder_uncensored_gguf}/*.gguf` or
+  `MS_FLUX2_KLEIN_GGUF_ENCODER_FILES`; a Q8_0 file is also checked row by row against the
+  package's unquantized `text_encoder/` or `text_encoder_uncensored/`), `test_encoder_gguf.py`
+  the name bridge, the tiny real Qwen3 GGUF through the manager and the recorded uncensored 9B
+  header. Torch / diffusers / transformers tests skip without them; no GPU,
   no network. Run them with `python -m pytest modules/ai_backend/inpaint/ -q` from the repo root.
 
 ## Memory behaviour under the manager
@@ -198,8 +213,10 @@ object itself.
   encoder use) and `require_loadable_encoder` refuse `text_encoder_fp8` with a GGUF file naming both
   fields; the fp8 spec lists no GGUF candidate. No silent fallback.
 - Config of a GGUF file (encoder and transformer alike): probed `<dir>/<subdir>`, `<dir>`,
-  `<parent>/<subdir>`, `<parent>`, then the installed 4B package's `<subdir>`
-  (`components.installed_4b_package_root`, `<side_models>/FLUX.2-klein-4B`). A candidate is accepted
+  `<parent>/<subdir>`, `<parent>`, then every installed klein package's `<subdir>`, 4B then 9B
+  (`components.installed_klein_package_roots`, `<side_models>/<KLEIN_PACKAGE_DIR_NAMES>`; the
+  names are the Rust `Flux2Variant::dir_name()`s, guarded by a Rust test that reads
+  `components.py`). A candidate is accepted
   only when it does not contradict the GGUF header (encoder: `architectures == ["Qwen3ForCausalLM"]`,
   `general.architecture == "qwen3"`, layer / width / head counts; transformer: class name, double /
   single block counts, inner width); the package fallback must declare every required field. No fit
@@ -210,6 +227,19 @@ object itself.
   and its family is named by the file's stem, so a Q4 cache is never served for bf16; the in-memory
   key carries the format; `.msprompt` metadata records `text_encoder_format` for display only.
 
+### Text-encoder config kwargs and the RoPE normalization
+- Every `Qwen3Config.from_pretrained` of the encoder and every pre-admission check of its config
+  goes through `components.text_encoder_config_kwargs(dir, keep)`: the truncation kwargs plus
+  `text_encoder_rope_kwargs(dir)`. A transformers-v5 config that keeps the RoPE base only in
+  `rope_parameters` (`rope_type: "default"`, no top-level `rope_theta`; the uncensored 9B
+  encoder's) gets `rope_theta=<base>`, because the pinned transformers 4.57 reads only the
+  top-level field and would silently use 10 000 instead of 1 000 000. Any other `rope_type`, a
+  `rope_parameters` without a usable `rope_theta`, or a contradicting top-level value is refused
+  naming the file.
+- The prompt-cache fingerprint asks the same decision function and, when it normalizes, appends
+  `"\nrope_theta=<repr(float(base))>"` to the hashed material: caches built under the wrong base
+  are never served again, every other fingerprint (stock 9B, every 4B) is unchanged.
+
 ### Monkeypatched symbols must be reached through their defining module
 The test suite replaces module-level attributes to keep the GPU, the filesystem and the memory
 snapshot out of the way. One `patch.object` reaches every caller only if every caller looks the name
@@ -219,7 +249,7 @@ up on the module that defines it:
 |---|---|
 | `memory_snapshot`, `_clear_torch_cache`, `_resolve_selected_backend_device` | `hardware` |
 | `_tables_for` (the forecast's cost tables) | `memory` |
-| `_weight_bytes` (the disk size `status` reports), `installed_4b_package_root` | `components` |
+| `_weight_bytes` (the disk size `status` reports), `installed_klein_package_roots` | `components` |
 | `program_root`, `write_prompt_file` | `prompt_cache` |
 | `build_text_attention_mask` | `attention` |
 | `is_torch_available` | `components` AND `hardware` — TWO bindings, see below |
@@ -275,9 +305,10 @@ which is what makes `assertLogs(svc.log)` capture records of the submodules.
   `../../runtime/large_models/` (model-agnostic: never special-case FLUX.2 there).
 - To change the llama.cpp <-> HF names of the Qwen3 encoder, see `encoder_gguf.py`; the encoder's
   formats, GGUF build and the D8 rule, `large_model.py`.
-- To change where a component (or a GGUF file's config) is looked for on disk, what a checkpoint
-  may contain, the variant rule, how deep the text encoder is, what the checkpoint declares about guidance distillation, or
-  the VAE's tiling threshold, see `components.py`.
+- To change where a component (or a GGUF file's config) is looked for on disk, which klein
+  packages a GGUF file may borrow from, what a checkpoint may contain, the variant rule, how deep
+  the text encoder is or how its RoPE config is normalized, what the checkpoint declares about
+  guidance distillation, or the VAE's tiling threshold, see `components.py`.
 - To change what happens to `guidance_scale` on a distilled checkpoint, see
   `service._effective_guidance_scale` — and nowhere else.
 - To change the dtype the text encoder runs in, see `params.text_encoder_dtype_name`.

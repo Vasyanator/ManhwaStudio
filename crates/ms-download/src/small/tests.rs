@@ -62,7 +62,7 @@ fn permanent_status_is_not_retried() {
     let fetcher = ScriptedFetcher::new(b"body", &[Step::Status(404, None)]);
     let sleep = SleepLog::new(None);
     let result = run(&fetcher, &sleep, &AtomicBool::new(false), 100);
-    assert!(matches!(result, Err(DownloadError::Http { .. })), "{result:?}");
+    assert!(matches!(result, Err(DownloadError::Http { status: Some(404), .. })), "{result:?}");
     assert_eq!(sleep.count(), 0);
 }
 
@@ -70,7 +70,7 @@ fn permanent_status_is_not_retried() {
 fn retries_are_bounded_without_progress() {
     let fetcher = ScriptedFetcher::new(b"body", &[Step::Status(503, None); 4]);
     let result = run(&fetcher, &SleepLog::new(None), &AtomicBool::new(false), 100);
-    assert!(matches!(result, Err(DownloadError::Http { .. })), "{result:?}");
+    assert!(matches!(result, Err(DownloadError::Http { status: None, .. })), "{result:?}");
     assert_eq!(fetcher.offsets().len(), 4, "the first attempt plus 3 retries");
 }
 

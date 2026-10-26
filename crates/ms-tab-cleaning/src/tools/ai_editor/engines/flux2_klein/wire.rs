@@ -2,10 +2,10 @@
 File: cleaning/tools/ai_editor/engines/flux2_klein/wire.rs
 
 Purpose:
-Every backend call the FLUX.2 klein engine makes that is not a download, a prompt-cache
-operation or a large-model forecast: the generation run itself, the `.status` query and its parsers, the component
-load/unload actions, and the encoding of the image/mask(/reference) blob that travels with a
-run.
+Every backend call the FLUX.2 klein engine makes that is not a prompt-cache operation or a
+large-model forecast (the model download is the app's catalog, not a backend call): the
+generation run itself, the `.status` query and its parsers, the component load/unload
+actions, and the encoding of the image/mask(/reference) blob that travels with a run.
 
 Main responsibilities:
 - run one generation and read what it reports about memory (`run_flux2_klein`,
@@ -52,7 +52,8 @@ pub(super) const FLUX2_MAX_SEQ: u32 = 512;
 
 /// Generation may load ~20 GB of weights before the first step; allow a wide window. It is
 /// the PER-FRAME timeout of every streaming call of this engine (`stream_call` restarts it on
-/// each progress frame), which is what lets a multi-hour model download share it.
+/// each progress frame), which is what lets a multi-minute weight load inside a run, a
+/// component action or a prompt-cache build share it.
 pub(super) const FLUX2_RUN_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// `.status` / `.unload` / the component calls are cheap bookkeeping calls.

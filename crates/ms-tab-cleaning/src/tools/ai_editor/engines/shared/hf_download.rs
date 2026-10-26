@@ -13,8 +13,7 @@ Main responsibilities:
   (`HfDownloadState`, `HfDownloadLink`, `HfDownloadRepo::link`);
 - own the check shape, generic over the QUESTION an engine stamps into it
   (`HfDownloadCheck<Q>`), its parser (`parse_hf_download_check`) and the verdict whether it
-  is permission to download (`hf_download_readiness`) or blames the token
-  (`download_check_blames_token`);
+  is permission to download (`hf_download_readiness`);
 - run the two calls (`call_hf_download_check`, `run_hf_download`);
 - keep the token entry field and its store/delete worker (`HfTokenControl`).
 
@@ -23,12 +22,12 @@ Key structures:
 - `HfDownloadReadiness`, `HfDownloadAction`, `HfTokenAction`, `HfTokenControl`
 
 Key functions:
-- `parse_hf_download_check()`, `hf_download_readiness()`, `download_check_blames_token()`
+- `parse_hf_download_check()`, `hf_download_readiness()`
 - `call_hf_download_check()`, `run_hf_download()`
 
 Notes:
-The pinned contract is `dev-docs/flux2_model_download.md` §3-§4 (the FLUX.2 methods were the
-first to use it). The HF token travels only in a request header the ENGINE builds and is
+The pinned contract is the gated-download section of `modules/ai_backend/ipc/PROTOCOL.md`
+(FLUX.3 klein's `.download.*`, its only user since the FLUX.2 methods were retired). The HF token travels only in a request header the ENGINE builds and is
 never persisted, logged or formatted here. The drawing half is `hf_download_ui.rs`. Every
 text is a `cleaning.tools.hf_download.*` key.
 */
@@ -48,7 +47,7 @@ use web_time::Duration;
 
 /// One repository's access verdict, as `.download.check` reports it.
 ///
-/// The mapping is FIXED by the pinned contract (`dev-docs/flux2_model_download.md` §3) and
+/// The mapping is FIXED by the pinned contract (the `state` table of `ipc/PROTOCOL.md`) and
 /// each state answers a different question for the user, which is the whole reason the
 /// backend distinguishes them instead of returning one "no access" error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,25 +241,6 @@ impl<Q> HfDownloadCheck<Q> {
     pub(in crate::tools::ai_editor::engines) fn ready(&self) -> bool {
         !self.repos.is_empty() && self.repos.iter().all(|repo| repo.state == Some(HfDownloadState::Ok))
     }
-}
-
-/// Whether the check blames the Hugging Face TOKEN for at least one repository.
-///
-/// Only [`HfDownloadState::NoToken`] and [`HfDownloadState::InvalidToken`] count: they are
-/// the two verdicts nothing but the token can resolve. `NotAccepted` is about the
-/// repository's conditions and already carries its own link, and an unrecognised literal is
-/// never guessed at.
-///
-/// It exists for an UNGATED model, whose panel draws no token row at all: without this the
-/// user is handed a verdict about a credential they have no control over anywhere in the
-/// application ([`ms_sysprobe::hf_token`] has its UI surface only in these download blocks).
-pub(in crate::tools::ai_editor::engines) fn download_check_blames_token<Q>(check: Option<&HfDownloadCheck<Q>>) -> bool {
-    check.is_some_and(|check| {
-        check
-            .repos
-            .iter()
-            .any(|repo| matches!(repo.state, Some(HfDownloadState::NoToken | HfDownloadState::InvalidToken)))
-    })
 }
 
 /// What the download controls render for the access check they were given.
@@ -848,26 +828,6 @@ mod tests {
             "plan": { "total_bytes": 40_000_000_000u64, "missing_bytes": 0, "missing_files": 0 }
         }));
         assert_eq!(done.plan.map(|plan| plan.missing_bytes), Some(0));
-    }
-
-    /// An ungated model draws no token row, so a token verdict there is a dead end unless
-    /// the panel notices it.
-    #[test]
-    fn only_the_two_token_verdicts_reopen_the_token_row() {
-        let with = |state: &str| {
-            Some(parse(&json!({
-                "repos": { "black-forest-labs/FLUX.2-klein-4B": { "state": state, "message": "" } }
-            })))
-        };
-        for state in ["no_token", "invalid_token"] {
-            assert!(download_check_blames_token(with(state).as_ref()), "{state} is the user's token and nothing else");
-        }
-        // `not_accepted` is about the repository's conditions and carries its own link;
-        // an unknown literal is never guessed at; and nothing is blamed before a check.
-        for state in ["ok", "not_accepted", "not_found", "network_error", "a_state_from_the_future"] {
-            assert!(!download_check_blames_token(with(state).as_ref()), "{state}");
-        }
-        assert!(!download_check_blames_token::<()>(None));
     }
 
     /// The question is the caller's: the parser stamps it verbatim and reads nothing for it.

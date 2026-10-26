@@ -9,8 +9,11 @@ Key items:
 - `hf_resolve_url()`: `{HF_ENDPOINT or https://huggingface.co}/{repo}/resolve/{rev}/{path}`
   with every component percent-encoded. Replaces `hf_hub::ApiBuilder::from_env`, which
   panics without a home directory (Android app processes have none).
-- `endpoint_from_env_value()` / `hf_resolve_url_at()`: the pure halves, tested without
-  touching the process environment.
+- `hf_auth_check_url()`: `{endpoint}/api/models/{repo}/auth-check`, the Hub's gated-access
+  probe (200 granted, 401 no / rejected token, 403 terms not accepted, 404 no such repo);
+  used by `hf_access`.
+- `endpoint_from_env_value()` / `hf_resolve_url_at()` / `hf_auth_check_url_at()`: the pure
+  halves, tested without touching the process environment.
 - `url_source_file_url()`: the same segment encoding for files of plain-HTTPS (`Url` source)
   external models (GitHub releases, the Surya model host).
 */
@@ -47,6 +50,22 @@ pub(crate) fn endpoint_from_env_value(value: Option<&str>) -> &str {
 #[must_use]
 pub(crate) fn hf_resolve_url_at(endpoint: &str, repo_id: &str, revision: &str, path: &str) -> String {
     format!("{endpoint}/{}/resolve/{}/{}", encode_segments(repo_id), percent_encode(revision), encode_segments(path))
+}
+
+/// URL of the Hugging Face access probe of model repository `repo_id` (`owner/name`) on the
+/// endpoint named by `HF_ENDPOINT` (default `https://huggingface.co`). The only host a
+/// Hugging Face token may be sent to, together with the resolve URLs above.
+#[must_use]
+pub(crate) fn hf_auth_check_url(repo_id: &str) -> String {
+    let configured = std::env::var(HF_ENDPOINT_ENV).ok();
+    hf_auth_check_url_at(endpoint_from_env_value(configured.as_deref()), repo_id)
+}
+
+/// [`hf_auth_check_url`] with an explicit endpoint (no trailing slash); every segment of
+/// `repo_id` is percent-encoded like a resolve URL.
+#[must_use]
+pub(crate) fn hf_auth_check_url_at(endpoint: &str, repo_id: &str) -> String {
+    format!("{endpoint}/api/models/{}/auth-check", encode_segments(repo_id))
 }
 
 /// URL of the `/`-separated relative `path` under a plain-HTTPS `base_url` (no trailing
@@ -99,6 +118,15 @@ mod tests {
         assert_eq!(hf_resolve_url_at("https://hf.example", "o/r", "main", "ä/x-y_z.~1"), "https://hf.example/o/r/resolve/main/%C3%A4/x-y_z.~1");
         // The revision is one segment: a branch-name slash is encoded as the Hub expects.
         assert_eq!(hf_resolve_url_at("https://hf.example", "o/r", "refs/pr/1", "f.bin"), "https://hf.example/o/r/resolve/refs%2Fpr%2F1/f.bin");
+    }
+
+    #[test]
+    fn auth_check_url_targets_the_hub_api_of_the_repository() {
+        assert_eq!(
+            hf_auth_check_url_at(DEFAULT_HF_ENDPOINT, "black-forest-labs/FLUX.2-klein-9B"),
+            "https://huggingface.co/api/models/black-forest-labs/FLUX.2-klein-9B/auth-check"
+        );
+        assert_eq!(hf_auth_check_url_at(endpoint_from_env_value(Some("https://hf-mirror.example/")), "o/r x"), "https://hf-mirror.example/api/models/o/r%20x/auth-check");
     }
 
     #[test]

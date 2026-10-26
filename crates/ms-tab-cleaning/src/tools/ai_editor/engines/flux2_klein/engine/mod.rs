@@ -21,16 +21,16 @@ Main responsibilities:
   they settle, re-query the catalog when the paths change, re-arm the forecast when the
   region SIZE settles, and cancel the run in flight when the region moves;
 - answer the questions the panel gates on — `pipeline_busy`, `model_readiness`,
-  `status_for_current_paths`, `prompt_cache_state`, `download_check_current`,
-  `catalog_snapshot`;
-- for a variant pinned in the Rust catalog (4B): own its `OcrModelDownloadController`
-  (`downloads`) and drive it every frame (`poll_catalog_bundle`: probes, the automatic
-  adoption, the end of a job), probe the installed weight formats on a worker
-  (`poll_installed_formats`), fold a weight-format change (`fold_resources_and_formats`,
+  `status_for_current_paths`, `prompt_cache_state`, `catalog_snapshot`;
+- for both variants (their packages are pinned in the app's catalog): own the
+  `OcrModelDownloadController` (`downloads`) and drive it every frame (`poll_catalog_bundle`:
+  probes, the automatic adoption, the end of a job), probe the installed weight formats and
+  the bf16 transformer layout on a worker (`poll_installed_formats`), fold a change of the
+  weight selection — formats or encoder source (`fold_resources_and_formats`,
   `note_weight_formats_changed`) and apply the catalog block's click (`apply_catalog_action`);
 - name the work that makes leaving this engine unsafe (`switch_block_reason`), which is
-  what closes the host's engine picker while a model download (backend or catalog), its
-  access check, or a catalog verify / automatic adoption is in flight.
+  what closes the host's engine picker while a catalog download, verify or automatic
+  adoption is in flight.
 
 Key structures:
 - `Flux2KleinEngine`
@@ -43,7 +43,7 @@ Key functions:
 
 Submodules:
 - `actions.rs`: the start/poll pairs of the long operations — component actions, the HF
-  token, the download, the translator, the file pickers and the prompt-cache jobs.
+  token, the translator, the file pickers and the prompt-cache jobs.
 
 Notes:
 Nothing here blocks the GUI thread: every start hands its work to an `ms_thread` worker
@@ -67,7 +67,7 @@ mod actions;
 pub struct Flux2KleinEngine {
     /// Which checkpoint this instance is. It is fixed at construction and never changes:
     /// the two variants are separate engines in the picker, each with its own settings
-    /// file, its own model directory and its own `.download.*` requests.
+    /// file, its own model directory and its own catalog bundle.
     pub(super) variant: Flux2Variant,
     pub(super) session: Flux2SessionState,
     /// The frame rectangle the forecast and the status line describe, `None` while the tool
@@ -193,15 +193,10 @@ pub struct Flux2KleinEngine {
     /// persisted and never sent anywhere on its own: it is only what «Сохранить» hands to the
     /// OS secret store, cleared as soon as the store accepts it.
     pub(super) hf_token: HfTokenControl,
-    /// The last `.download.check` answer; `None` until one lands.
-    pub(super) download_check: Option<Flux2DownloadCheck>,
-    pub(super) download_check_rx: Option<Receiver<Result<Flux2DownloadCheck, String>>>,
-    pub(super) download_check_error: Option<String>,
-    /// The streaming `.download.start` in flight. It claims the shared progress bar, which
-    /// is why it counts towards [`flux2_pipeline_busy`].
-    pub(super) download_rx: Option<Receiver<Result<Flux2DownloadOutcome, String>>>,
-    /// User-facing line about the last download, shown under the download controls.
-    pub(super) download_status: Option<String>,
+    /// The line saying that a switch of the encoder source changed the stored encoder format
+    /// (`Flux2KleinSettings::set_encoder_source`), shown under the toggle; cleared by the next
+    /// switch that keeps the format. Session state.
+    pub(super) encoder_format_notice: Option<String>,
     pub(super) translate_rx: Option<Receiver<Result<String, String>>>,
     pub(super) translate_status: Option<String>,
     /// The open file dialog and what it was opened for; at most one at a time.
@@ -236,18 +231,21 @@ pub struct Flux2KleinEngine {
     /// opens and closes the section while the verdict is still `Unknown` — the whole window
     /// a slow `.status` leaves open — gets it forced open again by the first `Missing`.
     pub(super) install_section_open_prev: Option<bool>,
-    /// The explicit catalog download of a variant whose package is pinned in the Rust catalog
-    /// (`Flux2Variant::downloads_from_catalog`, 4B): status probes, the download / verify job
-    /// and the automatic adoption of an unmarked existing download, all on its own workers.
-    /// `None` for the 9B checkpoint, which downloads through the backend and so gets no extra
-    /// status thread. Polled every frame by [`Self::poll_catalog_bundle`].
+    /// The explicit catalog download of this variant's pinned package: status probes, the
+    /// download / verify job (with the gated-repository access check) and the automatic
+    /// adoption of an unmarked existing download, all on its own workers. Polled every frame
+    /// by [`Self::poll_catalog_bundle`].
+    ///
+    /// `Some` for every engine the product builds ([`Self::new`]); `None` only in a TEST
+    /// build, where a real controller could adopt — hash and mark — the developer's real model
+    /// files (test hygiene: a test never writes a document the running program owns).
     pub(super) downloads: Option<OcrModelDownloadController>,
     /// The installed-formats probe in flight ([`probe_flux2_installed_formats`] on a worker);
     /// its answer goes into `settings.installed_formats`, which decides the wire's candidate
     /// lists.
     pub(super) installed_formats_rx: Option<Receiver<Flux2InstalledFormats>>,
-    /// Arms exactly ONE installed-formats probe: on construction (catalog variant only), after
-    /// a catalog job ends and on the refresh button.
+    /// Arms exactly ONE installed-formats probe: on construction, after a catalog job ends, on
+    /// a change of the weight selection and on the refresh button.
     pub(super) installed_formats_wanted: bool,
     /// Whether a catalog job (download, verify or adoption, of any bundle) was running at the
     /// last poll; its falling edge is when files on disk may have changed.
@@ -271,8 +269,8 @@ impl Flux2KleinEngine {
     ///
     /// The variant is the only difference between the two instances the picker offers, and
     /// it is stamped into the in-memory settings straight away so that everything derived
-    /// from them — the three model paths, the settings file a save lands in, the
-    /// `.download.*` requests — describes this checkpoint even before the load returns.
+    /// from them — the three model paths, the settings file a save lands in, the catalog
+    /// bundle — describes this checkpoint even before the load returns.
     /// Visibility: the ENGINE CATALOG and nothing wider. `pub(super)` — the module's
     /// declared ceiling — would stop at `flux2_klein` and reject `all_engines`, which lives
     /// one level further out in `engines`; naming that module keeps the constructor as
@@ -282,9 +280,9 @@ impl Flux2KleinEngine {
         let mut engine = Self::at_rest();
         engine.variant = variant;
         engine.settings.variant = variant.wire().to_string();
-        // Only a catalog variant downloads through the app: its controller spawns a status
-        // worker, which the 9B checkpoint has no use for.
-        if variant.downloads_from_catalog() {
+        // Both variants download through the app's catalog. A test build gets no controller:
+        // its automatic adoption would hash and mark the developer's real model files.
+        if !cfg!(test) {
             engine.downloads = Some(OcrModelDownloadController::new());
             engine.installed_formats_wanted = true;
         }
@@ -336,11 +334,7 @@ impl Flux2KleinEngine {
             component_action_pending: None,
             component_action_status: None,
             hf_token: HfTokenControl::default(),
-            download_check: None,
-            download_check_rx: None,
-            download_check_error: None,
-            download_rx: None,
-            download_status: None,
+            encoder_format_notice: None,
             translate_rx: None,
             translate_status: None,
             picker: None,
@@ -539,24 +533,6 @@ impl Flux2KleinEngine {
         )
     }
 
-    /// Whether the last `.download.check` answer still describes what the panel is asking
-    /// about — the same checkpoint and the same encoder toggle.
-    ///
-    /// THE accessor the panel goes through, for the same reason
-    /// [`Self::status_for_current_paths`] is: the comparison must use the EFFECTIVE toggle
-    /// ([`Flux2KleinSettings::uncensored_encoder_active`]), because that is the value
-    /// [`Self::start_download_check`] stamps into the answer. Comparing against the raw
-    /// persisted flag instead rejects every answer forever on a 4B document that carries
-    /// `uncensored_text_encoder: true` — a value that checkpoint cannot honour and whose
-    /// control its panel does not draw, so the user could never clear it.
-    pub(super) fn download_check_current(&self) -> bool {
-        download_check_matches_selection(
-            self.download_check.as_ref(),
-            self.settings.uncensored_encoder_active(),
-            self.variant,
-        )
-    }
-
     /// THE verdict on whether the model is installed, guarded against a stale catalog.
     ///
     /// Both consumers — the panel's readiness line and the run gate — read this rather
@@ -649,8 +625,8 @@ impl Flux2KleinEngine {
     }
 
     /// The download block's view of the catalog bundle the current selection needs
-    /// ([`flux2_catalog_bundle`]); `None` without a catalog controller (9B) or outside download
-    /// mode.
+    /// ([`flux2_catalog_bundle`]); `None` without a controller (a test build) or outside
+    /// download mode.
     pub(super) fn catalog_snapshot(&self) -> Option<OcrModelPanelSnapshot> {
         let downloads = self.downloads.as_ref()?;
         let bundle = flux2_catalog_bundle(&self.settings);
@@ -687,8 +663,10 @@ impl Flux2KleinEngine {
     }
 
     /// Drains the installed-formats probe into `settings.installed_formats` and starts the
-    /// next one when armed. A changed set re-arms the forecast: the candidate lists it sends
-    /// (`format_candidates`) follow it. Returns `true` while a probe is in flight.
+    /// next one when armed. A changed answer re-arms the forecast (the candidate lists it sends,
+    /// `format_candidates`, follow it) and, when the probed bf16 transformer layout moved the
+    /// effective paths, the `.status` catalog too (the bundle follows on its own: the next
+    /// `poll_catalog_bundle` probes the new one). Returns `true` while a probe is in flight.
     pub(super) fn poll_installed_formats(&mut self) -> bool {
         if let Some(rx) = self.installed_formats_rx.as_ref() {
             match rx.try_recv() {
@@ -697,6 +675,9 @@ impl Flux2KleinEngine {
                     if found != self.settings.installed_formats {
                         self.settings.installed_formats = found;
                         self.resources.arm();
+                        if flux2_status_paths_stale(&self.settings.effective_paths(), self.status_paths.as_ref(), self.status_query_paths.as_ref()) {
+                            self.status_wanted = true;
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => {}
@@ -724,21 +705,21 @@ impl Flux2KleinEngine {
         self.installed_formats_rx.is_some()
     }
 
-    /// Folds what the memory widget did this frame and reacts to a weight-format change made
-    /// anywhere in the panel (the two pickers, a format row of either axis, a format
-    /// suggestion).
+    /// Folds what the memory widget did this frame and reacts to a change of the weight
+    /// selection made anywhere in the panel (the two pickers, a format row of either axis, a
+    /// format suggestion, the uncensored toggle).
     ///
     /// The widget already wrote a picked step pair (and a picked transformer row) into the
     /// settings it was handed; a suggestion is written here, and the caps and the floor reset
     /// go to the controller. The transformer format is handed to the fold only while the
-    /// weight formats are in effect — elsewhere FLUX.2 has one format and a format action is
-    /// logged and ignored. `formats_before` is the (transformer, encoder) pair the frame
-    /// began with: a change saves the setting and re-arms the status and the forecast (the
-    /// settings-change path) plus the bundle probe ([`Self::note_weight_formats_changed`]).
+    /// weight formats are in effect (download mode) — in manual mode a format action is
+    /// logged and ignored. `selection_before` is the selection the frame began with: a change
+    /// saves the setting and re-arms the status and the forecast (the settings-change path)
+    /// plus the bundle probe ([`Self::note_weight_formats_changed`]).
     pub(super) fn fold_resources_and_formats(
         &mut self,
         actions: Vec<ResourcesAction>,
-        formats_before: (Flux2WeightFormat, Flux2WeightFormat),
+        selection_before: Flux2WeightSelection,
     ) {
         let mut choice = self.settings.step_choice();
         let before = choice;
@@ -750,19 +731,18 @@ impl Flux2KleinEngine {
         if resources_changed {
             self.note_settings_changed();
         }
-        let formats_after = (
-            self.settings.weight_format(Flux2WeightAxis::Transformer),
-            self.settings.weight_format(Flux2WeightAxis::TextEncoder),
-        );
-        if formats_after != formats_before {
-            self.note_weight_formats_changed(formats_after.1 != formats_before.1);
+        let selection_after = self.settings.weight_selection();
+        if selection_after != selection_before {
+            let encoder_changed = selection_after.source != selection_before.source || selection_after.text_encoder != selection_before.text_encoder;
+            self.note_weight_formats_changed(encoder_changed);
         }
     }
 
-    /// Re-asks everything the weight-format selection decides on the disk side: the new
-    /// bundle's status (even specs probed before: the user may have changed the disk), and,
-    /// when the ENCODER format moved, the prompt-cache listing (its family follows the encoder
-    /// file). The forecast and `.status` were re-armed by the settings change itself.
+    /// Re-asks everything the weight selection decides on the disk side: the new bundle's
+    /// status (even specs probed before: the user may have changed the disk), the installed
+    /// formats, and, when the ENCODER (its source or format) moved, the prompt-cache listing
+    /// (its family follows the encoder files). The forecast and `.status` were re-armed by the
+    /// settings change itself.
     pub(super) fn note_weight_formats_changed(&mut self, encoder_changed: bool) {
         let bundle = flux2_catalog_bundle(&self.settings);
         if let Some(downloads) = self.downloads.as_mut()
@@ -770,6 +750,7 @@ impl Flux2KleinEngine {
         {
             downloads.request_bundle_status(&bundle);
         }
+        self.installed_formats_wanted = true;
         if encoder_changed {
             self.prompt_cache_list_wanted = true;
         }
@@ -821,7 +802,6 @@ impl Flux2KleinEngine {
             self.session.run_rx.is_some(),
             self.prompt_cache_rx.is_some(),
             self.component_action_rx.is_some(),
-            self.download_rx.is_some(),
         ) || self.session.abandoned.busy()
     }
 
@@ -830,18 +810,16 @@ impl Flux2KleinEngine {
     ///
     /// This is what the run gate reads. It cannot read [`Self::pipeline_busy`], which is
     /// true during a run and would make the run button explain itself away mid-run; and it
-    /// must not read nothing, because a generation started under a `.prompt_cache.build`,
-    /// a `.component_action` or a multi-hour model download would queue behind it and
-    /// steal its progress bar.
+    /// must not read nothing, because a generation started under a `.prompt_cache.build` or
+    /// a `.component_action` would queue behind it and steal its progress bar.
     ///
-    /// A CANCELLED run or download whose worker has not ended counts too: it still holds the
-    /// backend, and a run started now would queue behind it (`session.abandoned`).
+    /// A CANCELLED run whose worker has not ended counts too: it still holds the backend, and
+    /// a run started now would queue behind it (`session.abandoned`).
     pub(super) fn non_run_pipeline_busy(&self) -> bool {
         flux2_pipeline_busy(
             false,
             self.prompt_cache_rx.is_some(),
             self.component_action_rx.is_some(),
-            self.download_rx.is_some(),
         ) || self.session.abandoned.busy()
     }
 
@@ -1047,12 +1025,9 @@ impl AiEngine for Flux2KleinEngine {
         let mut component_action: Option<(Flux2ComponentId, Flux2ComponentAction)> = None;
         let mut picker_requested: Option<Flux2PickerPurpose> = None;
         let mut hf_token_action: Option<HfTokenAction> = None;
-        let mut download_action: Option<HfDownloadAction> = None;
         // Read before the destructure: it is a process-wide global, not a field the
         // context can borrow.
         let hf_token_state = ms_sysprobe::hf_token::hf_token_state();
-        // Same reason: it compares a field the destructure hands out with one it does not.
-        let download_check_current = self.download_check_current();
         // Copied out before the destructure borrows `self` apart: the panel needs it in
         // several blocks and it is `Copy`.
         let variant = self.variant;
@@ -1066,16 +1041,18 @@ impl AiEngine for Flux2KleinEngine {
         // Same reason, and it reads three receivers the destructure hands out separately.
         let pipeline_busy = self.pipeline_busy();
         let region = self.region_size();
-        // The catalog download block (4B in download mode): its snapshot is taken here, before
-        // the format combos may move the bundle this frame; the block is drawn only while the
-        // snapshot still describes the bundle the selection needs.
+        // The catalog download block (download mode): its snapshot is taken here, before the
+        // format combos or the toggle may move the bundle this frame; the block is drawn only
+        // while the snapshot still describes the bundle the selection needs.
         let catalog_snapshot = self.catalog_snapshot();
         let bundle_missing = catalog_snapshot.as_ref().is_some_and(|snapshot| flux2_catalog_bundle_missing(&snapshot.state));
         let mut catalog_action = ModelDownloadAction::None;
-        let formats_before = (
-            self.settings.weight_format(Flux2WeightAxis::Transformer),
-            self.settings.weight_format(Flux2WeightAxis::TextEncoder),
-        );
+        // The gated repositories the token row is drawn for: those of the bundle's specs the
+        // controller has not seen installed (its last probe; nothing here touches the disk).
+        let gated_repos = flux2_gated_repos_missing(&flux2_catalog_bundle(&self.settings), |spec| {
+            self.downloads.as_ref().is_some_and(|downloads| matches!(downloads.state_for(spec.id), OcrModelDownloadState::Installed))
+        });
+        let selection_before = self.settings.weight_selection();
         {
             let Self {
                 settings,
@@ -1100,11 +1077,7 @@ impl AiEngine for Flux2KleinEngine {
                 install_section_seeded,
                 install_section_open_prev,
                 hf_token,
-                download_check,
-                download_check_rx,
-                download_check_error,
-                download_rx,
-                download_status,
+                encoder_format_notice,
                 ai_backend_available,
                 ..
             } = self;
@@ -1138,11 +1111,8 @@ impl AiEngine for Flux2KleinEngine {
                 hf_token_busy: hf_token.busy(),
                 hf_token_input: &mut hf_token.input,
                 hf_token_status: hf_token.status.as_deref(),
-                download_check: download_check.as_ref().filter(|_| download_check_current),
-                download_check_error: download_check_error.as_deref(),
-                download_check_busy: download_check_rx.is_some(),
-                download_busy: download_rx.is_some(),
-                download_status: download_status.as_deref(),
+                gated_repos: &gated_repos,
+                encoder_format_notice,
                 ai_backend_available: *ai_backend_available,
                 settings_changed: &mut settings_changed,
                 postprocess_changed: &mut postprocess_changed,
@@ -1155,7 +1125,6 @@ impl AiEngine for Flux2KleinEngine {
                 component_action: &mut component_action,
                 picker_requested: &mut picker_requested,
                 hf_token_action: &mut hf_token_action,
-                download_action: &mut download_action,
                 catalog_snapshot: catalog_snapshot.as_ref(),
                 bundle_missing,
                 catalog_action: &mut catalog_action,
@@ -1188,7 +1157,7 @@ impl AiEngine for Flux2KleinEngine {
                 self.installed_formats_wanted = true;
             }
         }
-        self.fold_resources_and_formats(resources_actions, formats_before);
+        self.fold_resources_and_formats(resources_actions, selection_before);
         self.apply_catalog_action(catalog_action);
         if translate_requested {
             self.start_translate();
@@ -1214,12 +1183,6 @@ impl AiEngine for Flux2KleinEngine {
         if let Some(action) = hf_token_action {
             self.hf_token.apply(action);
         }
-        match download_action {
-            Some(HfDownloadAction::Check) => self.start_download_check(),
-            Some(HfDownloadAction::Start) => self.start_download(),
-            Some(HfDownloadAction::Cancel) => self.cancel_download(),
-            None => {}
-        }
         if let Some(purpose) = picker_requested {
             self.start_picker(purpose);
         }
@@ -1240,9 +1203,9 @@ impl AiEngine for Flux2KleinEngine {
     ///
     /// The pipeline check comes first and reads [`Self::non_run_pipeline_busy`], not
     /// [`Self::pipeline_busy`]: a generation must not report itself as the reason it
-    /// cannot start, while a `.prompt_cache.build`, a `.component_action` or a
-    /// multi-hour model download genuinely blocks the next one — it holds the backend's
-    /// one pipeline and the single progress bar a starting run would steal.
+    /// cannot start, while a `.prompt_cache.build` or a `.component_action` genuinely blocks
+    /// the next one — it holds the backend's one pipeline and the single progress bar a
+    /// starting run would steal.
     /// The progress every long operation of this engine shares and the last run's outcome,
     /// pinned above the parameters.
     fn draw_progress(&mut self, ui: &mut egui::Ui) {
@@ -1278,27 +1241,18 @@ impl AiEngine for Flux2KleinEngine {
         flux2_run_block_reason(&self.settings, self.status_for_current_paths(), self.prompt_cache_state())
     }
 
-    /// Refuses the switch while THIS engine owns a model download, the access check that
-    /// prices one, or a running job of its catalog controller (4B: download, verify or
-    /// automatic adoption, [`flux2_catalog_switch_block_reason`]).
+    /// Refuses the switch while a job of THIS engine's catalog controller runs (download,
+    /// verify or automatic adoption, [`flux2_catalog_switch_block_reason`]).
     ///
     /// The download is the reason the hook exists: it is a multi-gigabyte transfer with its
-    /// own free-space budget and no frame state at all, so without this a user could start
-    /// one checkpoint's download, switch, and start the other's against the same disk. The
-    /// access check is included because it is the download's own pre-flight — leaving
-    /// mid-check abandons an answer the panel would otherwise apply to the wrong checkpoint.
+    /// own free-space budget and no frame state at all, and the host polls only the selected
+    /// engine, so a job left behind by a switch would run unseen.
     ///
     /// A generation, a `.prompt_cache.build` and a `.component_action` are NOT here: the
     /// first locks the frame, which is the picker's other gate, and the other two are the
     /// backend's one pipeline, which the newly selected engine would queue behind rather
     /// than duplicate.
     fn switch_block_reason(&self) -> Option<String> {
-        if self.download_rx.is_some() {
-            return Some(t!("cleaning.tools.flux2_klein.download.switch_blocked_download").to_string());
-        }
-        if self.download_check_rx.is_some() {
-            return Some(t!("cleaning.tools.flux2_klein.download.switch_blocked_check").to_string());
-        }
         flux2_catalog_switch_block_reason(self.downloads.as_ref().and_then(OcrModelDownloadController::running_job))
     }
 
@@ -1312,8 +1266,8 @@ impl AiEngine for Flux2KleinEngine {
     /// whatever [`Flux2KleinEngine::run_input`] refuses the request for.
     fn start(&mut self, request: EngineRunRequest) -> Result<(), String> {
         // Checked before anything is encoded: the backend has ONE pipeline, so a run
-        // started under a prompt-cache build, a component action or a model download would
-        // queue behind it for as long as it lasts AND steal its progress bar.
+        // started under a prompt-cache build or a component action would queue behind it for
+        // as long as it lasts AND steal its progress bar.
         if self.non_run_pipeline_busy() {
             return Err(t!("cleaning.tools.flux2_klein.pipeline_busy_error").to_string());
         }
@@ -1350,8 +1304,6 @@ impl AiEngine for Flux2KleinEngine {
         self.poll_prompt_cache();
         self.poll_and_maybe_query_prompt_cache_list();
         self.poll_hf_token();
-        self.poll_download_check();
-        self.poll_download();
         self.poll_picker();
         // The catalog download's probes, job and adoption, and the installed-formats probe.
         if self.poll_catalog_bundle() {
@@ -1487,81 +1439,13 @@ mod tests {
         assert!(!same_region(Some(&rect(1, 2, 64, 64)), None));
     }
 
-    /// A 4B settings document that carries `uncensored_text_encoder: true` — hand-edited, or
-    /// copied from the 9B file, which is the shape of the historic bug — must still accept
-    /// its OWN check answer.
-    ///
-    /// The flag is inert on that checkpoint and its panel draws no control to clear it, so
-    /// comparing the answer against the RAW flag rejected every check forever: «Скачать»
-    /// stayed dead with nothing on screen to say why. The comparison uses the value the
-    /// request is stamped from, `uncensored_encoder_active()`.
+    /// Only a running catalog job closes the engine picker
+    /// ([`flux2_catalog_switch_block_reason`], tested per job kind in `decisions.rs`): an idle
+    /// engine blocks nothing.
     #[test]
-    fn a_4b_document_carrying_the_raw_uncensored_flag_still_accepts_its_own_check() {
-        let mut engine = Flux2KleinEngine {
-            variant: Flux2Variant::Klein4B,
-            ..Default::default()
-        };
-        engine.settings.variant = Flux2Variant::Klein4B.wire().to_string();
-        engine.settings.uncensored_text_encoder = true;
-        assert!(
-            !engine.settings.uncensored_encoder_active(),
-            "the 4B checkpoint has no uncensored encoder, so the flag is inert"
-        );
-
-        // Exactly what `start_download_check` stamps: the EFFECTIVE toggle and the echoed
-        // checkpoint.
-        engine.download_check = Some(Flux2DownloadCheck {
-            question: Flux2CheckQuestion { uncensored: engine.settings.uncensored_encoder_active(), variant: Flux2Variant::Klein4B },
-            ..Default::default()
-        });
-        assert!(
-            engine.download_check_current(),
-            "the panel must show the answer its own request asked for"
-        );
-        assert!(
-            !download_check_matches_selection(
-                engine.download_check.as_ref(),
-                engine.settings.uncensored_text_encoder,
-                engine.variant,
-            ),
-            "the raw flag is what used to reject it; this pins the difference"
-        );
-    }
-
-    /// The 9B checkpoint keeps the toggle MEANINGFUL: there the flag and the effective value
-    /// agree, so an answer about the other toggle is still correctly refused.
-    #[test]
-    fn on_9b_an_answer_about_the_other_toggle_is_still_refused() {
-        let mut engine = Flux2KleinEngine::default();
-        engine.settings.uncensored_text_encoder = true;
-        assert!(engine.settings.uncensored_encoder_active());
-        engine.download_check = Some(Flux2DownloadCheck {
-            question: Flux2CheckQuestion { uncensored: false, variant: Flux2Variant::Klein9B },
-            ..Default::default()
-        });
-        assert!(!engine.download_check_current());
-    }
-
-    /// Two engines with two independent free-space budgets must not download at once, so the
-    /// engine closes the picker while it owns a transfer or the check that prices one.
-    #[test]
-    fn a_download_and_its_pre_flight_check_both_close_the_engine_picker() {
+    fn an_idle_engine_and_a_generation_do_not_close_the_engine_picker() {
         let engine = Flux2KleinEngine::default();
         assert!(engine.switch_block_reason().is_none(), "an idle engine blocks nothing");
-
-        let (_download_tx, download_rx) = mpsc::channel();
-        let engine = Flux2KleinEngine { download_rx: Some(download_rx), ..Default::default() };
-        assert_eq!(
-            engine.switch_block_reason().as_deref(),
-            Some(t!("cleaning.tools.flux2_klein.download.switch_blocked_download"))
-        );
-
-        let (_check_tx, check_rx) = mpsc::channel();
-        let engine = Flux2KleinEngine { download_check_rx: Some(check_rx), ..Default::default() };
-        assert_eq!(
-            engine.switch_block_reason().as_deref(),
-            Some(t!("cleaning.tools.flux2_klein.download.switch_blocked_check"))
-        );
 
         // A generation is NOT one of them: the frame lock is the picker's gate for that, and
         // restating it here would close the picker twice for one reason.
@@ -2159,14 +2043,16 @@ mod tests {
         assert!(engine.pipeline_busy());
     }
 
-    /// The download claims the shared bar, so it must count towards the same busy rule the
-    /// other three long operations do — and it must ALSO block a generation, which is what
+    /// A component action claims the shared bar, so it must count towards the same busy rule
+    /// the other long operations do — and it must ALSO block a generation, which is what
     /// `non_run_pipeline_busy` exists for.
     #[test]
-    fn a_download_holds_the_pipeline_exactly_as_the_other_long_operations_do() {
+    fn a_component_action_holds_the_pipeline_exactly_as_the_other_long_operations_do() {
         // The pure rule first, one flag at a time.
-        assert!(!flux2_pipeline_busy(false, false, false, false));
-        assert!(flux2_pipeline_busy(false, false, false, true));
+        assert!(!flux2_pipeline_busy(false, false, false));
+        assert!(flux2_pipeline_busy(false, false, true));
+        assert!(flux2_pipeline_busy(false, true, false));
+        assert!(flux2_pipeline_busy(true, false, false));
 
         let mut engine = Flux2KleinEngine {
             settings: runnable_settings(),
@@ -2180,9 +2066,9 @@ mod tests {
             "a configured engine with nothing running must be runnable"
         );
 
-        let (_download_tx, download_rx) = mpsc::channel();
-        engine.download_rx = Some(download_rx);
-        assert!(engine.pipeline_busy(), "a download holds the pipeline");
+        let (_action_tx, action_rx) = mpsc::channel();
+        engine.component_action_rx = Some(action_rx);
+        assert!(engine.pipeline_busy(), "a component action holds the pipeline");
         assert!(
             engine.non_run_pipeline_busy(),
             "and it is not a generation, so it blocks one"
@@ -2212,7 +2098,7 @@ mod tests {
                 import: false
             }
         );
-        engine.download_rx = None;
+        engine.component_action_rx = None;
 
         // A GENERATION is the one holder that must not report itself as the reason it
         // cannot start: the frame owns that state.
@@ -2224,27 +2110,39 @@ mod tests {
     }
 
 
-    /// A 4B engine in download mode whose catalog answer describes its current paths, with
-    /// nothing armed; no download controller (the tests never probe the real disk).
-    fn catalog_engine(transformer: Flux2WeightFormat, text_encoder: Flux2WeightFormat) -> Flux2KleinEngine {
+    /// An engine of `variant` in download mode whose catalog answer describes its current
+    /// paths, with nothing armed; no download controller (a test build never builds one).
+    fn download_engine(variant: Flux2Variant, source: Flux2EncoderSource, transformer: Flux2WeightFormat, text_encoder: Flux2WeightFormat) -> Flux2KleinEngine {
         let settings = Flux2KleinSettings {
-            variant: Flux2Variant::Klein4B.wire().to_string(),
+            variant: variant.wire().to_string(),
             source_mode: Flux2SourceMode::Download.wire().to_string(),
+            uncensored_text_encoder: source == Flux2EncoderSource::Uncensored,
             transformer_format: transformer.wire().to_string(),
             text_encoder_format: text_encoder.wire().to_string(),
             ..runnable_settings()
         };
         let asked_about = settings.effective_paths();
         Flux2KleinEngine {
-            variant: Flux2Variant::Klein4B,
+            variant,
             settings,
             settings_loaded: true,
             status_paths: Some(asked_about),
             status_wanted: false,
             prompt_cache_list_wanted: false,
+            installed_formats_wanted: false,
             dirty: false,
             ..Flux2KleinEngine::default()
         }
+    }
+
+    /// A 4B engine in download mode on the stock encoder.
+    fn catalog_engine(transformer: Flux2WeightFormat, text_encoder: Flux2WeightFormat) -> Flux2KleinEngine {
+        download_engine(Flux2Variant::Klein4B, Flux2EncoderSource::Stock, transformer, text_encoder)
+    }
+
+    /// The selection a frame began with: the given formats on the stock encoder.
+    fn stock_selection(transformer: Flux2WeightFormat, text_encoder: Flux2WeightFormat) -> Flux2WeightSelection {
+        Flux2WeightSelection { transformer, source: Flux2EncoderSource::Stock, text_encoder }
     }
 
     /// A transformer format row picked in «Память и скорость» (the widget writes it and
@@ -2256,11 +2154,12 @@ mod tests {
         engine.settings.transformer_format = Flux2WeightFormat::Q80.wire().to_string();
         engine.fold_resources_and_formats(
             vec![ResourcesAction::ApplyFormat(Flux2WeightFormat::Q80.wire().to_string())],
-            (Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16),
+            stock_selection(Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16),
         );
         assert_eq!(engine.settings.weight_format(Flux2WeightAxis::Transformer), Flux2WeightFormat::Q80);
         assert!(engine.dirty && engine.resources.wanted, "a save is owed and the forecast re-armed");
         assert!(engine.status_wanted, "the transformer path moved to the GGUF file");
+        assert!(engine.installed_formats_wanted, "the installed formats are probed again");
         assert!(!engine.prompt_cache_list_wanted, "the encoder family did not change");
     }
 
@@ -2270,7 +2169,7 @@ mod tests {
         let mut engine = catalog_engine(Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16);
         engine.fold_resources_and_formats(
             vec![ResourcesAction::ApplyFormat(Flux2WeightFormat::Q4KM.wire().to_string())],
-            (Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16),
+            stock_selection(Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16),
         );
         assert_eq!(engine.settings.weight_format(Flux2WeightAxis::Transformer), Flux2WeightFormat::Q4KM);
         assert!(engine.dirty && engine.status_wanted);
@@ -2284,37 +2183,42 @@ mod tests {
         let mut engine = catalog_engine(Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16);
         engine.settings.text_encoder_format = Flux2WeightFormat::Q80.wire().to_string();
         engine.note_settings_changed();
-        engine.fold_resources_and_formats(Vec::new(), (Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16));
+        engine.fold_resources_and_formats(Vec::new(), stock_selection(Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16));
         assert!(engine.prompt_cache_list_wanted && engine.status_wanted && engine.resources.wanted);
     }
 
-    /// 9B is unchanged: no catalog controller, no catalog block, and a format action from
-    /// the widget is ignored rather than written into its settings.
+    /// 9B downloads from the catalog too: in download mode a format action is applied, and
+    /// the uncensored toggle (a source change, even with the format kept) moves the encoder
+    /// path and re-asks the status, the forecast, the installed formats and the prompt-cache
+    /// listing.
     #[test]
-    fn nine_b_has_no_catalog_block_and_ignores_a_format_action() {
-        let mut engine = Flux2KleinEngine {
-            settings: Flux2KleinSettings { source_mode: Flux2SourceMode::Download.wire().to_string(), ..runnable_settings() },
-            settings_loaded: true,
-            dirty: false,
-            ..Flux2KleinEngine::default()
-        };
+    fn nine_b_applies_format_actions_and_the_toggle_rearms_the_encoder_answers() {
+        let mut engine = download_engine(Flux2Variant::Klein9B, Flux2EncoderSource::Stock, Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16);
         engine.fold_resources_and_formats(
             vec![ResourcesAction::ApplyFormat(Flux2WeightFormat::Q80.wire().to_string())],
-            (Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16),
+            stock_selection(Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16),
         );
-        assert_eq!(engine.settings.transformer_format, runnable_settings().transformer_format);
-        assert!(!engine.dirty, "nothing changed, nothing is owed");
-        assert!(engine.downloads.is_none() && engine.catalog_snapshot().is_none());
-        assert!(!engine.poll_catalog_bundle(), "nothing to poll, nothing to repaint for");
+        assert_eq!(engine.settings.weight_format(Flux2WeightAxis::Transformer), Flux2WeightFormat::Q80);
+        assert!(engine.dirty);
+
+        let mut toggled = download_engine(Flux2Variant::Klein9B, Flux2EncoderSource::Stock, Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16);
+        let before = toggled.settings.weight_selection();
+        assert_eq!(toggled.settings.set_encoder_source(Flux2EncoderSource::Uncensored), None, "bf16 is offered for both sources");
+        toggled.note_settings_changed();
+        toggled.fold_resources_and_formats(Vec::new(), before);
+        assert!(toggled.status_wanted, "the encoder path moved to text_encoder_uncensored/");
+        assert!(toggled.resources.wanted && toggled.installed_formats_wanted && toggled.prompt_cache_list_wanted);
+        assert!(toggled.downloads.is_none() && toggled.catalog_snapshot().is_none(), "a test build has no controller");
     }
 
     /// The installed formats are runtime state: a settings load (which replaces the settings
-    /// wholesale) keeps them, and a probe answer that changes them re-arms the forecast,
-    /// whose candidate lists follow them.
+    /// wholesale) keeps them, and a probe answer that changes them re-arms the forecast, whose
+    /// candidate lists follow them — and `.status` when the probed bf16 transformer layout
+    /// moved the effective paths.
     #[test]
     fn the_installed_formats_survive_a_settings_load_and_a_changed_probe_rearms_the_forecast() {
         let mut installed = Flux2InstalledFormats::default();
-        installed.insert(Flux2WeightAxis::Transformer, Flux2WeightFormat::Q80);
+        installed.insert(Flux2WeightAxis::Transformer, Flux2EncoderSource::Stock, Flux2WeightFormat::Q80);
 
         let (tx, rx) = mpsc::channel();
         assert!(tx.send(plain_load(runnable_settings())).is_ok(), "the test channel must accept the settings");
@@ -2331,5 +2235,17 @@ mod tests {
         assert!(!probed.poll_installed_formats(), "the probe has landed");
         assert_eq!(probed.settings.installed_formats, installed);
         assert!(probed.resources.wanted, "the candidate lists changed");
+
+        // A legacy 9B install: the layout moves the bf16 transformer path, so `.status` is
+        // asked about the folder that is really there.
+        let mut legacy = download_engine(Flux2Variant::Klein9B, Flux2EncoderSource::Stock, Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16);
+        let mut found = Flux2InstalledFormats::default();
+        found.transformer_layout = Flux2TransformerLayout::LegacyDiffusers;
+        let (tx, rx) = mpsc::channel();
+        assert!(tx.send(found).is_ok(), "the test channel must accept the probe answer");
+        legacy.installed_formats_rx = Some(rx);
+        assert!(!legacy.poll_installed_formats());
+        assert!(legacy.status_wanted, "the derived transformer path moved to transformer/");
+        assert!(legacy.settings.effective_paths().transformer.ends_with("transformer"));
     }
 }

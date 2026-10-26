@@ -130,8 +130,11 @@ from __future__ import annotations
 # `file_component` (`transformer` = DiT, `text_encoder`, `vae` = AE).
 # Load byte frames of both klein models: at most one per 0.2 s per read, plus
 # one 100% frame.
+# 22: `inpaint.flux2_klein.download.check` / `.start` are removed (the app's
+# model catalog downloads every FLUX.2 klein weight, 4B and 9B; the old names
+# are unknown methods). No other wire change.
 # ============================================================================
-PROTOCOL_VERSION = 21
+PROTOCOL_VERSION = 22
 
 # ============================================================================
 # FRAME SIZE GUARDS
@@ -253,15 +256,6 @@ METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_SAVE = "inpaint.flux2_klein.prompt_cache
 METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD = "inpaint.flux2_klein.prompt_cache.load"
 METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT = "inpaint.flux2_klein.prompt_cache.export"
 METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT = "inpaint.flux2_klein.prompt_cache.import"
-# Model acquisition from Hugging Face into `side_models/FLUX.2-klein-9B/`. Both
-# source repositories are GATED, so the token is a REQUEST FIELD of both methods
-# (never an env var of the backend, never inside `params`, never logged).
-# `.check` is non-streaming and answers one `state` per repository plus the plan
-# totals the button labels itself with; `.start` streams the same envelope as
-# `.prompt_cache.build`, so it claims the same single progress bar and can never
-# run beside a generation. The wire contract is `dev-docs/flux2_model_download.md`.
-METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK = "inpaint.flux2_klein.download.check"
-METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START = "inpaint.flux2_klein.download.start"
 # FLUX.3 Image Klein region editing (`ipc/handlers/flux3_klein.py`, PROTOCOL.md
 # "FLUX.3 klein"): the region is reference #0, the composite stays inside the
 # mask. The run streams `load` / `generate` frames with a stable `stage` and
@@ -353,8 +347,6 @@ ALL_METHODS = frozenset(
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LOAD,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT,
-        METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK,
-        METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START,
         METHOD_INPAINT_FLUX3_KLEIN,
         METHOD_INPAINT_FLUX3_KLEIN_STATUS,
         METHOD_INPAINT_FLUX3_KLEIN_UNLOAD,

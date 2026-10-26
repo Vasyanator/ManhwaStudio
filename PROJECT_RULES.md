@@ -62,10 +62,19 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   `cargo clippy -p <crate> --all-targets --all-features --target <t> -- -D warnings` per target.
 - **Baseline build of `HEAD`** (global §19 "Unrelated must be proven", when the dependency-graph
   proof is not enough): from a `git worktree` of `HEAD` under the scratchpad, run
-  `flock <lockfile> env CARGO_TARGET_DIR=<repo>/target/head-baseline cargo test -p <crate> -j 8`.
+  `flock <lockfile> env CARGO_TARGET_DIR=<repo>/target/head-baseline CARGO_BUILD_BUILD_DIR=<shared build-dir>/head-baseline cargo test -p <crate> -j 8`.
   The persistent `target/head-baseline` makes every check after the first incremental. Never
   build the worktree into the main `target/`: its binaries would overwrite
   `target/release/manhwastudio_rs` and mislead the stale-build check below.
+- **One shared cargo `build-dir`, one checkout per subdirectory.** The user's `~/.cargo/config.toml`
+  sets a single `build-dir` shared by all projects (disk space). Cargo names a workspace crate's
+  intermediates by its path RELATIVE to the workspace root, so two checkouts of this repository
+  (a `git worktree`, the baseline above) overwrite each other's artefacts there and a later
+  `cargo check` trusts the stale ones (seen: "no `Flux2EncoderSource`" from a worktree's older
+  ms-config). The main checkout uses the shared dir as is; every other checkout sets
+  `CARGO_BUILD_BUILD_DIR=<shared build-dir>/<checkout name>` and that subdirectory is deleted with
+  the checkout. After a collision, `cargo clean --workspace` in the main checkout repairs it
+  (dependencies stay cached).
 - **Two runnable binaries** (global §16 "Stale builds"): `target/release/manhwastudio_rs` and
   the repo-root `./manhwastudio_rs` that the `run-dev.*` launchers publish. Find out which one the
   user ran, then compare its mtime (`stat -c '%y' <binary>`) with
@@ -128,7 +137,10 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   reports a CUDA-like capability), the FLUX.2 weight-format list (`ms_config::Flux2WeightFormat`;
   Python lists no quants), llama.cpp <-> HF Qwen3 tensor names (the `gguf` package's own map via
   `flux2_klein/encoder_gguf.py`), adoption of present-but-unmarked catalog files
-  (`ms_sysprobe::ai_models::external::adopt_external_model`),
+  (`ms_sysprobe::ai_models::external::adopt_external_model`), the FLUX.2 encoder source and its
+  offered formats (`ms_config::Flux2EncoderSource` + `Flux2WeightFormat::offered_for`), the
+  Hugging Face gated-access check (`ms_sysprobe::ai_models::hf_access`), the uncensored encoder's
+  `rope_parameters` normalization (`flux2_klein/components.text_encoder_config_kwargs`),
   OS integration records — record names (`ms_os_integration::identity`), expected registry
   values (`ms_os_integration::windows::values`) and the "Open with" ownership rule
   (`open_with_command_targets_install`); no other crate spells a record name or builds its values;
@@ -258,6 +270,11 @@ Reformatting is acceptable only once proven inert this way.
   `ru.json`. `es` / `fr` / `pt` are translated separately and fall back to `en`; do not block on
   them.
 - If a string's meaning or context is unclear, ask the user; never invent a translation.
+- Never change the `{placeholder}` set of an existing key: the editable on-disk catalog
+  (`locale/*.json`, reconciled by `ms_config::locale_store`, which adds keys and never
+  overwrites) keeps the old text on every existing install, so the new arguments are not
+  substituted (seen: «Продолжить загрузку ({done} из {total})»). Add a key with a new id instead
+  and remove the old one.
 - A message that names a button substitutes the button's label via `{button}`, never a literal
   copy.
 - Exceptions (logs, protocol ids, persistence keys, on-disk names, probes) only per

@@ -28,7 +28,9 @@ Notes:
   total differs from the size already learned (the remote file changed), or a 416 showing
   that the `.part` is longer than the remote file. A transfer that stops early keeps them.
 - The bearer token (if a caller passes one) is only ever a request header; it is never
-  logged and is sent only to the first hop of a redirect chain.
+  logged and is sent only to the first hop of a redirect chain and to later hops on that
+  hop's own origin (`bearer_allowed`: same scheme + authority, e.g. Hugging Face's same-host
+  `/api/resolve-cache/…` redirect), never to another host (the LFS / xet CDN).
 - `UreqFetcher` follows redirects itself so a response can carry its `RemoteIdentity`
   (`X-Linked-Etag` of a Hugging Face LFS redirect, else the final `ETag`).
 */
@@ -116,16 +118,19 @@ pub enum FetchError {
     /// `retry_after` is the server's `Retry-After` when it sent one in delta-seconds form.
     Transient { detail: String, retry_after: Option<Duration> },
     /// Retrying cannot help: any other HTTP status, a malformed URL or proxy setting, a
-    /// redirect loop, a 206 for another range.
-    Permanent { detail: String },
+    /// redirect loop, a 206 for another range. `status` is the HTTP status code when the
+    /// failure IS an HTTP answer (e.g. `Some(401)`), `None` for transport and protocol
+    /// failures, so a consumer can map an access refusal without parsing `detail`.
+    Permanent { detail: String, status: Option<u16> },
     /// HTTP 416 to a request with a non-zero offset: the offset is at or past the end of the
     /// remote file. `total` is the file size from `Content-Range: bytes */N`, if sent.
     RangeNotSatisfiable { total: Option<u64> },
 }
 
 /// Classifies an HTTP error status: 408 (request timeout), 429 (rate limit) and every 5xx
-/// are transient, everything else permanent. `retry_after` is the raw `Retry-After` header;
-/// only the delta-seconds form is honoured (an HTTP-date falls back to the backoff).
+/// are transient, everything else permanent (carrying `status: Some(code)`). `retry_after` is
+/// the raw `Retry-After` header; only the delta-seconds form is honoured (an HTTP-date falls
+/// back to the backoff).
 #[must_use]
 pub fn classify_status(code: u16, retry_after: Option<&str>) -> FetchError {
     let detail = format!("HTTP status {code}");
@@ -133,7 +138,7 @@ pub fn classify_status(code: u16, retry_after: Option<&str>) -> FetchError {
         let retry_after = retry_after.and_then(|value| value.trim().parse::<u64>().ok()).map(Duration::from_secs);
         FetchError::Transient { detail, retry_after }
     } else {
-        FetchError::Permanent { detail }
+        FetchError::Permanent { detail, status: Some(code) }
     }
 }
 
@@ -232,7 +237,10 @@ pub enum StreamError {
     Io { path: PathBuf, source: std::io::Error },
     /// A permanent HTTP failure, retries exhausted, or a size the server never announced;
     /// the `.part` is kept for a later resume. English diagnostic `detail`, no secrets.
-    Http { detail: String },
+    /// `status` is the HTTP status of a permanent HTTP answer (from
+    /// [`FetchError::Permanent`], or `Some(416)` for an unsatisfiable resume of a pinned
+    /// file); `None` for transport / protocol failures, exhausted retries and an unannounced size.
+    Http { detail: String, status: Option<u16> },
     /// The staged bytes are proven wrong — more bytes than the size, or a 206 announcing a
     /// different total than the size already known — and the `.part` was deleted.
     /// `actual` is the length (or announced total) that contradicted `expected`.
@@ -337,6 +345,7 @@ impl ResumableFetch<'_> {
             if failures > self.retry.max_retries {
                 return Err(StreamError::Http {
                     detail: format!("{detail} (gave up after {} retries without progress)", self.retry.max_retries),
+                    status: None,
                 });
             }
             let delay = self.retry.delay_for(failures, retry_after);
@@ -368,7 +377,7 @@ impl ResumableFetch<'_> {
         let response = match self.fetcher.fetch(request.url, offset) {
             Ok(response) => response,
             Err(FetchError::Transient { detail, retry_after }) => return Err(AttemptError::Transient { detail, retry_after }),
-            Err(FetchError::Permanent { detail }) => return Err(AttemptError::Fatal(StreamError::Http { detail })),
+            Err(FetchError::Permanent { detail, status }) => return Err(AttemptError::Fatal(StreamError::Http { detail, status })),
             Err(FetchError::RangeNotSatisfiable { total }) => return self.range_not_satisfiable(request, state, total, hasher),
         };
         let mut handle = match response.status {
@@ -449,6 +458,7 @@ impl ResumableFetch<'_> {
             // `Content-Range` total.
             None => Err(AttemptError::Fatal(StreamError::Http {
                 detail: format!("the server announced no file size, so the {} downloaded bytes cannot be verified", state.written),
+                status: None,
             })),
         }
     }
@@ -467,7 +477,7 @@ impl ResumableFetch<'_> {
     ) -> Result<AttemptEnd, AttemptError> {
         let offset = state.written;
         if offset == 0 || request.expected_size.is_some() {
-            return Err(AttemptError::Fatal(StreamError::Http { detail: format!("HTTP status 416: range from byte {offset} is not satisfiable") }));
+            return Err(AttemptError::Fatal(StreamError::Http { detail: format!("HTTP status 416: range from byte {offset} is not satisfiable"), status: Some(416) }));
         }
         if total == Some(offset) {
             sync_file(request.part)?;
@@ -619,12 +629,13 @@ const MAX_REDIRECTS: usize = 5;
 /// the response identity of a Hugging Face LFS file (`X-Linked-Etag`) is a header of the
 /// redirect hop that ureq would discard. Hop rules: at most [`MAX_REDIRECTS`] hops, targets
 /// resolved per RFC 3986, only same-scheme or `http` -> `https` (an `https` -> `http`
-/// downgrade is a permanent, logged failure), `Authorization` only on the first request,
-/// every other header (`Range`, `Accept-Encoding`, the configured extras) on every hop.
+/// downgrade is a permanent, logged failure), `Authorization` only on the first request and on
+/// hops of the first request's own origin ([`bearer_allowed`]), every other header (`Range`,
+/// `Accept-Encoding`, the configured extras) on every hop.
 pub struct UreqFetcher {
     agent: ureq::Agent,
-    /// Access token (e.g. the Hugging Face token); sent as a bearer header to the FIRST hop
-    /// only (the LFS CDN is another host), never logged.
+    /// Access token (e.g. the Hugging Face token); sent as a bearer header to the first hop and
+    /// to same-origin hops only (the LFS CDN is another host), never logged.
     bearer: Option<String>,
     /// Extra headers of [`FetcherConfig::headers`], set on every request and every hop.
     headers: Vec<(String, String)>,
@@ -652,15 +663,16 @@ impl UreqFetcher {
         Self { agent: builder.build(), bearer, headers }
     }
 
-    /// Sends one GET of `url` (hop `hop` of the redirect chain) and maps a failure.
-    fn send(&self, url: &str, offset: u64, hop: usize) -> Result<ureq::Response, FetchError> {
+    /// Sends one GET of `url` and maps a failure; `authorize` adds the bearer token (the
+    /// caller decides per hop, see [`bearer_allowed`]).
+    fn send(&self, url: &str, offset: u64, authorize: bool) -> Result<ureq::Response, FetchError> {
         // Identity encoding: byte offsets and Content-Length must describe the file itself
         // (see the file header).
         let mut request = self.agent.get(url).set("Accept-Encoding", "identity");
         if offset > 0 {
             request = request.set("Range", &format!("bytes={offset}-"));
         }
-        if hop == 0
+        if authorize
             && let Some(token) = &self.bearer
         {
             request = request.set("Authorization", &format!("Bearer {token}"));
@@ -679,7 +691,7 @@ impl UreqFetcher {
                 Err(if transport_is_transient(transport.kind()) {
                     FetchError::Transient { detail, retry_after: None }
                 } else {
-                    FetchError::Permanent { detail }
+                    FetchError::Permanent { detail, status: None }
                 })
             }
         }
@@ -691,18 +703,21 @@ impl RangeFetcher for UreqFetcher {
         let mut current = url.to_owned();
         let mut linked_etag: Option<String> = None;
         for hop in 0..=MAX_REDIRECTS {
-            let response = self.send(&current, offset, hop)?;
+            // The token follows a same-origin redirect (Hugging Face resolves small files of a
+            // gated repository through a same-host hop) but never leaves for another host.
+            let response = self.send(&current, offset, hop == 0 || bearer_allowed(url, &current))?;
             if linked_etag.is_none() {
                 linked_etag = response.header("X-Linked-Etag").map(str::to_owned);
             }
             if (300..400).contains(&response.status()) {
                 let location = response.header("Location").ok_or_else(|| FetchError::Permanent {
                     detail: format!("HTTP status {} without a Location header", response.status()),
+                    status: Some(response.status()),
                 })?;
                 current = resolve_location(&current, location).map_err(|detail| {
                     // Never logs the target URL itself (a signed CDN URL); the reason is enough.
                     ms_log::runtime_log::log_warn(format!("[download] redirect not followed: hop={hop} reason={detail}"));
-                    FetchError::Permanent { detail }
+                    FetchError::Permanent { detail, status: None }
                 })?;
                 continue;
             }
@@ -714,16 +729,16 @@ impl RangeFetcher for UreqFetcher {
                     // A 206 for another range would silently corrupt the resumed file.
                     let range = response.header("Content-Range").unwrap_or_default();
                     if !range.starts_with(&format!("bytes {offset}-")) {
-                        return Err(FetchError::Permanent { detail: format!("unexpected Content-Range '{range}' for offset {offset}") });
+                        return Err(FetchError::Permanent { detail: format!("unexpected Content-Range '{range}' for offset {offset}"), status: None });
                     }
                     (FetchStatus::Partial, content_range_total(range))
                 }
-                other => return Err(FetchError::Permanent { detail: format!("unexpected HTTP status {other}") }),
+                other => return Err(FetchError::Permanent { detail: format!("unexpected HTTP status {other}"), status: Some(other) }),
             };
             let identity = RemoteIdentity::from_headers(linked_etag.as_deref(), response.header("ETag"));
             return Ok(FetchResponse { status, total_len, identity, body: Box::new(response.into_reader()) });
         }
-        Err(FetchError::Permanent { detail: format!("more than {MAX_REDIRECTS} redirects") })
+        Err(FetchError::Permanent { detail: format!("more than {MAX_REDIRECTS} redirects"), status: None })
     }
 }
 
@@ -831,6 +846,21 @@ fn resolve_location(base: &str, location: &str) -> Result<String, String> {
         url.push_str(query);
     }
     Ok(url)
+}
+
+/// Whether the bearer token may be sent to `target`, a hop of the redirect chain that started
+/// at `first_url`: only when both have a scheme and a non-empty authority and these are equal
+/// (ASCII case-insensitive; the authority includes the port, so an explicit default port
+/// counts as another origin — the safe direction). The first URL is the endpoint the caller
+/// chose to authenticate against (e.g. `huggingface.co` or `HF_ENDPOINT`'s host).
+fn bearer_allowed(first_url: &str, target: &str) -> bool {
+    let (first, next) = (parse_uri_ref(first_url.trim()), parse_uri_ref(target.trim()));
+    match (first.scheme, first.authority, next.scheme, next.authority) {
+        (Some(first_scheme), Some(first_authority), Some(next_scheme), Some(next_authority)) => {
+            !first_authority.is_empty() && first_scheme.eq_ignore_ascii_case(next_scheme) && first_authority.eq_ignore_ascii_case(next_authority)
+        }
+        _ => false,
+    }
 }
 
 /// Whether a ureq transport failure may pass on its own: network-level failures (DNS,

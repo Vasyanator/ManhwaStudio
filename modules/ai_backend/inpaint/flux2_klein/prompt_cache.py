@@ -15,7 +15,7 @@ embeddings of another encoder would load without an error and denoise into
 something the user did not ask for.
 
 Main responsibilities:
-- encoder identity (`text_encoder_fingerprint`, `local_encoder_identity`,
+- encoder identity (`text_encoder_fingerprint` with its RoPE salt, `local_encoder_identity`,
   `encoder_family_name`), for a folder or a GGUF file (whose identity and
   family never coincide with a folder's);
 - the container format (`prompt_file_metadata`, `read_prompt_file_header`,
@@ -48,6 +48,7 @@ from .components import (
     read_safetensors_header,
     text_encoder_available,
     text_encoder_config_dir,
+    text_encoder_rope_kwargs,
 )
 from .params import _to_bool, _to_int, text_encoder_dtype_name
 
@@ -180,11 +181,20 @@ def text_encoder_fingerprint(path: str) -> str:
     folder can never produce (the `gguf` marker), so a quantized encoder's
     embeddings are never taken for bf16 ones or vice versa.
 
+    **RoPE salt.** When the loader normalizes the config's RoPE base
+    (`components.text_encoder_rope_kwargs` answers `{"rope_theta": v}`: a
+    transformers-v5 config that keeps the base only in `rope_parameters`), the
+    material gains `"\nrope_theta=<repr(float(v))>"` last. Embeddings cached
+    while such an encoder ran with transformers' default base are therefore
+    never served again; every config the normalization leaves alone (the
+    stock encoders, every 4B one) keeps its fingerprint byte for byte.
+
     # Raises
     `ValueError` when `path` does not resolve to a directory carrying a
-    `config.json` (or a GGUF file without one found for it) — an encoder that
-    cannot be identified is one that cannot be loaded either, so this is the
-    same error the loader would raise later.
+    `config.json` (or a GGUF file without one found for it), or when its RoPE
+    is refused (`text_encoder_rope_kwargs`) — an encoder that cannot be
+    identified is one that cannot be loaded either, so this is the same error
+    the loader would raise later.
     """
     import hashlib
 
@@ -217,7 +227,19 @@ def text_encoder_fingerprint(path: str) -> str:
         # The separator is part of the hashed text so that ("ab", 1) and
         # ("a", 12) cannot collide into the same byte string.
         digest.update(f"\n{name}\x00{size}".encode("utf-8"))
+    _update_with_rope_salt(digest, source)
     return digest.hexdigest()
+
+
+def _update_with_rope_salt(digest: Any, config_dir: Path) -> None:
+    """Append the RoPE salt of `text_encoder_fingerprint` to `digest` when the loader normalizes `config_dir`'s RoPE (nothing otherwise).
+
+    # Raises
+    `ValueError` when the config's RoPE is refused (`text_encoder_rope_kwargs`).
+    """
+    rope = text_encoder_rope_kwargs(config_dir)
+    if rope:
+        digest.update(f"\nrope_theta={float(rope['rope_theta'])!r}".encode("utf-8"))
 
 
 def _gguf_encoder_fingerprint(gguf_file: Path) -> str:
@@ -230,8 +252,8 @@ def _gguf_encoder_fingerprint(gguf_file: Path) -> str:
     import hashlib
 
     try:
-        config = text_encoder_config_dir(str(gguf_file)) / _MODEL_CONFIG_MARKER
-        config_bytes = config.read_bytes()
+        config_dir = text_encoder_config_dir(str(gguf_file))
+        config_bytes = (config_dir / _MODEL_CONFIG_MARKER).read_bytes()
         size = gguf_file.stat().st_size
     except OSError as exc:
         # `FileNotFoundError` (no config found) included: unidentifiable is unloadable.
@@ -239,6 +261,7 @@ def _gguf_encoder_fingerprint(gguf_file: Path) -> str:
     digest = hashlib.sha256()
     digest.update(config_bytes)
     digest.update(f"\ngguf\x00{gguf_file.name}\x00{size}".encode("utf-8"))
+    _update_with_rope_salt(digest, config_dir)
     return digest.hexdigest()
 
 

@@ -416,20 +416,19 @@ pub(super) fn flux2_component_block(status: Option<&Flux2Status>) -> Flux2Compon
 }
 
 /// Whether the backend's ONE pipeline — and with it the single shared progress bar — is
-/// held right now by one of the FOUR long operations that claim it.
+/// held right now by one of the THREE long operations that claim it.
 ///
-/// A generation, a `.prompt_cache.build`, a `.component_action` and a `.download.start`
-/// all take the service for minutes (the download for hours) and all call
-/// [`begin_progress_generation`], so starting a second one would both queue behind the
-/// first and steal its bar. Every gate that means "wait for the current operation" reads
-/// this, and nothing re-derives it field by field.
+/// A generation, a `.prompt_cache.build` and a `.component_action` all take the service for
+/// minutes and all call [`begin_progress_generation`], so starting a second one would both
+/// queue behind the first and steal its bar. Every gate that means "wait for the current
+/// operation" reads this, and nothing re-derives it field by field. A catalog download is not
+/// one of them: it runs in the app, not on the backend, and has its own progress.
 pub(super) fn flux2_pipeline_busy(
     run_in_flight: bool,
     prompt_cache_in_flight: bool,
     component_action_in_flight: bool,
-    download_in_flight: bool,
 ) -> bool {
-    run_in_flight || prompt_cache_in_flight || component_action_in_flight || download_in_flight
+    run_in_flight || prompt_cache_in_flight || component_action_in_flight
 }
 
 /// Which of the model components a run needs the machine does not have.

@@ -18,10 +18,18 @@ Main responsibilities:
   and an encoder weights file resolve to the same configs the loaders read, and
   the guard stays SILENT for an empty path, a missing config or a config without
   the field — those are other faults with better diagnoses of their own;
-- verify the installed-4B-package fallback of a GGUF component kept outside
-  the package: the tokenizer / scheduler root (GGUF only, never for
-  `model_index.json`) and the transformer config, accepted only when
-  consistent with the GGUF header.
+- verify the installed-package fallback of a GGUF component kept outside
+  the packages: the tokenizer / scheduler roots (GGUF only, never for
+  `model_index.json`; every installed package, 4B then 9B) and the transformer
+  config, accepted only when consistent with the GGUF header, so a 9B file
+  takes the 9B package and a 4B file the 4B one (the recorded 9B header,
+  `fixtures/flux2_9b_gguf_headers.json`, written header-only);
+- verify the recorded 9B transformer header: strict match with the 9B config,
+  refusal of the 4B one, BFL names that convert onto the 9B model;
+- verify the text encoder's config kwargs: the truncation, and the RoPE
+  normalization of a transformers-v5 config (the uncensored 9B encoder's
+  `rope_parameters`: a real `Qwen3Config` gets `rope_theta == 1e6`; a stock
+  config gets no kwarg; any other RoPE type is refused).
 """
 
 from __future__ import annotations
@@ -33,9 +41,9 @@ import unittest
 from pathlib import Path
 
 from modules.ai_backend.inpaint import flux2_klein as svc
-from modules.ai_backend.inpaint.flux2_klein import components, large_model
+from modules.ai_backend.inpaint.flux2_klein import components, conversion, large_model
 
-from ._test_fixtures import _make_model_tree, _TempTreeCase, _write_safetensors
+from ._test_fixtures import _make_model_tree, _TempTreeCase, _write_safetensors, load_9b_config, load_9b_header_fixture, write_header_only_gguf
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +145,110 @@ class GgufPackageFallbackTests(_TempTreeCase):
     def test_the_package_fallback_needs_every_required_field(self) -> None:
         self._install("transformer", {"config.json": {key: value for key, value in self.CONFIG.items() if key != "num_layers"}})
         self.assertIsNone(components.find_transformer_config_dir(self.gguf))
+
+
+#: The shipped FLUX.2 klein 4B `transformer/config.json`, reduced to the fields
+#: the GGUF config match reads (recorded from the installed 4B package).
+KLEIN_4B_TRANSFORMER_CONFIG = {"_class_name": "Flux2Transformer2DModel", "attention_head_dim": 128, "in_channels": 128, "joint_attention_dim": 7680, "num_attention_heads": 24, "num_layers": 5, "num_single_layers": 20}
+
+
+def _write_4b_shaped_transformer_gguf(path: Path) -> Path:
+    """A header-only GGUF with the 4B transformer's block counts and widths (5 double, 20 single blocks, width 3072)."""
+    tensors: list[list[object]] = [["img_in.weight", [128, 3072], 30], ["txt_in.weight", [7680, 3072], 30]]
+    tensors += [[f"double_blocks.{index}.img_attn.qkv.weight", [3072, 9216], 8] for index in range(5)]
+    tensors += [[f"single_blocks.{index}.linear1.weight", [3072, 27648], 8] for index in range(20)]
+    return write_header_only_gguf(path, {"general.architecture": "flux"}, tensors)
+
+
+@unittest.skipUnless(importlib.util.find_spec("gguf") is not None, "needs the gguf package")
+class NineBPackageFallbackTests(_TempTreeCase):
+    """Both klein packages installed: a GGUF transformer outside them takes the config of the package it strictly matches (D18)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        folder = Path(outside.name) / "sd_models"
+        header = load_9b_header_fixture("f9_Q4_K_M.head")
+        self.gguf_9b = write_header_only_gguf(folder / "flux-2-klein-9b-Q4_K_M.gguf", header["metadata"], header["tensors"])  # type: ignore[arg-type]
+        self.gguf_4b = _write_4b_shaped_transformer_gguf(folder / "flux-2-klein-4b-Q8_0.gguf")
+
+    def _install(self, package: Path, config: dict[str, object]) -> Path:
+        folder = package / "transformer"
+        folder.mkdir(parents=True)
+        (folder / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        return folder
+
+    def test_each_file_takes_its_own_package(self) -> None:
+        folder_4b = self._install(self.installed_package, KLEIN_4B_TRANSFORMER_CONFIG)
+        folder_9b = self._install(self.installed_package_9b, load_9b_config("transformer"))
+        with self.assertLogs(components.log, "DEBUG") as logs:
+            self.assertEqual(components.find_transformer_config_dir(self.gguf_9b), folder_9b)
+        self.assertTrue(any("из установленного пакета FLUX.2-klein-9B" in line for line in logs.output), logs.output)
+        self.assertTrue(any("двойных блоков: в файле 8, в config.json 5" in line for line in logs.output), "the 4B package is probed first and rejected")
+        self.assertEqual(components.find_transformer_config_dir(self.gguf_4b), folder_4b)
+        self.assertEqual(large_model.transformer_config_dir(str(self.gguf_9b)), folder_9b)
+
+    def test_only_the_other_package_installed_is_a_refusal_naming_it(self) -> None:
+        self._install(self.installed_package, KLEIN_4B_TRANSFORMER_CONFIG)
+        self.assertIsNone(components.find_transformer_config_dir(self.gguf_9b))
+        with self.assertRaises(FileNotFoundError) as caught:
+            large_model.transformer_config_dir(str(self.gguf_9b))
+        message = str(caught.exception)
+        self.assertIn(str(self.installed_package / "transformer"), message)
+        self.assertIn("двойных блоков: в файле 8, в config.json 5", message)
+        self.assertIn("(4B или 9B)", message)
+
+    def test_every_installed_package_joins_the_tokenizer_search_in_order(self) -> None:
+        self.installed_package.mkdir(parents=True)
+        self.installed_package_9b.mkdir(parents=True)
+        roots = svc.component_search_roots({**self.paths, "transformer_path": str(self.gguf_9b)})
+        self.assertEqual(roots[-2:], [self.installed_package, self.installed_package_9b])
+        self.assertEqual(components.installed_klein_package_roots(), [self.installed_package, self.installed_package_9b])
+        self.assertNotIn(self.installed_package_9b, svc.component_search_roots(self.paths), "no GGUF, no fallback")
+
+    def test_the_package_names_are_the_catalog_directories(self) -> None:
+        # Mirrored by the Rust drift guard over `Flux2Variant::dir_name()`.
+        self.assertEqual(svc.KLEIN_PACKAGE_DIR_NAMES, ("FLUX.2-klein-4B", "FLUX.2-klein-9B"))
+
+
+@unittest.skipUnless(importlib.util.find_spec("gguf") is not None, "needs the gguf package")
+class NineBTransformerHeaderTests(unittest.TestCase):
+    """The recorded unsloth 9B transformer header against the 9B and 4B configs, and its names against the converter."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        header = load_9b_header_fixture("f9_Q4_K_M.head")
+        self.path = write_header_only_gguf(Path(tmp.name) / "flux-2-klein-9b-Q4_K_M.gguf", header["metadata"], header["tensors"])  # type: ignore[arg-type]
+        self.layout = components.gguf_layout(self.path)
+
+    def test_the_9b_config_matches_strictly_and_the_4b_one_does_not(self) -> None:
+        self.assertEqual(len(self.layout.spans), 201)
+        self.assertIsNone(components._gguf_transformer_mismatch(load_9b_config("transformer"), self.layout, True))
+        reason = components._gguf_transformer_mismatch(KLEIN_4B_TRANSFORMER_CONFIG, self.layout, True)
+        self.assertEqual(reason, "двойных блоков: в файле 8, в config.json 5")
+
+    def test_the_names_are_the_bfl_layout_without_a_prefix(self) -> None:
+        names = [span.name for span in self.layout.spans]
+        conversion.require_known_layout(names, source=self.path)
+        self.assertTrue(all(conversion.is_bfl_key(name) for name in names), [name for name in names if not conversion.is_bfl_key(name)])
+
+    @unittest.skipUnless(all(importlib.util.find_spec(name) is not None for name in ("torch", "diffusers", "accelerate")), "needs torch, diffusers and accelerate")
+    def test_the_names_convert_onto_the_9b_model_and_every_type_dequantizes(self) -> None:
+        import torch
+        from accelerate import init_empty_weights
+        from diffusers import Flux2Transformer2DModel
+
+        config = {key: value for key, value in load_9b_config("transformer").items() if not key.startswith("_")}
+        with init_empty_weights():
+            model = Flux2Transformer2DModel.from_config(config)
+        produced: set[str] = set()
+        for span in self.layout.spans:
+            placeholder = torch.empty(span.shape, dtype=getattr(torch, span.torch_dtype_name), device="meta")
+            produced.update(conversion.convert_bfl_tensor(span.name, placeholder))
+        self.assertEqual(produced, set(model.state_dict()))
+        large_model._require_dequantizable_gguf(self.layout.spans, source=self.path)
 
 
 class CheckpointIsDistilledTests(_TempTreeCase):
@@ -514,6 +626,73 @@ class EncoderTruncationKwargsTests(unittest.TestCase):
             svc.ENCODER_KEEP_LAYERS, max(svc.TEXT_ENCODER_OUT_LAYER_INDICES) + 1
         )
         self.assertEqual(svc.TEXT_ENCODER_OUT_LAYERS, len(svc.TEXT_ENCODER_OUT_LAYER_INDICES))
+
+
+class EncoderRopeKwargsTests(unittest.TestCase):
+    """`text_encoder_rope_kwargs` / `text_encoder_config_kwargs`: a transformers-v5 RoPE base is passed explicitly (D17)."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def _encoder(self, config: dict[str, object], name: str = "text_encoder") -> Path:
+        folder = self.root / name
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        return folder
+
+    def test_the_uncensored_config_gets_its_base_and_the_truncation(self) -> None:
+        folder = self._encoder(load_9b_config("uncensored_text_encoder"))
+        self.assertEqual(svc.text_encoder_rope_kwargs(folder), {"rope_theta": 1_000_000.0})
+        with self.assertLogs(components.log, "INFO") as logs:
+            kwargs = svc.text_encoder_config_kwargs(folder, svc.ENCODER_KEEP_LAYERS)
+        self.assertEqual(kwargs["rope_theta"], 1_000_000.0)
+        self.assertEqual(kwargs["num_hidden_layers"], svc.ENCODER_KEEP_LAYERS)
+        self.assertEqual(len(kwargs["layer_types"]), svc.ENCODER_KEEP_LAYERS)
+        self.assertTrue(any("rope_theta = 1000000.0" in line for line in logs.output), logs.output)
+
+    def test_a_stock_config_gets_no_rope_kwarg(self) -> None:
+        for config in (load_9b_config("text_encoder"), {"num_hidden_layers": 36}, {}):
+            with self.subTest(config=sorted(config)):
+                folder = self._encoder(config)
+                self.assertEqual(svc.text_encoder_rope_kwargs(folder), {})
+                self.assertNotIn("rope_theta", svc.text_encoder_config_kwargs(folder))
+
+    def test_an_agreeing_top_level_base_needs_nothing(self) -> None:
+        folder = self._encoder({"rope_theta": 1000000, "rope_parameters": {"rope_type": "default", "rope_theta": 1000000.0}})
+        self.assertEqual(svc.text_encoder_rope_kwargs(folder), {})
+
+    def test_every_other_rope_is_refused_by_name(self) -> None:
+        cases = {
+            "yarn": {"rope_parameters": {"rope_type": "yarn", "rope_theta": 1000000, "factor": 4.0}},
+            "no type": {"rope_parameters": {"rope_theta": 1000000}},
+            "no theta": {"rope_parameters": {"rope_type": "default"}},
+            "bool theta": {"rope_parameters": {"rope_type": "default", "rope_theta": True}},
+            "not an object": {"rope_parameters": [1000000]},
+            "contradiction": {"rope_theta": 10000, "rope_parameters": {"rope_type": "default", "rope_theta": 1000000}},
+        }
+        for what, config in cases.items():
+            with self.subTest(what=what):
+                folder = self._encoder(config, name=what.replace(" ", "_"))
+                with self.assertRaises(ValueError) as caught:
+                    svc.text_encoder_config_kwargs(folder)
+                self.assertIn(str(folder / "config.json"), str(caught.exception))
+        with self.assertRaisesRegex(ValueError, "'yarn'"):
+            svc.text_encoder_rope_kwargs(self.root / "yarn")
+
+    @unittest.skipIf(importlib.util.find_spec("transformers") is None, "transformers is not installed in this environment")
+    def test_a_real_qwen3_config_gets_the_models_base(self) -> None:
+        # The defect itself: transformers 4.57 ignores `rope_parameters` and
+        # falls back to 10 000; the kwarg restores the model's 1 000 000.
+        from transformers import Qwen3Config
+
+        folder = self._encoder(load_9b_config("uncensored_text_encoder"))
+        fixed = Qwen3Config.from_pretrained(str(folder), local_files_only=True, **svc.text_encoder_config_kwargs(folder))
+        self.assertEqual(fixed.rope_theta, 1_000_000.0)
+        self.assertEqual(fixed.num_hidden_layers, svc.ENCODER_KEEP_LAYERS)
+        stock = self._encoder(load_9b_config("text_encoder"), name="stock")
+        self.assertEqual(Qwen3Config.from_pretrained(str(stock), local_files_only=True, **svc.text_encoder_config_kwargs(stock)).rope_theta, 1_000_000)
 
 
 @unittest.skipIf(

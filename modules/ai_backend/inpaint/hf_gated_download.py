@@ -6,9 +6,10 @@ The model-agnostic half of a backend-side Hugging Face model download: a
 manifest of repository PREFIXES resolved against live listings into a plan,
 the per-repository access check with the fixed `state` taxonomy, and the
 resumable transfer with two-level throttled progress, a free-space guard and
-real cancellation. A model package (`flux2_download.py`, `flux3_download.py`)
-supplies only WHAT it needs — a `DownloadTarget` (label, repositories,
-manifest rules, destination root) — and maps its own wire fields onto it.
+real cancellation. A model package (today only `flux3_download.py`; FLUX.2
+klein comes from the app's Rust catalog) supplies only WHAT it needs — a
+`DownloadTarget` (label, repositories, manifest rules, destination root) —
+and maps its own wire fields onto it.
 Every repository this machinery serves is GATED (a token AND accepted
 conditions): a public repository is not a case it handles.
 
@@ -71,7 +72,7 @@ from ..engines.model_download import (
 
 log = logging.getLogger(__name__)
 
-# --- Access states (`dev-docs/flux2_model_download.md` §3, FIXED) ----------
+# --- Access states (`ipc/PROTOCOL.md`, gated Hugging Face download, FIXED) --
 STATE_OK = "ok"
 STATE_NO_TOKEN = "no_token"
 STATE_INVALID_TOKEN = "invalid_token"

@@ -17,11 +17,14 @@ Main responsibilities:
 - own the dtype vocabulary and the persisted step ids (`step_choice`);
 - migrate a document written before the step axes existed (`legacy_memory_steps`,
   which owns the placement -> step-pair table; the backend refuses those fields);
-- derive the effective model paths from the source mode AND the variant, and for a catalog
-  variant (4B) in download mode from the two weight formats (`transformer_format` /
-  `text_encoder_format`, `Flux2WeightFormat` wire ids; bf16 keeps today's folders); build the
-  `*_formats` candidate lists of `params` from the runtime `installed_formats`
-  (`format_candidates`, filled by the worker probe `probe_flux2_installed_formats`);
+- derive the effective model paths from the source mode AND the variant, and in download
+  mode (both variants come from the app's catalog) from the encoder source
+  (`encoder_source`, persisted as the historic `uncensored_text_encoder` bool; a switch maps
+  the encoder format through `closest_offered`, `set_encoder_source`), the two weight formats
+  (`transformer_format` / `text_encoder_format`, `Flux2WeightFormat` wire ids; bf16 keeps the
+  existing folders) and the probed bf16 transformer layout; build the `*_formats` candidate
+  lists of `params` from the runtime `installed_formats` (`format_candidates`, filled by the
+  worker probe `probe_flux2_installed_formats`);
 - read the settings file, moving a damaged one aside instead of ever overwriting it
   (`load_flux2_settings_from`, over the shared `read_settings_file`), and write it back
   (`save_flux2_settings`, over the shared `write_settings_json`).
@@ -33,13 +36,14 @@ the file the document itself names.
 
 Key structures:
 - `Flux2KleinSettings`, `Flux2EffectivePaths`, `Flux2Dtype`, `Flux2SourceMode`
-- `Flux2InstalledFormats` (runtime only, never persisted)
+- `Flux2InstalledFormats` (runtime only, never persisted), `Flux2WeightSelection`
 - `Flux2LoadedDocument`, `Flux2SettingsLoad` (its `problem` is the shared `SettingsProblem`)
 
 Key functions:
 - `load_flux2_settings()`, `load_flux2_settings_from()`, `save_flux2_settings()`,
   `settings_from_json()`, `legacy_memory_steps()`
-- `Flux2KleinSettings::{weight_format, format_candidates, effective_paths, normalized}`,
+- `Flux2KleinSettings::{encoder_source, set_encoder_source, weight_format, format_candidates,
+  effective_paths, normalized}`,
   `probe_flux2_installed_formats()` (worker only)
 - `normalize_source_lang()`, `source_lang_title()`
 
@@ -50,9 +54,9 @@ submodules' re-exported items. `normalized()` is the ONLY value ever put on the 
 */
 
 use super::*;
-use ms_config::{Flux2WeightAxis, Flux2WeightFormat};
+use ms_config::{Flux2EncoderSource, Flux2WeightAxis, Flux2WeightFormat};
 use ms_sysprobe::ai_models::external::{ExternalModelStatus, external_model_status};
-use ms_sysprobe::ai_models::external_catalog::{flux2_klein_spec, flux2_klein_weights_path};
+use ms_sysprobe::ai_models::external_catalog::{Flux2SpecRole, flux2_klein_spec_role, flux2_klein_transformer_layout, flux2_klein_weights_path};
 
 // ---------------------------------------------------------------------------------------
 // Wire enums
@@ -228,60 +232,109 @@ pub(super) struct Flux2EffectivePaths {
     pub(super) vae: String,
 }
 
-/// Which weight formats of each axis have their catalog files installed, as the last worker
-/// probe saw them ([`probe_flux2_installed_formats`]). Runtime state only: never persisted,
-/// and an unprobed (default) value means "nothing known to be installed", which leaves each
-/// candidate list holding just the selected format.
+/// Which weight formats of each component have their catalog files installed, and which
+/// bf16 transformer layout is in use, as the last worker probe saw them
+/// ([`probe_flux2_installed_formats`]). Runtime state only: never persisted, and an unprobed
+/// (default) value means "nothing known to be installed" with the `Primary` layout, which
+/// leaves each candidate list holding just the selected format.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Flux2InstalledFormats {
     transformer: Vec<Flux2WeightFormat>,
-    text_encoder: Vec<Flux2WeightFormat>,
+    stock_text_encoder: Vec<Flux2WeightFormat>,
+    uncensored_text_encoder: Vec<Flux2WeightFormat>,
+    /// The bf16 transformer layout the catalog's one rule chose
+    /// (`external_catalog::flux2_klein_transformer_layout`): `LegacyDiffusers` keeps a 9B
+    /// install made by the backend's former download in use instead of refetching 18 GB.
+    pub(super) transformer_layout: Flux2TransformerLayout,
 }
 
 impl Flux2InstalledFormats {
-    /// Whether `format` of `axis` was found installed.
+    /// Whether `format` of `axis` (from encoder `source`; the transformer ignores it) was
+    /// found installed.
     #[must_use]
-    pub(super) fn contains(&self, axis: Flux2WeightAxis, format: Flux2WeightFormat) -> bool {
-        self.formats(axis).contains(&format)
+    pub(super) fn contains(&self, axis: Flux2WeightAxis, source: Flux2EncoderSource, format: Flux2WeightFormat) -> bool {
+        self.formats(axis, source).contains(&format)
     }
 
-    /// Marks `format` of `axis` as installed (idempotent).
-    pub(super) fn insert(&mut self, axis: Flux2WeightAxis, format: Flux2WeightFormat) {
-        let formats = match axis {
-            Flux2WeightAxis::Transformer => &mut self.transformer,
-            Flux2WeightAxis::TextEncoder => &mut self.text_encoder,
+    /// Marks `format` of `axis` (from encoder `source`; the transformer ignores it) as
+    /// installed (idempotent).
+    pub(super) fn insert(&mut self, axis: Flux2WeightAxis, source: Flux2EncoderSource, format: Flux2WeightFormat) {
+        let formats = match (axis, source) {
+            (Flux2WeightAxis::Transformer, Flux2EncoderSource::Stock | Flux2EncoderSource::Uncensored) => &mut self.transformer,
+            (Flux2WeightAxis::TextEncoder, Flux2EncoderSource::Stock) => &mut self.stock_text_encoder,
+            (Flux2WeightAxis::TextEncoder, Flux2EncoderSource::Uncensored) => &mut self.uncensored_text_encoder,
         };
         if !formats.contains(&format) {
             formats.push(format);
         }
     }
 
-    fn formats(&self, axis: Flux2WeightAxis) -> &[Flux2WeightFormat] {
-        match axis {
-            Flux2WeightAxis::Transformer => &self.transformer,
-            Flux2WeightAxis::TextEncoder => &self.text_encoder,
+    fn formats(&self, axis: Flux2WeightAxis, source: Flux2EncoderSource) -> &[Flux2WeightFormat] {
+        match (axis, source) {
+            (Flux2WeightAxis::Transformer, Flux2EncoderSource::Stock | Flux2EncoderSource::Uncensored) => &self.transformer,
+            (Flux2WeightAxis::TextEncoder, Flux2EncoderSource::Stock) => &self.stock_text_encoder,
+            (Flux2WeightAxis::TextEncoder, Flux2EncoderSource::Uncensored) => &self.uncensored_text_encoder,
         }
     }
 }
 
+/// The catalog spec that holds `variant`'s component `axis` in `format` (from encoder
+/// `source`) in the bf16 transformer `layout` — the spec `flux2_klein_package_specs` puts in the
+/// bundle for that selection, found by its catalog role, so the legacy-layout rule is the
+/// catalog's and is never restated here. `None` for a format that is not offered.
+fn flux2_component_spec(
+    variant: Flux2Variant,
+    axis: Flux2WeightAxis,
+    source: Flux2EncoderSource,
+    format: Flux2WeightFormat,
+    layout: Flux2TransformerLayout,
+) -> Option<&'static ExternalModelSpec> {
+    let (transformer, text_encoder) = match axis {
+        Flux2WeightAxis::Transformer => (format, Flux2WeightFormat::Bf16),
+        Flux2WeightAxis::TextEncoder => (Flux2WeightFormat::Bf16, format),
+    };
+    flux2_klein_package_specs(variant, transformer, layout, source, text_encoder)
+        .into_iter()
+        .find(|spec| match flux2_klein_spec_role(spec.id) {
+            Some(Flux2SpecRole::Weights { axis: role_axis, format: role_format, .. }) => role_axis == axis && role_format == format,
+            Some(Flux2SpecRole::LegacyTransformer { .. }) => axis == Flux2WeightAxis::Transformer,
+            Some(Flux2SpecRole::Base { .. } | Flux2SpecRole::TextEncoderConfig { .. }) | None => false,
+        })
+}
+
 /// Probes which offered weight formats of `variant` have their catalog spec INSTALLED
 /// (`external_model_status` = `Installed`: marker present, every file of exact size) under
-/// `side_models_root`. Stat-only, never hashes, but still filesystem I/O: WORKER THREADS ONLY.
-/// A variant that does not download from the catalog answers the empty set.
+/// `side_models_root`, per component and per encoder source, and which bf16 transformer layout
+/// is in use (`flux2_klein_transformer_layout`; the bf16 transformer counts as installed in
+/// THAT layout). Stat-only, never hashes, but still filesystem I/O: WORKER THREADS ONLY.
 #[must_use]
 pub(super) fn probe_flux2_installed_formats(side_models_root: &Path, variant: Flux2Variant) -> Flux2InstalledFormats {
-    let mut installed = Flux2InstalledFormats::default();
-    for axis in Flux2WeightAxis::all() {
-        for &format in Flux2WeightFormat::offered_for(variant, axis) {
-            let Some(spec) = flux2_klein_spec(variant, axis, format) else {
+    let layout = flux2_klein_transformer_layout(side_models_root, variant);
+    let mut installed = Flux2InstalledFormats { transformer_layout: layout, ..Flux2InstalledFormats::default() };
+    // The transformer ignores the source: it is probed once, as `Stock`.
+    let mut choices = vec![(Flux2WeightAxis::Transformer, Flux2EncoderSource::Stock)];
+    choices.extend(Flux2EncoderSource::offered_for(variant).iter().map(|&source| (Flux2WeightAxis::TextEncoder, source)));
+    for (axis, source) in choices {
+        for &format in Flux2WeightFormat::offered_for(variant, axis, source) {
+            let Some(spec) = flux2_component_spec(variant, axis, source, format, layout) else {
                 continue;
             };
             if external_model_status(side_models_root, spec) == ExternalModelStatus::Installed {
-                installed.insert(axis, format);
+                installed.insert(axis, source, format);
             }
         }
     }
     installed
+}
+
+/// What the catalog bundle and the derived weight paths follow: the two weight formats in
+/// effect and the encoder source. The engine compares it across a frame to notice a change
+/// made anywhere in the panel (a picker, a format row, the uncensored toggle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Flux2WeightSelection {
+    pub(super) transformer: Flux2WeightFormat,
+    pub(super) source: Flux2EncoderSource,
+    pub(super) text_encoder: Flux2WeightFormat,
 }
 
 /// Everything the tool persists to THIS VARIANT's settings file
@@ -313,38 +366,40 @@ pub(super) struct Flux2KleinSettings {
     /// ([`Flux2KleinSettings::effective_paths`]) and this keeps whatever the user typed, so
     /// flipping the mode back restores his configuration exactly.
     pub(super) text_encoder_path: String,
-    /// Use the UNCENSORED text encoder rather than the official one.
+    /// «Расцензуренный энкодер»: the persisted spelling of the encoder SOURCE
+    /// ([`Flux2KleinSettings::encoder_source`]; no separate field, no migration).
     ///
-    /// A normal persisted setting and not a global: it selects which encoder the model
-    /// download fetches AND which of the two managed directories `text_encoder_path`
-    /// points at. Both encoders may sit on disk at once, so flipping it when the other one
-    /// is already there repoints the path and downloads nothing
-    /// ([`flux2_text_encoder_path_after_toggle`]). It never travels inside `params`: the
-    /// download methods carry it as their own top-level `uncensored` field.
+    /// It selects which encoder the download mode runs and the catalog bundle fetches (its
+    /// files live in their own folders, so both sources may be installed at once and
+    /// switching costs nothing when the other one is there). Inert for a variant that offers
+    /// no uncensored encoder (4B). It never travels inside `params`: the derived encoder path
+    /// already names the chosen files.
     pub(super) uncensored_text_encoder: bool,
     /// Either a `.safetensors` file or a diffusers directory.
     pub(super) transformer_path: String,
     /// VAE directory or `.safetensors` file.
     pub(super) vae_path: String,
     /// «Веса трансформера»: the `Flux2WeightFormat` wire id (`bf16`, `q8_0`, ...) of the
-    /// transformer the DOWNLOAD mode of a catalog variant runs
-    /// ([`Flux2Variant::downloads_from_catalog`]).
+    /// transformer the DOWNLOAD mode runs (both variants come from the app's catalog).
     ///
     /// Persisted as the wire id so a hand-edited file stays readable; an absent field reads as
     /// `bf16` (every file written before the formats existed), and an unknown id or one the
     /// variant does not offer reads as `bf16` too ([`Flux2KleinSettings::weight_format`]).
-    /// Inert in manual mode (the picked path is sent as-is and the backend derives its format)
-    /// and for the 9B checkpoint, which offers only `bf16`.
+    /// Inert in manual mode (the picked path is sent as-is and the backend derives its format).
     pub(super) transformer_format: String,
-    /// «Веса текстового энкодера»: the same, for the text encoder. A GGUF encoder excludes
-    /// `text_encoder_fp8` (D8): `normalized()` sends fp8 off while a GGUF encoder is in effect.
+    /// «Веса текстового энкодера»: the same, for the text encoder of the selected source
+    /// (offered per source: the uncensored 9B encoder has no `q5_k_m`; a source switch maps the
+    /// stored id through `Flux2WeightFormat::closest_offered`, [`Flux2KleinSettings::set_encoder_source`]).
+    /// A GGUF encoder excludes `text_encoder_fp8` (D8): `normalized()` sends fp8 off while a GGUF
+    /// encoder is in effect.
     pub(super) text_encoder_format: String,
-    /// Which formats of each axis have their catalog files INSTALLED — runtime state, never
-    /// persisted (`serde(skip)`), filled by the engine from a worker probe
-    /// ([`probe_flux2_installed_formats`]). It decides the `*_formats` candidate lists of
-    /// `params` ([`Flux2KleinSettings::format_candidates`]); it lives in the settings value
-    /// because that value is what every request builder receives, and the GUI thread that
-    /// builds some of them must not stat the disk.
+    /// Which formats of each component have their catalog files INSTALLED, and the bf16
+    /// transformer layout in use — runtime state, never persisted (`serde(skip)`), filled by
+    /// the engine from a worker probe ([`probe_flux2_installed_formats`]). It decides the
+    /// `*_formats` candidate lists of `params` ([`Flux2KleinSettings::format_candidates`]) and
+    /// the derived bf16 transformer path; it lives in the settings value because that value is
+    /// what every request builder receives, and the GUI thread that builds some of them must
+    /// not stat the disk.
     #[serde(skip)]
     pub(super) installed_formats: Flux2InstalledFormats,
     /// The ENGLISH prompt, i.e. the one actually sent to the backend.
@@ -488,11 +543,10 @@ impl Flux2KleinSettings {
                 .wire()
                 .to_string(),
             text_encoder_path: self.text_encoder_path.trim().to_string(),
-            // Forced off for a variant that has no uncensored encoder published for it:
-            // the backend refuses that pair outright, and the panel never draws the toggle
-            // there, so a hand-edited settings file is the only way it could arrive.
-            uncensored_text_encoder: self.uncensored_text_encoder
-                && variant.supports_uncensored_encoder(),
+            // Forced off for a variant that offers no uncensored encoder: the panel never
+            // draws the toggle there, so a hand-edited settings file is the only way it could
+            // arrive, and it must not select files nothing publishes.
+            uncensored_text_encoder: self.encoder_source() == Flux2EncoderSource::Uncensored,
             transformer_path: self.transformer_path.trim().to_string(),
             vae_path: self.vae_path.trim().to_string(),
             // An unknown id, or one this variant does not offer, normalizes to bf16.
@@ -563,18 +617,44 @@ impl Flux2KleinSettings {
         Flux2Variant::from_wire(&self.variant)
     }
 
-    /// Whether the «Расцензуренный энкодер» toggle is in effect right now.
-    ///
-    /// The persisted flag AND the variant's capability: only the 9B checkpoint has an
-    /// uncensored encoder published for it, so the flag is inert for the other one rather
-    /// than pointing a path at a directory nothing fills.
-    pub(super) fn uncensored_encoder_active(&self) -> bool {
-        self.uncensored_text_encoder && self.variant().supports_uncensored_encoder()
+    /// The encoder source in effect: `Uncensored` when the persisted toggle asks for it AND
+    /// the variant offers it ([`Flux2EncoderSource::offered_for`]), else `Stock` — the flag is
+    /// inert for 4B rather than pointing a path at files nothing publishes.
+    #[must_use]
+    pub(super) fn encoder_source(&self) -> Flux2EncoderSource {
+        let offered = Flux2EncoderSource::offered_for(self.variant());
+        if self.uncensored_text_encoder && offered.contains(&Flux2EncoderSource::Uncensored) {
+            Flux2EncoderSource::Uncensored
+        } else {
+            Flux2EncoderSource::Stock
+        }
+    }
+
+    /// The weight selection in effect ([`Flux2WeightSelection`]).
+    #[must_use]
+    pub(super) fn weight_selection(&self) -> Flux2WeightSelection {
+        Flux2WeightSelection {
+            transformer: self.weight_format(Flux2WeightAxis::Transformer),
+            source: self.encoder_source(),
+            text_encoder: self.weight_format(Flux2WeightAxis::TextEncoder),
+        }
+    }
+
+    /// Stores `source` and maps the stored encoder format onto what that source offers
+    /// (`Flux2WeightFormat::closest_offered`: the format itself, else the next smaller quant,
+    /// else bf16). Returns `Some((from, to))` when the stored format had to change, so the
+    /// panel can say so; `None` when it was kept. An unknown stored id reads as `bf16`.
+    pub(super) fn set_encoder_source(&mut self, source: Flux2EncoderSource) -> Option<(Flux2WeightFormat, Flux2WeightFormat)> {
+        self.uncensored_text_encoder = source == Flux2EncoderSource::Uncensored;
+        let from = Flux2WeightFormat::from_wire(&self.text_encoder_format).unwrap_or(Flux2WeightFormat::Bf16);
+        let to = from.closest_offered(Flux2WeightFormat::offered_for(self.variant(), Flux2WeightAxis::TextEncoder, self.encoder_source()));
+        self.text_encoder_format = to.wire().to_string();
+        (to != from).then_some((from, to))
     }
 
     /// The selected weight format of `axis`: the persisted id when this document's variant
-    /// offers it ([`Flux2WeightFormat::offered_for`]), else `Bf16` — an absent, unknown or
-    /// not-offered id never reaches a path or the wire.
+    /// offers it for the current encoder source ([`Flux2WeightFormat::offered_for`]), else
+    /// `Bf16` — an absent, unknown or not-offered id never reaches a path or the wire.
     #[must_use]
     pub(super) fn weight_format(&self, axis: Flux2WeightAxis) -> Flux2WeightFormat {
         let stored = match axis {
@@ -582,16 +662,16 @@ impl Flux2KleinSettings {
             Flux2WeightAxis::TextEncoder => &self.text_encoder_format,
         };
         Flux2WeightFormat::from_wire(stored)
-            .filter(|format| Flux2WeightFormat::offered_for(self.variant(), axis).contains(format))
+            .filter(|format| Flux2WeightFormat::offered_for(self.variant(), axis, self.encoder_source()).contains(format))
             .unwrap_or(Flux2WeightFormat::Bf16)
     }
 
-    /// Whether the two weight-format settings are IN EFFECT: download mode of a variant whose
-    /// package comes from the catalog ([`Flux2Variant::downloads_from_catalog`]). Everywhere
-    /// else (manual mode, the 9B checkpoint) they are inert and nothing of them is sent.
+    /// Whether the two weight-format settings are IN EFFECT: download mode (both variants'
+    /// packages come from the catalog). In manual mode they are inert and nothing of them is
+    /// sent.
     #[must_use]
     pub(super) fn weight_formats_in_effect(&self) -> bool {
-        self.source_mode() == Flux2SourceMode::Download && self.variant().downloads_from_catalog()
+        self.source_mode() == Flux2SourceMode::Download
     }
 
     /// Whether the run uses a GGUF text encoder chosen through the format setting (D8: it
@@ -603,22 +683,23 @@ impl Flux2KleinSettings {
         self.weight_formats_in_effect() && self.weight_format(Flux2WeightAxis::TextEncoder).is_gguf()
     }
 
-    /// The catalog path of `format` on `axis` for this document's variant: the bf16 folder
-    /// (the same folder `config::flux2_klein_{transformer,text_encoder}_dir` names) or the
-    /// GGUF file. Pure path arithmetic, no disk access.
+    /// The catalog path of `format` on `axis` for this document's variant and encoder source,
+    /// in the probed bf16 transformer layout (`installed_formats.transformer_layout`,
+    /// `Primary` before the probe): the bf16 folder or single file, or the GGUF file. Pure path
+    /// arithmetic, no disk access.
     ///
     /// Every offered format resolves (pinned by the catalog's own tests and by
     /// `every_offered_format_has_a_catalog_path` here); an unresolvable one yields an EMPTY
     /// path, which the run gate refuses visibly instead of running some other file.
     fn catalog_weights_path(&self, axis: Flux2WeightAxis, format: Flux2WeightFormat) -> String {
-        flux2_klein_weights_path(&config::side_models_dir(), self.variant(), axis, format)
+        flux2_klein_weights_path(&config::side_models_dir(), self.variant(), axis, self.encoder_source(), format, self.installed_formats.transformer_layout)
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default()
     }
 
-    /// The `*_formats` candidate list of `axis`: every offered format whose catalog files are
-    /// installed (`installed_formats`), plus the selected one whatever its state, each with
-    /// its catalog path, ordered best quality first (the order of
+    /// The `*_formats` candidate list of `axis`: every format offered for the current encoder
+    /// source whose catalog files are installed (`installed_formats`), plus the selected one
+    /// whatever its state, each with its catalog path, ordered best quality first (the order of
     /// [`Flux2WeightFormat::offered_for`]). The selected entry's path is exactly the
     /// component's effective path, as the wire contract requires.
     ///
@@ -629,10 +710,11 @@ impl Flux2KleinSettings {
             return Vec::new();
         }
         let selected = self.weight_format(axis);
-        Flux2WeightFormat::offered_for(self.variant(), axis)
+        let source = self.encoder_source();
+        Flux2WeightFormat::offered_for(self.variant(), axis, source)
             .iter()
             .copied()
-            .filter(|&format| format == selected || self.installed_formats.contains(axis, format))
+            .filter(|&format| format == selected || self.installed_formats.contains(axis, source, format))
             .map(|format| (format, self.catalog_weights_path(axis, format)))
             .collect()
     }
@@ -651,17 +733,17 @@ impl Flux2KleinSettings {
     /// ([`Flux2KleinSettings::variant`]), which is what keeps the two engines from
     /// overwriting each other's copy of the model.
     ///
-    /// For a variant whose package comes from the catalog (4B), the transformer and the
-    /// encoder follow their selected weight format: the catalog's bf16 folder (identical to
-    /// the folder the 9B rule derives, so an existing install stays valid) or the GGUF file
-    /// under `transformer_gguf/` / `text_encoder_gguf/`. The VAE has no format axis.
+    /// Both variants' packages come from the app's catalog: the transformer and the encoder
+    /// follow their selected weight format and the encoder source
+    /// (`external_catalog::flux2_klein_weights_path`): the bf16 folder or single file (the 9B
+    /// transformer in the probed layout: the BFL single file, or the legacy `transformer/`
+    /// folder of an install made by the backend's former download), the uncensored folder, or
+    /// the GGUF file under `transformer_gguf/` / `text_encoder*_gguf/`. Every bf16 path is the
+    /// one an existing install already has, so it stays valid. The VAE has no format axis.
     ///
-    /// The derived encoder is a SIBLING of the downloaded `tokenizer/` and `scheduler/`
-    /// directories under the variant's own root, which is what the backend's component search
-    /// needs: it probes each supplied path and ITS PARENT (`component_search_roots` /
-    /// `component_probe_order` in `modules/ai_backend/inpaint/flux2_klein.py`), so the repo
-    /// root is reached from any of the three and both encoder directories resolve the
-    /// tokenizer.
+    /// The backend finds the tokenizer, the scheduler and the component configs from these
+    /// paths: it probes each supplied path and ITS PARENT, so the package root is reached from
+    /// any of them (`modules/ai_backend/inpaint/flux2_klein/components.py`).
     #[must_use]
     pub(super) fn effective_paths(&self) -> Flux2EffectivePaths {
         match self.source_mode() {
@@ -670,37 +752,11 @@ impl Flux2KleinSettings {
                 transformer: self.transformer_path.trim().to_string(),
                 vae: self.vae_path.trim().to_string(),
             },
-            Flux2SourceMode::Download if self.variant().downloads_from_catalog() => Flux2EffectivePaths {
-                // The catalog package (4B): each weight component per its selected format.
-                // For bf16 these are the very folders the arm below derives, so an install made
-                // before the formats existed stays valid.
-                text_encoder: self.catalog_weights_path(
-                    Flux2WeightAxis::TextEncoder,
-                    self.weight_format(Flux2WeightAxis::TextEncoder),
-                ),
-                transformer: self.catalog_weights_path(
-                    Flux2WeightAxis::Transformer,
-                    self.weight_format(Flux2WeightAxis::Transformer),
-                ),
+            Flux2SourceMode::Download => Flux2EffectivePaths {
+                text_encoder: self.catalog_weights_path(Flux2WeightAxis::TextEncoder, self.weight_format(Flux2WeightAxis::TextEncoder)),
+                transformer: self.catalog_weights_path(Flux2WeightAxis::Transformer, self.weight_format(Flux2WeightAxis::Transformer)),
                 vae: config::flux2_klein_vae_dir(self.variant()).to_string_lossy().to_string(),
             },
-            Flux2SourceMode::Download => {
-                let variant = self.variant();
-                Flux2EffectivePaths {
-                    text_encoder: config::flux2_klein_text_encoder_dir(
-                        variant,
-                        self.uncensored_encoder_active(),
-                    )
-                    .to_string_lossy()
-                    .to_string(),
-                    transformer: config::flux2_klein_transformer_dir(variant)
-                        .to_string_lossy()
-                        .to_string(),
-                    vae: config::flux2_klein_vae_dir(variant)
-                        .to_string_lossy()
-                        .to_string(),
-                }
-            }
         }
     }
 
@@ -773,8 +829,8 @@ impl Flux2KleinSettings {
             "max_sequence_length": FLUX2_MAX_SEQ,
         });
         // The weight formats (protocol 21, D5) travel only while their settings are in
-        // effect: download mode of a catalog variant. Manual mode and 9B send nothing new
-        // (the backend then derives each format from the file's container).
+        // effect: download mode, either variant. Manual mode sends nothing of them (the
+        // backend then derives each format from the file's container).
         if self.weight_formats_in_effect()
             && let Some(map) = params.as_object_mut()
         {
@@ -963,6 +1019,7 @@ pub(super) fn save_flux2_settings(settings: &Flux2KleinSettings) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ms_sysprobe::ai_models::external_catalog::flux2_klein_legacy_transformer_spec;
 
     /// A test build never writes the user's real settings file (the saver's teardown flush
     /// can reach the product writer from any test): it answers `Ok` and leaves the file alone.
@@ -1369,8 +1426,8 @@ mod tests {
         );
     }
 
-    /// The toggle is a persisted setting, and it must NOT leak into `params`: the download
-    /// methods carry it as their own top-level field.
+    /// The toggle is a persisted setting, and it must NOT leak into `params`: the derived
+    /// encoder path already names the chosen files.
     #[test]
     fn the_encoder_toggle_persists_but_never_enters_the_generation_params() {
         let settings = Flux2KleinSettings {
@@ -1386,7 +1443,7 @@ mod tests {
         let params = settings.normalized().to_params(false);
         assert!(
             params.get("uncensored").is_none() && params.get("uncensored_text_encoder").is_none(),
-            "the toggle belongs to the download request, not to `params`"
+            "the toggle selects a path, it is not a parameter of the request"
         );
     }
 
@@ -1468,14 +1525,11 @@ mod tests {
             ..hand_made.clone()
         };
         let derived = downloaded.effective_paths();
-        assert_eq!(
-            derived.transformer,
-            config::flux2_klein_transformer_dir(Flux2Variant::Klein9B).to_string_lossy()
-        );
+        assert_eq!(derived.transformer, package_path(Flux2Variant::Klein9B, "flux-2-klein-9b.safetensors"));
         assert_eq!(derived.vae, config::flux2_klein_vae_dir(Flux2Variant::Klein9B).to_string_lossy());
         assert_eq!(
             derived.text_encoder,
-            config::flux2_klein_text_encoder_dir(Flux2Variant::Klein9B, false).to_string_lossy(),
+            package_path(Flux2Variant::Klein9B, "text_encoder"),
             "the toggle is off, so the official encoder is derived"
         );
         for hand in [&manual.text_encoder, &manual.transformer, &manual.vae] {
@@ -1493,10 +1547,7 @@ mod tests {
             ..downloaded.clone()
         };
         let derived_uncensored = uncensored.effective_paths();
-        assert_eq!(
-            derived_uncensored.text_encoder,
-            config::flux2_klein_text_encoder_dir(Flux2Variant::Klein9B, true).to_string_lossy()
-        );
+        assert_eq!(derived_uncensored.text_encoder, package_path(Flux2Variant::Klein9B, "text_encoder_uncensored"));
         assert_ne!(derived_uncensored.text_encoder, derived.text_encoder);
         assert_eq!(derived_uncensored.transformer, derived.transformer);
         assert_eq!(derived_uncensored.vae, derived.vae);
@@ -1542,14 +1593,8 @@ mod tests {
             ..hand_made.clone()
         };
         let derived_params = downloaded.normalized().to_params(false);
-        assert_eq!(
-            derived_params["text_encoder_path"],
-            json!(config::flux2_klein_text_encoder_dir(Flux2Variant::Klein9B, true).to_string_lossy())
-        );
-        assert_eq!(
-            derived_params["transformer_path"],
-            json!(config::flux2_klein_transformer_dir(Flux2Variant::Klein9B).to_string_lossy())
-        );
+        assert_eq!(derived_params["text_encoder_path"], json!(package_path(Flux2Variant::Klein9B, "text_encoder_uncensored")));
+        assert_eq!(derived_params["transformer_path"], json!(package_path(Flux2Variant::Klein9B, "flux-2-klein-9b.safetensors")));
         assert_eq!(
             derived_params["vae_path"],
             json!(config::flux2_klein_vae_dir(Flux2Variant::Klein9B).to_string_lossy())
@@ -1634,7 +1679,8 @@ mod tests {
         // came with the second engine, «Внимание только к маске» with the pinned run
         // options, the two step axes with the large-model manager and «Энкодер на CPU» with
         // the encoder placement, the two local colour-match values with the local match, the
-        // two weight formats with the 4B GGUF quants (inert for 9B, which offers only bf16); a
+        // two weight formats with the GGUF quants (the encoder source stays the historic
+        // `uncensored_text_encoder` bool, no new key); a
         // document without any of them still loads (`#[serde(default)]`). The runtime
         // `installed_formats` is never written (`serde(skip)`).
         assert_eq!(
@@ -1707,15 +1753,16 @@ mod tests {
     /// that sets the flag anyway must not reach a path or the wire with it.
     #[test]
     fn the_4b_variant_never_carries_the_uncensored_encoder() {
-        assert!(!Flux2Variant::Klein4B.supports_uncensored_encoder());
+        assert_eq!(Flux2EncoderSource::offered_for(Flux2Variant::Klein4B), &[Flux2EncoderSource::Stock]);
         let forced = Flux2KleinSettings {
             variant: Flux2Variant::Klein4B.wire().to_string(),
             source_mode: Flux2SourceMode::Download.wire().to_string(),
             uncensored_text_encoder: true,
             ..runnable_settings()
         };
-        assert!(
-            !forced.uncensored_encoder_active(),
+        assert_eq!(
+            forced.encoder_source(),
+            Flux2EncoderSource::Stock,
             "the flag is inert for a variant that has no uncensored encoder"
         );
         assert!(
@@ -1724,7 +1771,7 @@ mod tests {
         );
         assert_eq!(
             forced.effective_paths().text_encoder,
-            config::flux2_klein_text_encoder_dir(Flux2Variant::Klein4B, false).to_string_lossy(),
+            package_path(Flux2Variant::Klein4B, "text_encoder"),
             "the derived encoder stays the official one"
         );
         // The 9B engine is unaffected: there the flag still selects the other directory.
@@ -1732,39 +1779,55 @@ mod tests {
             variant: Flux2Variant::Klein9B.wire().to_string(),
             ..forced
         };
-        assert!(allowed.uncensored_encoder_active());
+        assert_eq!(allowed.encoder_source(), Flux2EncoderSource::Uncensored);
         assert!(allowed.normalized().uncensored_text_encoder);
-        assert_eq!(
-            allowed.effective_paths().text_encoder,
-            config::flux2_klein_text_encoder_dir(Flux2Variant::Klein9B, true).to_string_lossy()
-        );
+        assert_eq!(allowed.effective_paths().text_encoder, package_path(Flux2Variant::Klein9B, "text_encoder_uncensored"));
     }
 
     // -----------------------------------------------------------------------------------
-    // Weight formats (4B catalog package, protocol 21)
+    // Weight formats and encoder source (catalog packages, protocol 21)
     // -----------------------------------------------------------------------------------
 
-    /// A 4B document in download mode with the given formats.
-    fn catalog_settings(transformer: Flux2WeightFormat, text_encoder: Flux2WeightFormat) -> Flux2KleinSettings {
+    /// `name` (a `/`-separated relative path) inside `variant`'s package root, as a string.
+    fn package_path(variant: Flux2Variant, name: &str) -> String {
+        name.split('/').fold(config::flux2_klein_dir(variant), |path, part| path.join(part)).to_string_lossy().to_string()
+    }
+
+    /// A document of `variant` in download mode with the given formats and encoder source.
+    fn download_settings(variant: Flux2Variant, source: Flux2EncoderSource, transformer: Flux2WeightFormat, text_encoder: Flux2WeightFormat) -> Flux2KleinSettings {
         Flux2KleinSettings {
-            variant: Flux2Variant::Klein4B.wire().to_string(),
+            variant: variant.wire().to_string(),
             source_mode: Flux2SourceMode::Download.wire().to_string(),
+            uncensored_text_encoder: source == Flux2EncoderSource::Uncensored,
             transformer_format: transformer.wire().to_string(),
             text_encoder_format: text_encoder.wire().to_string(),
             ..runnable_settings()
         }
     }
 
-    /// The catalog path of `format` on `axis` for 4B, as the catalog itself answers it.
-    fn catalog_path(axis: Flux2WeightAxis, format: Flux2WeightFormat) -> String {
-        flux2_klein_weights_path(&config::side_models_dir(), Flux2Variant::Klein4B, axis, format)
-            .expect("every offered 4B format resolves")
+    /// A 4B document in download mode with the given formats.
+    fn catalog_settings(transformer: Flux2WeightFormat, text_encoder: Flux2WeightFormat) -> Flux2KleinSettings {
+        download_settings(Flux2Variant::Klein4B, Flux2EncoderSource::Stock, transformer, text_encoder)
+    }
+
+    /// The catalog path of a component, as the catalog itself answers it.
+    fn catalog_path(variant: Flux2Variant, axis: Flux2WeightAxis, source: Flux2EncoderSource, format: Flux2WeightFormat, layout: Flux2TransformerLayout) -> String {
+        flux2_klein_weights_path(&config::side_models_dir(), variant, axis, source, format, layout)
+            .expect("every offered format resolves")
             .to_string_lossy()
             .to_string()
     }
 
+    /// The (axis, source) pairs `variant` offers, the transformer once (it ignores the source).
+    fn component_choices(variant: Flux2Variant) -> Vec<(Flux2WeightAxis, Flux2EncoderSource)> {
+        let mut choices = vec![(Flux2WeightAxis::Transformer, Flux2EncoderSource::Stock)];
+        choices.extend(Flux2EncoderSource::offered_for(variant).iter().map(|&source| (Flux2WeightAxis::TextEncoder, source)));
+        choices
+    }
+
     /// A file written before the formats existed reads bf16 on both axes; a persisted id
-    /// round-trips; an unknown id, or one the variant does not offer, normalizes to bf16.
+    /// round-trips; an unknown id, or one the variant does not offer for the current source,
+    /// normalizes to bf16.
     #[test]
     fn an_old_document_reads_bf16_and_a_bad_format_id_normalizes_to_bf16() {
         let old = loaded_settings(&json!({ "variant": "4b", "prompt": "remove the text" }));
@@ -1786,63 +1849,119 @@ mod tests {
         };
         assert_eq!(bad.normalized().transformer_format, "bf16", "ids are lowercase wire ids");
         assert_eq!(bad.normalized().text_encoder_format, "bf16", "an unknown id");
-        // 9B offers only bf16: a GGUF id copied into its file is inert.
+        // 9B offers the GGUF quants too: the same ids are kept there.
         let nine = Flux2KleinSettings { variant: Flux2Variant::Klein9B.wire().to_string(), ..chosen };
-        assert_eq!(nine.weight_format(Flux2WeightAxis::Transformer), Flux2WeightFormat::Bf16);
-        assert_eq!(nine.normalized().text_encoder_format, "bf16");
+        assert_eq!(nine.weight_format(Flux2WeightAxis::Transformer), Flux2WeightFormat::Q4KM);
+        assert_eq!(nine.normalized().text_encoder_format, "q6_k");
+        // …except where the uncensored encoder offers no such quant: `q5_k_m` reads as bf16.
+        let uncensored = download_settings(Flux2Variant::Klein9B, Flux2EncoderSource::Uncensored, Flux2WeightFormat::Bf16, Flux2WeightFormat::Q5KM);
+        assert_eq!(uncensored.weight_format(Flux2WeightAxis::TextEncoder), Flux2WeightFormat::Bf16);
     }
 
-    /// bf16 in download mode of the catalog variant derives EXACTLY the folders the
-    /// pre-format rule derived, so an existing 4B install stays valid without a re-download.
+    /// An old 9B settings file with the toggle on and no format keys — every install made by
+    /// the backend's former download of the uncensored encoder — runs the uncensored bf16
+    /// encoder from `text_encoder_uncensored/`, exactly the folder that download wrote, and
+    /// sends it as the selected bf16 candidate.
+    #[test]
+    fn an_old_9b_uncensored_document_runs_the_uncensored_bf16_folder() {
+        let old = loaded_settings(&json!({ "source_mode": "download", "uncensored_text_encoder": true, "prompt": "remove the text" }));
+        assert_eq!(old.variant(), Flux2Variant::Klein9B);
+        assert_eq!(old.encoder_source(), Flux2EncoderSource::Uncensored);
+        assert_eq!(old.weight_format(Flux2WeightAxis::TextEncoder), Flux2WeightFormat::Bf16);
+        let paths = old.effective_paths();
+        assert_eq!(paths.text_encoder, package_path(Flux2Variant::Klein9B, "text_encoder_uncensored"));
+        let params = old.normalized().to_params(false);
+        assert_eq!(params["text_encoder_format"], json!("bf16"));
+        assert_eq!(params["text_encoder_formats"], json!([{ "id": "bf16", "path": paths.text_encoder }]));
+    }
+
+    /// bf16 in download mode derives EXACTLY the folders an existing install has, so it stays
+    /// valid without a re-download: 4B's diffusers folders, 9B's single file (or the legacy
+    /// `transformer/` folder once the probe found that layout), and both encoder folders.
     #[test]
     fn bf16_catalog_paths_are_the_existing_folders() {
-        let paths = catalog_settings(Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16).effective_paths();
-        assert_eq!(paths.transformer, config::flux2_klein_transformer_dir(Flux2Variant::Klein4B).to_string_lossy());
-        assert_eq!(paths.text_encoder, config::flux2_klein_text_encoder_dir(Flux2Variant::Klein4B, false).to_string_lossy());
-        assert_eq!(paths.vae, config::flux2_klein_vae_dir(Flux2Variant::Klein4B).to_string_lossy());
+        let four = catalog_settings(Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16).effective_paths();
+        assert_eq!(four.transformer, package_path(Flux2Variant::Klein4B, "transformer"));
+        assert_eq!(four.text_encoder, package_path(Flux2Variant::Klein4B, "text_encoder"));
+        assert_eq!(four.vae, config::flux2_klein_vae_dir(Flux2Variant::Klein4B).to_string_lossy());
+
+        let mut nine = download_settings(Flux2Variant::Klein9B, Flux2EncoderSource::Stock, Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16);
+        assert_eq!(nine.effective_paths().transformer, package_path(Flux2Variant::Klein9B, "flux-2-klein-9b.safetensors"), "before the probe: the download target");
+        nine.installed_formats.transformer_layout = Flux2TransformerLayout::LegacyDiffusers;
+        let legacy = nine.effective_paths();
+        assert_eq!(legacy.transformer, package_path(Flux2Variant::Klein9B, "transformer"), "the backend's former download layout");
+        assert_eq!(legacy.text_encoder, package_path(Flux2Variant::Klein9B, "text_encoder"), "the layout moves only the bf16 transformer");
+        // A GGUF transformer ignores the layout.
+        nine.transformer_format = Flux2WeightFormat::Q80.wire().to_string();
+        assert_eq!(nine.effective_paths().transformer, package_path(Flux2Variant::Klein9B, "transformer_gguf/flux-2-klein-9b-Q8_0.gguf"));
     }
 
-    /// Each GGUF format points its axis at the catalog's `.gguf` file and leaves the other
-    /// axis and the VAE alone; every offered format resolves to a non-empty path.
+    /// Every offered (variant, component, source, format, layout) points its component at the
+    /// catalog's path and leaves the other component and the VAE alone.
     #[test]
     fn every_offered_format_has_a_catalog_path() {
-        let bf16 = catalog_settings(Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16).effective_paths();
-        for axis in Flux2WeightAxis::all() {
-            for &format in Flux2WeightFormat::offered_for(Flux2Variant::Klein4B, axis) {
-                let settings = match axis {
-                    Flux2WeightAxis::Transformer => catalog_settings(format, Flux2WeightFormat::Bf16),
-                    Flux2WeightAxis::TextEncoder => catalog_settings(Flux2WeightFormat::Bf16, format),
-                };
-                let paths = settings.effective_paths();
-                let (this, other, other_bf16) = match axis {
-                    Flux2WeightAxis::Transformer => (&paths.transformer, &paths.text_encoder, &bf16.text_encoder),
-                    Flux2WeightAxis::TextEncoder => (&paths.text_encoder, &paths.transformer, &bf16.transformer),
-                };
-                assert!(!this.is_empty(), "{axis:?} {format:?}");
-                assert_eq!(*this, catalog_path(axis, format), "{axis:?} {format:?}");
-                assert!(this.contains(Flux2Variant::Klein4B.dir_name()), "{this}");
-                assert_eq!(this.ends_with(".gguf"), format.is_gguf(), "{this}");
-                assert_eq!(other, other_bf16, "the other axis is untouched");
-                assert_eq!(paths.vae, bf16.vae, "the VAE has no format axis");
+        for variant in Flux2Variant::all() {
+            for layout in [Flux2TransformerLayout::Primary, Flux2TransformerLayout::LegacyDiffusers] {
+                for (axis, source) in component_choices(variant) {
+                    for &format in Flux2WeightFormat::offered_for(variant, axis, source) {
+                        let (transformer, text_encoder) = match axis {
+                            Flux2WeightAxis::Transformer => (format, Flux2WeightFormat::Bf16),
+                            Flux2WeightAxis::TextEncoder => (Flux2WeightFormat::Bf16, format),
+                        };
+                        let mut settings = download_settings(variant, source, transformer, text_encoder);
+                        settings.installed_formats.transformer_layout = layout;
+                        let paths = settings.effective_paths();
+                        let (this, other, other_axis) = match axis {
+                            Flux2WeightAxis::Transformer => (&paths.transformer, &paths.text_encoder, Flux2WeightAxis::TextEncoder),
+                            Flux2WeightAxis::TextEncoder => (&paths.text_encoder, &paths.transformer, Flux2WeightAxis::Transformer),
+                        };
+                        let case = format!("{variant:?} {axis:?} {source:?} {format:?} {layout:?}");
+                        assert_eq!(*this, catalog_path(variant, axis, source, format, layout), "{case}");
+                        assert!(this.contains(variant.dir_name()), "{case}: {this}");
+                        assert_eq!(this.ends_with(".gguf"), format.is_gguf(), "{case}: {this}");
+                        assert_eq!(*other, catalog_path(variant, other_axis, source, Flux2WeightFormat::Bf16, layout), "{case}: the other component is untouched");
+                        assert_eq!(paths.vae, config::flux2_klein_vae_dir(variant).to_string_lossy(), "{case}: the VAE has no format axis");
+                    }
+                }
             }
         }
     }
 
-    /// The 9B checkpoint and manual mode are untouched by the formats: the same paths as
-    /// before and none of the four new `params` fields.
+    /// Switching the encoder source keeps an encoder format the new source offers and maps one
+    /// it does not onto the next smaller quant (`closest_offered`), reporting the change; the
+    /// transformer format is never touched.
     #[test]
-    fn nine_b_and_manual_mode_send_no_format_fields() {
-        let format_keys = ["transformer_format", "transformer_formats", "text_encoder_format", "text_encoder_formats"];
-        let nine = Flux2KleinSettings {
-            variant: Flux2Variant::Klein9B.wire().to_string(),
-            ..catalog_settings(Flux2WeightFormat::Q80, Flux2WeightFormat::Q80)
-        };
-        let nine_paths = nine.effective_paths();
-        assert_eq!(nine_paths.transformer, config::flux2_klein_transformer_dir(Flux2Variant::Klein9B).to_string_lossy());
-        assert_eq!(nine_paths.text_encoder, config::flux2_klein_text_encoder_dir(Flux2Variant::Klein9B, false).to_string_lossy());
-        assert!(nine.format_candidates(Flux2WeightAxis::Transformer).is_empty());
+    fn switching_the_encoder_source_maps_the_encoder_format_to_the_closest_offered() {
+        let mut settings = download_settings(Flux2Variant::Klein9B, Flux2EncoderSource::Stock, Flux2WeightFormat::Q6K, Flux2WeightFormat::Q5KM);
+        assert_eq!(settings.weight_format(Flux2WeightAxis::TextEncoder), Flux2WeightFormat::Q5KM);
+        assert_eq!(
+            settings.set_encoder_source(Flux2EncoderSource::Uncensored),
+            Some((Flux2WeightFormat::Q5KM, Flux2WeightFormat::Q4KM)),
+            "the uncensored encoder has no Q5_K_M: the next smaller quant"
+        );
+        assert_eq!(settings.encoder_source(), Flux2EncoderSource::Uncensored);
+        assert!(settings.uncensored_text_encoder);
+        assert_eq!(settings.text_encoder_format, "q4_k_m");
+        assert_eq!(settings.weight_format(Flux2WeightAxis::Transformer), Flux2WeightFormat::Q6K, "the transformer is not the encoder");
+        assert_eq!(settings.set_encoder_source(Flux2EncoderSource::Stock), None, "Q4_K_M is offered for the stock encoder too");
+        assert_eq!(settings.text_encoder_format, "q4_k_m");
+        assert_eq!(settings.set_encoder_source(Flux2EncoderSource::Uncensored), None);
+        // An unknown stored id reads as bf16, which every source offers.
+        settings.text_encoder_format = "iq2_xs".to_string();
+        assert_eq!(settings.set_encoder_source(Flux2EncoderSource::Stock), None, "bf16 is offered: nothing to report");
+        assert_eq!(settings.text_encoder_format, "bf16");
+        // The encoder path follows the source.
+        let stock = settings.effective_paths().text_encoder;
+        settings.set_encoder_source(Flux2EncoderSource::Uncensored);
+        assert_eq!(stock, package_path(Flux2Variant::Klein9B, "text_encoder"));
+        assert_eq!(settings.effective_paths().text_encoder, package_path(Flux2Variant::Klein9B, "text_encoder_uncensored"));
+    }
 
-        // Manual 4B: a picked `.gguf` path travels as-is, the backend derives its format.
+    /// Manual mode sends none of the four format fields (a picked `.gguf` path travels as-is
+    /// and the backend derives its format); download mode of EITHER variant sends them.
+    #[test]
+    fn manual_mode_sends_no_format_fields_and_download_mode_of_both_variants_does() {
+        let format_keys = ["transformer_format", "transformer_formats", "text_encoder_format", "text_encoder_formats"];
         let manual = Flux2KleinSettings {
             source_mode: Flux2SourceMode::Manual.wire().to_string(),
             transformer_path: "/home/u/models/flux-2-klein-4b-Q4_K_M.gguf".to_string(),
@@ -1853,19 +1972,32 @@ mod tests {
         let manual_params = manual.normalized().to_params(false);
         assert_eq!(manual_params["transformer_path"], json!("/home/u/models/flux-2-klein-4b-Q4_K_M.gguf"));
         assert_eq!(manual_params["text_encoder_path"], json!("/home/u/models/FLUX.2-klein-4B/text_encoder_gguf/Qwen3-4B-Q8_0.gguf"));
-
-        for params in [nine.normalized().to_params(false), nine.normalized().to_profiles_params(true), manual_params, manual.normalized().to_profiles_params(false)] {
+        for params in [manual_params, manual.normalized().to_profiles_params(false)] {
             for key in format_keys {
                 assert!(params.get(key).is_none(), "`{key}` must not be sent: {params}");
             }
         }
+
+        let nine = download_settings(Flux2Variant::Klein9B, Flux2EncoderSource::Uncensored, Flux2WeightFormat::Q80, Flux2WeightFormat::Q6K).normalized();
+        for params in [nine.to_params(false), nine.to_profiles_params(true)] {
+            assert_eq!(params["transformer_format"], json!("q8_0"));
+            assert_eq!(params["transformer_formats"], json!([{ "id": "q8_0", "path": params["transformer_path"] }]));
+            assert_eq!(params["text_encoder_format"], json!("q6_k"));
+            assert_eq!(params["text_encoder_formats"], json!([{ "id": "q6_k", "path": params["text_encoder_path"] }]));
+            assert_eq!(
+                params["text_encoder_path"],
+                json!(package_path(Flux2Variant::Klein9B, "text_encoder_uncensored_gguf/flux2-klein-9b-uncensored-q6_k.gguf"))
+            );
+        }
     }
 
-    /// Download mode of 4B sends the selected id and the candidates: the installed formats
-    /// plus the selected one, best quality first, each with its catalog path, the selected
-    /// entry's path equal to the component path. Ids match the wire grammar.
+    /// Download mode sends the selected id and the candidates: the installed formats of the
+    /// current encoder source plus the selected one, best quality first, each with its
+    /// catalog path, the selected entry's path equal to the component path. Ids match the wire
+    /// grammar.
     #[test]
     fn catalog_download_mode_sends_the_selected_format_and_its_candidates() {
+        let path4 = |axis, format| catalog_path(Flux2Variant::Klein4B, axis, Flux2EncoderSource::Stock, format, Flux2TransformerLayout::Primary);
         // Nothing probed yet: each list holds the selected format alone.
         let fresh = catalog_settings(Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16).normalized();
         let params = fresh.to_params(false);
@@ -1876,17 +2008,19 @@ mod tests {
 
         let mut settings = catalog_settings(Flux2WeightFormat::Q4KM, Flux2WeightFormat::Q6K);
         for format in [Flux2WeightFormat::Q4KM, Flux2WeightFormat::Bf16, Flux2WeightFormat::Q80] {
-            settings.installed_formats.insert(Flux2WeightAxis::Transformer, format);
+            settings.installed_formats.insert(Flux2WeightAxis::Transformer, Flux2EncoderSource::Stock, format);
         }
-        settings.installed_formats.insert(Flux2WeightAxis::TextEncoder, Flux2WeightFormat::Bf16);
+        settings.installed_formats.insert(Flux2WeightAxis::TextEncoder, Flux2EncoderSource::Stock, Flux2WeightFormat::Bf16);
+        // An installed format of the OTHER source is not a candidate of this one.
+        settings.installed_formats.insert(Flux2WeightAxis::TextEncoder, Flux2EncoderSource::Uncensored, Flux2WeightFormat::Q80);
         let normalized = settings.normalized();
         for params in [normalized.to_params(false), normalized.to_params(true), normalized.to_profiles_params(true)] {
             assert_eq!(params["transformer_format"], json!("q4_k_m"));
             assert_eq!(
                 params["transformer_formats"],
                 json!([
-                    { "id": "bf16", "path": catalog_path(Flux2WeightAxis::Transformer, Flux2WeightFormat::Bf16) },
-                    { "id": "q8_0", "path": catalog_path(Flux2WeightAxis::Transformer, Flux2WeightFormat::Q80) },
+                    { "id": "bf16", "path": path4(Flux2WeightAxis::Transformer, Flux2WeightFormat::Bf16) },
+                    { "id": "q8_0", "path": path4(Flux2WeightAxis::Transformer, Flux2WeightFormat::Q80) },
                     { "id": "q4_k_m", "path": params["transformer_path"] },
                 ]),
                 "installed formats, best first, insertion order irrelevant"
@@ -1895,7 +2029,7 @@ mod tests {
             assert_eq!(
                 params["text_encoder_formats"],
                 json!([
-                    { "id": "bf16", "path": catalog_path(Flux2WeightAxis::TextEncoder, Flux2WeightFormat::Bf16) },
+                    { "id": "bf16", "path": path4(Flux2WeightAxis::TextEncoder, Flux2WeightFormat::Bf16) },
                     { "id": "q6_k", "path": params["text_encoder_path"] },
                 ]),
                 "the selected format is a candidate even before its files are installed"
@@ -1910,7 +2044,7 @@ mod tests {
     }
 
     /// D8: a GGUF encoder in effect sends fp8 off; the stored choice is kept, and nothing
-    /// else (a GGUF transformer, manual mode, 9B) touches the flag.
+    /// else (a GGUF transformer, manual mode) touches the flag.
     #[test]
     fn a_gguf_encoder_excludes_fp8_on_the_wire_only() {
         let gguf_encoder = Flux2KleinSettings { text_encoder_fp8: true, ..catalog_settings(Flux2WeightFormat::Bf16, Flux2WeightFormat::Q80) };
@@ -1926,18 +2060,20 @@ mod tests {
         let manual = Flux2KleinSettings { source_mode: Flux2SourceMode::Manual.wire().to_string(), ..gguf_encoder.clone() };
         assert!(manual.normalized().text_encoder_fp8, "the format setting is inert in manual mode");
         let nine = Flux2KleinSettings { variant: Flux2Variant::Klein9B.wire().to_string(), ..gguf_encoder };
-        assert!(nine.normalized().text_encoder_fp8, "9B offers no GGUF encoder");
+        assert!(!nine.normalized().text_encoder_fp8, "9B offers GGUF encoders too");
     }
 
     /// The installed set is runtime state: never written to the file, and an empty side-models
-    /// root (or a non-catalog variant) probes as nothing installed. The probe root is a unique
+    /// root probes as nothing installed with the `Primary` layout. The probe root is a unique
     /// temp path that is never created, so nothing is left behind.
     #[test]
     fn installed_formats_are_never_persisted_and_an_empty_root_probes_empty() {
         let mut settings = catalog_settings(Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16);
-        settings.installed_formats.insert(Flux2WeightAxis::Transformer, Flux2WeightFormat::Q80);
+        settings.installed_formats.insert(Flux2WeightAxis::Transformer, Flux2EncoderSource::Stock, Flux2WeightFormat::Q80);
+        settings.installed_formats.transformer_layout = Flux2TransformerLayout::LegacyDiffusers;
         let written = serde_json::to_value(&settings).expect("serialize");
         assert!(written.get("installed_formats").is_none());
+        assert!(written.get("transformer_layout").is_none());
         assert_eq!(loaded_settings(&written).installed_formats, Flux2InstalledFormats::default());
 
         let root = std::env::temp_dir().join(format!("ms_flux2_probe_absent_{}", std::process::id()));
@@ -1946,5 +2082,26 @@ mod tests {
             assert_eq!(probe_flux2_installed_formats(&root, variant), Flux2InstalledFormats::default(), "{variant:?}");
         }
         assert!(!root.exists(), "the probe never creates anything");
+    }
+
+    /// The probe's spec lookup is the catalog's bundle rule: the bf16 transformer is the
+    /// legacy spec in the legacy layout, every other component the download spec, and a
+    /// format that is not offered has none.
+    #[test]
+    fn the_probed_spec_of_each_component_is_the_bundle_spec() {
+        let legacy = Flux2TransformerLayout::LegacyDiffusers;
+        let spec = |axis, source, format, layout| flux2_component_spec(Flux2Variant::Klein9B, axis, source, format, layout).map(|spec| spec.id);
+        let t = Flux2WeightAxis::Transformer;
+        assert_eq!(spec(t, Flux2EncoderSource::Stock, Flux2WeightFormat::Bf16, legacy), flux2_klein_legacy_transformer_spec(Flux2Variant::Klein9B).map(|spec| spec.id));
+        for (axis, source) in component_choices(Flux2Variant::Klein9B) {
+            for &format in Flux2WeightFormat::offered_for(Flux2Variant::Klein9B, axis, source) {
+                assert_eq!(
+                    spec(axis, source, format, Flux2TransformerLayout::Primary),
+                    flux2_klein_spec(Flux2Variant::Klein9B, axis, source, format).map(|spec| spec.id),
+                    "{axis:?} {source:?} {format:?}"
+                );
+            }
+        }
+        assert_eq!(spec(Flux2WeightAxis::TextEncoder, Flux2EncoderSource::Uncensored, Flux2WeightFormat::Q5KM, Flux2TransformerLayout::Primary), None);
     }
 }

@@ -48,7 +48,9 @@ Long work is delegated to focused controllers:
   Cleaning tab reuses controller and block for its SDXL configs.
   It also ADOPTS, automatically and once per process per spec, a spec whose files are already on
   disk with no marker at all (hash + marker, no network, nothing deleted); a marker of another
-  identity is an older install and goes through the regular download.
+  identity is an older install and goes through the regular download. For a gated Hugging Face
+  repository it checks access (`ms_sysprobe::ai_models::hf_access`) before and during a download
+  and reports it per repository; it never disables the Download button over it.
 - `text_detector/` owns the text detector worker and returns page boxes plus editable binary
   masks. Detector modes (`TextDetectorRunMode`): `Classic` (local Otsu threshold + dilation +
   connected components), `PaddleOcr` (native ONNX or backend `textdetector.paddle.forward`),
@@ -342,8 +344,10 @@ network failures itself and reports the wait as the `Retrying` phase). A downloa
 without installing (cancel, failure) leaves a `DownloadNotice` and re-probes the bundle's specs; a
 second bundle's Download is disabled while one runs (busy line names the running one).
 A download interrupted by a tab rebuild (controller drop) or a crash is recognized by its staged
-bytes: the next probe reports `Partial`, shown as "download was interrupted" + Resume; no
-process-global state keeps it.
+bytes: the next probe reports `Partial`, shown as "part of the model is on disk" + a button
+priced at the bytes still missing; no process-global state keeps it. Files found without any
+completion marker (some, not all) read `Partial` the same way, so the button never prices files
+already on disk (the download hashes them and fetches only the rest).
 `ocr::external_model_specs` is the single owner of the engine -> external bundle mapping.
 AI API OCR bypasses the Python backend and uses Rust `genai` (through `ms_ai_api`, streamed by
 `exec_chat_validated`) from the OCR worker thread; its answer is cleaned
@@ -505,7 +509,15 @@ is an author note addressed to the translator, not a replica.
   `AdoptFailed` / `AdoptCancelled` and Download repairs only the differing files; the spec ids
   tried are recorded process-wide in `AUTO_ADOPT_ATTEMPTED`, so a tab rebuild never re-hashes;
   a decided bundle is not re-registered by the per-frame `probe_unknown` until a spec of it is
-  probed again or `request_bundle_status` re-asks it; `running_job` names the running job kind)
+  probed again or `request_bundle_status` re-asks it; `running_job` names the running job kind;
+  gated Hugging Face repositories: an `AccessCheck` (`hf_repo_access` + the cached token) runs on
+  a detached worker once per repository and token for every gated spec of a shown bundle probed
+  `Missing` / `Partial` (repository: `ExternalModelSpec::gated_repo`), an `Unreachable` answer is
+  asked again after `UNREACHABLE_RECHECK` (60 s) and after any job ends, a token change seen by
+  `poll` drops the answers and every `DownloadNotice::Access`, a download re-checks its pending
+  specs' repositories before any transfer with the job's cancel flag and a definite refusal
+  (`HfAccess::refuses_download`) ends it with `DownloadNotice::Access` — `Unreachable` does not;
+  the snapshot's `RepoAccessLine`s carry the answers)
   — with progress over the whole bundle coalesced in a mutex snapshot,
   injected worker bodies for tests; a running download is cancelled and DETACHED on drop, never
   joined on the GUI thread), `bundle_key`, `OcrModelDownloadState` + `DownloadNotice` +

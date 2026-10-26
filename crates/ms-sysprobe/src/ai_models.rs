@@ -15,7 +15,8 @@ Main responsibilities:
 - Return concrete local paths for Rust model initialization code.
 
 - Mount the `external` (pinned third-party model downloader), `external_catalog`,
-  `easyocr` and `hf_url` (Hugging Face resolve URLs) submodules; see
+  `easyocr`, `hf_url` (Hugging Face resolve URLs) and `hf_access` (gated-repository access
+  probe) submodules; see
   `ai_models/MODULE_README.md`.
 
 Notes:
@@ -62,6 +63,9 @@ pub mod easyocr;
 /// Hugging Face resolve URLs of both downloaders (`HF_ENDPOINT` honoured, no home directory).
 #[cfg(not(target_arch = "wasm32"))]
 mod hf_url;
+/// Gated Hugging Face repository access: the Hub's auth-check probe and the typed
+/// per-repository state (`HfAccess`) of the pinned catalog's gated sources.
+pub mod hf_access;
 /// Tests of the main-repository downloader `download_hf_file_with`.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod main_repo_tests;
@@ -682,7 +686,7 @@ fn map_download_error(remote: &str, error: DownloadError) -> ModelEnsureError {
     match error {
         DownloadError::Cancelled => ModelEnsureError::Cancelled,
         DownloadError::Io { path, source } => ModelEnsureError::Failed(tf!("ai_models.write_error", tmp_path = path.display(), err = source)),
-        DownloadError::Http { detail } => ModelEnsureError::Failed(tf!("ai_models.download_error", remote = remote, err = detail)),
+        DownloadError::Http { detail, .. } => ModelEnsureError::Failed(tf!("ai_models.download_error", remote = remote, err = detail)),
         other @ (DownloadError::Busy { .. }
         | DownloadError::InvalidRequest { .. }
         | DownloadError::SizeMismatch { .. }

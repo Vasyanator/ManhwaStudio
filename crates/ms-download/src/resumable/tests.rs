@@ -183,7 +183,7 @@ fn a_404_is_not_retried() {
     let fetcher = ScriptedFetcher::new(&body, &[Step::Status(404, None)]);
     let sleeps = SleepLog::new(None);
     let (result, retries) = fetch_unpinned(&fetcher, &part, &AtomicBool::new(false), &sleeps);
-    assert!(matches!(&result, Err(StreamError::Http { detail }) if detail.contains("404")), "{result:?}");
+    assert!(matches!(&result, Err(StreamError::Http { detail, status: Some(404) }) if detail.contains("404")), "{result:?}");
     assert_eq!(fetcher.offsets(), vec![0]);
     assert_eq!(sleeps.count(), 0);
     assert!(retries.is_empty());
@@ -220,7 +220,7 @@ fn no_announced_size_is_refused_and_the_part_kept() {
     let part = part_in(&root);
     let fetcher = ScriptedFetcher::new(&body, &[Step::Announce(None)]);
     let (result, _) = fetch_unpinned(&fetcher, &part, &AtomicBool::new(false), &SleepLog::new(None));
-    assert!(matches!(&result, Err(StreamError::Http { detail }) if detail.contains("no file size")), "{result:?}");
+    assert!(matches!(&result, Err(StreamError::Http { detail, status: None }) if detail.contains("no file size")), "{result:?}");
     assert_eq!(file_len(&part), Some(3000));
 }
 
@@ -281,8 +281,30 @@ fn a_416_with_a_pinned_size_is_permanent() {
     let engine = ResumableFetch { fetcher: &fetcher, retry: &policy, cancel: &cancel, log_tag: "[test]", log_context: "file=model.bin" };
     let request = PartRequest { url: "mem://model.bin", part: &part, offset: 1500, expected_size: Some(2000) };
     let result = engine.fetch_part(&request, None, &mut |_| {});
-    assert!(matches!(&result, Err(StreamError::Http { detail }) if detail.contains("416")), "{result:?}");
+    assert!(matches!(&result, Err(StreamError::Http { detail, status: Some(416) }) if detail.contains("416")), "{result:?}");
     assert_eq!(file_len(&part), Some(1500));
+}
+
+#[test]
+fn classify_status_keeps_the_code_of_a_permanent_answer() {
+    for code in [400_u16, 401, 403, 404, 410, 451] {
+        let error = classify_status(code, None);
+        assert_eq!(error, FetchError::Permanent { detail: format!("HTTP status {code}"), status: Some(code) }, "{code}");
+    }
+    for code in [408_u16, 429, 500, 503, 599] {
+        assert!(matches!(classify_status(code, None), FetchError::Transient { .. }), "{code}");
+    }
+}
+
+#[test]
+fn exhausted_retries_carry_no_status() {
+    let body = content(500, 13);
+    let root = temp_root();
+    let part = part_in(&root);
+    let fetcher = ScriptedFetcher::new(&body, &[Step::Status(503, None); 6]);
+    let sleeps = SleepLog::new(None);
+    let (result, _retries) = fetch_unpinned(&fetcher, &part, &AtomicBool::new(false), &sleeps);
+    assert!(matches!(&result, Err(StreamError::Http { detail, status: None }) if detail.contains("503")), "{result:?}");
 }
 
 #[test]
@@ -339,6 +361,33 @@ fn downgrades_and_foreign_schemes_are_refused() {
     assert!(resolve_location(base, "file:/etc/passwd").is_err());
     assert!(resolve_location("file:///etc/x", "/y").is_err());
     assert!(resolve_location("http://plain/x", "http://other/y").is_ok());
+}
+
+/// The bearer token follows a redirect only on the first request's own origin: Hugging
+/// Face's same-host `/api/resolve-cache/…` hop (also under an `HF_ENDPOINT` mirror) keeps it,
+/// the LFS / xet CDN and any other host never get it.
+#[test]
+fn the_bearer_token_stays_on_the_first_requests_origin() {
+    let first = "https://huggingface.co/owner/gated/resolve/0123/config.json";
+    let hop = |location: &str| resolve_location(first, location).unwrap_or_else(|detail| panic!("{location}: {detail}"));
+    // Same host: a relative, an absolute and a differently-cased redirect keep the token.
+    assert!(bearer_allowed(first, &hop("/api/resolve-cache/models/owner/gated/0123/config.json")));
+    assert!(bearer_allowed(first, &hop("https://huggingface.co/api/resolve-cache/x")));
+    assert!(bearer_allowed(first, &hop("HTTPS://HuggingFace.co/x")));
+    assert!(bearer_allowed(first, first));
+    // Another host never gets it: the CDN, a sub-domain, a look-alike, another port.
+    assert!(!bearer_allowed(first, &hop("https://cdn-lfs.huggingface.co/repos/x?sig=1")));
+    assert!(!bearer_allowed(first, &hop("https://cas-bridge.xethub.hf.co/x")));
+    assert!(!bearer_allowed(first, &hop("https://huggingface.co.evil.example/x")));
+    assert!(!bearer_allowed(first, &hop("https://huggingface.co:8443/x")));
+    // A mirror endpoint is its own origin: same-host hops keep the token there.
+    let mirror = "https://hf-mirror.example/owner/gated/resolve/0123/config.json";
+    assert!(bearer_allowed(mirror, "https://hf-mirror.example/api/resolve-cache/x"));
+    assert!(!bearer_allowed(mirror, "https://huggingface.co/api/resolve-cache/x"));
+    // An http -> https upgrade is another origin (scheme differs); unparsable URLs never match.
+    assert!(!bearer_allowed("http://huggingface.co/x", "https://huggingface.co/x"));
+    assert!(!bearer_allowed("not a url", "not a url"));
+    assert!(!bearer_allowed("https:///x", "https:///x"));
 }
 
 #[test]

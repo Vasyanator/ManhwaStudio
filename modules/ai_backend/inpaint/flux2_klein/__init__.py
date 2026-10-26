@@ -38,8 +38,10 @@ folder, or a llama.cpp GGUF file), a transformer (`.safetensors` single file,
 a GGUF file or a diffusers folder) and an `AutoencoderKLFlux2` folder; the
 tokenizer and the scheduler are DISCOVERED next to them, and a single-file
 transformer needs its own `config.json` beside it. A GGUF file kept outside
-the package borrows its config, tokenizer and scheduler from the installed
-FLUX.2 klein 4B package when that config matches the file's header.
+the packages borrows its config, tokenizer and scheduler from an installed
+FLUX.2 klein package (4B or 9B) whose config matches the file's header. The
+text encoder's config goes through one kwargs entry (truncation plus the
+RoPE base of a transformers-v5 config, `components.text_encoder_config_kwargs`).
 
 Module layout (this file re-exports the package's public surface):
 - `params.py`       - request normalization, region validation, coercion helpers.
@@ -138,10 +140,11 @@ from .components import (  # noqa: F401  - re-exported public surface
     find_transformer_config_dir,
     gguf_config_candidates,
     gguf_layout,
-    installed_4b_package_root,
+    existing_klein_package_roots,
+    installed_klein_package_roots,
     is_gguf_file,
     text_encoder_config_dir,
-    FLUX2_KLEIN_4B_DIR_NAME,
+    KLEIN_PACKAGE_DIR_NAMES,
     GGUF_ENCODER_ARCHITECTURE,
     GgufConfigSearch,
     is_fp8_scaled_checkpoint,
@@ -150,6 +153,8 @@ from .components import (  # noqa: F401  - re-exported public surface
     require_encoder_transformer_compatible,
     require_text_encoder,
     text_encoder_available,
+    text_encoder_config_kwargs,
+    text_encoder_rope_kwargs,
     text_encoder_truncation_kwargs,
     transformer_config_dir,
     transformer_config_roots,

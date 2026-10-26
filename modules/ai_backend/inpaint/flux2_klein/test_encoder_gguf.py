@@ -6,9 +6,12 @@ Unit tests for the GGUF text encoder of FLUX.2 klein: the llama.cpp <-> HF
 Qwen3 name bridge (`encoder_gguf.py`: full 398-name coverage, truncation, the
 dropped head, refusals), the encoder spec over a GGUF file (`large_model.py`:
 formats, keys, the D7 encode variant, the D8 fp8 refusal, the pre-admission
-refusals, the GGUF module swap) and a tiny REAL Qwen3 written as a GGUF and
+refusals, the GGUF module swap), a tiny REAL Qwen3 written as a GGUF and
 loaded through the real manager on the CPU, which must compute exactly like
-the same model built from the dequantized weights (also under «Энкодер на CPU»).
+the same model built from the dequantized weights (also under «Энкодер на CPU»),
+and the RECORDED uncensored 9B encoder header (`fixtures/flux2_9b_gguf_headers.json`,
+written header-only): its 399 names, its quantized keys, its strict match with
+the stock 9B config and the package fallback that picks the 9B package for it.
 
 Notes:
 The name-bridge tests need gguf, transformers and accelerate (the key set is
@@ -28,7 +31,7 @@ from modules.ai_backend.inpaint.flux2_klein import components, encoder_gguf, lar
 from modules.ai_backend.runtime.large_models.manager import LargeModelManager, MemoryLimitsStore
 from modules.ai_backend.runtime.residency.arbiter import ResidencyArbiter
 
-from ._test_fixtures import TINY_GGUF_ENCODER_CONFIG, _RoomyProbes, _TempTreeCase, _flat_tables, _write_qwen3_gguf_encoder
+from ._test_fixtures import TINY_GGUF_ENCODER_CONFIG, _RoomyProbes, _TempTreeCase, _flat_tables, _write_qwen3_gguf_encoder, load_9b_config, load_9b_header_fixture, write_header_only_gguf
 
 
 def _has(*modules: str) -> bool:
@@ -264,7 +267,7 @@ class GgufEncoderLoadTests(_GgufEncoderCase):
 
 @unittest.skipUnless(_has(*_NAME_STACK), "needs gguf, torch, transformers and accelerate")
 class GgufEncoderConfigDiscoveryTests(_GgufEncoderCase):
-    """Where a GGUF encoder's `config.json` comes from: beside it, else the installed 4B package, never an inconsistent one."""
+    """Where a GGUF encoder's `config.json` comes from: beside it, else an installed klein package, never an inconsistent one."""
 
     def _outside(self) -> Path:
         outside = tempfile.TemporaryDirectory()
@@ -317,6 +320,52 @@ class GgufEncoderConfigDiscoveryTests(_GgufEncoderCase):
         components.require_encoder_transformer_compatible({"text_encoder_path": str(self.gguf), "transformer_path": self.paths["transformer_path"]})
         # No config for an outside GGUF: silent here, refused by `require_loadable_encoder`.
         components.require_encoder_transformer_compatible({"text_encoder_path": str(self._outside()), "transformer_path": self.paths["transformer_path"]})
+
+
+#: The shipped Qwen3-4B `text_encoder/config.json` of the klein 4B package,
+#: reduced to the fields the GGUF config match reads.
+_KLEIN_4B_ENCODER_CONFIG = {"architectures": ["Qwen3ForCausalLM"], "head_dim": 128, "hidden_size": 2560, "intermediate_size": 9728, "num_attention_heads": 32, "num_hidden_layers": 36, "num_key_value_heads": 8, "vocab_size": 151936}
+
+
+@unittest.skipUnless(_has(*_NAME_STACK), "needs gguf, torch, transformers and accelerate")
+class UncensoredNineBEncoderHeaderTests(_TempTreeCase):
+    """The recorded uncensored 9B Q8_0 encoder header: names, quantized keys, config match and the 9B package fallback."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        header = load_9b_header_fixture("unc_q8.head")
+        self.path = write_header_only_gguf(Path(outside.name) / "sd_models" / "flux2-klein-9b-uncensored-q8_0.gguf", header["metadata"], header["tensors"])  # type: ignore[arg-type]
+        self.layout = components.gguf_layout(self.path)
+
+    def test_every_name_maps_and_the_tied_head_is_dropped(self) -> None:
+        keep = svc.ENCODER_KEEP_LAYERS
+        names = [span.name for span in self.layout.spans]
+        self.assertEqual(len(names), 399)
+        self.assertIn("output.weight", names)
+        self.assertIsNone(encoder_gguf.encoder_state_key_of_gguf("output.weight", keep))
+        encoder_gguf.require_known_encoder_names(names, keep, source=self.path)
+
+    def test_the_quantized_keys_are_every_kept_linear_and_the_embedding(self) -> None:
+        keep = svc.ENCODER_KEEP_LAYERS
+        quantized = encoder_gguf.gguf_encoder_quant_types(self.layout.spans, keep)
+        linears = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+        expected = {"embed_tokens.weight", *(f"layers.{index}.{linear}.weight" for index in range(keep) for linear in linears)}
+        self.assertEqual(set(quantized), expected)
+        self.assertEqual(set(quantized.values()), {8}, "Q8_0 throughout")
+
+    def test_the_stock_9b_config_matches_strictly_and_the_4b_one_does_not(self) -> None:
+        self.assertIsNone(components._gguf_encoder_mismatch(load_9b_config("text_encoder"), self.layout, True))
+        self.assertEqual(components._gguf_encoder_mismatch(_KLEIN_4B_ENCODER_CONFIG, self.layout, True), "ширина: в файле 4096, в config.json 2560")
+
+    def test_the_fallback_takes_the_9b_package_and_never_the_4b_one(self) -> None:
+        for package, config in ((self.installed_package, _KLEIN_4B_ENCODER_CONFIG), (self.installed_package_9b, load_9b_config("text_encoder"))):
+            folder = package / "text_encoder"
+            folder.mkdir(parents=True)
+            (folder / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        self.assertEqual(components.find_text_encoder_config_dir(self.path), self.installed_package_9b / "text_encoder")
+        large_model._require_loadable_gguf_encoder(self.path, fp8=False)
 
 
 if __name__ == "__main__":

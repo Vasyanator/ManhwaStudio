@@ -11,8 +11,8 @@ network call, a whole download into the destination root with the token on
 the wire, and a resume over a staged `.part`.
 
 Notes:
-The fake transports come from `test_flux2_download.py` (one implementation of
-the `requests` stand-ins). Files go to temporary directories.
+The fake transports come from `_hf_download_test_fakes.py` (one implementation
+of the `requests` stand-ins). Files go to temporary directories.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from modules.ai_backend.inpaint import flux3_download as f3
 from modules.ai_backend.inpaint import hf_gated_download as hgd
 from modules.ai_backend.inpaint.flux3_klein.config import WeightFormat
 
-from .test_flux2_download import _FakeRequests, _FakeRequestsModule, _RangeRequests
+from modules.ai_backend.inpaint._hf_download_test_fakes import _FakeRequests, _FakeRequestsModule, _RangeRequests
 
 #: The repository's layout (as the local `hf download` tree shows it), tiny sizes.
 LISTING = {

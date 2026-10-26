@@ -6,29 +6,30 @@ downloads itself, pinned by commit (Hugging Face) or by exact size + sha256 (pla
 opposed to the unpinned app-managed `Vasyanator2/ManhwaStudio_AI_Models` tree that
 `ai_models.rs` resolves. Today: Baberu OCR, the PaddleOCR-VL variants, EasyOCR (14 scripts,
 GitHub release zips), Surya detection + recognition (the Surya model host), the SDXL
-diffusers configs, the curated SDXL inpainting model and the FLUX.2 klein 4B package (BFL bf16
-files + unsloth GGUF transformer and Qwen3-4B encoder quants; the 9B variant stays a backend
-download). The Python backend never downloads
+diffusers configs, the curated SDXL inpainting model and the FLUX.2 klein 4B and 9B packages
+(BFL bf16 files + unsloth GGUF transformer and Qwen3 encoder quants; for 9B also the gated
+uncensored encoder with its GGUF quants, and the stock encoder's configs as their own spec). The Python backend never downloads
 these; it receives the resolved directory or file paths from Rust and loads offline. Plus
 `hf_url.rs`, the URLs BOTH downloaders use; the HTTP stream they share is the `ms-download`
 crate.
 
 ## Architecture
 - `external_catalog.rs` is DATA: one `ExternalModelSpec` per model (`ExternalSource`:
-  `HuggingFace { repo_id, revision }` or `Url { base_url }`; file allowlist with exact size +
+  `HuggingFace { repo_id, revision, gated }` or `Url { base_url }`; file allowlist with exact size +
   sha256; target directory relative to `side_models`; `DirLayout`), the typed
   `PaddleVlVariant` selector, the Baberu layout helper `baberu_files`, the FLUX.2 klein
   lookups and `all_specs()`.
-- FLUX.2 klein 4B: eleven `Shared` specs. Three BFL specs (`flux2_klein_4b_base` — licence,
-  index, scheduler, tokenizer, VAE, transformer + encoder configs; `…_transformer_bf16`;
-  `…_text_encoder_bf16`) publish into `FLUX.2-klein-4B/` at exactly the relative paths of
-  `ms_config::flux2_klein_*_dir` (and of the backend's former download, so an existing folder
-  is adoptable); the GGUF quants go to `FLUX.2-klein-4B/transformer_gguf/` and
-  `FLUX.2-klein-4B/text_encoder_gguf/`, one spec per `ms_config::Flux2WeightFormat`.
-  `flux2_klein_spec(variant, axis, format)` (one component), `flux2_klein_package_specs`
-  (base + transformer + encoder of a selection; empty for 9B) and `flux2_klein_weights_path`
-  (bf16 folder or GGUF file sent to the backend) are the only lookups; the format list itself
-  is `ms_config`'s, never repeated here.
+- FLUX.2 klein (`external_catalog/flux2_klein.rs`, re-exported by `external_catalog`; detail in
+  `external_catalog/MODULE_README.md`): 11 `Shared` specs for 4B and 17 for 9B under
+  `<side_models>/<Flux2Variant::dir_name()>/` (base, bf16 component(s), GGUF quants per
+  `ms_config::Flux2WeightFormat`; 9B adds the gated uncensored encoder source, an ADOPT-ONLY
+  legacy diffusers transformer and the stock encoder's configs, bundled for the stock source
+  only). The bf16 paths are the ones the backend's former download
+  wrote, so existing installs are adopted. Lookups: `flux2_klein_spec(variant, axis, source,
+  format)` (download target), `flux2_klein_package_specs` (bundle), `flux2_klein_weights_path`
+  (backend path), `flux2_klein_transformer_layout` (the one bf16 layout rule),
+  `flux2_klein_spec_role` (id -> typed role). The format and source lists are `ms_config`'s
+  (`Flux2WeightFormat::offered_for`, `Flux2EncoderSource::offered_for`), never repeated here.
 - `easyocr.rs` is the ONE owner of EasyOCR decisions: `normalize_easyocr_langs` (raw setting
   -> canonical codes sent to the backend), `easyocr_script_for` (mirror of easyocr 1.7.2
   `Reader.__init__`), `EasyOcrScript`, `easyocr_spec`. Every script spec lives in the ONE
@@ -46,8 +47,18 @@ crate.
   the per-spec busy guard is `ms_download::busy::BusyGuard`.
 - `hf_url.rs` (native-only): `hf_resolve_url` (endpoint from `HF_ENDPOINT`, default
   `https://huggingface.co`, every path segment percent-encoded; no `hf_hub` and no home
-  directory, which Android app processes lack) and `url_source_file_url` (same encoding under
+  directory, which Android app processes lack), `hf_auth_check_url`
+  (`{endpoint}/api/models/{repo}/auth-check`) and `url_source_file_url` (same encoding under
   a `Url` source's base).
+- `hf_access.rs`: the ONE owner of gated Hugging Face access. `HfAccess` (`Granted`,
+  `NoToken`, `TokenRejected`, `TermsNotAccepted`, `RepoNotFound`, `Unreachable { detail }`),
+  `HfAccess::refuses_download` (which answers stop a download up front: the four definite
+  refusals, never `Unreachable`), `hf_repo_access(repo_id, cancel)` (the auth-check probe with
+  the cached token and the caller's cancel flag, 2 short retries, one INFO log line; worker
+  threads only; wasm -> `Unreachable`), its testable core
+  `hf_repo_access_with` and `access_from_status` (200 granted; 401 -> no token / token
+  rejected by whether a token was sent; 403 -> terms not accepted; 404 -> no repository),
+  which the downloader also applies to a 401 / 403 met during a transfer.
 - Neither reads config: callers pass the side-models root (`ms_config::side_models_dir()`).
 - Threading: none of it may run on the GUI thread; the OCR download controller in
   `ms-tab-translation` owns the worker and polls the progress it is given.
@@ -56,6 +67,10 @@ Download flow for one spec (`<side_models>/<spec.dir>`; marker and staging per `
 `Exclusive` = `.ms_model_complete.json` + `.download/`, `Shared` =
 `.ms_model_complete.<id>.json` + `.download/<id>/`):
 1. validate the spec; take the process-wide per-spec busy guard (`Busy` for a second call);
+   for a `gated` Hugging Face spec (`ExternalModelSpec::gated_repo`) with any file not at its
+   exact size (stat only), run the access probe once with the download's cancel flag — a
+   definite refusal (`HfAccess::refuses_download`) ends here with `AccessDenied`, nothing on
+   disk touched; `Unreachable` proceeds (the transfer retries and maps a real 401 / 403);
 2. move the completion marker into `<staging>/previous_marker.json` (no reader sees
    "installed" while files change; the old file list survives a cancel);
 3. discard staged parts that belong to a different spec identity (its file paths are merged
@@ -96,6 +111,9 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
   the fixture.
 - `hf_url.rs`: resolve / `Url`-source URLs and their tests (encoding, endpoint override).
   Edit for the URL shape or the `HF_ENDPOINT` rule.
+- `hf_access.rs`: `HfAccess`, the auth-check probe and the status rule, with tests over
+  `ms_download::test_support::ScriptedFetcher` (no network) including the token-redaction
+  and token-destination checks.
 - `main_repo_tests.rs`: tests of the main-repository downloader
   `ai_models::ensure_files_with` over `ms_download::test_support::ScriptedFetcher` (publish,
   resume, failure, progress thinning, cancel mid-transfer / mid-backoff / while waiting for
@@ -104,8 +122,10 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
 - `external/tests.rs`: downloader tests over an in-memory fetcher in a self-removing temp
   dir (including hand-built STORED zips for the member flow, shared directories and the
   legacy marker bytes), plus one opt-in `#[ignore]` real download (`MS_TEST_EXTERNAL_DOWNLOAD=1`).
-- `external_catalog.rs`: the pinned specs, `PaddleVlVariant`, the FLUX.2 klein lookups,
-  `all_specs()`. Edit to add a model or move a pin.
+- `external_catalog.rs`: the pinned specs, `PaddleVlVariant`, `all_specs()`. Edit to add a
+  model or move a pin.
+- `external_catalog/flux2_klein.rs`: the FLUX.2 klein 4B / 9B specs, lookups and their tests
+  (see `external_catalog/MODULE_README.md`).
 
 ## Contracts and invariants
 - The catalog (with `easyocr.rs` for EasyOCR) is the ONLY owner of source, revision, file
@@ -123,7 +143,7 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
   installed model, and it hands repair back to a normal download by deleting the wrong
   files and the affected markers.
 - Adoption (the one owner: `adopt_external_model`): for files on disk with NO completion
-  marker at all (e.g. the FLUX.2 klein 4B folder the backend used to download). A marker of
+  marker at all (e.g. the FLUX.2 klein 4B / 9B folders the backend used to download). A marker of
   another identity is an older install: never adopted (`unmarked_files_present` reads `false`,
   the adoption refuses with `NotDownloaded`); its upgrade is the regular download, which
   retires that marker and cleans stale files of an Exclusive directory. Worker thread only,
@@ -134,14 +154,25 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
   regular download then keeps the matching files (by hash) and fetches only the others. No
   network: it takes no fetcher. When to adopt (once per process) is the download controller's
   decision in `ms-tab-translation`.
+- Gated access: `gated` is catalog data (never part of the marker identity). The preflight
+  runs only inside `download_external_model` / `download_with`; adoption and
+  `verify_external_model` never touch the network, and a complete install of a gated spec
+  downloads nothing (present files are kept by hash). A 401 / 403 during the transfer of a
+  GATED spec is `AccessDenied` too; for an ungated Hugging Face spec (a CDN or region 403)
+  and a `Url` source it stays `Http`. `ExternalModelSpec::gated_repo` is the one owner of
+  "which gated repository does a spec use" (the downloader, the OCR download controller and
+  the FLUX.2 klein panel ask it).
 - `Url` sources never send the Hugging Face token; `total_bytes`, progress and `Partial`
   count network bytes (`ExternalFile::download_size`: the archive size for a zip member).
 - No implicit download: `installed_dir` only reports; `NotDownloaded` is the answer for a
   missing or partial model.
 - `Installed` = completion marker equals the spec identity AND every file has its exact
   size (stat-only; hashes are verified at download time). Any pin change therefore reads as
-  `Missing` until re-downloaded. `Partial` is reported only while `.download/in_progress.json`
-  belongs to this exact spec.
+  `Missing` until re-downloaded. `Partial` is reported while `.download/in_progress.json`
+  belongs to this exact spec, or when NO completion marker exists and some (not all) files
+  are at their exact pinned size (`bytes_present` = those files; the download hashes them and
+  fetches only the rest). Every file present without a marker stays `Missing`: the adoption
+  candidate. A marker of another identity never makes `Partial`.
 - A published file was always verified (size then sha256) before its rename. A `.part` is
   deleted ONLY on a sha256 mismatch or when the server sends more than the pinned size
   (`SizeMismatch`); a short body, exhausted retries (`Http`) and cancel keep it for resume,
@@ -150,8 +181,11 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
   loses nothing; after an OS crash / power loss its unsynced tail may be garbage on some
   filesystems, which the final sha256 check catches (that one file is downloaded again).
   A periodic fsync would not help without a durable "verified up to" checkpoint.
-- The HF token goes only into the bearer header, is never logged, and ureq drops it on any
-  redirect. Requests resolve through `hf_url::hf_resolve_url`, so `HF_ENDPOINT` is
+- The HF token goes only into the bearer header of a Hugging Face resolve or auth-check
+  request (both built by `hf_url`), is never logged (`hf_access`'s log line and `HfAccess`
+  carry no token; `AuthCheckTarget`'s `Debug` redacts it), and the fetcher keeps it only on
+  a redirect to the same origin (Hugging Face's same-host resolve-cache hop), never on
+  another host (CDN). Requests resolve through `hf_url::hf_resolve_url`, so `HF_ENDPOINT` is
   honoured; nothing here may call `hf_hub::ApiBuilder::from_env` (it panics without a home
   directory). The main-repository downloader sends no token (public repository).
 - Size rule of the shared stream: a pinned size is authoritative; without one the size is
@@ -175,13 +209,15 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
   total there. Pins come from `tools/model_pins/compute_pins.py`.
 - New EasyOCR version: regenerate the fixture from the installed library, re-pin the zips,
   update `easyocr.rs` until its tests pass.
-- New FLUX.2 klein weight format: add the variant to `ms_config::Flux2WeightFormat`, then a
-  spec per offering variant and axis here (the exhaustive `flux2_klein_4b_weights_spec` match
-  forces it) plus its row in `tools/model_pins/sources.json`; the catalog tests require every
-  offered format to resolve to exactly one spec.
+- New FLUX.2 klein weight format or encoder source: extend `ms_config::Flux2WeightFormat` /
+  `Flux2EncoderSource` and their `offered_for`, then add a spec per offering (variant, axis,
+  source) in `external_catalog/flux2_klein.rs` (the exhaustive `flux2_klein_4b_weights_spec` /
+  `flux2_klein_9b_weights_spec` matches force it) plus its row in
+  `tools/model_pins/sources.json`; the catalog tests require every offered combination to
+  resolve to exactly one spec.
 - Moving a pin: change revision and the changed file rows together; installs of the old pin
   then read `Missing` and a re-download keeps unchanged files.
-- Pinned-download behaviour (verification, marker, staging): `external.rs` +
-  `external/tests.rs`. Resume / retry / HTTP behaviour of both downloaders: the `ms-download` crate
+- Pinned-download behaviour (verification, marker, staging, gated preflight): `external.rs` +
+  `external/tests.rs`. Classification of Hugging Face access answers: `hf_access.rs`. Resume / retry / HTTP behaviour of both downloaders: the `ms-download` crate
   (`crates/ms-download/src/resumable.rs` + its tests; the pinned retry tests stay in
   `external/tests.rs`, the main-repository ones in `main_repo_tests.rs`).

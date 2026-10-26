@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `21` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `22` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `crates/ms-backend-ipc/src/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -78,7 +78,7 @@ WebSocket is only a carrier.
 
 | Field             | Type   | Required on            | Meaning                                                                 |
 |-------------------|--------|------------------------|-------------------------------------------------------------------------|
-| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 21. Optional/ignored on others.  |
+| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 22. Optional/ignored on others.  |
 | `id`              | u64    | all framed messages    | Correlation id. `0` means a server-initiated frame (events, hello).     |
 | `kind`            | string | all                    | One of `hello`,`request`,`response`,`progress`,`event`,`cancel`,`error`.|
 | `method`          | string | `request`              | Method name, e.g. `ocr.manga`. See §5.                                  |
@@ -229,7 +229,7 @@ Legend:
   method replaced; it is not an address the backend serves. Methods added after
   the HTTP backend was retired have no such column entry.
 
-Total methods mapped: **51** — the full contents of `ALL_METHODS` in
+Total methods mapped: **53** — the full contents of `ALL_METHODS` in
 `protocol.py`, which is the machine-readable source of the same list. A method
 present in `protocol.py` but absent here is a documentation defect.
 
@@ -417,10 +417,10 @@ the CLIENT enforces that: it dilates the painted mask into the LATENT mask the
 request carries, and post-processes the RAW answer itself (colour match, inward
 feathered composite). The request carries a REGION of the page rather than a
 whole page. The three component paths
-are supplied by the user, so generation itself downloads nothing and its streamed
-phases are `load`/`generate`. Acquiring those components is a SEPARATE pair of
-methods (`download.check` / `download.start`, below), and only `download.start`
-streams `phase:"download"`.
+are supplied by the client, so generation itself downloads nothing and its streamed
+phases are `load`/`generate`. The backend never downloads FLUX.2 klein weights: the
+application's model catalog fetches every component, 4B and 9B (v22 removed
+`inpaint.flux2_klein.download.check` / `.start`; the old names are unknown methods).
 
 | method                          | request fields (inline)                                                                 | blob(req)              | response fields (status=ok)                                            | blob(resp) | stream  | cancel |
 |---------------------------------|------------------------------------------------------------------------------------------|------------------------|--------------------------------------------------------------------------|------------|---------|--------|
@@ -434,137 +434,6 @@ streams `phase:"download"`.
 | `inpaint.flux2_klein.prompt_cache.load`   | `params: object`, `name: string`                                         | none                   | `family`, `name`, `path`, `prompt`, `prompt_cached: true`, `max_sequence_length`, `dtype`, `created_at`, `encoder_verified: bool` | none | no | no |
 | `inpaint.flux2_klein.prompt_cache.export` | `params: object`, `name: string`, `path: string` (`*.msprompt`)          | none                   | `family`, `name`, `path`, `size_bytes`                                    | none       | no      | no     |
 | `inpaint.flux2_klein.prompt_cache.import` | `params: object`, `path: string` (`*.msprompt`), `name: string?`, `overwrite: bool=false` | none | `family`, `name`, `path`, `size_bytes`, `prompt`, `created_at`, `current_family`, `family_matches: bool` | none | no | no |
-| `inpaint.flux2_klein.download.check` | `hf_token: string` (may be empty), `uncensored: bool=false`, `variant: "9b"="9b"` (`"4b"` refused since v21) | none                   | `variant: string`, `repos: object` (repo id -> `{state, message}`), `plan: {total_bytes, missing_bytes, missing_files}\|null`, `plan_error: string` | none | no | no |
-| `inpaint.flux2_klein.download.start` | `hf_token: string`, `uncensored: bool=false`, `variant: "9b"="9b"` (`"4b"` refused since v21) | none          | `paths: {transformer, text_encoder, vae}`, `downloaded_bytes: int`, `skipped_files: int` | none | **yes** | yes |
-
-**Model download from Hugging Face** (`dev-docs/flux2_model_download.md` is the
-authoritative contract; `inpaint/flux2_download.py` implements it):
-
-**The backend downloads FLUX.2 klein 9B only; an absent `variant` means `"9b"`.**
-That default is pinned so a client built before the field existed keeps
-downloading exactly what it used to:
-
-| `variant` | repository | gated | plan | uncensored encoder | destination |
-|---|---|---|---|---|---|
-| `"9b"` (default) | `black-forest-labs/FLUX.2-klein-9B` | yes (`gated: auto`) | ~34.7 GB | yes | `<side_models>/FLUX.2-klein-9B/` |
-
-**`"4b"` is refused since v21.** The FLUX.2 klein 4B package
-(`<side_models>/FLUX.2-klein-4B/`) and its GGUF quants are downloaded by the
-application itself from its pinned model catalog (Rust
-`ms_sysprobe::ai_models::external_catalog`, checksummed files), so each variant
-has exactly one download owner; the backend answers a `"4b"` request with a
-`status:"error"` whose message says so, on both methods, before any token check
-or network call.
-
-Two further request shapes are REFUSED with `status:"error"` rather than served
-with a substitute, on both methods and before any network call:
-
-- an unknown `variant` — never downgraded to `"9b"`, which would fetch tens of
-  gigabytes the user did not ask for into a directory they did not name;
-- `uncensored:true` on a variant without an uncensored encoder (no current
-  variant lacks one) — handing back the official encoder under that button
-  would be a silent swap of the weights the user asked for.
-
-`hf_token` is a REQUEST FIELD of both methods. It never travels as an
-environment variable of the backend process, never sits inside `params`, and is
-never logged on either side; a message that must mention it says "the token" and
-nothing more. **Every repository the backend downloads from is gated**, so an
-empty token short-circuits to `no_token` (`.check`) or a refusal (`.start`) with
-no network call, and a present token is sent to every repository.
-
-`download.check` reports one entry per repository the variant and the
-`uncensored` toggle actually need — the variant's official one always, the
-uncensored encoder only while the toggle is on — and ECHOES `variant` back, so a
-client can tell a fresh answer from one computed for the variant it was showing
-a moment ago. `state` is one of, and the mapping is FIXED:
-
-| state | when |
-|---|---|
-| `ok` | the token may download that repository |
-| `no_token` | `hf_token` was empty AND the request needs one — no network call is made at all |
-| `invalid_token` | HTTP 401 |
-| `not_accepted` | HTTP 403 / `GatedRepoError` — the conditions were not accepted |
-| `not_found` | HTTP 404 |
-| `network_error` | anything else; `message` carries the detail verbatim |
-
-`message` is always present and is empty for `ok`. The access probe is
-`HfApi.auth_check`, NOT a repository listing: the metadata of a `gated: auto`
-repository is public and comes back for a request with no token at all, so a
-listing proves nothing about access.
-
-**`plan` is NULLABLE and a zeroed plan is never synthesised.** It is computed from
-the listings the check fetches once every needed repository answered `ok`, so the
-button can say how many gigabytes are missing without a second round trip;
-`missing_bytes` counts only files absent or the wrong length on disk. When no plan
-could be computed, `plan` is `null`:
-
-- the listing FAILED although every auth probe passed — `plan_error` then carries
-  the message (scrubbed of the token). Access and listing are two different
-  network operations, and this case deliberately gets no repo state of its own:
-  auth genuinely succeeded, and calling it `network_error` would send the user to
-  the wrong link. A zero-valued plan beside `ok` states is indistinguishable from
-  "everything is already downloaded" and was observed rendering a complete
-  installation on an empty machine, so the client must render a `null` plan as
-  "size unknown", never as complete;
-- no token, or a repository the user cannot download from — `plan_error` is then
-  EMPTY, because the repo `state` already says what is wrong.
-
-`plan_error` is empty whenever `plan` is present.
-
-`download.start` streams the same envelope as `.prompt_cache.build`, so it claims
-the same single progress bar and can never run beside a generation. Its progress
-frames keep the four existing fields and ADD three optional ones:
-
-```json
-{ "phase": "download", "step": 12884901888, "total": 34722790808,
-  "label": "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
-  "file_step": 3221225472, "file_total": 9801069272,
-  "file_label": "diffusion_pytorch_model-00001-of-00002.safetensors" }
-```
-
-- `step`/`total` are OVERALL bytes across the files still to fetch, which keeps
-  every existing single-level consumer correct;
-- `file_step`/`file_total`/`file_label` describe the file in flight. A consumer
-  that does not know them ignores them, and a frame that omits them (the terminal
-  one) is legal;
-- frames are throttled to at most ~10 per second AND at least 4 MiB apart, and
-  the last frame of a run always reports the completed byte count;
-- **a staged file is published only after its length matches the size the listing
-  announced for it**, and a file already on disk counts as present only at that
-  same length. A short body that ends CLEANLY raises nothing anywhere in the
-  stack, so without the check it is renamed to its final name and skipped by
-  every later run — a permanently truncated multi-gigabyte shard, surfacing as
-  corrupt weights at load time. When the listing announces no size the old
-  non-empty rule stands and the reason is logged;
-- `uncensored` SELECTS the text encoder, it does not add one: the plan carries the
-  official `text_encoder/` or the uncensored `text_encoder_uncensored/`, never
-  both, so a 9B plan is ~34.7 GB either way. Everything else comes from the
-  official repository in both states, which is why both repositories are
-  access-checked whenever the toggle is on;
-- **the repository-root single-file transformer is never fetched**
-  (`flux-2-klein-9b.safetensors`): it is the same weights as the `transformer/`
-  folder the plan already takes, so fetching it would put a duplicate 18.16 GB
-  copy on disk, and diffusers' single-file loader silently discards the
-  `device_map` this engine's layered offload needs;
-- an INTERRUPTED file resumes rather than restarts: its partial bytes are parked
-  beside the destination and continued with `Range: bytes=<n>-` on the next
-  `download.start`, so a dropped connection at 8 of 9.8 GB does not cost those
-  gigabytes again. A resumed file whose final length is still wrong is refetched
-  from zero once, and only then reported as an error;
-- `step` and `file_step` of a resumed file both begin at the resumed offset, so a
-  client deriving a transfer rate from consecutive frames never sees a backwards
-  jump. The ONE exception is that from-zero refetch, where the file genuinely
-  restarts — a client must tolerate a single backwards step per file rather than
-  render it as a negative or absurd rate;
-- files already present at the announced size are skipped, so a re-run resumes at
-  file granularity and flipping the toggle downloads only the missing encoder. Both
-  encoder directories may end up on disk from two runs; the unselected one is
-  never re-fetched and never deleted;
-- free space is checked BEFORE the first byte and a refusal names both the
-  required and the available number of bytes;
-- `cancel{id}` really stops the transfer: the cancel event is polled at every
-  chunk boundary. Files already published stay (they are complete and were
-  renamed atomically); the staging file of the one in flight is discarded.
 
 `params` keys (all optional except `transformer_path` and `vae_path`;
 out-of-range numbers are clamped, an unknown enum or a missing/absent
@@ -949,6 +818,79 @@ client names (`source_root`); acquiring it is the separate `download.*` pair.
 | `inpaint.flux3_klein.download.check` | `hf_token: string` (may be empty), `format: "bf16"\|"fp8r"\|"nvfp4"="fp8r"`              | none                              | `format: string` (echo), `repos: {"black-forest-labs/flux-3-image-klein": {state, message}}`, `plan: {total_bytes, missing_bytes, missing_files}\|null`, `plan_error: string` | none | no | no |
 | `inpaint.flux3_klein.download.start` | `hf_token: string`, `format` (as above)                                                  | none                              | `root: string` (the package root to send as `source_root`), `downloaded_bytes: int`, `skipped_files: int` | none | **yes** | yes |
 
+**Gated Hugging Face download** (`download.check` / `download.start`;
+`inpaint/flux3_download.py` over the model-agnostic `inpaint/hf_gated_download.py`).
+`hf_token` is a REQUEST FIELD of both methods. It never travels as an
+environment variable of the backend process, never sits inside `params`, and is
+never logged on either side; a message that must mention it says "the token" and
+nothing more. **Every repository the backend downloads from is gated**, so an
+empty token short-circuits to `no_token` (`.check`) or a refusal (`.start`) with
+no network call, and a present token is sent to every repository (access probe,
+listing and transfer).
+
+`download.check` reports one entry per repository the request needs and ECHOES
+its selection field (`format`), so a client can tell a fresh answer from one
+computed for what it was showing a moment ago. `state` is one of, and the
+mapping is FIXED:
+
+| state | when |
+|---|---|
+| `ok` | the token may download that repository |
+| `no_token` | `hf_token` was empty — no network call is made at all |
+| `invalid_token` | HTTP 401 |
+| `not_accepted` | HTTP 403 / `GatedRepoError` — the conditions were not accepted |
+| `not_found` | HTTP 404 |
+| `network_error` | anything else; `message` carries the detail verbatim |
+
+`message` is always present and is empty for `ok`. The access probe is
+`HfApi.auth_check`, NOT a repository listing: the metadata of a `gated: auto`
+repository is public and comes back for a request with no token at all, so a
+listing proves nothing about access.
+
+**`plan` is NULLABLE and a zeroed plan is never synthesised.** It is computed from
+the listings the check fetches once every needed repository answered `ok`;
+`missing_bytes` counts only files absent or the wrong length on disk. `plan` is
+`null` when the listing FAILED although every auth probe passed — `plan_error`
+then carries the message (scrubbed of the token), and the repo states stay `ok`,
+because auth genuinely succeeded; the client must render it as "size unknown",
+never as complete — and when there is no token or a repository the user cannot
+download from, where `plan_error` is EMPTY because the `state` already says what
+is wrong. `plan_error` is empty whenever `plan` is present.
+
+`download.start` streams `phase:"download"` frames that keep the four usual
+fields and ADD three optional ones:
+
+```json
+{ "phase": "download", "step": 12884901888, "total": 21474836480,
+  "label": "text_encoder/model-00001-of-00002.safetensors",
+  "file_step": 3221225472, "file_total": 4980000000,
+  "file_label": "model-00001-of-00002.safetensors" }
+```
+
+- `step`/`total` are OVERALL bytes across the files still to fetch, which keeps
+  every single-level consumer correct; `file_step`/`file_total`/`file_label`
+  describe the file in flight, and a frame that omits them (the terminal one) is
+  legal;
+- frames are throttled to at most ~10 per second AND at least 4 MiB apart, and
+  the last frame of a run always reports the completed byte count; a retry is an
+  ordinary forced frame whose `label` announces it;
+- **a staged file is published only after its length (and, for an LFS file, its
+  sha256) matches what the listing announced**, and a file already on disk counts
+  as present only at that same length; when the listing announces no size the
+  non-empty rule stands and the reason is logged;
+- an INTERRUPTED file resumes rather than restarts: its partial bytes are parked
+  beside the destination and continued with `Range: bytes=<n>-`, within the run
+  after a backoff wait or on the next `download.start`. `step` and `file_step` of
+  a resumed file both begin at the resumed offset; only a from-zero refetch after
+  proven-wrong bytes moves them backwards, once per file;
+- files already present at the announced size are skipped, so a re-run resumes at
+  file granularity;
+- free space (minus the bytes already staged) is checked BEFORE the first byte and
+  a refusal names both the required and the available number of bytes;
+- `cancel{id}` really stops the transfer: the cancel event is polled at every
+  chunk boundary and during every retry wait. Files already published stay; the
+  bytes of the one in flight are parked for the next run.
+
 `params` (one mapping, `inpaint/flux3_klein/wire.py`; read by the run, `.status`
 and `large_models.profiles`). An UNKNOWN key, a wrong type or an out-of-range
 value is a request error naming the field — never clamped:
@@ -988,8 +930,8 @@ region's size).
   (0..11) and `total` is `11`;
 - `phase:"generate"` — `stage:"denoise"`, `step` / `total` are flow-map steps
   (a `0/total` frame when the denoise begins). A degrade retry may repeat steps.
-- `phase:"download"` (download.start only) — the FLUX.2 two-level byte frames
-  (`file_step` / `file_total` / `file_label`).
+- `phase:"download"` (download.start only) — the two-level byte frames of the
+  gated download above (`file_step` / `file_total` / `file_label`).
 - Disk reads (v21): every checkpoint read of the run adds a byte level to the
   `phase:"load"` frame of the stage in force (same `step` / `total` / `label` /
   `stage`; a reload during the denoise is a `load` frame of stage `denoise`):

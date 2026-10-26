@@ -2,49 +2,36 @@
 FILE HEADER (cleaning/tools/ai_editor/engines/flux2_klein/variant_presentation.rs)
 
 Purpose:
-The two facts about a `Flux2Variant` that are this ENGINE's business rather than the
-configuration layer's: the localized picker caption and the Hugging Face repository the
-model is downloaded from. Everything else about the enum — its wire token, its model
-directory, its settings file name, its engine id, `all()` and the two capability
-predicates — stays in `ms-config`, because those key runtime PATHS and persisted
-documents, which is that crate's subject.
+The one fact about a `Flux2Variant` that is this ENGINE's business rather than the
+configuration layer's: the localized picker caption. Everything else about the enum — its
+wire token, its model directory, its settings file name, its engine id, its size token and
+`all()` — stays in `ms-config`, because those key runtime PATHS and persisted documents,
+which is that crate's subject; which encoder sources and weight formats a variant offers is
+`ms_config::flux2_weight_format`, and where its files come from (and which repositories are
+gated) is catalog data (`ms_sysprobe::ai_models::external_catalog`).
 
-They live here as an extension TRAIT because an inherent `impl` may only be written in
-the crate that defines the type, and `Flux2Variant` is defined in `ms-config`.
+It lives here as an extension TRAIT because an inherent `impl` may only be written in the
+crate that defines the type, and `Flux2Variant` is defined in `ms-config`.
 
 Key items:
 - `Flux2VariantPresentation`: the trait, implemented for `Flux2Variant`.
 
 Notes:
-Both values are FROZEN in the same sense the identities in `ms-config` are: the captions
-are the two picker entries users recognise, and a repository id that drifts turns every
-download into a 404. The `title` keys are UI strings and go through `t!`; the repository
-ids are backend identifiers and stay literal (`dev-docs/i18n_exclusions.md`).
+The captions are the two picker entries users recognise; the `title` keys are UI strings and
+go through `t!`.
 */
 
 use super::*;
 
-/// The presentation half of [`Flux2Variant`] — the caption the picker shows and the
-/// repository the download names.
+/// The presentation half of [`Flux2Variant`] — the caption the picker shows.
 ///
-/// This is a trait rather than more methods on the enum for one reason: `Flux2Variant` is
+/// This is a trait rather than one more method on the enum for one reason: `Flux2Variant` is
 /// declared in `ms-config`, an inherent `impl` is only legal in the defining crate, and a
-/// localized caption plus a Hugging Face repository id are the concern of the ONE crate
-/// that consumes them — this one — not of the bottom configuration crate.
+/// localized caption is the concern of the ONE crate that consumes it — this one — not of the
+/// bottom configuration crate.
 pub(super) trait Flux2VariantPresentation {
     /// The localized picker caption of this engine.
     fn title(self) -> &'static str;
-
-    /// The Hugging Face repository the model itself is downloaded from.
-    ///
-    /// A repository ID is a backend identifier and stays literal in the UI, exactly like
-    /// the ids the `.download.check` rows carry.
-    fn model_repo(self) -> &'static str;
-
-    /// The gated Hugging Face repository of the UNCENSORED text encoder the download can fetch
-    /// instead of the official one, `None` for a variant that has none published
-    /// (`Flux2Variant::supports_uncensored_encoder`). Literal for the same reason.
-    fn uncensored_encoder_repo(self) -> Option<&'static str>;
 }
 
 impl Flux2VariantPresentation for Flux2Variant {
@@ -54,46 +41,11 @@ impl Flux2VariantPresentation for Flux2Variant {
             Flux2Variant::Klein4B => t!("cleaning.tools.flux2_klein.title_4b"),
         }
     }
-
-    fn model_repo(self) -> &'static str {
-        match self {
-            Flux2Variant::Klein9B => "black-forest-labs/FLUX.2-klein-9B",
-            Flux2Variant::Klein4B => "black-forest-labs/FLUX.2-klein-4B",
-        }
-    }
-
-    fn uncensored_encoder_repo(self) -> Option<&'static str> {
-        match self {
-            Flux2Variant::Klein9B => Some("ponpoke/flux2-klein-9b-uncensored-text-encoder"),
-            Flux2Variant::Klein4B => None,
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The two engines are downloaded from DIFFERENT repositories, and the 9B id is what
-    /// every existing installation already fetched from. The distinctness assertion moved
-    /// here together with `model_repo` itself; the `ms-config` test keeps the identities
-    /// that crate still owns (wire token, engine id, settings file, model directory).
-    #[test]
-    fn the_two_variants_name_distinct_frozen_repositories() {
-        assert_eq!(Flux2Variant::Klein9B.model_repo(), "black-forest-labs/FLUX.2-klein-9B");
-        assert_eq!(Flux2Variant::Klein4B.model_repo(), "black-forest-labs/FLUX.2-klein-4B");
-        assert_ne!(Flux2Variant::Klein9B.model_repo(), Flux2Variant::Klein4B.model_repo());
-    }
-
-    /// The uncensored encoder's repository exists exactly where the capability gate says one
-    /// is published, so the access hint never links a repository the download cannot use.
-    #[test]
-    fn only_a_variant_with_an_uncensored_encoder_names_its_repository() {
-        for variant in Flux2Variant::all() {
-            assert_eq!(variant.uncensored_encoder_repo().is_some(), variant.supports_uncensored_encoder(), "{variant:?}");
-        }
-        assert_eq!(Flux2Variant::Klein9B.uncensored_encoder_repo(), Some("ponpoke/flux2-klein-9b-uncensored-text-encoder"));
-    }
 
     /// A caption is what the picker distinguishes the two entries by, so an empty or
     /// shared one would leave the user unable to tell which engine is selected.

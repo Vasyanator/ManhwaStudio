@@ -3,11 +3,13 @@ File: crates/ms-sysprobe/src/ai_models/external/tests.rs
 
 Purpose:
 Unit tests of the external-model downloader core (`download_with`), its transient-failure
-retry, and the stat-only status probe, driven by in-memory `RangeFetcher`s (one plain, one
+retry, and the stat-only status probe (including `Partial` for an unmarked directory
+holding some files, whose download fetches only the others), driven by in-memory `RangeFetcher`s (one plain, one
 scripted with drops / short bodies / error statuses) and an injected backoff sleep that only
 records — plus the repair path `verify_with` (shared-file corruption invalidating every
 spec that lists it) and adoption of present-but-unmarked files (`unmarked_files_present`,
-`adopt_external_model`; a fetcher that panics proves no request is made) — no network, no real waiting, scratch data only under a unique `tempfile`
+`adopt_external_model`; a fetcher that panics proves no request is made) and the gated-access
+preflight / `AccessDenied` mapping (an injected, recording access probe) — no network, no real waiting, scratch data only under a unique `tempfile`
 directory removed on drop. One opt-in `#[ignore]` test downloads the real Baberu
 spec when `MS_TEST_EXTERNAL_DOWNLOAD=1`.
 
@@ -81,7 +83,7 @@ impl RangeFetcher for FakeFetcher {
 
 /// A fake-server internal failure as a permanent fetch error.
 fn permanent(err: impl std::fmt::Display) -> FetchError {
-    FetchError::Permanent { detail: err.to_string() }
+    FetchError::Permanent { detail: err.to_string(), status: None }
 }
 
 /// The whole-file size a fake server announces.
@@ -92,6 +94,14 @@ fn total_len(body: &[u8]) -> u64 {
 fn url_of(file: &ExternalFile) -> String {
     format!("mem://{}", file.remote_path())
 }
+
+/// An access probe that must never run (the spec is not gated, or is already present).
+fn no_probe(repo_id: &str, _cancel: &AtomicBool) -> HfAccess {
+    panic!("unexpected access probe of {repo_id}")
+}
+
+/// The remote of an ungated test spec: in-memory URLs, no token, no access probe.
+const PUBLIC: RemoteSource<'static> = RemoteSource { url: &url_of, token_sent: false, probe: &no_probe };
 
 fn sha_hex(bytes: &[u8]) -> String {
     hex_lower(&Sha256::digest(bytes))
@@ -115,7 +125,7 @@ fn make_spec(id: &str, revision: &str, files: &[(&str, &[u8])]) -> (&'static Ext
     let bodies = entries.iter().zip(files).map(|(file, (_, body))| (url_of(file), body.to_vec())).collect();
     let spec = Box::leak(Box::new(ExternalModelSpec {
         id: leak(id.to_owned()),
-        source: ExternalSource::HuggingFace { repo_id: "owner/repo", revision: leak(revision.to_owned()) },
+        source: ExternalSource::HuggingFace { repo_id: "owner/repo", revision: leak(revision.to_owned()), gated: false },
         dir: leak(format!("Test/{id}")),
         layout: DirLayout::Exclusive,
         files: Box::leak(entries.into_boxed_slice()),
@@ -142,7 +152,7 @@ fn quiet_policy() -> RetryPolicy<'static> {
 }
 
 fn run(fetcher: &dyn RangeFetcher, root: &Path, spec: &'static ExternalModelSpec, cancel: &AtomicBool) -> Result<PathBuf, ExternalModelError> {
-    download_with(fetcher, &url_of, root, spec, cancel, &quiet_policy(), &mut |_| {})
+    download_with(fetcher, &PUBLIC, root, spec, cancel, &quiet_policy(), &mut |_| {})
 }
 
 fn read(path: &Path) -> Vec<u8> {
@@ -164,7 +174,7 @@ fn fresh_download_publishes_files_and_marker() {
     assert!(matches!(installed_dir(root.path(), spec), Err(ExternalModelError::NotDownloaded { .. })));
 
     let mut last = None;
-    let dir = download_with(&fetcher, &url_of, root.path(), spec, &AtomicBool::new(false), &quiet_policy(), &mut |progress| last = Some(*progress));
+    let dir = download_with(&fetcher, &PUBLIC, root.path(), spec, &AtomicBool::new(false), &quiet_policy(), &mut |progress| last = Some(*progress));
     let dir = dir.unwrap_or_else(|err| panic!("download failed: {err}"));
 
     assert_eq!(read(&dir.join("onnx").join("big.bin")), big);
@@ -247,7 +257,7 @@ fn cancel_keeps_the_part_and_a_later_call_resumes() {
     let root = temp_root();
     let fetcher = FakeFetcher::new(bodies, RangeMode::Honour);
     let cancel = AtomicBool::new(false);
-    let result = download_with(&fetcher, &url_of, root.path(), spec, &cancel, &quiet_policy(), &mut |progress| {
+    let result = download_with(&fetcher, &PUBLIC, root.path(), spec, &cancel, &quiet_policy(), &mut |progress| {
         if progress.phase == ExternalDownloadPhase::Downloading && progress.file_done >= 128 * 1024 {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -297,7 +307,7 @@ fn staged_parts_of_another_pin_are_discarded() {
     let (old_spec, old_bodies) = make_spec("repinpart", REV_A, &[("model.bin", &content(5000, 14))]);
     let root = temp_root();
     let cancel = AtomicBool::new(false);
-    let result = download_with(&FakeFetcher::new(old_bodies, RangeMode::Honour), &url_of, root.path(), old_spec, &cancel, &quiet_policy(), &mut |progress| {
+    let result = download_with(&FakeFetcher::new(old_bodies, RangeMode::Honour), &PUBLIC, root.path(), old_spec, &cancel, &quiet_policy(), &mut |progress| {
         if progress.phase == ExternalDownloadPhase::Downloading {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -322,7 +332,7 @@ fn files_published_by_an_abandoned_pin_are_removed_by_the_next_install() {
     // Pin B publishes `b_only.txt`, then is cancelled while streaming its last file.
     let (spec_b, bodies_b) = make_spec("abandon", REV_B, &[("shared.json", &shared), ("b_only.txt", &content(50, 22)), ("b_big.bin", &content(300 * 1024, 23))]);
     let cancel = AtomicBool::new(false);
-    let result = download_with(&FakeFetcher::new(bodies_b, RangeMode::Honour), &url_of, root.path(), spec_b, &cancel, &quiet_policy(), &mut |progress| {
+    let result = download_with(&FakeFetcher::new(bodies_b, RangeMode::Honour), &PUBLIC, root.path(), spec_b, &cancel, &quiet_policy(), &mut |progress| {
         if progress.file_path == "b_big.bin" && progress.phase == ExternalDownloadPhase::Downloading {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -448,7 +458,7 @@ fn invalid_specs_are_rejected_before_any_io() {
     ];
     let root = temp_root();
     let fetcher = FakeFetcher::new(BTreeMap::new(), RangeMode::Honour);
-    let hf = |revision: &'static str| ExternalSource::HuggingFace { repo_id: "owner/repo", revision };
+    let hf = |revision: &'static str| ExternalSource::HuggingFace { repo_id: "owner/repo", revision, gated: false };
     let leak_spec = |id: &'static str, source: ExternalSource, layout: DirLayout, files: &[ExternalFile]| -> &'static ExternalModelSpec {
         Box::leak(Box::new(ExternalModelSpec { id, source, dir: "Dir", layout, files: Box::leak(files.to_vec().into_boxed_slice()) }))
     };
@@ -459,7 +469,7 @@ fn invalid_specs_are_rejected_before_any_io() {
     }
     let duplicate = leak_spec("dup", hf(REV_A), DirLayout::Exclusive, &[good, good]);
     assert!(matches!(validate_spec(duplicate), Err(ExternalModelError::InvalidSpec(_))));
-    let bad_repo = leak_spec("repo", ExternalSource::HuggingFace { repo_id: "no-slash", revision: REV_A }, DirLayout::Exclusive, &[good]);
+    let bad_repo = leak_spec("repo", ExternalSource::HuggingFace { repo_id: "no-slash", revision: REV_A, gated: false }, DirLayout::Exclusive, &[good]);
     assert!(matches!(validate_spec(bad_repo), Err(ExternalModelError::InvalidSpec(_))));
     for base_url in ["http://h.example/x", "https://", "https://h.example/x/", "https://h.example/x?y=1", "https://h.example/../x", "https://u@h.example", "https://h.example/a b"] {
         let spec = leak_spec("url", ExternalSource::Url { base_url }, DirLayout::Exclusive, &[good]);
@@ -500,7 +510,7 @@ fn progress_is_monotonic_within_a_phase() {
     let root = temp_root();
     let reports = AtomicUsize::new(0);
     let mut last_total = 0_u64;
-    let result = download_with(&FakeFetcher::new(bodies, RangeMode::Honour), &url_of, root.path(), spec, &AtomicBool::new(false), &quiet_policy(), &mut |progress| {
+    let result = download_with(&FakeFetcher::new(bodies, RangeMode::Honour), &PUBLIC, root.path(), spec, &AtomicBool::new(false), &quiet_policy(), &mut |progress| {
         reports.fetch_add(1, Ordering::Relaxed);
         assert!(progress.total_done >= last_total);
         assert!(progress.file_done <= progress.file_total);
@@ -607,7 +617,7 @@ fn run_scripted(
     let sleep = |slice: Duration| sleeps.sleep(slice);
     let policy = RetryPolicy { sleep: &sleep, ..RetryPolicy::standard() };
     let mut retries = Vec::new();
-    let result = download_with(fetcher, &url_of, root, spec, cancel, &policy, &mut |progress| {
+    let result = download_with(fetcher, &PUBLIC, root, spec, cancel, &policy, &mut |progress| {
         if matches!(progress.phase, ExternalDownloadPhase::Retrying { .. }) {
             retries.push((progress.phase, progress.file_done));
         }
@@ -861,7 +871,7 @@ fn zip_members_are_fetched_verified_extracted_and_their_archives_removed() {
     let root = temp_root();
     let fetcher = FakeFetcher::new(bodies, RangeMode::Honour);
     let mut last = None;
-    let dir = download_with(&fetcher, &url_of, root.path(), spec, &AtomicBool::new(false), &quiet_policy(), &mut |progress| {
+    let dir = download_with(&fetcher, &PUBLIC, root.path(), spec, &AtomicBool::new(false), &quiet_policy(), &mut |progress| {
         assert!(progress.file_done <= progress.file_total);
         last = Some(*progress);
     })
@@ -907,7 +917,8 @@ fn specs_sharing_a_directory_keep_independent_status_and_share_the_common_file()
 
     run(&fetcher, root.path(), spec_a, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
     assert_eq!(external_model_status(root.path(), spec_a), ExternalModelStatus::Installed);
-    assert_eq!(external_model_status(root.path(), spec_b), ExternalModelStatus::Missing);
+    // B has no marker and finds the shared detector at its pinned size: partly present.
+    assert_eq!(external_model_status(root.path(), spec_b), ExternalModelStatus::Partial { bytes_present: spec_b.files[0].download_size() });
 
     let before = fetcher.calls().len();
     let dir = run(&fetcher, root.path(), spec_b, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
@@ -1000,8 +1011,9 @@ fn verify_repairs_a_same_size_corruption_of_a_shared_file_for_every_spec() {
     assert_eq!(report.invalidated, vec!["verify_a", "verify_b"]);
     assert!(!report.is_intact());
     assert!(!dir.join("det.pth").exists());
-    assert_eq!(external_model_status(root.path(), spec_a), ExternalModelStatus::Missing);
-    assert_eq!(external_model_status(root.path(), spec_b), ExternalModelStatus::Missing);
+    // Both markers are gone and each spec's own recognizer is still at its size: partly present.
+    assert_eq!(external_model_status(root.path(), spec_a), ExternalModelStatus::Partial { bytes_present: spec_a.files[1].download_size() });
+    assert_eq!(external_model_status(root.path(), spec_b), ExternalModelStatus::Partial { bytes_present: spec_b.files[1].download_size() });
     assert_eq!(read(&dir.join("b.pth")), rec_b, "the other spec's own file is untouched");
 
     // A normal download repairs both.
@@ -1208,4 +1220,264 @@ fn adoption_is_busy_while_the_spec_has_another_job_and_honours_cancel() {
     assert!(spec.local_dir(root.path()).join("a.bin").is_file(), "cancel deletes nothing");
     assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Missing);
     assert!(unmarked_files_present(root.path(), spec), "a cancelled adoption stays adoptable");
+}
+
+/// The same leaked spec with its Hugging Face source marked `gated`.
+fn gated(spec: &'static ExternalModelSpec) -> &'static ExternalModelSpec {
+    let ExternalSource::HuggingFace { repo_id, revision, .. } = spec.source else { panic!("a Hugging Face test spec") };
+    Box::leak(Box::new(ExternalModelSpec { source: ExternalSource::HuggingFace { repo_id, revision, gated: true }, ..*spec }))
+}
+
+/// Records every repository the access probe was asked about and answers `answer`.
+struct ProbeLog {
+    answer: HfAccess,
+    asked: Mutex<Vec<String>>,
+}
+
+impl ProbeLog {
+    fn new(answer: HfAccess) -> Self {
+        Self { answer, asked: Mutex::new(Vec::new()) }
+    }
+
+    fn probe(&self, repo_id: &str) -> HfAccess {
+        if let Ok(mut asked) = self.asked.lock() {
+            asked.push(repo_id.to_owned());
+        }
+        self.answer.clone()
+    }
+
+    fn asked(&self) -> Vec<String> {
+        self.asked.lock().map(|asked| asked.clone()).unwrap_or_default()
+    }
+}
+
+#[test]
+fn a_refused_preflight_blocks_the_transfer_and_touches_nothing() {
+    for answer in [HfAccess::NoToken, HfAccess::TokenRejected, HfAccess::TermsNotAccepted, HfAccess::RepoNotFound] {
+        let (spec, bodies) = make_spec("gated_refused", REV_A, &[("model.bin", &content(4000, 90))]);
+        let spec = gated(spec);
+        let root = temp_root();
+        let fetcher = FakeFetcher::new(bodies, RangeMode::Honour);
+        let log = ProbeLog::new(answer.clone());
+        let probe = |repo_id: &str, _cancel: &AtomicBool| log.probe(repo_id);
+        let remote = RemoteSource { url: &url_of, token_sent: true, probe: &probe };
+        let result = download_with(&fetcher, &remote, root.path(), spec, &AtomicBool::new(false), &quiet_policy(), &mut |_| {});
+        assert!(matches!(&result, Err(ExternalModelError::AccessDenied { repo_id: "owner/repo", access }) if *access == answer), "{result:?}");
+        assert_eq!(log.asked(), vec!["owner/repo".to_owned()]);
+        assert!(fetcher.calls().is_empty(), "no transfer after a refused preflight");
+        assert!(!spec.staging_dir(root.path()).exists(), "no staging and no .part");
+        assert!(!spec.local_dir(root.path()).join("model.bin").exists());
+        assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Missing);
+    }
+}
+
+#[test]
+fn a_granted_preflight_downloads_and_asks_once() {
+    let body = content(4000, 91);
+    let (spec, bodies) = make_spec("gated_granted", REV_A, &[("model.bin", &body), ("config.json", &content(40, 92))]);
+    let spec = gated(spec);
+    let root = temp_root();
+    let fetcher = FakeFetcher::new(bodies, RangeMode::Honour);
+    let log = ProbeLog::new(HfAccess::Granted);
+    let probe = |repo_id: &str, _cancel: &AtomicBool| log.probe(repo_id);
+    let remote = RemoteSource { url: &url_of, token_sent: true, probe: &probe };
+    let dir = download_with(&fetcher, &remote, root.path(), spec, &AtomicBool::new(false), &quiet_policy(), &mut |_| {}).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(read(&dir.join("model.bin")), body);
+    assert_eq!(log.asked().len(), 1);
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Installed);
+}
+
+#[test]
+fn an_all_present_gated_spec_makes_no_request() {
+    let (spec, bodies) = make_spec("gated_present", REV_A, &[("model.bin", &content(3000, 93)), ("config.json", &content(30, 94))]);
+    let spec = gated(spec);
+    let root = temp_root();
+    place_files(root.path(), spec, &bodies);
+    // No bodies: any request would fail; the probe panics if asked.
+    let fetcher = FakeFetcher::new(BTreeMap::new(), RangeMode::Honour);
+    let remote = RemoteSource { url: &url_of, token_sent: false, probe: &no_probe };
+    let result = download_with(&fetcher, &remote, root.path(), spec, &AtomicBool::new(false), &quiet_policy(), &mut |_| {});
+    assert!(result.is_ok(), "{result:?}");
+    assert!(fetcher.calls().is_empty(), "present files are kept by hash, never fetched");
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Installed);
+}
+
+/// An unanswered preflight (`Unreachable`: network down, Hub API failing) is not a refusal:
+/// the download proceeds and its transfer, with the full retry policy, decides.
+#[test]
+fn an_unreachable_preflight_downloads_anyway() {
+    let body = content(4000, 97);
+    let (spec, bodies) = make_spec("gated_unreachable", REV_A, &[("model.bin", &body)]);
+    let spec = gated(spec);
+    let root = temp_root();
+    let fetcher = FakeFetcher::new(bodies, RangeMode::Honour);
+    let log = ProbeLog::new(HfAccess::Unreachable { detail: "offline".to_owned() });
+    let probe = |repo_id: &str, _cancel: &AtomicBool| log.probe(repo_id);
+    let remote = RemoteSource { url: &url_of, token_sent: true, probe: &probe };
+    let dir = download_with(&fetcher, &remote, root.path(), spec, &AtomicBool::new(false), &quiet_policy(), &mut |_| {}).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(read(&dir.join("model.bin")), body);
+    assert_eq!(log.asked(), vec!["owner/repo".to_owned()]);
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Installed);
+}
+
+/// The probe gets the download's cancel flag; a cancel seen once it returns ends the download
+/// as `Cancelled` (not as a refusal), before any transfer.
+#[test]
+fn the_preflight_honours_the_download_cancel_flag() {
+    let (spec, bodies) = make_spec("gated_cancelled", REV_A, &[("model.bin", &content(4000, 98))]);
+    let spec = gated(spec);
+    let root = temp_root();
+    let fetcher = FakeFetcher::new(bodies, RangeMode::Honour);
+    let cancel = AtomicBool::new(false);
+    // The user presses Cancel while the probe waits: the probe sees the same flag.
+    let probe = |_repo_id: &str, flag: &AtomicBool| {
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed), "the probe polls the download's own flag");
+        HfAccess::Unreachable { detail: "cancelled".to_owned() }
+    };
+    let remote = RemoteSource { url: &url_of, token_sent: true, probe: &probe };
+    let result = download_with(&fetcher, &remote, root.path(), spec, &cancel, &quiet_policy(), &mut |_| {});
+    assert!(matches!(result, Err(ExternalModelError::Cancelled)), "{result:?}");
+    assert!(fetcher.calls().is_empty());
+    assert!(!spec.staging_dir(root.path()).exists());
+}
+
+#[test]
+fn a_401_or_403_during_a_gated_transfer_is_access_denied() {
+    let cases = [(401, false, HfAccess::NoToken), (401, true, HfAccess::TokenRejected), (403, true, HfAccess::TermsNotAccepted)];
+    for (code, token_sent, expected) in cases {
+        let body = content(3000, 95);
+        let (spec, _) = make_spec("transfer_refused", REV_A, &[("model.bin", &body)]);
+        let spec = gated(spec);
+        let root = temp_root();
+        let fetcher = ScriptedFetcher::new(&body, &[Step::Status(code, None)]);
+        // The preflight grants; the refusal comes from the file request itself.
+        let log = ProbeLog::new(HfAccess::Granted);
+        let probe = |repo_id: &str, _cancel: &AtomicBool| log.probe(repo_id);
+        let remote = RemoteSource { url: &url_of, token_sent, probe: &probe };
+        let result = download_with(&fetcher, &remote, root.path(), spec, &AtomicBool::new(false), &quiet_policy(), &mut |_| {});
+        assert!(matches!(&result, Err(ExternalModelError::AccessDenied { repo_id: "owner/repo", access }) if *access == expected), "{code}: {result:?}");
+        assert_eq!(fetcher.offsets(), vec![0], "a refusal is not retried");
+    }
+}
+
+/// A public repository has no terms to accept: a 401 / 403 (a CDN or region refusal) stays a
+/// plain HTTP error naming the file.
+#[test]
+fn a_401_or_403_of_an_ungated_hugging_face_spec_stays_an_http_error() {
+    for code in [401, 403] {
+        let body = content(3000, 99);
+        let (spec, _) = make_spec("ungated_refused", REV_A, &[("model.bin", &body)]);
+        let root = temp_root();
+        let fetcher = ScriptedFetcher::new(&body, &[Step::Status(code, None)]);
+        let remote = RemoteSource { url: &url_of, token_sent: true, probe: &no_probe };
+        let result = download_with(&fetcher, &remote, root.path(), spec, &AtomicBool::new(false), &quiet_policy(), &mut |_| {});
+        assert!(matches!(&result, Err(ExternalModelError::Http { file: "model.bin", detail }) if detail.contains(&code.to_string())), "{code}: {result:?}");
+    }
+}
+
+#[test]
+fn a_401_from_a_url_source_stays_an_http_error() {
+    let body = content(2000, 96);
+    let file = ExternalFile::direct("model.bin", u64::try_from(body.len()).unwrap_or(u64::MAX), leak(sha_hex(&body)));
+    let spec: &'static ExternalModelSpec = Box::leak(Box::new(ExternalModelSpec {
+        id: "url_refused",
+        source: ExternalSource::Url { base_url: "https://models.example/m" },
+        dir: "Test/url_refused",
+        layout: DirLayout::Exclusive,
+        files: Box::leak(vec![file].into_boxed_slice()),
+    }));
+    let root = temp_root();
+    let fetcher = ScriptedFetcher::new(&body, &[Step::Status(401, None)]);
+    let result = download_with(&fetcher, &PUBLIC, root.path(), spec, &AtomicBool::new(false), &quiet_policy(), &mut |_| {});
+    assert!(matches!(&result, Err(ExternalModelError::Http { file: "model.bin", detail }) if detail.contains("401")), "{result:?}");
+}
+
+#[test]
+fn gated_repo_names_only_a_gated_hugging_face_source() {
+    let (open, _) = make_spec("gated_repo_rule", REV_A, &[("model.bin", &content(10, 1))]);
+    assert_eq!(open.gated_repo(), None);
+    assert_eq!(gated(open).gated_repo(), Some("owner/repo"));
+    let url = ExternalModelSpec { source: ExternalSource::Url { base_url: "https://models.example/m" }, ..*open };
+    assert_eq!(url.gated_repo(), None);
+}
+
+/// Writes `body` at the catalog path `relative` of `spec`'s directory.
+fn place(root: &Path, spec: &ExternalModelSpec, relative: &str, body: &[u8]) -> PathBuf {
+    let path = join_relative(&spec.local_dir(root), relative);
+    std::fs::create_dir_all(path.parent().unwrap_or(root)).unwrap_or_else(|err| panic!("{err}"));
+    std::fs::write(&path, body).unwrap_or_else(|err| panic!("{err}"));
+    path
+}
+
+#[test]
+fn unmarked_files_partly_present_read_partial_and_the_download_fetches_only_the_absent_one() {
+    let vae = content(200_000, 30);
+    let config = content(700, 31);
+    let licence = content(1800, 32);
+    let (spec, bodies) = make_spec("partly_present", REV_A, &[("vae/weights.bin", &vae), ("config.json", &config), ("LICENSE.md", &licence)]);
+    let root = temp_root();
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Missing, "all absent");
+
+    // The weights are the user's own copy, linked into the model directory (followed by the
+    // stat probe and by the download's hash check, never replaced).
+    #[cfg(unix)]
+    {
+        let outside = root.path().join("own_copy.bin");
+        std::fs::write(&outside, &vae).unwrap_or_else(|err| panic!("{err}"));
+        let link = join_relative(&spec.local_dir(root.path()), "vae/weights.bin");
+        std::fs::create_dir_all(link.parent().unwrap_or(root.path())).unwrap_or_else(|err| panic!("{err}"));
+        std::os::unix::fs::symlink(&outside, &link).unwrap_or_else(|err| panic!("{err}"));
+    }
+    #[cfg(not(unix))]
+    place(root.path(), spec, "vae/weights.bin", &vae);
+    place(root.path(), spec, "config.json", &config);
+    let expected_present = spec.files[0].size + spec.files[1].size;
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Partial { bytes_present: expected_present });
+    assert_eq!(spec.total_bytes() - expected_present, 1800);
+    assert!(!unmarked_files_present(root.path(), spec));
+
+    let fetcher = FakeFetcher::new(bodies, RangeMode::Honour);
+    let dir = run(&fetcher, root.path(), spec, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(fetcher.calls(), vec![("mem://LICENSE.md".to_owned(), 0)]);
+    assert_eq!(read(&dir.join("LICENSE.md")), licence);
+    #[cfg(unix)]
+    assert!(dir.join("vae").join("weights.bin").is_symlink(), "a present file is kept as it is");
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Installed);
+}
+
+#[test]
+fn a_wrong_size_file_is_not_present_and_a_wrong_hash_one_is_fetched_again() {
+    let first = content(900, 33);
+    let second = content(400, 34);
+    let (spec, bodies) = make_spec("partly_wrong", REV_A, &[("first.bin", &first), ("second.bin", &second)]);
+    let root = temp_root();
+    // A file of the wrong size counts as absent.
+    place(root.path(), spec, "first.bin", &first[..100]);
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Missing);
+    // Same size, other bytes: counted by the stat-only estimate, rejected by the download's hash.
+    place(root.path(), spec, "first.bin", &content(900, 99));
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Partial { bytes_present: 900 });
+
+    let fetcher = FakeFetcher::new(bodies, RangeMode::Honour);
+    let dir = run(&fetcher, root.path(), spec, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(fetcher.calls(), vec![("mem://first.bin".to_owned(), 0), ("mem://second.bin".to_owned(), 0)]);
+    assert_eq!(read(&dir.join("first.bin")), first);
+}
+
+#[test]
+fn every_unmarked_file_present_stays_missing_for_adoption_and_a_foreign_marker_is_never_partial() {
+    let first = content(300, 35);
+    let second = content(200, 36);
+    let (spec, _) = make_spec("unmarked_all", REV_A, &[("first.bin", &first), ("second.bin", &second)]);
+    let root = temp_root();
+    place(root.path(), spec, "first.bin", &first);
+    place(root.path(), spec, "second.bin", &second);
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Missing);
+    assert!(unmarked_files_present(root.path(), spec));
+
+    // An older pin's marker: its files are an older install, upgraded only by a download.
+    let (repin, _) = make_spec("unmarked_all", REV_B, &[("first.bin", &first), ("third.bin", &content(50, 37))]);
+    write_json_atomically(&spec.marker_path(root.path()), &Marker::for_spec(spec)).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(external_model_status(root.path(), repin), ExternalModelStatus::Missing);
 }

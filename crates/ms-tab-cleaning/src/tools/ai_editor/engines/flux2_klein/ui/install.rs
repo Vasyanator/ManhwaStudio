@@ -3,7 +3,7 @@ File: cleaning/tools/ai_editor/engines/flux2_klein/ui/install.rs
 
 Purpose:
 The «Установка модели» half of the panel: where the model comes from, where its three
-paths point, and the Hugging Face download that fills them in.
+paths point, and the catalog download that fills them in.
 
 Main responsibilities:
 - draw the source-mode switch, the one control that decides whether the paths are typed
@@ -11,22 +11,20 @@ Main responsibilities:
 - draw an editable model-path row with its browse buttons (`Flux2PathRow`,
   `draw_path_row`) and the read-only derived paths of the download mode
   (`draw_derived_paths`);
-- draw the CATALOG download block of a variant pinned in the Rust catalog (4B): the two
-  weight-format pickers and one pinned bundle download (`Flux2CatalogDownloadView`,
-  `draw_catalog_download_block`, over the shared `draw_ocr_model_download`);
-- draw the Hugging Face download block (9B) — the heading and repository line, the token row
-  (`draw_flux2_token_row` over the shared `draw_hf_token_row`, unconditional for a gated
-  repository and reopened on an ungated one whose check blamed the token), the encoder
-  toggle, the derived paths, and the shared access-check / plan / download controls
-  (`draw_hf_download_controls`) (`Flux2DownloadView`, `draw_download_block`).
+- draw the CATALOG download block of download mode, both variants
+  (`Flux2CatalogDownloadView` / `Flux2CatalogDownloadOut`, `draw_catalog_download_block`): the
+  «Расцензуренный энкодер» toggle where the variant offers it with the line a format
+  adjustment leaves (`draw_encoder_source_toggle`), the two weight-format pickers
+  (`draw_weight_format_combo`), the derived paths, the Hugging Face token row while a gated
+  spec is missing (the shared `draw_hf_token_row`), and one pinned bundle download over the
+  shared `draw_ocr_model_download` (which also draws the per-repository access lines).
 
 Key structures:
-- `Flux2DownloadView`, `Flux2CatalogDownloadView`, `Flux2PathRow`
+- `Flux2CatalogDownloadView`, `Flux2CatalogDownloadOut`, `Flux2PathRow`
 
 Key functions:
 - `draw_source_mode_switch()`, `draw_path_row()`, `draw_derived_paths()`
-- `draw_download_block()`, `draw_flux2_token_row()`
-- `draw_catalog_download_block()`, `draw_weight_format_combo()`
+- `draw_catalog_download_block()`, `draw_encoder_source_toggle()`, `draw_weight_format_combo()`
 
 Notes:
 The HF token never reaches this file's own state: it lives in the process-wide `hf_token`
@@ -85,10 +83,10 @@ pub(super) fn draw_source_mode_switch(
 /// Draws the three DERIVED destination paths of the download mode, read-only, with what
 /// the backend reports about each one's presence.
 ///
-/// Read-only because nothing here is a choice: the paths follow the models directory and
-/// the encoder toggle. They are shown anyway because the user still has to see where his
-/// 35 GB went and whether the install is complete, and making him switch modes to find that
-/// out would be the same as not showing it.
+/// Read-only because nothing here is a choice: the paths follow the models directory, the
+/// weight formats and the encoder toggle. They are shown anyway because the user still has to
+/// see where the files went and whether the install is complete, and making him switch modes
+/// to find that out would be the same as not showing it.
 ///
 /// Presence comes from the last `.status` answer, never from a filesystem probe: this runs
 /// on the GUI thread, which must not touch the disk. No answer yet means the mark is
@@ -132,205 +130,130 @@ pub(super) fn draw_derived_paths(ui: &mut egui::Ui, settings: &Flux2KleinSetting
     }
 }
 
-/// Everything the model-download block READS, grouped so the block stays one function
-/// with a reviewable signature instead of eleven positional parameters.
-pub(super) struct Flux2DownloadView<'a> {
-    /// The checkpoint this block installs. It decides whether a Hugging Face token row is
-    /// drawn at all and whether the uncensored-encoder toggle exists, and it names the
-    /// repository the block reports on.
-    pub(super) variant: Flux2Variant,
+/// Everything the CATALOG download block reads (download mode, either variant) and the token
+/// field it edits.
+pub(super) struct Flux2CatalogDownloadView<'a> {
+    /// The controller's view of the bundle the selection needed when the frame began; `None`
+    /// without a controller (a test build). Drawn only while its `bundle_key` still matches.
+    pub(super) snapshot: Option<&'a OcrModelPanelSnapshot>,
+    /// The last `.status` answer, for the presence marks beside the derived paths.
+    pub(super) status: Option<&'a Flux2Status>,
+    /// The gated repositories of the bundle's specs not known to be installed
+    /// ([`flux2_gated_repos_missing`]): the token row is drawn while this is non-empty.
+    pub(super) gated_repos: &'a [&'static str],
     pub(super) token_state: ms_sysprobe::hf_token::HfTokenState,
     /// The masked field's buffer. Never persisted and never logged.
     pub(super) token_input: &'a mut String,
     pub(super) token_status: Option<&'a str>,
     pub(super) token_busy: bool,
-    /// The last access check, ALREADY filtered to the checkpoint and the encoder toggle
-    /// currently selected ([`Flux2KleinEngine::download_check_current`]).
-    pub(super) check: Option<&'a Flux2DownloadCheck>,
-    pub(super) check_error: Option<&'a str>,
-    pub(super) check_busy: bool,
-    pub(super) download_busy: bool,
-    pub(super) download_status: Option<&'a str>,
-    pub(super) ai_backend_available: bool,
-    pub(super) pipeline_busy: bool,
-    /// The last `.status` answer, for the presence marks beside the derived paths.
-    pub(super) status: Option<&'a Flux2Status>,
 }
 
-/// Draws the Hugging Face model-download block: the repository it fetches, the token row,
-/// the encoder toggle, the per-repository access verdicts with the link each one
-/// prescribes, and the download controls.
-///
-/// TWO of those are per-variant:
-/// - the TOKEN row is unconditional only for a gated repository (`requires_hf_token`); the
-///   4B checkpoint is apache-2.0, so it gets one line saying no token is needed — UNLESS
-///   the check itself blamed the token, in which case the row appears with an explanation,
-///   because that credential has no other UI anywhere in the application;
-/// - the UNCENSORED-encoder toggle is drawn only where such an encoder is published
-///   (`supports_uncensored_encoder`); the backend refuses the other pairing, so offering
-///   the control could only manufacture a refusal.
-///
-/// Everything else — the derived paths, the access check, the plan, the buttons and the
-/// progress — is identical for both, because it is keyed by the three component paths.
-///
-/// The token never reaches this function's own state: it lives in the process-wide
-/// `hf_token` module, `token_input` is only the buffer of the entry field, and no branch
-/// here prints, logs or formats a token value.
-pub(super) fn draw_download_block(
-    ui: &mut egui::Ui,
-    settings: &mut Flux2KleinSettings,
-    mut view: Flux2DownloadView<'_>,
-    changed: &mut bool,
-    hf_token_action: &mut Option<HfTokenAction>,
-    download_action: &mut Option<HfDownloadAction>,
-) {
-    ui.separator();
-    ui.label(t!("cleaning.tools.flux2_klein.download.heading"));
-    // This hint is entirely about GATING — a token and accepted conditions — so it is
-    // drawn only where that is true. For an ungated variant it would be a false warning,
-    // and `token_not_needed_hint` below says the opposite in one line.
-    if view.variant.requires_hf_token() {
-        ui.small(t!("cleaning.tools.flux2_klein.download.hint"));
-    }
-    // The repository the model itself comes from, named BEFORE any check has run: the
-    // per-repository rows below only exist once the backend has answered, and until then
-    // the block says nothing about which of the two checkpoints it would fetch. The id is
-    // a backend identifier and stays literal, exactly as it does on those rows.
-    ui.small(tf!(
-        "cleaning.tools.flux2_klein.download.repo_status",
-        repo = view.variant.model_repo()
-    ));
-
-    // --- the token row -------------------------------------------------------------
-    // The access hint names the uncensored encoder's gated repository only while that toggle
-    // is in effect, i.e. while the download would actually fetch from it.
-    let uncensored = settings.uncensored_encoder_active();
-    // Always drawn for a variant whose repository is gated. For an ungated one it appears
-    // only when the last check actually BLAMED the token: the 4B checkpoint is apache-2.0,
-    // the request carries an empty token legally, and an unconditional field there would
-    // ask the user to solve a problem they do not have. A verdict of `no_token` or
-    // `invalid_token` means they DO have it — and `hf_token` has exactly one UI surface in
-    // the whole application, this block, so leaving the row out there strands them with a
-    // dead «Скачать» and a credential they cannot reach.
-    if view.variant.requires_hf_token() {
-        draw_flux2_token_row(ui, &mut view, uncensored, hf_token_action);
-    } else if download_check_blames_token(view.check) {
-        // Only reachable from a backend that authenticates against this repository even
-        // though it is open — an outdated one. Both halves are said: what the answer means,
-        // and the controls that make it actionable.
-        ui.colored_label(
-            ms_theme::status::WARNING,
-            t!("cleaning.tools.flux2_klein.download.token_unexpected_hint"),
-        );
-        draw_flux2_token_row(ui, &mut view, uncensored, hf_token_action);
-    } else {
-        // Said once, positively: the absence of a token row is otherwise indistinguishable
-        // from a missing feature, and a user who set one up for the 9B model would wonder
-        // why it is gone here.
-        ui.small(t!("cleaning.tools.flux2_klein.download.token_not_needed_hint"));
-    }
-
-    // --- the encoder toggle --------------------------------------------------------
-    // Only for a variant that HAS an uncensored encoder published for it. The backend
-    // refuses the other pairing outright, so offering the control would only manufacture a
-    // refusal; `normalized()` keeps the persisted flag inert there as well.
-    if view.variant.supports_uncensored_encoder() {
-        let toggled = ui
-            .checkbox(
-                &mut settings.uncensored_text_encoder,
-                t!("cleaning.tools.flux2_klein.download.uncensored_label"),
-            )
-            .on_hover_text(t!("cleaning.tools.flux2_klein.download.uncensored_hint"))
-            .changed();
-        if toggled {
-            *changed = true;
-            // The toggle selects the encoder AND the directory the tool reads it from. Only
-            // a path this block manages is repointed; a hand-picked one survives the flip.
-            if let Some(path) = flux2_text_encoder_path_after_toggle(
-                &settings.text_encoder_path,
-                settings.uncensored_text_encoder,
-                view.variant,
-            ) {
-                settings.text_encoder_path = path;
-            }
-        }
-    }
-
-    // Where the files go, and whether they are there. Drawn after the toggle because the
-    // encoder path follows it.
-    draw_derived_paths(ui, settings, view.status);
-
-    // --- the access check and the download (shared) ---------------------------------
-    draw_hf_download_controls(
-        ui,
-        &HfDownloadControlsView {
-            check: view.check,
-            check_error: view.check_error,
-            check_busy: view.check_busy,
-            download_busy: view.download_busy,
-            download_status: view.download_status,
-            ai_backend_available: view.ai_backend_available,
-            pipeline_busy: view.pipeline_busy,
-            download_tooltip: t!("cleaning.tools.flux2_klein.download.download_tooltip"),
-        },
-        download_action,
-    );
+/// What the catalog block's controls did this frame, for the engine to fold back.
+pub(super) struct Flux2CatalogDownloadOut<'a> {
+    /// A persisted value changed (a format, the encoder source): saved and re-armed.
+    pub(super) changed: &'a mut bool,
+    /// The bundle block's click (download / verify / cancel).
+    pub(super) action: &'a mut ModelDownloadAction,
+    /// The token row's click (save / delete).
+    pub(super) hf_token_action: &'a mut Option<HfTokenAction>,
+    /// The line under the encoder toggle: set when a source switch changed the stored encoder
+    /// format, cleared by a switch that kept it.
+    pub(super) encoder_format_notice: &'a mut Option<String>,
 }
 
-/// Everything the CATALOG download block reads (a variant whose package is pinned in the
-/// Rust catalog, i.e. 4B, in download mode).
-pub(super) struct Flux2CatalogDownloadView<'a> {
-    /// The controller's view of the bundle the selection needed when the frame began; `None`
-    /// before the engine has one. Drawn only while its `bundle_key` still matches.
-    pub(super) snapshot: Option<&'a OcrModelPanelSnapshot>,
-    /// The last `.status` answer, for the presence marks beside the derived paths.
-    pub(super) status: Option<&'a Flux2Status>,
-}
-
-/// Draws the catalog download block: «Веса трансформера» and «Веса текстового энкодера»
-/// (each a `WheelComboBox` of the offered formats with size and installed mark), the derived
-/// paths they lead to, and ONE pinned download block for the whole bundle
-/// (`draw_ocr_model_download`, the SDXL pattern: download / resume / verify / cancel, and the
+/// Draws the catalog download block of download mode, both variants: the «Расцензуренный
+/// энкодер» toggle where the variant offers that source, «Веса трансформера» and «Веса
+/// текстового энкодера» (each a `WheelComboBox` of the offered formats with size and installed
+/// mark; the encoder's list is the selected source's), the derived paths they lead to, the
+/// Hugging Face token row while a gated spec of the bundle is not installed, and ONE pinned
+/// download block for the whole bundle (`draw_ocr_model_download`, the SDXL pattern: download
+/// / resume / verify / cancel, the per-repository access lines of its gated sources, and the
 /// automatic adoption of an unmarked existing download shown as its check).
 ///
-/// There is no token row and no backend download here: the repositories are open and the
-/// app fetches the pinned files itself. A changed format raises `changed` (the engine saves
-/// it and re-arms the status, the forecast and the bundle probe). `action` receives the
-/// block's click, applied by the engine to the CURRENT bundle; the block is skipped for the
-/// one frame in which the combos have just moved the bundle away from `view.snapshot`.
-pub(super) fn draw_catalog_download_block(
-    ui: &mut egui::Ui,
-    settings: &mut Flux2KleinSettings,
-    view: Flux2CatalogDownloadView<'_>,
-    changed: &mut bool,
-    action: &mut ModelDownloadAction,
-) {
+/// The app fetches the pinned files itself; no backend method is involved. A changed format or
+/// source raises `out.changed` (the engine saves it and re-arms the status, the forecast, the
+/// installed formats and the bundle probe). `out.action` receives the block's click, applied by
+/// the engine to the CURRENT bundle; the block is skipped for the one frame in which the
+/// controls have just moved the bundle away from `view.snapshot`.
+///
+/// The token never reaches this function's own state: it lives in the process-wide `hf_token`
+/// module, `token_input` is only the buffer of the entry field, and no branch here prints,
+/// logs or formats a token value.
+pub(super) fn draw_catalog_download_block(ui: &mut egui::Ui, settings: &mut Flux2KleinSettings, view: Flux2CatalogDownloadView<'_>, out: Flux2CatalogDownloadOut<'_>) {
     ui.separator();
     ui.label(t!("cleaning.tools.flux2_klein.download.heading"));
+    draw_encoder_source_toggle(ui, settings, out.changed, out.encoder_format_notice);
     for axis in Flux2WeightAxis::all() {
-        draw_weight_format_combo(ui, settings, axis, changed);
+        draw_weight_format_combo(ui, settings, axis, out.changed);
     }
     // After the combos: the transformer and encoder paths follow the formats.
     draw_derived_paths(ui, settings, view.status);
+    // The token is needed only to fetch from a gated repository; once those specs are
+    // installed (or for 4B, whose repositories are open) the row would ask for nothing. The
+    // per-repository access verdicts and the repository links are the bundle block's own
+    // lines below, so no second list is drawn here.
+    if !view.gated_repos.is_empty() {
+        draw_hf_token_row(
+            ui,
+            HfTokenView { state: view.token_state, input: view.token_input, status: view.token_status, busy: view.token_busy },
+            "cleaning_flux2_klein_hf_token",
+            None,
+            out.hf_token_action,
+        );
+    }
     let current = bundle_key(&flux2_catalog_bundle(settings));
     if let Some(snapshot) = view.snapshot.filter(|snapshot| snapshot.bundle_key == current) {
         let clicked = draw_ocr_model_download(ui, snapshot);
         if clicked != ModelDownloadAction::None {
-            *action = clicked;
+            *out.action = clicked;
         }
     }
 }
 
+/// Draws «Расцензуренный энкодер» where the variant offers more than one encoder source
+/// (`Flux2EncoderSource::offered_for`; 4B has none, so nothing is drawn there), and under it
+/// the line a format adjustment left. A switch stores the source and maps the encoder format
+/// through `closest_offered` (`Flux2KleinSettings::set_encoder_source`); when that changed the
+/// format the line names both, otherwise the line is cleared.
+///
+/// A plain checkbox: the toggle's `Id` does not hold state, so its localized caption needs no
+/// salt (`egui-docs/05-ids-and-i18n.md` §2).
+fn draw_encoder_source_toggle(ui: &mut egui::Ui, settings: &mut Flux2KleinSettings, changed: &mut bool, notice: &mut Option<String>) {
+    if Flux2EncoderSource::offered_for(settings.variant()).len() > 1 {
+        let mut uncensored = settings.encoder_source() == Flux2EncoderSource::Uncensored;
+        let toggled = ui
+            .checkbox(&mut uncensored, t!("cleaning.tools.flux2_klein.download.uncensored_label"))
+            .on_hover_text(t!("cleaning.tools.flux2_klein.download.uncensored_hint"))
+            .changed();
+        if toggled {
+            let previous = settings.encoder_source();
+            let source = if uncensored { Flux2EncoderSource::Uncensored } else { Flux2EncoderSource::Stock };
+            *notice = settings.set_encoder_source(source).map(|(from, to)| {
+                tf!(
+                    "cleaning.tools.flux2_klein.text_encoder_format_adjusted_status",
+                    from = flux2_encoder_format_token(previous, from),
+                    to = flux2_encoder_format_token(source, to)
+                )
+            });
+            *changed = true;
+        }
+    }
+    if let Some(line) = notice.as_deref() {
+        ui.colored_label(ms_theme::status::WARNING, line);
+    }
+}
+
 /// Draws one weight-format picker: its caption (hover: what the axis choice means) and a
-/// `WheelComboBox` of the formats the variant offers on `axis`, each captioned by
-/// [`flux2_weight_format_label`] and hovered by [`flux2_weight_format_hint`]. A pick is
-/// written into the axis's persisted wire id and raises `changed`.
+/// `WheelComboBox` of the formats the variant offers on `axis` for the selected encoder source,
+/// each captioned by [`flux2_weight_format_label`] and hovered by [`flux2_weight_format_hint`].
+/// A pick is written into the axis's persisted wire id and raises `changed`.
 ///
 /// The combo's `Id` comes from a fixed `id_salt` per axis, never from the localized caption
 /// (`egui-docs/05-ids-and-i18n.md` §2); a `WheelComboBox` rather than `egui::ComboBox`
 /// (`egui-docs/04-widgets.md` §0.2).
 fn draw_weight_format_combo(ui: &mut egui::Ui, settings: &mut Flux2KleinSettings, axis: Flux2WeightAxis, changed: &mut bool) {
     let variant = settings.variant();
+    let source = settings.encoder_source();
     let selected = settings.weight_format(axis);
     let (label, hint, id_salt) = match axis {
         Flux2WeightAxis::Transformer => (
@@ -349,10 +272,10 @@ fn draw_weight_format_combo(ui: &mut egui::Ui, settings: &mut Flux2KleinSettings
     ui.horizontal_wrapped(|ui| {
         ui.label(label).on_hover_text(hint);
         WheelComboBox::from_id_salt(id_salt)
-            .selected_text(flux2_weight_format_label(variant, axis, selected, installed))
+            .selected_text(flux2_weight_format_label(variant, axis, source, selected, installed))
             .show_ui(ui, |ui| {
-                for &format in Flux2WeightFormat::offered_for(variant, axis) {
-                    ui.selectable_value(&mut picked, format, flux2_weight_format_label(variant, axis, format, installed))
+                for &format in Flux2WeightFormat::offered_for(variant, axis, source) {
+                    ui.selectable_value(&mut picked, format, flux2_weight_format_label(variant, axis, source, format, installed))
                         .on_hover_text(flux2_weight_format_hint(axis, format));
                 }
             })
@@ -367,43 +290,6 @@ fn draw_weight_format_combo(ui: &mut egui::Ui, settings: &mut Flux2KleinSettings
         *stored = picked.wire().to_string();
         *changed = true;
     }
-}
-
-/// Draws the Hugging Face token row of this block through the shared `draw_hf_token_row`.
-///
-/// Split out because it has TWO callers with different conditions — a gated repository,
-/// which always needs it, and an ungated one whose check nevertheless blamed the token —
-/// and duplicating it would let the two drift into offering different controls for the
-/// same credential. The field keeps its historic id (`cleaning_flux2_klein_hf_token`); the
-/// per-variant `push_id` around the whole body keeps the two engines apart.
-///
-/// The row carries the step-by-step access hint (`ms_widgets::HfAccessHint`) for the
-/// repositories this download needs: the variant's own model repository, plus the gated
-/// uncensored encoder's while that toggle is in effect (`uncensored`).
-fn draw_flux2_token_row(
-    ui: &mut egui::Ui,
-    view: &mut Flux2DownloadView<'_>,
-    uncensored: bool,
-    hf_token_action: &mut Option<HfTokenAction>,
-) {
-    let variant = view.variant;
-    let mut hint = HfAccessHint::new("cleaning_flux2_klein_hf_access_hint", token_save_button_label())
-        .repo(variant.title(), variant.model_repo());
-    if uncensored && let Some(repo) = variant.uncensored_encoder_repo() {
-        hint = hint.repo(t!("cleaning.tools.flux2_klein.download.uncensored_label"), repo);
-    }
-    draw_hf_token_row(
-        ui,
-        HfTokenView {
-            state: view.token_state,
-            input: &mut *view.token_input,
-            status: view.token_status,
-            busy: view.token_busy,
-        },
-        "cleaning_flux2_klein_hf_token",
-        Some(hint),
-        hf_token_action,
-    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -459,41 +345,26 @@ pub(super) fn draw_path_row(
 mod tests {
     use super::*;
 
+    /// Reads one embedded catalog as a JSON object.
+    fn catalog(tag: &str, source: &str) -> Value {
+        serde_json::from_str(source).unwrap_or_else(|error| panic!("locale `{tag}` is not valid JSON: {error}"))
+    }
+
     /// The FLUX.2 keys of this block (the shared ones are pinned in
-    /// `../../shared/hf_download_ui.rs` and `stream_progress_ui.rs`).
+    /// `../../shared/hf_download_ui.rs` and `stream_progress_ui.rs`) that every shipped locale
+    /// carries.
     #[test]
     fn every_catalog_carries_the_download_block_strings() {
-        let interpolated = [
-            ("cleaning.tools.flux2_klein.download.error", vec!["{err}"]),
-            ("cleaning.tools.flux2_klein.download.done_status", vec!["{size}", "{skipped}"]),
-            // Without `{repo}` the line would claim to name a repository and name none,
-            // which is worse than not drawing it: the two variants differ by exactly that
-            // id before any check has run.
-            ("cleaning.tools.flux2_klein.download.repo_status", vec!["{repo}"]),
-            // Both checkpoints are named, or the sentence cannot say what went wrong.
-            ("cleaning.tools.flux2_klein.download.variant_mismatch_error", vec!["{expected}", "{actual}"]),
-        ];
         let plain = [
             "cleaning.tools.flux2_klein.pipeline_busy_error",
             "cleaning.tools.flux2_klein.download.heading",
-            "cleaning.tools.flux2_klein.download.hint",
-            "cleaning.tools.flux2_klein.download.download_tooltip",
             "cleaning.tools.flux2_klein.download.uncensored_label",
             "cleaning.tools.flux2_klein.download.uncensored_hint",
-            // The 4B half of the block: the line that replaces the token row, and the one
-            // that explains why the other engine's model disappears from memory.
-            "cleaning.tools.flux2_klein.download.token_not_needed_hint",
-            // …and the line that replaces it when the backend nevertheless blames the token,
-            // which is the only thing that reopens the token row on an ungated checkpoint.
-            "cleaning.tools.flux2_klein.download.token_unexpected_hint",
             // The picker's disabled tooltips: a closed control that says nothing is a defect.
             "cleaning.tools.flux2_klein.download.switch_blocked_download",
-            "cleaning.tools.flux2_klein.download.switch_blocked_check",
             "cleaning.tools.flux2_klein.variant_residency_hint",
             "cleaning.tools.flux2_klein.title",
             "cleaning.tools.flux2_klein.title_4b",
-            "cleaning.tools.flux2_klein.download.running_status",
-            "cleaning.tools.flux2_klein.download.cancelled_status",
             "cleaning.tools.flux2_klein.download.derived_paths_label",
             "cleaning.tools.flux2_klein.source_mode_label",
             "cleaning.tools.flux2_klein.source_mode_manual",
@@ -502,8 +373,7 @@ mod tests {
             "cleaning.tools.flux2_klein.source_mode_download_hint",
         ];
         for (tag, source) in ms_i18n::embedded_locales() {
-            let catalog: Value = serde_json::from_str(source)
-                .unwrap_or_else(|error| panic!("locale `{tag}` is not valid JSON: {error}"));
+            let catalog = catalog(tag, source);
             let entry = |key: &str| -> String {
                 catalog
                     .get(key)
@@ -512,19 +382,7 @@ mod tests {
                     .to_owned()
             };
             for key in plain {
-                assert!(
-                    !entry(key).trim().is_empty(),
-                    "locale `{tag}`: `{key}` is empty"
-                );
-            }
-            for (key, placeholders) in &interpolated {
-                let text = entry(key);
-                for placeholder in placeholders {
-                    assert!(
-                        text.contains(placeholder),
-                        "locale `{tag}`: `{key}` must carry `{placeholder}`, `{text}` does not"
-                    );
-                }
+                assert!(!entry(key).trim().is_empty(), "locale `{tag}`: `{key}` is empty");
             }
             // The two modes are a switch: identical captions would make it unusable.
             assert_ne!(
@@ -542,10 +400,11 @@ mod tests {
         }
     }
 
-    /// The catalog half of the block (4B): the two pickers, the row captions and hovers, the
-    /// readiness line of an incomplete bundle and the fp8 checkbox a GGUF encoder closes. The
-    /// two catalogs maintained by hand (`en`, the reference, and `ru`) must carry them; `es` /
-    /// `fr` / `pt` fall back to `en`.
+    /// The catalog half of the block: the two pickers, the row captions and hovers, the line a
+    /// source switch leaves, the readiness line of an incomplete bundle and the fp8 checkbox a
+    /// GGUF encoder closes. The two catalogs maintained by hand (`en`, the reference, and
+    /// `ru`) must carry them; `es` / `fr` / `pt` fall back to `en`. The retired backend-download
+    /// keys are gone from both.
     #[test]
     fn the_reference_catalogs_carry_the_weight_format_keys() {
         let plain = [
@@ -558,15 +417,31 @@ mod tests {
             "cleaning.tools.flux2_klein.format_gguf_encoder_hint",
             "cleaning.tools.flux2_klein.text_encoder_fp8_gguf_disabled_hint",
             "cleaning.tools.flux2_klein.bundle_missing_status",
+            "cleaning.tools.flux2_klein.download.switch_blocked_verify",
         ];
-        // A format row is only a choice while it names the format and its size.
-        let interpolated: [(&str, &[&str]); 2] = [
-            ("cleaning.tools.flux2_klein.format_bf16_label", &["{size}"]),
+        // A format row is only a choice while it names the format and its size; the switch
+        // line names both formats.
+        let interpolated: [(&str, &[&str]); 3] = [
+            ("cleaning.tools.flux2_klein.format_unquantized_label", &["{dtype}", "{size}"]),
             ("cleaning.tools.flux2_klein.format_gguf_label", &["{quant}", "{size}"]),
+            ("cleaning.tools.flux2_klein.text_encoder_format_adjusted_status", &["{from}", "{to}"]),
+        ];
+        let retired = [
+            "cleaning.tools.flux2_klein.format_bf16_label",
+            "cleaning.tools.flux2_klein.download.hint",
+            "cleaning.tools.flux2_klein.download.repo_status",
+            "cleaning.tools.flux2_klein.download.token_not_needed_hint",
+            "cleaning.tools.flux2_klein.download.token_unexpected_hint",
+            "cleaning.tools.flux2_klein.download.variant_mismatch_error",
+            "cleaning.tools.flux2_klein.download.switch_blocked_check",
+            "cleaning.tools.flux2_klein.download.running_status",
+            "cleaning.tools.flux2_klein.download.cancelled_status",
+            "cleaning.tools.flux2_klein.download.done_status",
+            "cleaning.tools.flux2_klein.download.error",
+            "cleaning.tools.flux2_klein.download.download_tooltip",
         ];
         for (tag, source) in ms_i18n::embedded_locales().iter().filter(|(tag, _)| matches!(*tag, "en" | "ru")) {
-            let catalog: Value = serde_json::from_str(source)
-                .unwrap_or_else(|error| panic!("locale `{tag}` is not valid JSON: {error}"));
+            let catalog = catalog(tag, source);
             let entry = |key: &str| -> String {
                 catalog
                     .get(key)
@@ -582,6 +457,9 @@ mod tests {
                 for placeholder in placeholders {
                     assert!(text.contains(placeholder), "locale `{tag}`: `{key}` must carry `{placeholder}`, `{text}` does not");
                 }
+            }
+            for key in retired {
+                assert!(catalog.get(key).is_none(), "locale `{tag}`: the retired `{key}` is still there");
             }
             // The two pickers sit one under the other: identical captions would hide which
             // component a choice is for.

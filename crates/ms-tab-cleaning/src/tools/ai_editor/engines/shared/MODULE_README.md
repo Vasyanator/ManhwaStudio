@@ -44,7 +44,8 @@ forecast / caps / learned-floor half of «Память и скорость» is 
 - `hf_download.rs`: the per-repository verdicts (`HfDownloadState`, `HfDownloadLink`,
   `HfDownloadRepo::link`), the check generic over the engine's QUESTION (`HfDownloadCheck<Q>`,
   `parse_hf_download_check(header, question)`), the nullable plan and `hf_download_readiness`,
-  `download_check_blames_token`, the two calls, the token field's worker (`HfTokenControl`).
+  the two calls, the token field's worker (`HfTokenControl`; FLUX.2 klein uses only this part,
+  its download being the app's model catalog).
 - `hf_download_ui.rs`: the token row (`HfTokenView`, caller-given field id, an optional
   `ms_widgets::HfAccessHint` beside the badge whose last step names `token_save_button_label`),
   one repository row,
@@ -111,7 +112,7 @@ forecast / caps / learned-floor half of «Память и скорость» is 
 - To change how the bar looks or what its lines say: `stream_progress_ui.rs` and the
   `cleaning.tools.engine_progress.*` keys; its arithmetic: `stream_progress.rs`.
 - To change the verdict vocabulary, a verdict's link, or the readiness rule:
-  `hf_download.rs` (the wire literals are pinned by `dev-docs/flux2_model_download.md` §3 and matched by the
+  `hf_download.rs` (the wire literals are pinned by the `state` table of `modules/ai_backend/ipc/PROTOCOL.md` and matched by the
   backend's download module).
 - To change the token row or the download controls for every engine: `hf_download_ui.rs`.
 - To change the quarantine naming, the temp naming, the save debounce or backoff, or the

@@ -35,9 +35,11 @@ pub enum DownloadError {
     #[error("file operation failed on {}: {source}", path.display())]
     Io { path: PathBuf, source: std::io::Error },
     /// A permanent HTTP failure, retries exhausted, or a size the server never announced;
-    /// staged bytes are kept.
+    /// staged bytes are kept. `status` is the HTTP status code of a permanent HTTP answer
+    /// (e.g. `Some(401)`, so a consumer can map an access refusal without parsing `detail`);
+    /// `None` for transport / protocol failures, exhausted retries and an unannounced size.
     #[error("download failed: {detail}")]
-    Http { detail: String },
+    Http { detail: String, status: Option<u16> },
     /// The content is proven longer / shorter than allowed (pinned size, announced size or a
     /// `max_bytes` cap); the staged file was deleted.
     #[error("size mismatch: expected {expected} bytes, got {actual}")]
@@ -55,7 +57,7 @@ impl From<StreamError> for DownloadError {
         match error {
             StreamError::Cancelled => Self::Cancelled,
             StreamError::Io { path, source } => Self::Io { path, source },
-            StreamError::Http { detail } => Self::Http { detail },
+            StreamError::Http { detail, status } => Self::Http { detail, status },
             StreamError::SizeMismatch { expected, actual } => Self::SizeMismatch { expected, actual },
         }
     }

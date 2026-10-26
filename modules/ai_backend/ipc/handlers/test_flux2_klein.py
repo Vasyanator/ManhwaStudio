@@ -43,22 +43,13 @@ Coverage:
   prompt phase and is cancellable, `name`/`path` are required non-empty strings,
   `overwrite` defaults to `false`, an import's `name` is optional and trimmed,
   and the import answer carries `family_matches` for the foreign-family warning;
-- the two `inpaint.flux2_klein.download.*` methods: the token, the toggle and
-  the `variant` travel as request fields — `variant` VERBATIM, because the
-  vocabulary, the absent-field default and the cost of an unknown name are the
-  downloader's single answer — the `.check` reply echoes the variant back, the
-  retired `4b` (protocol 21: the application's catalog downloads it) is refused
-  by the real downloader before any network call, a variant refusal
-  propagates unchanged, a non-string token is a request error, a NULL `plan`
-  and its `plan_error` reach the client unchanged (a listing failure must never
-  render as a completed installation), `.start`
-  streams the two-level progress frame (the three extra fields OMITTED rather
-  than nulled when the level is absent), its cancel EVENT is handed into the work
-  instead of being polled only around it, its own cancellation maps to
-  `Interrupted`, and its readable refusals propagate unchanged;
-- the additive nature of that second progress level: a four-positional-argument
-  caller — every service callback that existed before the download — emits
-  exactly the frame it always did.
+- the two `inpaint.flux2_klein.download.*` methods are gone (protocol 22: the
+  application's model catalog downloads the weights): no handler, not in
+  `ALL_METHODS`;
+- the progress forwarder: a four-positional-argument caller emits exactly the
+  four-field frame, the optional byte level (`file_step` / `file_total` /
+  `file_label` / `file_component`) is forwarded when given, and a dead peer is
+  logged once per request without aborting the work.
 """
 
 from __future__ import annotations
@@ -77,8 +68,6 @@ from modules.ai_backend.ipc.protocol import (
     KIND_PROGRESS,
     METHOD_INPAINT_FLUX2_KLEIN,
     METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION,
-    METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK,
-    METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT,
@@ -851,310 +840,11 @@ def test_every_prompt_cache_method_is_registered() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Model download from Hugging Face
+# Progress forwarding and retired methods
 # ---------------------------------------------------------------------------
-class _FakeDownloads:
-    """Stand-in for `inpaint/flux2_download.py` injected into the handler.
-
-    Records what the handler passed it and replays a scripted two-level progress
-    sequence, so the exact on-the-wire frame shape is asserted without a network,
-    a token or a gigabyte.
-    """
-
-    class DownloadCanceled(Exception):
-        pass
-
-    def __init__(
-        self,
-        *,
-        script: tuple[tuple[Any, ...], ...] = (),
-        fail: BaseException | None = None,
-        plan_fails: bool = False,
-    ) -> None:
-        self.checked: list[tuple[str, bool, Any]] = []
-        self.started: list[tuple[str, bool, Any]] = []
-        self.script = script
-        self.fail = fail
-        self.plan_fails = plan_fails
-        self.cancel_probe: Any = None
-
-    def check_access(self, token: str, *, uncensored: bool, variant: Any = None) -> dict[str, Any]:
-        self.checked.append((token, uncensored, variant))
-        # The real module echoes the variant it answered for; the fake echoes the
-        # raw field so a handler that dropped it would be visible here.
-        if self.plan_fails:
-            return {
-                "variant": variant or "9b",
-                "repos": {"black-forest-labs/FLUX.2-klein-9B": {"state": "ok", "message": ""}},
-                "plan": None,
-                "plan_error": "offline",
-            }
-        return {
-            "variant": variant or "9b",
-            "repos": {"black-forest-labs/FLUX.2-klein-9B": {"state": "ok", "message": ""}},
-            "plan": {"total_bytes": 100, "missing_bytes": 40, "missing_files": 2},
-            "plan_error": "",
-        }
-
-    def download(
-        self,
-        token: str,
-        *,
-        uncensored: bool,
-        variant: Any = None,
-        progress_callback: Any = None,
-        should_cancel: Any = None,
-    ) -> dict[str, Any]:
-        self.started.append((token, uncensored, variant))
-        self.cancel_probe = should_cancel
-        for frame in self.script:
-            if progress_callback is not None:
-                phase, step, total, label, extra = frame
-                progress_callback(phase, step, total, label, **extra)
-        if self.fail is not None:
-            raise self.fail
-        return {
-            "paths": {"transformer": "/m/transformer", "text_encoder": "/m/text_encoder", "vae": "/m/vae"},
-            "downloaded_bytes": 40,
-            "skipped_files": 2,
-        }
-
-
-def _with_downloads(monkeypatch: Any, fake: _FakeDownloads) -> _FakeDownloads:
-    """Point the handler's lazy module lookup at `fake`."""
-    from modules.ai_backend.ipc.handlers import flux2_klein as module
-
-    monkeypatch.setattr(module, "_download_module", lambda: fake)
-    return fake
-
-
-def test_download_check_forwards_the_token_and_the_toggle(monkeypatch: Any) -> None:
-    fake = _with_downloads(monkeypatch, _FakeDownloads())
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK)
-
-    header, blob = handler(
-        _ctx(_FakeFlux2KleinService()),
-        {"hf_token": "secret-token", "uncensored": True},
-        b"",
-        _no_cancel(),
-    )
-
-    assert fake.checked == [("secret-token", True, None)]
-    assert blob == b""
-    assert header["plan"] == {"total_bytes": 100, "missing_bytes": 40, "missing_files": 2}
-    assert header["plan_error"] == ""
-    assert header["repos"]["black-forest-labs/FLUX.2-klein-9B"]["state"] == "ok"
-
-
-def test_download_check_passes_a_null_plan_and_its_error_through(monkeypatch: Any) -> None:
-    # A listing that failed after a successful auth probe must reach the client
-    # as "size unknown, here is why" — never as a zero-valued plan beside `ok`
-    # states, which renders as a completed installation on an empty machine.
-    _with_downloads(monkeypatch, _FakeDownloads(plan_fails=True))
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK)
-
-    header, _blob = handler(
-        _ctx(_FakeFlux2KleinService()), {"hf_token": "t"}, b"", _no_cancel()
-    )
-
-    assert header["plan"] is None
-    assert header["plan_error"] == "offline"
-    assert header["repos"]["black-forest-labs/FLUX.2-klein-9B"]["state"] == "ok"
-
-
-def test_download_check_accepts_an_absent_token_as_empty(monkeypatch: Any) -> None:
-    fake = _with_downloads(monkeypatch, _FakeDownloads())
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK)
-
-    handler(_ctx(_FakeFlux2KleinService()), {}, b"", _no_cancel())
-
-    assert fake.checked == [("", False, None)]
-
-
-def test_download_check_forwards_the_variant_verbatim(monkeypatch: Any) -> None:
-    # The handler must NOT re-derive the vocabulary: which variants exist, what
-    # an absent field defaults to and what an unknown name costs are the
-    # downloader's single answer (`resolve_variant`).
-    fake = _with_downloads(monkeypatch, _FakeDownloads())
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK)
-
-    for sent in ("9b", "  9B ", "nonsense", None):
-        header, _blob = handler(
-            _ctx(_FakeFlux2KleinService()),
-            {"hf_token": "t", "variant": sent} if sent is not None else {"hf_token": "t"},
-            b"",
-            _no_cancel(),
-        )
-        assert fake.checked[-1] == ("t", False, sent)
-        # The answer ECHOES the variant, so a client can tell a fresh answer
-        # from one computed for the variant it was showing a moment ago.
-        assert "variant" in header
-
-
-@pytest.mark.parametrize(
-    "method",
-    [METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK, METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START],
-)
-def test_the_retired_4b_variant_is_refused_by_the_real_downloader(method: str) -> None:
-    # Protocol 21: FLUX.2 klein 4B is downloaded by the application from its
-    # pinned model catalog, so the backend download refuses `variant: "4b"`.
-    # The REAL downloader module answers here (no fake): the refusal comes from
-    # `resolve_variant`, before any token check or network call, and reaches the
-    # client unchanged on both methods — with or without a token.
-    handler = get_handler(method)
-
-    for request in ({"variant": "4b"}, {"hf_token": "t", "variant": " 4B "}):
-        with pytest.raises(ValueError) as caught:
-            handler(_ctx(_FakeFlux2KleinService()), request, b"", _no_cancel())
-        assert "4B" in str(caught.value)
-        assert "приложением" in str(caught.value)
-
-
-def test_download_start_forwards_the_variant(monkeypatch: Any) -> None:
-    fake = _with_downloads(monkeypatch, _FakeDownloads())
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START)
-
-    handler(_ctx(_FakeFlux2KleinService()), {"hf_token": "t", "variant": "9b"}, b"", _no_cancel())
-    handler(_ctx(_FakeFlux2KleinService()), {"hf_token": "t"}, b"", _no_cancel())
-
-    assert fake.started == [("t", False, "9b"), ("t", False, None)]
-
-
-@pytest.mark.parametrize(
-    "method",
-    [METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK, METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START],
-)
-def test_a_variant_refusal_reaches_the_client_unchanged(monkeypatch: Any, method: str) -> None:
-    # `resolve_variant` / `require_uncensored_supported` raise `ValueError` with
-    # user-facing Russian text; both methods must let it through untouched
-    # rather than turning it into a generic failure.
-    refusal = ValueError("Вариант модели FLUX.2 klein не поддерживается")
-    fake = _with_downloads(monkeypatch, _FakeDownloads(fail=refusal))
-
-    def explode(*_args: Any, **_kwargs: Any) -> Any:
-        raise refusal
-
-    # `.check` raises from `check_access`, `.start` from `download` — the fake's
-    # `fail` already covers the second.
-    monkeypatch.setattr(fake, "check_access", explode)
-    handler = get_handler(method)
-
-    with pytest.raises(ValueError) as caught:
-        handler(
-            _ctx(_FakeFlux2KleinService()),
-            {"hf_token": "t", "uncensored": True, "variant": "nonsense"},
-            b"",
-            _no_cancel(),
-        )
-    assert "не поддерживается" in str(caught.value)
-
-
-def test_download_check_rejects_a_non_string_token(monkeypatch: Any) -> None:
-    _with_downloads(monkeypatch, _FakeDownloads())
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK)
-
-    with pytest.raises(ValueError):
-        handler(_ctx(_FakeFlux2KleinService()), {"hf_token": 42}, b"", _no_cancel())
-
-
-def test_download_start_streams_two_level_progress(monkeypatch: Any) -> None:
-    script = (
-        # A preparation frame legally omits the file level...
-        ("download", 0, 4096, "", {}),
-        # ...and a transfer frame carries all three extra fields.
-        (
-            "download",
-            1024,
-            4096,
-            "transformer/config.json",
-            {"file_step": 1024, "file_total": 2048, "file_label": "config.json"},
-        ),
-    )
-    fake = _with_downloads(monkeypatch, _FakeDownloads(script=script))
-    emitter, disp = _emitter()
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START)
-
-    header, blob = handler(
-        _ctx(_FakeFlux2KleinService(), emitter=emitter),
-        {"hf_token": "t", "uncensored": False},
-        b"",
-        _no_cancel(),
-    )
-
-    assert blob == b""
-    assert header["downloaded_bytes"] == 40
-    assert header["skipped_files"] == 2
-    assert set(header["paths"]) == {"transformer", "text_encoder", "vae"}
-
-    assert len(disp.frames) == 2
-    prepare, transfer = disp.frames
-    assert prepare[0][HEADER_KIND] == KIND_PROGRESS
-    assert prepare[0][HEADER_ID] == REQUEST_ID
-    assert prepare[1] == b""
-    # The optional level is OMITTED rather than sent as null.
-    assert "file_step" not in prepare[0]
-    assert "file_total" not in prepare[0]
-    assert "file_label" not in prepare[0]
-    # The four existing fields keep their meaning for a single-level consumer.
-    assert transfer[0]["phase"] == "download"
-    assert transfer[0]["step"] == 1024
-    assert transfer[0]["total"] == 4096
-    assert transfer[0]["label"] == "transformer/config.json"
-    assert transfer[0]["file_step"] == 1024
-    assert transfer[0]["file_total"] == 2048
-    assert transfer[0]["file_label"] == "config.json"
-
-
-def test_download_start_hands_the_cancel_event_into_the_work(monkeypatch: Any) -> None:
-    # Every other method of this group checks cancellation only before and after
-    # the call; this one must be able to stop a multi-gigabyte transfer, so the
-    # event itself travels into the downloader.
-    fake = _with_downloads(monkeypatch, _FakeDownloads())
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START)
-    cancel = threading.Event()
-
-    handler(_ctx(_FakeFlux2KleinService()), {"hf_token": "t"}, b"", cancel)
-
-    assert fake.cancel_probe is not None
-    assert fake.cancel_probe() is False
-    cancel.set()
-    assert fake.cancel_probe() is True
-
-
-def test_download_start_maps_its_cancellation_to_interrupted(monkeypatch: Any) -> None:
-    fake = _FakeDownloads()
-    fake.fail = _FakeDownloads.DownloadCanceled("canceled")
-    _with_downloads(monkeypatch, fake)
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START)
-
-    with pytest.raises(Interrupted):
-        handler(_ctx(_FakeFlux2KleinService()), {"hf_token": "t"}, b"", _no_cancel())
-
-
-def test_download_start_refuses_when_already_canceled(monkeypatch: Any) -> None:
-    fake = _with_downloads(monkeypatch, _FakeDownloads())
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START)
-    cancel = threading.Event()
-    cancel.set()
-
-    with pytest.raises(Interrupted):
-        handler(_ctx(_FakeFlux2KleinService()), {"hf_token": "t"}, b"", cancel)
-    assert fake.started == []
-
-
-@pytest.mark.parametrize("failure", [ValueError("нет токена"), RuntimeError("нет места")])
-def test_download_start_propagates_readable_refusals(monkeypatch: Any, failure: BaseException) -> None:
-    _with_downloads(monkeypatch, _FakeDownloads(fail=failure))
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START)
-
-    with pytest.raises(type(failure)):
-        handler(_ctx(_FakeFlux2KleinService()), {"hf_token": "t"}, b"", _no_cancel())
-
-
 def test_existing_four_argument_progress_callers_are_unchanged() -> None:
-    # The download's three extra fields are additive: a service that calls its
-    # progress callback with four positional arguments — every caller that
-    # existed before — must emit exactly the frame it always did.
+    # The byte level is additive: a service that calls its progress callback
+    # with four positional arguments must emit exactly the four-field frame.
     from modules.ai_backend.ipc.handlers.streaming import progress_forwarder
 
     emitter, disp = _emitter()
@@ -1184,14 +874,17 @@ def test_the_forwarder_sends_the_component_of_a_load_byte_level() -> None:
     assert frame_header["file_component"] == "text_encoder"
 
 
-def test_both_download_methods_are_registered() -> None:
-    assert get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK) is not None
-    assert get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START) is not None
+@pytest.mark.parametrize("method", ["inpaint.flux2_klein.download.check", "inpaint.flux2_klein.download.start"])
+def test_the_download_methods_are_gone(method: str) -> None:
+    # Protocol 22: the application's model catalog downloads every FLUX.2 klein
+    # weight; the dispatcher answers the old names as unknown methods.
+    assert get_handler(method) is None
+    assert method not in ALL_METHODS
 
 
 def test_a_dead_peer_is_logged_once_per_request_and_never_aborts_the_work(caplog: pytest.LogCaptureFixture) -> None:
     # Documented semantics: the work goes on (a disconnect does not cancel a
-    # run or a download), but the failure is no longer swallowed silently.
+    # run), but the failure is never swallowed silently.
     from modules.ai_backend.ipc.handlers.streaming import progress_forwarder
 
     class _DeadDispatcher:

@@ -79,16 +79,21 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   downloading / not downloaded). An EasyOCR language list easyocr refuses shows its localized
   error in red and blocks the load button.
 - `ocr_model_download.rs`: the shared external-model download block of one bundle (status line,
-  the last cancel / failure / verify / adoption notice, Download / Resume button, "Verify files" once
+  the last cancel / failure / verify / adoption notice, Download / "download the rest" button priced at the bytes still missing, "Verify files" once
   installed (`ModelDownloadAction::Verify`, the repair path for a same-size corruption), `ProgressBar` with file N of M and
   byte counters over the bundle, the automatic-retry countdown or "checking files found on disk"
   during an automatic adoption, Cancel; while ANOTHER bundle downloads, verifies or adopts, a line
-  naming it with its progress over a disabled Download button). The pure
+  naming it with its progress over a disabled Download button; one line per gated Hugging Face
+  repository that is not granted — reason from `ocr_model_download::access_status_key`, plus a
+  link that opens the repository page (`ms_widgets::hf_access_hint::hf_repo_url`) through
+  `ms_platform::shell_open::open_url`, a failure shown under it from egui temp data; a refused
+  download's repository comes first, with the access map's answer when it has one (never older
+  than the notice); the button stays enabled). The pure
   `download_block_view` maps `OcrModelPanelSnapshot` -> what is shown; button captions come from
   `crate::ocr_model_download::offered_download_label` (shared with the "not downloaded" errors);
-  `external_model_display_name` names every catalog spec (the FLUX.2 klein 4B parts through the
-  catalog's `flux2_klein_spec` over `Flux2WeightFormat::offered_for`, a GGUF part with its
-  `{quant}` token; a test walks `all_specs()`). `pub` items (`draw_ocr_model_download`,
+  `external_model_display_name` names every catalog spec (the FLUX.2 klein parts of both variants
+  through the catalog's reverse lookup `flux2_klein_spec_role`, with `{variant}` and a GGUF
+  part's `{quant}` / an unquantized encoder's `{dtype}`; tests walk `all_specs()`). `pub` items (`draw_ocr_model_download`,
   `load_blocked_reason`, `ModelDownloadAction`): the OCR and detector panels here and the
   Cleaning tab's SDXL engine draw it. The detector panel draws it for
   `text_detector::SURYA_DETECTOR_SPECS` while Surya is selected

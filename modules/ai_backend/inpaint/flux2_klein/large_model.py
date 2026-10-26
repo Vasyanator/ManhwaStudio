@@ -525,7 +525,8 @@ def require_loadable_encoder(normalized: dict[str, Any]) -> None:
     A GGUF file (`_require_loadable_gguf_encoder`) must not come with
     `text_encoder_fp8` (D8), must be a `qwen3` GGUF deep enough, hold only
     dequantizable types and Qwen3 tensor names, and have a consistent
-    `config.json` (beside it or in the installed 4B package).
+    `config.json` (beside it or in an installed klein package), and a RoPE
+    the loader can express (`components.text_encoder_config_kwargs`).
 
     # Raises
     `ValueError` / `FileNotFoundError` naming the folder or file (and, for a
@@ -538,7 +539,7 @@ def require_loadable_encoder(normalized: dict[str, Any]) -> None:
     encoder_dir = components.component_dir_for_path(source)
     if not encoder_dir.is_dir():
         raise ValueError(f"Путь текстового энкодера должен быть каталогом в формате transformers: {encoder_dir}")
-    components.text_encoder_truncation_kwargs(encoder_dir, components.ENCODER_KEEP_LAYERS)
+    components.text_encoder_config_kwargs(encoder_dir, components.ENCODER_KEEP_LAYERS)
 
 
 def _require_loadable_gguf_encoder(source: Path, *, fp8: bool) -> None:
@@ -571,7 +572,7 @@ def _require_loadable_gguf_encoder(source: Path, *, fp8: bool) -> None:
         )
     _require_dequantizable_gguf(layout.spans, source=source, component="Текстовый энкодер")
     encoder_gguf.require_known_encoder_names([span.name for span in layout.spans], keep, source=source)
-    components.text_encoder_truncation_kwargs(components.find_text_encoder_config_dir(source), keep)
+    components.text_encoder_config_kwargs(components.find_text_encoder_config_dir(source), keep)
 
 
 # =====================================================================
@@ -836,9 +837,11 @@ def _make_build_encoder_meta(fp8: bool) -> Any:
         # Raises
         `ValueError` for an encoder shallower than the pipeline reads, or a
         config that does not say how deep it is (a whole-model load would
-        not match the truncated key set), a torch without float8, fp8 asked
-        for a GGUF file (D8), or a quantized tensor naming no linear /
-        embedding; `FileNotFoundError` for a GGUF file without a config.
+        not match the truncated key set), a RoPE the config kwargs refuse
+        (`components.text_encoder_config_kwargs`), a torch without float8,
+        fp8 asked for a GGUF file (D8), or a quantized tensor naming no
+        linear / embedding; `FileNotFoundError` for a GGUF file without a
+        config.
         """
         import torch
         from accelerate import init_empty_weights
@@ -850,7 +853,7 @@ def _make_build_encoder_meta(fp8: bool) -> Any:
             raise ValueError(_fp8_gguf_message(path))
         folder = components.text_encoder_config_dir(path)
         keep = components.ENCODER_KEEP_LAYERS
-        kwargs = components.text_encoder_truncation_kwargs(folder, keep)
+        kwargs = components.text_encoder_config_kwargs(folder, keep)
         config = Qwen3Config.from_pretrained(str(folder), local_files_only=True, **kwargs)
         if int(config.num_hidden_layers) != keep:
             raise ValueError(f"Текстовый энкодер {folder}: в config.json {config.num_hidden_layers} слоёв, а модель грузится урезанной до {keep}; укажите энкодер FLUX.2 klein.")

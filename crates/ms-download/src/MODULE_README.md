@@ -39,7 +39,7 @@ download per id" busy guard. It is the mechanism the project's network-download 
   key is free (cancellable); `dest_key(dest)` names a destination file.
 - `test_support.rs` (`cfg(test)` or feature `test-support`): `ScriptedFetcher` + `Step`, a
   single-body in-memory server that replays drops, short bodies, statuses and size
-  announcements.
+  announcements and records the requested offsets and URLs.
 - Consumers own the worker thread, the URL, the `.part` and destination paths, the pins,
   markers and user-facing text. They verify and publish through `fetch_verified` /
   `zip_member_atomic` (e.g. `ms_sysprobe::ai_models::external` with size + sha256 pins and
@@ -78,7 +78,9 @@ download per id" busy guard. It is the mechanism the project's network-download 
 - A 206 must start exactly at the requested offset (`UreqFetcher` checks `Content-Range`);
   a 200 to a range request restarts the file and resets the caller's hasher.
 - The bearer token is only a request header: never logged; `UreqFetcher` sends it to the
-  first hop only and keeps `Range` and the extra headers on every hop.
+  first hop and to later hops on the first request's own origin (`bearer_allowed`: equal
+  scheme + authority, e.g. Hugging Face's same-host resolve-cache redirect), never to another
+  host (CDN), and keeps `Range` and the extra headers on every hop.
 - Resume identity: `RemoteIdentity::lfs_sha256` is read ONLY from `X-Linked-Etag` (64 hex);
   a plain `ETag` is a version tag, never a hash. A server that sends no tag at all resumes
   without binding (as before); a `.part` without a recorded identity restarts once the
@@ -103,6 +105,12 @@ download per id" busy guard. It is the mechanism the project's network-download 
 - Errors are typed (`FetchError`, `StreamError`, `Busy`, `DownloadError`) with English
   diagnostic details and no secrets (`FetcherConfig`'s `Debug` redacts the token and header
   values); consumers map them to their own errors and localized text.
+- HTTP status of a permanent failure: `FetchError::Permanent`, `StreamError::Http` and
+  `DownloadError::Http` carry `status: Option<u16>` — `Some(code)` when the failure IS an HTTP
+  answer (set by `classify_status`, an unexpected status, a 3xx without `Location`, a pinned
+  416), `None` for transport and protocol failures, exhausted retries (transient answers keep
+  no status) and an unannounced size. Consumers branch on it (e.g. 401 / 403 -> an access
+  refusal) instead of parsing `detail`.
 - Tests never touch the network: a scripted `RangeFetcher` plus an injected sleep.
 
 ## Editing map

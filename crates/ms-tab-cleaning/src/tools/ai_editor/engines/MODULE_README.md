@@ -27,8 +27,8 @@ Adding an engine is a module plus one line in `all_engines`. The picker's two se
 ONE MODULE MAY CONTRIBUTE SEVERAL ENTRIES when the difference between them is a parameter and not
 an implementation. `flux2_klein/` contributes one per `config::Flux2Variant` — FLUX.2 klein 9B and
 FLUX.2 klein 4B — and the variant keys the engine id, the picker caption, the settings FILE, the
-model directory and the download owner (the backend's `.download.*` pair for 9B, the Rust model
-catalog for 4B). Duplicating the module
+model directory and the catalog bundle the app downloads for it (both variants come from the Rust
+model catalog). Duplicating the module
 for a second checkpoint is the wrong answer; parameterizing it is the pattern.
 
 THE OPPOSITE SHAPE IS ALSO CORRECT, and `lama/` and `sdxl/` are it: ONE picker entry offering four
@@ -65,7 +65,7 @@ functions with unit tests, not conditionals inside the drawing code.
   `MODULE_README.md` is the map of the split and is where to look before editing it (IPC methods
   `inpaint.flux2_klein` streaming,
   `.status`, `.unload`, `.component_action` streaming, the six
-  `.prompt_cache.*` methods, and the two `.download.*` methods). The user paints the
+  `.prompt_cache.*` methods; the model download is the app's catalog, not a backend method). The user paints the
   area the model is ALLOWED to change, writes a prompt and gets that area regenerated; everything
   outside the painted mask must survive untouched, which is why the engine declares exactly ONE
   mask layer and puts its bytes on the wire verbatim. Leaving that layer EMPTY is the other
@@ -428,104 +428,60 @@ functions with unit tests, not conditionals inside the drawing code.
     use"**, and every consumer goes through it — the wire `params`, the run gate, the
     prompt-cache gates, the read-only paths the download body shows. Two places computing it
     is how the two modes drift apart.
-  - **In download mode the three paths are DERIVED** from `config::flux2_klein_dir(variant)` and
-    the encoder toggle, and **the manual fields are never read and never written**. A finished
-    download therefore does NOT write its answer into the settings: the manual fields hold a
-    configuration the user switches back to, so writing over them would destroy it. The answered
-    paths are kept only to LOG drift between the two halves. Derivation is what configures the
-    engine, continuously rather than once at the end of a download.
-  - For a variant whose package is pinned in the Rust catalog (`downloads_from_catalog`: 4B),
-    the transformer and encoder paths also follow the persisted weight formats
-    (`transformer_format` / `text_encoder_format`, `ms_config::Flux2WeightFormat`) through
-    `external_catalog::flux2_klein_weights_path`: bf16 is the same folder as before, a GGUF
-    quant is the `.gguf` file under `transformer_gguf/` / `text_encoder_gguf/`. See
+  - **In download mode the three paths are DERIVED** under `config::flux2_klein_dir(variant)`
+    from the encoder source and the persisted weight formats (`transformer_format` /
+    `text_encoder_format`, `ms_config::Flux2WeightFormat`) through
+    `external_catalog::flux2_klein_weights_path`, and **the manual fields are never read and
+    never written**. A finished download therefore writes nothing into the settings: the manual
+    fields hold a configuration the user switches back to. Derivation is what configures the
+    engine, continuously rather than once at the end of a download. See
     `flux2_klein/MODULE_README.md`.
-  - The derived encoder is a SIBLING of the downloaded `tokenizer/` and `scheduler/` under the
-    VARIANT's own root (`FLUX.2-klein-9B/` or `FLUX.2-klein-4B/`), which is what the backend needs: `component_search_roots` probes each
-    supplied path AND ITS PARENT, so the repo root is reached from any of the three and both
-    `text_encoder/` and `text_encoder_uncensored/` resolve the tokenizer (verified against
-    `modules/ai_backend/inpaint/flux2_klein.py`, hit at probe position 2 of 8 for both).
-  - The uncensored toggle belongs to the download body alone. In manual mode it is meaningless
-    — the user simply points at whichever encoder he wants — and it is drawn only for a variant
-    that HAS an uncensored encoder published for it (`supports_uncensored_encoder`, true for 9B
-    only). `normalized()` forces the flag off for the other one, so the pairing the backend
-    refuses cannot reach a path or the wire even from a hand-edited settings file.
-- FLUX.2 klein 9B DOWNLOADS ITS OWN MODEL from Hugging Face, in the download mode of that switch:
-  `.download.check` (one-shot) and `.download.start` (streaming). The pinned wire contract is
-  `dev-docs/flux2_model_download.md`. FLUX.2 klein 4B (`downloads_from_catalog`) does NOT use
-  that pair: its package and GGUF quants come from the app's pinned model catalog
-  (`ms_sysprobe::ai_models::external_catalog`, the catalog download controller), the backend
-  refuses `variant: "4b"` since protocol 21, and the engine refuses to send it locally. What this
-  side owns for 9B:
-  - **The token is NOT this engine's.** It is the process-wide `crate::hf_token` global, kept in
-    the OS secret store under `"ManhwaStudio Hugging Face"`, seeded at startup. This engine is its
-    first UI surface, not its owner: the token is never a `Flux2KleinSettings` field, never reaches
-    a settings JSON, and never appears in a log line or an error message — it travels as the
-    per-call `hf_token` request field and nowhere else. The badge is TRI-state: "not read yet" is
-    distinct from "not stored" and is never rendered as it.
-  - **Six access verdicts, three of them with a link, and that IS the feature.** `no_token` and
-    `invalid_token` link to the token settings page, `not_accepted` to that repository's own page;
-    `ok`, `not_found` and `network_error` offer none. Every row also carries the backend's own
-    `message`, shown on hover and logged — the technical half, because `network_error` has no
-    localizable content. A literal this build does not know degrades to "not known" with the
-    literal on hover and NO link, exactly as the residency block does.
-  - **The «Расцензуренный энкодер» toggle is a normal persisted setting**
-    (`uncensored_text_encoder`), never a global and never inside `params`: the download methods
-    carry it as their own top-level `uncensored` field. It selects which encoder is fetched AND
-    repoints `text_encoder_path` — but only when that path is empty or names the OTHER managed
-    directory OF THE SAME VARIANT (`config::flux2_klein_text_encoder_dir`), so a hand-picked
-    encoder, and the other engine's directory, both survive a flip.
-  - **The two `.download.*` methods carry a `variant`** (`"9b"`, also the default when absent;
-    `"4b"` is refused by the backend since protocol 21), and `check` ECHOES it back — which is why the staleness rule is
-    `download_check_matches_selection` over the toggle AND the variant, so an answer about the
-    other checkpoint stops being shown instead of pricing the wrong download. Every OTHER method
-    is unchanged: they are already keyed by the three component paths, and the prompt-cache
-    family is fingerprinted backend-side from the encoder, so 4B gets its own family for free.
+  - **Two axes per package: the encoder SOURCE and the weight FORMAT.** The source
+    (`ms_config::Flux2EncoderSource`: `Stock` / `Uncensored`) is persisted as the historic
+    `uncensored_text_encoder` bool and read through `encoder_source`; only 9B offers
+    `Uncensored` (the gated `ponpoke` encoder, whose formats lack `Q5_K_M`), so the
+    «Расцензуренный энкодер» toggle is drawn only there and the flag is inert for 4B
+    (`normalized()` sends it off). A switch maps the stored encoder format with
+    `closest_offered` and says so in one line. Each component is bf16 (a folder or a single
+    file) or a GGUF quant (`transformer_gguf/`, `text_encoder_gguf/`,
+    `text_encoder_uncensored_gguf/` under the package root).
+  - **The 9B bf16 transformer has two on-disk layouts** (`Flux2TransformerLayout`): `Primary`,
+    the BFL single file at the package root and the only one ever downloaded, and
+    `LegacyDiffusers`, the diffusers `transformer/` folder the backend's former download wrote —
+    ADOPT-ONLY, used when the worker probe (`flux2_klein_transformer_layout`, runtime
+    `installed_formats.transformer_layout`) finds it installed or adoptable, so an existing
+    install is used rather than refetched. 4B has only `Primary` (its diffusers folder).
+  - The derived components sit under the VARIANT's own root (`FLUX.2-klein-9B/` or
+    `FLUX.2-klein-4B/`), beside the catalog's `tokenizer/` and `scheduler/`; the backend
+    discovers those next to the supplied paths and, for a GGUF component, in the installed
+    klein packages (`modules/ai_backend/inpaint/MODULE_README.md`).
+- **Both FLUX.2 klein variants download through the app's model catalog**
+  (`ms_sysprobe::ai_models::external_catalog`, `flux2_klein_package_specs`); the backend's
+  `.download.*` pair was retired at protocol 22 and the backend fetches no FLUX.2 file. What
+  this side owns:
+  - **The engine holds an `OcrModelDownloadController`** (`ms_tab_translation::ocr_model_download`)
+    and polls it from `AiEngine::poll`: it probes the bundle of the SELECTED variant, source and
+    formats (`flux2_catalog_bundle`), runs the download / verify job and automatically adopts
+    unmarked files already on disk (the former backend download included). The panel draws the
+    bundle through the shared `draw_ocr_model_download`
+    (`ms_tab_translation::panels::ocr_model_download`), which shows the catalog progress and,
+    for a gated source, one Hugging Face access line per repository, checked in Rust
+    (`ms_sysprobe::ai_models::hf_access`) before any transfer. The end of a job re-probes the
+    installed formats and re-asks `.status`, the forecast and the prompt-cache listing.
+  - **The token is NOT this engine's.** It is the process-wide `ms_sysprobe::hf_token` global,
+    kept in the OS secret store and seeded at startup; this panel only edits it through the
+    shared token row (`shared/`, `HfTokenControl`), drawn while a gated spec of the bundle is
+    not installed (`flux2_gated_repos_missing`: 9B's BFL repository and the uncensored
+    encoder; 4B's repositories are open). It is never a `Flux2KleinSettings` field, never
+    reaches a settings JSON or the backend, and never appears in a log line.
+  - **The catalog download does not claim the engine's progress bar**: it has its own
+    progress in its block, and `flux2_pipeline_busy` spans the three backend operations (a
+    generation, a prompt-cache build, a component action). A running catalog job blocks the
+    engine picker (`flux2_catalog_switch_block_reason`).
   - **Only ONE variant is resident at a time.** The backend keeps one pipeline and one text
     encoder, keyed by the component paths, so selecting the other engine unloads the previous
     model. This side orchestrates nothing and only says so, in one line at the top of
     «Установка модели» (`variant_residency_hint`).
-  - **The 4B repository is UNGATED** (apache-2.0), so its download block draws no token row and
-    says so in one line instead; the gating hint above it is drawn only for a gated variant.
-  - **The download claims the shared progress bar**, so `flux2_pipeline_busy` now spans FOUR
-    operations. `run_block_reason` and `start` read `non_run_pipeline_busy` — the same rule with
-    the generation taken out, so a run cannot report itself as the reason it cannot start while a
-    prompt-cache build, a component action or a download genuinely blocks the next one.
-  - **Two progress levels.** `step`/`total` stay the OVERALL counter (bytes across the whole plan),
-    which is what keeps every existing single-level consumer correct; `file_step`/`file_total`/
-    `file_label` are OPTIONAL and describe the file in flight. A frame without them renders the
-    overall bar alone — never a second bar frozen at zero — and a `file_total` of zero renders an
-    indeterminate bar rather than dividing.
-  - **`plan` is NULLABLE, and an absent plan alone decides that NO size and NO completion
-    state may be drawn** — whatever the repository states say. The backend sends `null` for
-    all three of "no token", "a repository is inaccessible" and "the file listing failed",
-    because a zero-valued plan is the same lie in every one of them: it reads as "nothing
-    left to download", and was observed rendering a complete installation on an empty
-    machine. Access and listing are two different network operations, so every row can read
-    `ok` with no plan behind it; the rows then stay `ok` (authentication really did succeed)
-    and `plan_error` carries the reason. `plan_error` is non-empty exactly when the rows
-    cannot explain the gap — it is shown on hover beside a localized line, the way a repo
-    `message` is — and empty otherwise, when no extra line is synthesised at all. That case
-    keeps «Скачать» OPEN, because pressing it re-lists. The four-way decision is the pure
-    `hf_download_readiness` (`shared/hf_download.rs`), and `Complete` is reachable only through
-    a plan that was actually computed.
-  - **Speed and remaining time are DERIVED on this side, with no wire field for either.**
-    `RateEstimator` (`shared/stream_progress.rs`) averages the OVERALL byte counter over a five-second wall-clock
-    window — a time window and not a frame count, because the backend's two throttles (~10
-    frames/s AND >= 4 MB apart) make the frame cadence depend on the line speed. It is never
-    fed the per-file counter, which resets at every file boundary. Nothing is reported until
-    the window spans `RATE_MIN_SPAN`, so a transfer shows no estimate at its start
-    rather than a wrong one, and a stalled or finished counter reports no rate rather than
-    zero or infinity. A BACKWARDS step discards the window and restarts it: a resumed file
-    whose length check fails is refetched from zero, so the overall counter really does move
-    backwards once per such file (`ipc/PROTOCOL.md`, `download.start`); averaging across that
-    seam would report a rate that never happened. The numbers are cleared by
-    `begin_progress_generation` and drawn only while the bar is active and the phase is
-    `download`, so they never sit frozen beside an idle bar.
-  - **A finished download writes nothing into the settings**: in download mode the effective
-    paths are derived from the models directory (`Flux2KleinSettings::effective_paths`), so the
-    manual-mode paths the user set by hand survive; an answer path that differs from the derived
-    one is logged as a layout drift between the two halves.
 - Every `t!` key of FLUX.3 klein lives under `cleaning.tools.flux3_klein.*` (stage names
   `cleaning.tools.flux3_klein.stage_<id>`).
 - Every `t!` key of FLUX.2 klein lives under `cleaning.tools.flux2_klein.*` (its own download
@@ -562,9 +518,14 @@ functions with unit tests, not conditionals inside the drawing code.
   the five bodies under it are `draw_prompt`, `draw_strength`, `draw_readiness`,
   `draw_install_section`, `draw_memory_section` and `draw_advanced_section`.
 - To change where the Hugging Face token is stored or to add a SECOND UI surface for it:
-  `ms_sysprobe::hf_token`, never here — this engine only reads the global and puts it on the wire.
-- To change where the downloaded model lands: `config::flux2_klein_dir` /
-  `config::flux2_klein_text_encoder_dir`, together with the Python half's own manifest.
+  `ms_sysprobe::hf_token`, never here — this engine only edits the global through the shared token
+  row; the catalog download controller reads it for the gated repositories.
+- To change where the downloaded model lands, which files a variant / source / format needs or
+  which 9B transformer layout is used: `ms_sysprobe::ai_models::external_catalog::flux2_klein`
+  (`flux2_klein_package_specs`, `flux2_klein_weights_path`, `flux2_klein_transformer_layout`) over
+  `config::flux2_klein_dir` / `Flux2Variant::dir_name`, together with the backend's
+  `KLEIN_PACKAGE_DIR_NAMES` (`modules/ai_backend/inpaint/flux2_klein/components.py`, drift-guarded
+  by a Rust test).
 - To change its size contract: `Flux2KleinEngine::frame_constraints` AND `region_block_reason`
   together — the test that compares them will fail otherwise.
 - To change which LaMa checkpoints are offered, which backend method one runs, or whether it can

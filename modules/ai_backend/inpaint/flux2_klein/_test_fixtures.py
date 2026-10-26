@@ -31,9 +31,15 @@ Key declarations:
   or `None` for no manifest at all, to build an undeclared checkpoint.
 - `_TempTreeCase` - a `TestCase` with a complete model tree in a temp directory
   (`real_weights = True` in a subclass for the tiny real models); it points
-  `components.installed_4b_package_root` at an absent `self.installed_package`
-  under that directory, so the GGUF package fallback never sees the machine's
-  real `side_models/`.
+  `components.installed_klein_package_roots` at `<tmp>/_installed/`, where
+  the packages `self.installed_package` (4B) and `self.installed_package_9b`
+  are absent until a test creates them, so the GGUF package fallback never
+  sees the machine's real `side_models/`.
+- `FIXTURES_DIR`, `load_9b_header_fixture`, `load_9b_config` and
+  `write_header_only_gguf` - the recorded FLUX.2 klein 9B GGUF headers and
+  configs (`fixtures/flux2_9b_*.json`, no tensor data) and a stdlib writer that
+  turns one recorded header into a header-only GGUF file (a header view
+  needs no tensor bytes: `runtime.tensor_container`).
 - `_FakeEmbeds` - a prompt-embedding stand-in for the library tests.
 - `_ManagedRunFixture` (+ `_RoomyProbes`, `_FakeRunPipeline`, `_ImageProcessor`,
   `_flat_tables`) - real manager, arbiter, small pool, torch and model classes;
@@ -447,6 +453,80 @@ def _write_qwen3_gguf_encoder(path: Path, *, quant: str = "Q8_0", config: dict[s
     return reference
 
 
+#: The package's recorded fixtures (`forecast_golden.json`, the 9B headers and configs).
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+
+#: Recorded GGUF headers of the FLUX.2 klein 9B files (no tensor data):
+#: `files[<key>]` holds `metadata`, `tensor_count`, `type_histogram` and, for
+#: `f9_Q4_K_M.head` (the unsloth 9B transformer) and `unc_q8.head` (the
+#: uncensored encoder), `tensors` = `[name, GGUF dims (innermost first), ggml type]`.
+NINE_B_HEADERS_FILE = FIXTURES_DIR / "flux2_9b_gguf_headers.json"
+
+
+def load_9b_header_fixture(key: str) -> dict[str, object]:
+    """One recorded 9B GGUF header (`NINE_B_HEADERS_FILE`), e.g. `"f9_Q4_K_M.head"` or `"unc_q8.head"`."""
+    files = json.loads(NINE_B_HEADERS_FILE.read_text(encoding="utf-8"))["files"]
+    return files[key]
+
+
+def load_9b_config(name: str) -> dict[str, object]:
+    """A recorded 9B `config.json`: `name` is `transformer`, `text_encoder` or `uncensored_text_encoder` (`fixtures/flux2_9b_<name>_config.json`)."""
+    return json.loads((FIXTURES_DIR / f"flux2_9b_{name}_config.json").read_text(encoding="utf-8"))
+
+
+#: GGUF metadata value type ids (the GGUF spec's `gguf_type`).
+_GGUF_UINT32, _GGUF_INT64, _GGUF_FLOAT32, _GGUF_BOOL, _GGUF_STRING = 4, 11, 6, 7, 8
+
+#: Default GGUF data alignment (no `general.alignment` key is written).
+_GGUF_ALIGNMENT = 32
+
+
+def write_header_only_gguf(path: Path, metadata: dict[str, object], tensors: list[list[object]]) -> Path:
+    """Write a GGUF v3 file at `path` holding only the header: `metadata` scalars and `tensors` infos (`[name, GGUF dims, ggml type]`).
+
+    Offsets are laid out back to back at the default alignment from each
+    tensor's true byte size, so the header is exactly what a real file of that
+    layout declares; the data section is absent (a header view never reads
+    it). Integers are written as u32 when they fit, else i64; floats as f32.
+    Needs the `gguf` package (block sizes). Parents are created.
+    """
+    from gguf.constants import GGML_QUANT_SIZES, GGMLQuantizationType
+
+    def string(value: str) -> bytes:
+        raw = value.encode("utf-8")
+        return struct.pack("<Q", len(raw)) + raw
+
+    def value_bytes(value: object) -> bytes:
+        if isinstance(value, bool):
+            return struct.pack("<I?", _GGUF_BOOL, value)
+        if isinstance(value, int):
+            return struct.pack("<II", _GGUF_UINT32, value) if 0 <= value < 2**32 else struct.pack("<Iq", _GGUF_INT64, value)
+        if isinstance(value, float):
+            return struct.pack("<If", _GGUF_FLOAT32, value)
+        if isinstance(value, str):
+            return struct.pack("<I", _GGUF_STRING) + string(value)
+        raise TypeError(f"unsupported GGUF metadata value {value!r}")
+
+    out = bytearray(b"GGUF")
+    out += struct.pack("<IQQ", 3, len(tensors), len(metadata))
+    for key, value in metadata.items():
+        out += string(key) + value_bytes(value)
+    offset = 0
+    for name, dims, type_id in tensors:
+        assert isinstance(name, str) and isinstance(dims, list) and isinstance(type_id, int)
+        block_size, type_size = GGML_QUANT_SIZES[GGMLQuantizationType(type_id)]
+        rows = 1
+        for dim in dims[1:]:
+            rows *= int(dim)
+        nbytes = rows * (int(dims[0]) // block_size) * type_size
+        out += string(name) + struct.pack("<I", len(dims)) + b"".join(struct.pack("<Q", int(dim)) for dim in dims) + struct.pack("<IQ", type_id, offset)
+        offset += -(-nbytes // _GGUF_ALIGNMENT) * _GGUF_ALIGNMENT
+    out += bytes(-len(out) % _GGUF_ALIGNMENT)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(out))
+    return path
+
+
 def _write_safetensors(path: Path, header: dict[str, object]) -> None:
     """Write a safetensors container carrying only `header` (no tensor bytes)."""
     payload = json.dumps(header).encode("utf-8")
@@ -476,10 +556,13 @@ class _TempTreeCase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
-        # The installed 4B package a GGUF component falls back to: absent unless
-        # a test creates it, so no test sees the real `side_models/` of the machine.
-        self.installed_package = self.root / "_installed" / components.FLUX2_KLEIN_4B_DIR_NAME
-        package_patch = patch.object(components, "installed_4b_package_root", lambda: self.installed_package)
+        # The installed klein packages a GGUF component falls back to: absent
+        # unless a test creates them (the existence filter runs at call time),
+        # so no test sees the real `side_models/` of the machine.
+        installed = self.root / "_installed"
+        self.installed_package = installed / components.KLEIN_PACKAGE_DIR_NAMES[0]
+        self.installed_package_9b = installed / components.KLEIN_PACKAGE_DIR_NAMES[1]
+        package_patch = patch.object(components, "installed_klein_package_roots", lambda: components.existing_klein_package_roots(installed))
         package_patch.start()
         self.addCleanup(package_patch.stop)
         self.paths = _make_model_tree(

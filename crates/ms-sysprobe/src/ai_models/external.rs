@@ -13,7 +13,8 @@ Key items:
   its `DirLayout` and the file allowlist.
 - `ExternalFile` + `FileOrigin`: one pinned file (exact size + lowercase sha256), fetched
   directly or extracted from a pinned zip archive (`ZipMember`).
-- `external_model_status()` / `installed_dir()`: stat-only probes (no hashing, no network).
+- `external_model_status()` / `installed_dir()`: stat-only probes (no hashing, no network);
+  an unmarked directory holding some of the files at their pinned size reads `Partial`.
 - `verify_external_model()` + `VerifyReport`: the repair path — hash every file against its
   pin, delete mismatching ones and the markers of every spec listing them.
 - `unmarked_files_present()` + `adopt_external_model()`: ADOPTION of a model whose files are
@@ -23,10 +24,14 @@ Key items:
   network, nothing deleted.
 - `download_external_model()`: blocking download with byte progress, cancel, resume,
   automatic retry of transient network failures, size + sha256 verification, atomic
-  per-file publish and a completion marker.
-- `download_with()`: the testable core with an injected `RangeFetcher` and `RetryPolicy`
-  (injected backoff sleep). One file is fetched and published by
-  `ms_download::fetch_verified`, an archive member extracted by
+  per-file publish and a completion marker. A `gated` Hugging Face spec is access-checked
+  (`hf_access`) before its first transfer; a definite refusal (preflight, or a 401 / 403 of a
+  gated spec mid-transfer) is the typed `ExternalModelError::AccessDenied`.
+- `ExternalModelSpec::gated_repo()`: the one owner of "which gated repository does this spec
+  download from" (the preflight, the download controller and the FLUX.2 klein panel ask it).
+- `download_with()`: the testable core with an injected `RangeFetcher`, `RetryPolicy`
+  (injected backoff sleep) and `RemoteSource` (file URLs, token presence, access probe).
+  One file is fetched and published by `ms_download::fetch_verified`, an archive member extracted by
   `ms_download::unpack::zip_member_atomic`; this file adds the pins, the staging layout and
   the markers.
 - `ExternalModelError`: typed errors; `Display` is English diagnostic text for logs, the UI
@@ -51,7 +56,13 @@ Notes:
 - No implicit download anywhere: `installed_dir` only reports.
 - Hugging Face URLs come from `hf_url::hf_resolve_url` (`HF_ENDPOINT` honoured, no home
   directory needed); the HF token is sent as a bearer header to the first hop of a Hugging
-  Face request only and is never logged. `Url`-source requests carry no token at all.
+  Face request and to same-origin redirect hops only (`ms_download`'s rule), never logged. `Url`-source requests carry no token at all.
+- Gated-access preflight: only for a `gated` Hugging Face spec, only when some file is not
+  already at its exact size (a complete install, adoption and re-verify stay offline), under
+  the spec's busy guard and BEFORE the staging directory is touched, with the download's
+  cancel flag; a definite refusal (`HfAccess::refuses_download`) ends the download with
+  `AccessDenied`. `Unreachable` proceeds: the transfer has the full retry policy and maps a
+  real 401 / 403 itself.
 - A Shared directory never deletes stale files: a file there may belong to another spec.
 - Retry: a TRANSIENT failure (connect / DNS / reset / read timeout, a body that ends before
   the pinned size, HTTP 408 / 429 / 5xx) is retried with exponential backoff, resuming the
@@ -73,6 +84,9 @@ use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Serialize};
 
+use super::hf_access::HfAccess;
+#[cfg(not(target_arch = "wasm32"))]
+use super::hf_access::{access_from_status, hf_repo_access};
 #[cfg(not(target_arch = "wasm32"))]
 use super::hf_url::{hf_resolve_url, url_source_file_url};
 #[cfg(not(target_arch = "wasm32"))]
@@ -118,6 +132,10 @@ pub enum ExternalSource {
         repo_id: &'static str,
         /// Pinned commit: 40 lowercase hex characters, never a branch name.
         revision: &'static str,
+        /// The repository is gated (licence terms to accept, token required): a download runs
+        /// the `hf_access` preflight first and the UI shows the token row and access lines.
+        /// Catalog data only; never part of the completion marker.
+        gated: bool,
     },
     /// A plain HTTPS location (a GitHub release, a model host); a file is fetched from
     /// `<base_url>/<remote path>` without any token. The pins are what make it immutable.
@@ -229,6 +247,17 @@ impl ExternalModelSpec {
         join_relative(side_models_root, self.dir)
     }
 
+    /// The repository of a `gated` Hugging Face source (`owner/name`); `None` for an ungated
+    /// Hugging Face source and for a `Url` source. The one owner of this question: download
+    /// gates, access lines and token rows all ask it.
+    #[must_use]
+    pub fn gated_repo(&self) -> Option<&'static str> {
+        match self.source {
+            ExternalSource::HuggingFace { repo_id, gated: true, .. } => Some(repo_id),
+            ExternalSource::HuggingFace { gated: false, .. } | ExternalSource::Url { .. } => None,
+        }
+    }
+
     /// The completion marker of this spec (see [`DirLayout`]).
     fn marker_path(&self, side_models_root: &Path) -> PathBuf {
         let dir = self.local_dir(side_models_root);
@@ -253,11 +282,16 @@ impl ExternalModelSpec {
 pub enum ExternalModelStatus {
     /// The completion marker matches this spec and every file has its exact size.
     Installed,
-    /// A download of THIS spec was started and not finished; `bytes_present` counts, in
+    /// Part of this spec is on disk, a download fetches only the rest. Either a download of
+    /// THIS spec was started and not finished — `bytes_present` counts, in
     /// [`ExternalModelSpec::total_bytes`] units, published files of exact size plus staged
-    /// prefixes and verified archives (capped per file).
+    /// prefixes and verified archives (capped per file) — or the spec has no completion
+    /// marker at all and some, not all, of its files are at their exact pinned size —
+    /// `bytes_present` counts those files (stat-only: their hashes are checked by the download).
     Partial { bytes_present: u64 },
-    /// Nothing usable for this spec (including an install of a different pin).
+    /// Nothing usable for this spec (including an install of a different pin), or every file
+    /// present at its exact size without any marker (an adoption candidate,
+    /// [`unmarked_files_present`]).
     Missing,
 }
 
@@ -344,6 +378,11 @@ pub enum ExternalModelError {
     /// Downloading is not available on this build target (web).
     #[error("external model download is not supported on this platform")]
     Unsupported,
+    /// The gated Hugging Face repository `repo_id` refused this installation (`access` is a
+    /// definite refusal, [`HfAccess::refuses_download`]): from the preflight (nothing staged or
+    /// touched) or from a 401 / 403 during a transfer (staged `.part` files kept for resume).
+    #[error("access to Hugging Face repository '{repo_id}' was refused: {access}")]
+    AccessDenied { repo_id: &'static str, access: HfAccess },
 }
 
 /// Returns the stat-only install state of `spec` under `side_models_root`.
@@ -357,9 +396,14 @@ pub fn external_model_status(side_models_root: &Path, spec: &ExternalModelSpec) 
     let marker_matches = read_json::<Marker>(&spec.marker_path(side_models_root)).as_ref() == Some(&identity);
     let staging = spec.staging_dir(side_models_root);
     let mut all_exact = true;
+    let mut any_exact = false;
+    // Published files of exact size only; `bytes_present` adds the staged bytes on top.
+    let mut published_bytes = 0_u64;
     let mut bytes_present = 0_u64;
     for file in spec.files {
         if file_len(&join_relative(&dir, file.path)) == Some(file.size) {
+            any_exact = true;
+            published_bytes = published_bytes.saturating_add(file.download_size());
             bytes_present = bytes_present.saturating_add(file.download_size());
             continue;
         }
@@ -380,7 +424,17 @@ pub fn external_model_status(side_models_root: &Path, spec: &ExternalModelSpec) 
     // directory that belongs to this exact spec makes the state Partial.
     let in_progress_matches = read_json::<Marker>(&staging.join(IN_PROGRESS_MARKER)).as_ref() == Some(&identity);
     if in_progress_matches && bytes_present > 0 {
-        ExternalModelStatus::Partial { bytes_present }
+        return ExternalModelStatus::Partial { bytes_present };
+    }
+    // No marker at all (proven absent) and SOME files already at their pinned size, e.g. the
+    // user's own copies or an older downloader's leftovers: a download keeps every file that
+    // hashes to its pin and fetches only the rest, so the panel must price only the rest.
+    // Staged bytes of a foreign identity are never counted (a download discards them). All
+    // files present stays `Missing`: that is the adoption candidate (`unmarked_files_present`),
+    // hashed and marked without any download.
+    let marker_absent = matches!(spec.marker_path(side_models_root).try_exists(), Ok(false));
+    if marker_absent && any_exact && !all_exact {
+        ExternalModelStatus::Partial { bytes_present: published_bytes }
     } else {
         ExternalModelStatus::Missing
     }
@@ -560,12 +614,14 @@ fn run_adoption(
 /// `progress` is called after every read of at most 128 KiB (in practice per socket read).
 /// Transient network failures are retried per [`RetryPolicy::standard`]. A Hugging Face
 /// source uses the cached token (`hf_token::hf_token()`) when non-empty; a `Url` source never
-/// sends one.
+/// sends one. A `gated` spec with a file not at its exact size is first access-checked with
+/// [`hf_repo_access`] (see the file header; an unanswered check does not block).
 ///
 /// # Errors
 /// `InvalidSpec`, `Busy` (same spec already downloading in this process), `Cancelled`,
-/// `Io`, `Http` (permanent, or retries exhausted), `SizeMismatch`, `HashMismatch`; on wasm
-/// always `Unsupported`.
+/// `Io`, `Http` (permanent, or retries exhausted), `SizeMismatch`, `HashMismatch`,
+/// `AccessDenied` (gated preflight refused, or a 401 / 403 of a gated spec's transfer); on
+/// wasm always `Unsupported`.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn download_external_model(
     side_models_root: &Path,
@@ -575,15 +631,31 @@ pub fn download_external_model(
 ) -> Result<PathBuf, ExternalModelError> {
     validate_spec(spec)?;
     let remote_url = |file: &ExternalFile| match spec.source {
-        ExternalSource::HuggingFace { repo_id, revision } => hf_resolve_url(repo_id, revision, file.remote_path()),
+        ExternalSource::HuggingFace { repo_id, revision, .. } => hf_resolve_url(repo_id, revision, file.remote_path()),
         ExternalSource::Url { base_url } => url_source_file_url(base_url, file.remote_path()),
     };
     let token = match spec.source {
         ExternalSource::HuggingFace { .. } => Some(crate::hf_token::hf_token()).filter(|token| !token.is_empty()),
         ExternalSource::Url { .. } => None,
     };
+    let remote = RemoteSource { url: &remote_url, token_sent: token.is_some(), probe: &hf_repo_access };
     let fetcher = UreqFetcher::new(token);
-    download_with(&fetcher, &remote_url, side_models_root, spec, cancel, &RetryPolicy::standard(), progress)
+    download_with(&fetcher, &remote, side_models_root, spec, cancel, &RetryPolicy::standard(), progress)
+}
+
+/// Where a download's files come from, whether it authenticates against a Hugging Face
+/// source, and how it checks access to a gated one; injected so tests run without network.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct RemoteSource<'a> {
+    /// Maps a catalog file to the URL of its [`ExternalFile::remote_path`].
+    pub url: &'a dyn Fn(&ExternalFile) -> String,
+    /// Whether the fetcher sends a Hugging Face token: a 401 then means `TokenRejected`, not
+    /// `NoToken`.
+    pub token_sent: bool,
+    /// Asks the Hub about one repository with the download's cancel flag (production:
+    /// [`hf_repo_access`]); called at most once per download, only for a `gated` spec that is
+    /// not completely present.
+    pub probe: &'a dyn Fn(&str, &AtomicBool) -> HfAccess,
 }
 
 /// Web build: there is no blocking HTTP stack, so downloading is rejected explicitly.
@@ -620,7 +692,7 @@ pub(crate) fn validate_spec(spec: &ExternalModelSpec) -> Result<(), ExternalMode
         return invalid("a shared-directory id names its marker file: [a-z0-9_] only".to_owned());
     }
     match spec.source {
-        ExternalSource::HuggingFace { repo_id, revision } => {
+        ExternalSource::HuggingFace { repo_id, revision, .. } => {
             let repo_parts: Vec<&str> = repo_id.split('/').collect();
             if repo_parts.len() != 2 || repo_parts.iter().any(|part| !is_safe_component(part)) {
                 return invalid(format!("repository id '{repo_id}' is not owner/name"));
@@ -683,8 +755,8 @@ fn is_valid_base_url(base_url: &str) -> bool {
     !host.is_empty() && segments.all(is_safe_component)
 }
 
-/// Testable download core; see [`download_external_model`] for the contract. `remote_url`
-/// maps a catalog file to the URL of its [`ExternalFile::remote_path`]; `retry` schedules
+/// Testable download core; see [`download_external_model`] for the contract. `remote` gives
+/// the file URLs, the token presence and the gated-access probe; `retry` schedules
 /// transient-failure retries.
 ///
 /// # Errors
@@ -692,7 +764,7 @@ fn is_valid_base_url(base_url: &str) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn download_with(
     fetcher: &dyn RangeFetcher,
-    remote_url: &dyn Fn(&ExternalFile) -> String,
+    remote: &RemoteSource<'_>,
     side_models_root: &Path,
     spec: &'static ExternalModelSpec,
     cancel: &AtomicBool,
@@ -702,7 +774,7 @@ pub(crate) fn download_with(
     validate_spec(spec)?;
     // Process-wide "one download per spec" guard (separate from `ai_models::DOWNLOAD_LOCK`).
     let _active = BusyGuard::try_acquire(spec.id).map_err(|_busy| ExternalModelError::Busy { id: spec.id })?; // RAII: held until return
-    let result = run_download(fetcher, remote_url, side_models_root, spec, cancel, retry, progress);
+    let result = preflight_access(side_models_root, spec, remote, cancel).and_then(|()| run_download(fetcher, remote, side_models_root, spec, cancel, retry, progress));
     match &result {
         Ok(dir) => ms_log::runtime_log::log_info(format!(
             "{LOG_TAG} download complete: id={} source={} bytes={} dir={}",
@@ -721,11 +793,43 @@ pub(crate) fn download_with(
     result
 }
 
+/// The gated-access preflight of [`download_with`]: for a `gated` Hugging Face spec with at
+/// least one file not at its exact size (stat only), asks `remote.probe` once with `cancel`.
+/// Touches nothing on disk; every other spec passes without a request. An `Unreachable`
+/// answer passes too (logged): the transfer retries transient failures under the full policy
+/// and maps a real 401 / 403 to `AccessDenied` itself.
+///
+/// # Errors
+/// `Cancelled` when `cancel` is set once the probe returns; `AccessDenied` with the probe's
+/// answer when it is a definite refusal ([`HfAccess::refuses_download`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn preflight_access(side_models_root: &Path, spec: &'static ExternalModelSpec, remote: &RemoteSource<'_>, cancel: &AtomicBool) -> Result<(), ExternalModelError> {
+    let Some(repo_id) = spec.gated_repo() else { return Ok(()) };
+    let dir = spec.local_dir(side_models_root);
+    if spec.files.iter().all(|file| file_len(&join_relative(&dir, file.path)) == Some(file.size)) {
+        return Ok(());
+    }
+    let access = (remote.probe)(repo_id, cancel);
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(ExternalModelError::Cancelled);
+    }
+    if access.refuses_download() {
+        return Err(ExternalModelError::AccessDenied { repo_id, access });
+    }
+    if let HfAccess::Unreachable { detail } = &access {
+        ms_log::runtime_log::log_warn(format!(
+            "{LOG_TAG} access check of '{repo_id}' failed, downloading anyway (the transfer reports a real refusal): id={} detail={detail}",
+            spec.id
+        ));
+    }
+    Ok(())
+}
+
 /// Body of [`download_with`] under the busy guard; logging stays with the caller.
 #[cfg(not(target_arch = "wasm32"))]
 fn run_download(
     fetcher: &dyn RangeFetcher,
-    remote_url: &dyn Fn(&ExternalFile) -> String,
+    remote: &RemoteSource<'_>,
     side_models_root: &Path,
     spec: &'static ExternalModelSpec,
     cancel: &AtomicBool,
@@ -747,9 +851,9 @@ fn run_download(
     retire_complete_marker(&marker, &staging)?;
     prepare_staging(&staging, spec)?;
 
-    let mut job = FileJob { fetcher, cancel, retry, progress, spec, dir: &dir, staging: &staging, done_before: 0 };
+    let mut job = FileJob { fetcher, cancel, retry, progress, spec, token_sent: remote.token_sent, dir: &dir, staging: &staging, done_before: 0 };
     for (index, file) in spec.files.iter().enumerate() {
-        job.fetch_file(index, file, &remote_url(file))?;
+        job.fetch_file(index, file, &(remote.url)(file))?;
         job.done_before = job.done_before.saturating_add(file.download_size());
     }
 
@@ -797,6 +901,8 @@ struct FileJob<'a> {
     retry: &'a RetryPolicy<'a>,
     progress: &'a mut dyn FnMut(&ExternalDownloadProgress),
     spec: &'static ExternalModelSpec,
+    /// Whether the fetcher sends a Hugging Face token (see [`map_download_error`]).
+    token_sent: bool,
     dir: &'a Path,
     staging: &'a Path,
     /// Sum of the download sizes of the files already handled.
@@ -836,7 +942,7 @@ impl FileJob<'_> {
         let key = member_key(final_path);
         let (cancel, retry) = (self.cancel, self.retry);
         let _guard = BusyGuard::acquire_waiting(&key, cancel, retry, &mut || self.report(index, file, ExternalDownloadPhase::Downloading, 0))
-            .map_err(|error| map_download_error(self.spec, file, file.sha256, error))?;
+            .map_err(|error| map_download_error(self.spec, file, file.sha256, self.token_sent, error))?;
         let staged_archive = join_relative(self.staging, pin.archive);
         if file_len(final_path) == Some(file.size) {
             if self.hashes_to(index, file, final_path, file.sha256)? {
@@ -854,7 +960,7 @@ impl FileJob<'_> {
         self.fetch_verified_into(index, file, &request, pin.archive_sha256)?;
         self.report(index, file, ExternalDownloadPhase::Verifying, 0);
         zip_member_atomic(&staged_archive, pin.member, final_path, Expected::SizeSha256 { size: file.size, sha256: file.sha256 })
-            .map_err(|error| map_download_error(self.spec, file, file.sha256, error))?;
+            .map_err(|error| map_download_error(self.spec, file, file.sha256, self.token_sent, error))?;
         self.report(index, file, ExternalDownloadPhase::Verifying, file.download_size());
         remove_file_if_exists(&staged_archive)
     }
@@ -873,7 +979,7 @@ impl FileJob<'_> {
                 self.report(index, file, ExternalDownloadPhase::Retrying { attempt, max_attempts, delay_secs }, staged);
             }
         });
-        result.map(|_size| ()).map_err(|error| map_download_error(self.spec, file, pin_sha256, error))
+        result.map(|_size| ()).map_err(|error| map_download_error(self.spec, file, pin_sha256, self.token_sent, error))
     }
 
     /// Whether the whole of `path` hashes to `sha256`, reporting `Verifying` progress scaled
@@ -1036,7 +1142,8 @@ pub(crate) fn verify_with(
         let _member = match file.origin {
             FileOrigin::ZipMember { .. } => Some(
                 BusyGuard::acquire_waiting(&member_key(&path), cancel, retry, &mut || emit(0))
-                    .map_err(|error| map_download_error(spec, file, file.sha256, error))?,
+                    // Verification makes no request: a token never matters here.
+                    .map_err(|error| map_download_error(spec, file, file.sha256, false, error))?,
             ),
             FileOrigin::Direct => None,
         };
@@ -1122,15 +1229,24 @@ fn scale(done: u64, from: u64, to: u64) -> u64 {
 }
 
 /// Maps an `ms_download` failure while handling `file` onto the module's typed error;
-/// `pin_sha256` is the pin a hash mismatch was checked against.
+/// `pin_sha256` is the pin a hash mismatch was checked against. A 401 / 403 answer of a GATED
+/// Hugging Face spec is `AccessDenied` (`token_sent` tells `NoToken` from `TokenRejected`); for
+/// any other spec it stays `Http` (a CDN or region 403 of a public repository must not ask the
+/// user to accept terms that repository does not have).
 #[cfg(not(target_arch = "wasm32"))]
-fn map_download_error(spec: &'static ExternalModelSpec, file: &'static ExternalFile, pin_sha256: &'static str, error: DownloadError) -> ExternalModelError {
+fn map_download_error(spec: &'static ExternalModelSpec, file: &'static ExternalFile, pin_sha256: &'static str, token_sent: bool, error: DownloadError) -> ExternalModelError {
     match error {
         DownloadError::Cancelled => ExternalModelError::Cancelled,
         DownloadError::Busy { .. } => ExternalModelError::Busy { id: spec.id },
         DownloadError::InvalidRequest { detail } => ExternalModelError::InvalidSpec(format!("{}: {detail}", spec.id)),
         DownloadError::Io { path, source } => ExternalModelError::Io { path, source },
-        DownloadError::Http { detail } => ExternalModelError::Http { file: file.path, detail },
+        DownloadError::Http { detail, status } => match (spec.gated_repo(), status) {
+            (Some(repo_id), Some(code @ (401 | 403))) => match access_from_status(code, token_sent) {
+                Some(access) => ExternalModelError::AccessDenied { repo_id, access },
+                None => ExternalModelError::Http { file: file.path, detail },
+            },
+            (Some(_) | None, _) => ExternalModelError::Http { file: file.path, detail },
+        },
         DownloadError::SizeMismatch { expected, actual } => ExternalModelError::SizeMismatch { file: file.path, expected, actual },
         DownloadError::HashMismatch { actual, .. } => ExternalModelError::HashMismatch { file: file.path, expected: pin_sha256, actual },
         DownloadError::Archive { detail } => ExternalModelError::InvalidSpec(format!("{}: archive of '{}': {detail}", spec.id, file.path)),
@@ -1141,7 +1257,7 @@ fn map_download_error(spec: &'static ExternalModelSpec, file: &'static ExternalF
 #[cfg(not(target_arch = "wasm32"))]
 fn source_label(spec: &ExternalModelSpec) -> String {
     match spec.source {
-        ExternalSource::HuggingFace { repo_id, revision } => format!("{repo_id}@{revision}"),
+        ExternalSource::HuggingFace { repo_id, revision, .. } => format!("{repo_id}@{revision}"),
         ExternalSource::Url { base_url } => base_url.to_owned(),
     }
 }
@@ -1318,7 +1434,7 @@ struct AbandonedFiles {
 impl Marker {
     fn for_spec(spec: &ExternalModelSpec) -> Self {
         let (repo_id, revision, url) = match spec.source {
-            ExternalSource::HuggingFace { repo_id, revision } => (Some(repo_id.to_owned()), Some(revision.to_owned()), None),
+            ExternalSource::HuggingFace { repo_id, revision, .. } => (Some(repo_id.to_owned()), Some(revision.to_owned()), None),
             ExternalSource::Url { base_url } => (None, None, Some(base_url.to_owned())),
         };
         Self {

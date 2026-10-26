@@ -9,8 +9,8 @@ dependents' tests (enabled only from `[dev-dependencies]`).
 
 Key items:
 - `Step`: one scripted answer.
-- `ScriptedFetcher`: the server; `offsets()` lists every requested offset, `with_identity()`
-  makes it announce a `RemoteIdentity`.
+- `ScriptedFetcher`: the server; `offsets()` / `urls()` list every requested offset / URL,
+  `with_identity()` makes it announce a `RemoteIdentity`.
 
 Notes:
 - No network, no files: everything is in memory.
@@ -42,6 +42,7 @@ pub struct ScriptedFetcher {
     body: Vec<u8>,
     script: Mutex<VecDeque<Step>>,
     offsets: Mutex<Vec<u64>>,
+    urls: Mutex<Vec<String>>,
     /// Identity every successful response carries (`None`: the server sends no entity tag).
     identity: Option<RemoteIdentity>,
 }
@@ -50,7 +51,7 @@ impl ScriptedFetcher {
     /// A server for `body` that first replays `script`, one step per request.
     #[must_use]
     pub fn new(body: &[u8], script: &[Step]) -> Self {
-        Self { body: body.to_vec(), script: Mutex::new(script.iter().copied().collect()), offsets: Mutex::new(Vec::new()), identity: None }
+        Self { body: body.to_vec(), script: Mutex::new(script.iter().copied().collect()), offsets: Mutex::new(Vec::new()), urls: Mutex::new(Vec::new()), identity: None }
     }
 
     /// The same server, announcing `identity` on every successful response.
@@ -65,6 +66,12 @@ impl ScriptedFetcher {
     pub fn offsets(&self) -> Vec<u64> {
         self.offsets.lock().map(|offsets| offsets.clone()).unwrap_or_default()
     }
+
+    /// Every URL requested so far, in order (empty if the record lock is poisoned).
+    #[must_use]
+    pub fn urls(&self) -> Vec<String> {
+        self.urls.lock().map(|urls| urls.clone()).unwrap_or_default()
+    }
 }
 
 /// A body reader whose every read fails like a reset connection.
@@ -78,12 +85,13 @@ impl Read for ResetReader {
 
 /// A fake-server internal failure as a permanent fetch error.
 fn permanent(err: impl std::fmt::Display) -> FetchError {
-    FetchError::Permanent { detail: err.to_string() }
+    FetchError::Permanent { detail: err.to_string(), status: None }
 }
 
 impl RangeFetcher for ScriptedFetcher {
-    fn fetch(&self, _url: &str, offset: u64) -> Result<FetchResponse, FetchError> {
+    fn fetch(&self, url: &str, offset: u64) -> Result<FetchResponse, FetchError> {
         self.offsets.lock().map_err(permanent)?.push(offset);
+        self.urls.lock().map_err(permanent)?.push(url.to_owned());
         let step = self.script.lock().map_err(permanent)?.pop_front();
         let total = chunk_len(self.body.len());
         if offset > 0 && offset >= total {

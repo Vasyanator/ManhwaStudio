@@ -8,6 +8,9 @@ directory layout of a save, and every refusal a `.msprompt` load owes the user.
 
 Main responsibilities:
 - verify nothing composes a path outside `prompt_cache/`;
+- verify the RoPE salt of the fingerprint: only a config whose RoPE base the
+  loader normalizes (the uncensored 9B encoder's) changes identity, the stock
+  formula stays byte for byte, and a refused RoPE is unidentifiable;
 - verify a listing survives a corrupt file;
 - verify the refusals of a foreign encoder, another sequence length, another
   dtype, another fp8 flag, a foreign container and a newer version;
@@ -38,7 +41,7 @@ from modules.ai_backend.inpaint import flux2_klein as svc
 from modules.ai_backend.inpaint.flux2_klein import hardware, prompt_cache
 from modules.ai_backend.runtime.model_manager import SmallModelManager
 
-from ._test_fixtures import TINY_GGUF_ENCODER_CONFIG, _FakeEmbeds, _ManagedRunFixture, _TempTreeCase, _png_bytes, _write_qwen3_gguf_encoder
+from ._test_fixtures import TINY_GGUF_ENCODER_CONFIG, _FakeEmbeds, _ManagedRunFixture, _TempTreeCase, _png_bytes, _write_qwen3_gguf_encoder, load_9b_config
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +160,52 @@ class EncoderFingerprintTests(_TempTreeCase):
         self.assertNotEqual(mine, theirs)
 
 
+class EncoderRopeSaltTests(_TempTreeCase):
+    """The fingerprint carries the RoPE normalization, so caches made under the wrong base are never served (D17)."""
+
+    def _encoder(self, config: dict[str, object]) -> str:
+        folder = self.root / "text_encoder"
+        (folder / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+        return str(folder)
+
+    def _unsalted(self, folder: str) -> str:
+        """The fingerprint formula WITHOUT any salt: config bytes, then each weight file's name and size."""
+        import hashlib
+
+        source = Path(folder)
+        digest = hashlib.sha256((source / "config.json").read_bytes())
+        for entry in sorted((item for item in source.iterdir() if item.suffix == ".safetensors"), key=lambda item: item.name):
+            digest.update(f"\n{entry.name}\x00{entry.stat().st_size}".encode("utf-8"))
+        return digest.hexdigest()
+
+    def test_a_normalized_config_is_salted_with_its_base(self) -> None:
+        import hashlib
+
+        folder = self._encoder(load_9b_config("uncensored_text_encoder"))
+        fingerprint = svc.text_encoder_fingerprint(folder)
+        self.assertNotEqual(fingerprint, self._unsalted(folder), "the pre-fix identity is never produced again")
+        source = Path(folder)
+        digest = hashlib.sha256((source / "config.json").read_bytes())
+        digest.update(f"\nmodel.safetensors\x00{(source / 'model.safetensors').stat().st_size}".encode("utf-8"))
+        digest.update(b"\nrope_theta=1000000.0")
+        self.assertEqual(fingerprint, digest.hexdigest())
+
+    def test_it_differs_from_the_same_config_without_rope_parameters(self) -> None:
+        config = load_9b_config("uncensored_text_encoder")
+        salted = svc.text_encoder_fingerprint(self._encoder(config))
+        plain = svc.text_encoder_fingerprint(self._encoder({key: value for key, value in config.items() if key != "rope_parameters"}))
+        self.assertNotEqual(salted, plain)
+
+    def test_a_stock_config_keeps_its_identity(self) -> None:
+        folder = self._encoder(load_9b_config("text_encoder"))
+        self.assertEqual(svc.text_encoder_fingerprint(folder), self._unsalted(folder))
+
+    def test_a_refused_rope_cannot_be_identified(self) -> None:
+        folder = self._encoder({"rope_parameters": {"rope_type": "yarn", "rope_theta": 1000000}})
+        with self.assertRaisesRegex(ValueError, "yarn"):
+            svc.text_encoder_fingerprint(folder)
+
+
 @unittest.skipUnless(all(importlib.util.find_spec(name) is not None for name in ("gguf", "torch", "transformers", "accelerate")), "needs gguf, torch, transformers and accelerate")
 class GgufEncoderIdentityTests(_TempTreeCase):
     """A GGUF encoder's identity and family never coincide with its bf16 counterpart's, and the in-memory key carries the format."""
@@ -178,6 +227,19 @@ class GgufEncoderIdentityTests(_TempTreeCase):
         family = svc.encoder_family_name(str(self.q8), q8)
         self.assertEqual(family, f"Qwen3-tiny-Q8_0-{q8[: svc.PROMPT_CACHE_FAMILY_HASH_CHARS]}", "named by the file the user picked")
         self.assertNotEqual(family, svc.encoder_family_name(self.paths["text_encoder_path"], folder))
+
+    def test_a_gguf_whose_config_is_normalized_is_salted(self) -> None:
+        import hashlib
+
+        config = self.root / "text_encoder" / "config.json"
+        config.write_text(json.dumps({**TINY_GGUF_ENCODER_CONFIG, "rope_parameters": {"rope_type": "default", "rope_theta": 1000000}}), encoding="utf-8")
+        digest = hashlib.sha256(config.read_bytes())
+        digest.update(f"\ngguf\x00{self.q8.name}\x00{self.q8.stat().st_size}".encode("utf-8"))
+        unsalted = digest.hexdigest()
+        digest.update(b"\nrope_theta=1000000.0")
+        fingerprint = svc.text_encoder_fingerprint(str(self.q8))
+        self.assertEqual(fingerprint, digest.hexdigest())
+        self.assertNotEqual(fingerprint, unsalted)
 
     def test_a_gguf_without_a_config_cannot_be_identified(self) -> None:
         (self.root / "text_encoder" / "config.json").unlink()

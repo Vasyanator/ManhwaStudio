@@ -12,8 +12,9 @@ Methods hosted here:
     inpaint.flux2_klein.prompt_cache.load   — put a stored entry back in the cache.
     inpaint.flux2_klein.prompt_cache.export — copy an entry to any `.msprompt` path.
     inpaint.flux2_klein.prompt_cache.import — copy a `.msprompt` file into the library.
-    inpaint.flux2_klein.download.check      — per-repo access state + plan totals.
-    inpaint.flux2_klein.download.start      — fetch the missing weights, streaming.
+
+No method here downloads weights: every FLUX.2 klein download (4B and 9B) is
+owned by the application's model catalog (Rust `ms_sysprobe::ai_models`).
 
 Streaming: like ``inpaint.flux_fill`` the handler pushes ``progress{id}`` frames
 via the dispatcher's ``ProgressEmitter`` (``HandlerContext.progress_emitter``),
@@ -54,8 +55,6 @@ from typing import Any
 from ..protocol import (
     METHOD_INPAINT_FLUX2_KLEIN,
     METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION,
-    METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK,
-    METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT,
@@ -66,7 +65,7 @@ from ..protocol import (
     METHOD_INPAINT_FLUX2_KLEIN_UNLOAD,
 )
 from ..registry import HandlerContext, Interrupted, register
-from .streaming import progress_forwarder, read_hf_token, require_params, require_segment_len
+from .streaming import progress_forwarder, require_params, require_segment_len
 
 #: The settings reported back as `applied` (`PROTOCOL.md §5.4`): the ones the
 #: client persists after a run. Every name here is present in every response.
@@ -385,109 +384,3 @@ def _handle_prompt_cache_import(
 
 register(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT, _handle_prompt_cache_import)
 
-
-# ---------------------------------------------------------------------------
-# Model download from Hugging Face
-# ---------------------------------------------------------------------------
-def _read_variant(header: dict[str, Any]) -> Any:
-    """Read the `variant` request field verbatim; absent or `null` means `None`.
-
-    The value is NOT validated here. Which variants exist, what an absent field
-    defaults to (`"9b"`) and what an unknown name costs are the downloader's
-    single answer (`flux2_download.resolve_variant`), exactly as `component` and
-    `action` are the service's — duplicating the vocabulary in this layer is the
-    drift the contract puts it in one place to avoid.
-    """
-    return header.get("variant")
-
-
-def _download_module() -> "Any":
-    """The FLUX.2 download module, imported lazily.
-
-    It is a stateless function module — no resident weights, no lease, no
-    residency — so it is NOT an `AppState` service and gets no field there;
-    importing it here on demand is the same shape `handlers/sdxl.py` uses for the
-    inpaint helper it shares, and it keeps this handler module free of
-    `huggingface_hub` at import time.
-    """
-    from ...inpaint import flux2_download
-
-    return flux2_download
-
-
-def _handle_download_check(
-    ctx: HandlerContext,
-    header: dict[str, Any],
-    blob: bytes,
-    cancel_event: threading.Event,
-) -> tuple[dict[str, Any], bytes]:
-    """Report per-repository access and the plan totals; no bytes are fetched.
-
-    Only the repositories the `variant` and the `uncensored` toggle actually
-    need are checked and reported, and the answer ECHOES `variant` back so the
-    client can tell a fresh answer from one computed for the variant it was
-    showing a moment ago. Non-streaming: it costs one auth probe per repository
-    plus, when all answered `ok`, one metadata listing each.
-    """
-    if cancel_event.is_set():
-        raise Interrupted("inpaint.flux2_klein.download.check canceled before start.")
-    token = read_hf_token(header)
-    uncensored = bool(header.get("uncensored", False))
-    result = _download_module().check_access(
-        token, uncensored=uncensored, variant=_read_variant(header)
-    )
-    return dict(result), b""
-
-
-register(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK, _handle_download_check)
-
-
-def _handle_download_start(
-    ctx: HandlerContext,
-    header: dict[str, Any],
-    blob: bytes,
-    cancel_event: threading.Event,
-) -> tuple[dict[str, Any], bytes]:
-    """Download every missing model file, streaming two-level byte progress.
-
-    `variant` selects both the repositories and the destination directory; an
-    unknown name and the retired `variant:"4b"` (protocol 21: the application
-    downloads 4B from its own model catalog) are typed refusals from the
-    downloader and reach the user unchanged, like every other readable refusal
-    below.
-
-    Unlike every other method of this handler group, cancellation is observed
-    INSIDE the work: `cancel_event.is_set` is handed to the downloader, which
-    polls it at every chunk boundary and raises its own `DownloadCanceled`. That
-    is the whole point — a cancel that only stopped the progress frames while the
-    socket kept pulling gigabytes would be a lie. Files already published stay;
-    the staging file of the one in flight is removed by the shared primitive.
-    """
-    if cancel_event.is_set():
-        raise Interrupted("inpaint.flux2_klein.download.start canceled before start.")
-    downloads = _download_module()
-    token = read_hf_token(header)
-    uncensored = bool(header.get("uncensored", False))
-    try:
-        result = downloads.download(
-            token,
-            uncensored=uncensored,
-            variant=_read_variant(header),
-            progress_callback=progress_forwarder(ctx, METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START),
-            should_cancel=cancel_event.is_set,
-        )
-    except downloads.DownloadCanceled:
-        raise Interrupted("inpaint.flux2_klein.download.start canceled.") from None
-    except (ValueError, FileNotFoundError, RuntimeError):
-        # Readable refusals (no token, no access, no space, changed repo layout)
-        # are already user-facing text and must reach the user unchanged.
-        raise
-    except Exception:  # noqa: BLE001
-        if cancel_event.is_set():
-            raise Interrupted("inpaint.flux2_klein.download.start canceled.") from None
-        traceback.print_exc()
-        raise
-    return dict(result), b""
-
-
-register(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START, _handle_download_start)

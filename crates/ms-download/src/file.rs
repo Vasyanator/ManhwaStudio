@@ -297,6 +297,7 @@ impl RangeFetcher for IdentityBinder<'_> {
         if response.identity != bound {
             write_identity(self.sidecar, response.identity.as_ref()).map_err(|err| FetchError::Permanent {
                 detail: format!("cannot record the remote identity in {}: {err}", self.sidecar.display()),
+                status: None,
             })?;
             *self.bound.borrow_mut() = response.identity.clone();
         }

@@ -206,6 +206,7 @@ mod tests {
             missing_bytes: specs.iter().map(|spec| spec.total_bytes()).sum(),
             notice: None,
             other_download: None,
+            access: Vec::new(),
         }
     }
 

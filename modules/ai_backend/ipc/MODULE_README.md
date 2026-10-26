@@ -195,13 +195,13 @@ live in `handlers/MODULE_README.md`.
   TWO documented exceptions, both stateless function modules with no `AppState` counterpart, both
   imported INSIDE a function so the handler module remains torch-free at import time:
   `handlers/sdxl.py` -> `_encode_png_bytes_rgb` from `../../inpaint/sdxl.py` (a pure byte helper),
-  and `handlers/flux2_klein.py` / `handlers/flux3_klein.py` -> `../../inpaint/flux2_download.py` /
-  `flux3_download.py` (the klein model acquisition, which owns no resident state). The FLUX.3 run
+  and `handlers/flux3_klein.py` -> `../../inpaint/flux3_download.py` (the FLUX.3 klein model
+  acquisition, which owns no resident state). The FLUX.3 run
   handler also imports `inpaint/flux3_klein/region.py` lazily: a function module over the
   `AppState.flux3_klein` service it is handed, holding no state of its own. Do not grow this list:
   any NEW access to something that HOLDS state goes through `HandlerContext.state`.
 - A `progress{id}` frame's field set is OPEN for additive optional fields, and the download's second
-  level is the precedent: `inpaint.flux2_klein.download.start` adds `file_step` / `file_total` /
+  level is the precedent: `inpaint.flux3_klein.download.start` adds `file_step` / `file_total` /
   `file_label` while `phase`/`step`/`total`/`label` keep their meaning, so a consumer that does not
   know the new names stays correct. `inpaint.flux3_klein` adds a stable `stage` id the same way, and FLUX.2's load-phase byte level adds `file_component`. An additive field must be OMITTED when absent, never sent as
   `null`, and must never re-purpose one of the four existing names.
