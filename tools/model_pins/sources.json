@@ -502,6 +502,64 @@
       "note": "ms_sysprobe external_catalog FLUX2_KLEIN_9B_TEXT_ENCODER_UNCENSORED_BF16 (F16 weights + the two configs; no tokenizer, the official one is used) + _UNCENSORED_GGUF_* (the publisher ships no Q5_K_M, ms_config::Flux2WeightFormat::offered_for). GATED repository: reading it needs a Hugging Face token (HF_TOKEN) of an account that accepted the model's terms; compute_pins.py sends no token yet, so this row fails until it does (the current pins were read from the tree API with a token)"
     },
     {
+      "id": "flux3-klein/black-forest-labs/flux-3-image-klein",
+      "kind": "hf_repo",
+      "repo": "black-forest-labs/flux-3-image-klein",
+      "revision": "337337621b8526e120f2275d250242f4a6bedd75",
+      "paths": [
+        "ae.safetensors",
+        "config.json",
+        "text_encoder/LICENSE",
+        "text_encoder/chat_template.json",
+        "text_encoder/config.json",
+        "text_encoder/generation_config.json",
+        "text_encoder/merges.txt",
+        "text_encoder/preprocessor_config.json",
+        "text_encoder/tokenizer.json",
+        "text_encoder/tokenizer_config.json",
+        "text_encoder/video_preprocessor_config.json",
+        "text_encoder/vocab.json",
+        "model.safetensors",
+        "manifest.json",
+        "variants/fp8r/config.json",
+        "variants/fp8r/hf_quant_config.json",
+        "variants/fp8r/manifest.json",
+        "variants/fp8r/model.safetensors",
+        "variants/nvfp4/config.json",
+        "variants/nvfp4/hf_quant_config.json",
+        "variants/nvfp4/manifest.json",
+        "variants/nvfp4/model.safetensors",
+        "text_encoder/model-00001-of-00002.safetensors",
+        "text_encoder/model-00002-of-00002.safetensors",
+        "text_encoder/model.safetensors.index.json"
+      ],
+      "note": "ms_sysprobe external_catalog FLUX3_KLEIN_BASE + _DIT_CONFIG + _DIT_BF16 + _DIT_FP8R + _DIT_NVFP4 + _TEXT_ENCODER_BF16 (the repository layout the FLUX.3 klein engine loads; the diffusers transformer/ + vae/ folders and the READMEs are not used). GATED repository: reading it needs a Hugging Face token (HF_TOKEN) of an account that accepted the model's terms; compute_pins.py sends no token yet, so this row fails until it does (the current pins were read from the tree API with a token)"
+    },
+    {
+      "id": "flux3-klein/unsloth/flux-3-image-klein-GGUF",
+      "kind": "hf_repo",
+      "repo": "unsloth/flux-3-image-klein-GGUF",
+      "revision": "12ef13ce920d53f45fe805093910c899668b9e76",
+      "paths": [
+        "flux-3-image-klein-Q8_0.gguf",
+        "flux-3-image-klein-Q6_K.gguf",
+        "flux-3-image-klein-Q5_K_M.gguf",
+        "flux-3-image-klein-Q4_K_M.gguf"
+      ],
+      "note": "ms_sysprobe external_catalog FLUX3_KLEIN_DIT_GGUF_* (one per ms_config::Flux3DitFormat GGUF quant)"
+    },
+    {
+      "id": "flux3-klein/Qwen/Qwen3-VL-4B-Instruct-GGUF",
+      "kind": "hf_repo",
+      "repo": "Qwen/Qwen3-VL-4B-Instruct-GGUF",
+      "revision": "1cd86afb9a95c410a6038ab3b40d8b578c892266",
+      "paths": [
+        "Qwen3VL-4B-Instruct-Q8_0.gguf",
+        "Qwen3VL-4B-Instruct-Q4_K_M.gguf"
+      ],
+      "note": "ms_sysprobe external_catalog FLUX3_KLEIN_TEXT_ENCODER_GGUF_* (one per ms_config::Flux3EncoderFormat GGUF quant; text-only, the vision tower is the separate mmproj file, not pinned)"
+    },
+    {
       "id": "lama-mpe/main-repo",
       "kind": "hf_repo",
       "repo": "Vasyanator2/ManhwaStudio_AI_Models",

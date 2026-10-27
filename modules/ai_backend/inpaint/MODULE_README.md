@@ -75,27 +75,11 @@ Every service follows the same shape and is safe to copy from when adding anothe
   `flux2_klein/MODULE_README.md` for the layout and the FLUX.2 klein sections below for the
   contracts.
 - `flux3_klein/`: `Flux3KleinService` — FLUX.3 Image Klein generation from the official weight
-  package (bf16 / fp8r / nvfp4 DiT, AE, Qwen3-VL encoder), with a `PhaseObserver` per phase;
+  package (bf16 / fp8r / nvfp4 or GGUF DiT, AE, bf16 or GGUF Qwen3-VL encoder), with a `PhaseObserver` per phase;
   `AppState.flux3_klein` (`inpaint.flux3_klein*`, the `large_models.profiles` adapter
   `flux3_klein`); the region editor `region.py` and its wire `wire.py`. Also driven by the
   measurement tool `tools/large_model_calibration/`. See the FLUX.3 klein section below and
   `flux3_klein/MODULE_README.md`.
-- `flux3_download.py`: acquisition of one weight format of the FLUX.3 klein package from the gated
-  repository (`inpaint.flux3_klein.download.check` / `.start`) into
-  `side_models/FLUX.3-image-klein/` (mirrored by Rust `ms_config::flux3_klein_dir`): the format
-  manifest over `hf_gated_download`. Stateless, imported lazily by the handler. Tests:
-  `test_flux3_download.py`.
-- `hf_gated_download.py`: the model-agnostic half of a backend-side Hugging Face download
-  (`DownloadTarget` = label + `RepoSpec`s + `ManifestEntry` prefixes + root) for GATED repositories
-  only: plan resolution, the per-repository access check (`STATE_*`), the token rule (an empty
-  token is refused before any network call; a token is sent to every repository), the publish gates,
-  free space, throttled two-level progress and the resumable transfer over
-  `../engines/model_download.py`. Used by `flux3_download.py`. Tests: `test_hf_gated_download.py`
-  (a synthetic two-repository gated target; no network).
-- `_hf_download_test_fakes.py`: TEST-ONLY network stand-ins shared by `test_hf_gated_download.py` and
-  `test_flux3_download.py` (fake `requests` transports with and without `Range`, the seam installer
-  over `model_download._default_get` / `_default_sleep`, fake `HfApi` classes, real
-  `huggingface_hub` errors with a status). Never imported by runtime code.
 - `region_imaging.py`: the region editors' wire codecs (FLUX.2 klein, FLUX.3 klein): strict L8 mask
   and RGB decode, the solid-mask check, the RGB PNG answer. Tests: `test_region_imaging.py`.
 - `test_lease_hints.py`: the owner and the file-size hint each small-pool service hands
@@ -103,12 +87,11 @@ Every service follows the same shape and is safe to copy from when adding anothe
 - `test_health_during_load.py`: `health()` answers while AOT's lock section loads and infers, and
   reflects loading -> ready and a load error (stubbed load and inference, no torch).
 - `test_lama_decode.py`: LaMa's cv2 decode failure is logged and falls back to PIL (stub cv2).
-- `test_sdxl.py`, `test_flux_fill.py`, `test_hf_gated_download.py`, `test_lease_protocol.py`
+- `test_sdxl.py`, `test_flux_fill.py`, `test_lease_protocol.py`
   (`flux2_klein/`'s and `flux3_klein/`'s tests run real torch on the CPU, see their readmes):
   pure-Python
   unit tests (no torch, no diffusers, no weights, no GPU — fake `torch`/`diffusers`/`transformers`
-  modules are injected into `sys.modules`, `test_hf_gated_download.py` fakes the repository listings and
-  the `requests` module, and `test_lease_protocol.py` stubs each service's load and
+  modules are injected into `sys.modules`, and `test_lease_protocol.py` stubs each service's load and
   inference step instead).
 
 ## Contracts and invariants
@@ -193,8 +176,8 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
 - All weights live under `ManhwaStudio_AI_Models/side_models/FLUX.1-Fill-dev-GGUF/`, **not** the
   Hugging Face cache: the chosen GGUF quant from `YarvixPA/FLUX.1-Fill-dev-GGUF`, plus the diffusers
   components (VAE / CLIP-L / T5-XXL / scheduler / tokenizers) from the open `ostris/Flex.1-alpha`
-  repo under `components/`. Downloads go through `../engines/model_download.download_bearer_to_path`
-  (shared with `hf_gated_download.py`): serialized per destination file, staged into a process-private
+  repo under `components/`. Downloads go through `../engines/model_download.download_bearer_to_path`:
+  serialized per destination file, staged into a process-private
   `<name>.<pid>.part`, retried with backoff and resumed with `Range` on transient failures (bytes of
   a failed call are parked for the next one), checked against the size the hub listing announced,
   and published with an atomic `os.replace`. The listing is mandatory: `_build_download_plan`
@@ -386,7 +369,7 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   service knows nothing about Hugging Face.
 - **The transformer and the text encoder may each be a GGUF file** (protocol 21; the unsloth
   FLUX.2 klein 4B / 9B quants and Qwen3 4B / 8B GGUF encoders, all from the Rust catalog;
-  `flux2_klein/encoder_gguf.py` bridges the llama.cpp tensor names to HF Qwen3, the GGUF weights
+  `../runtime/qwen3_gguf.py` bridges the llama.cpp tensor names to HF Qwen3, the GGUF weights
   stay quantized in memory and are dequantized per forward by `runtime.gguf_layers`). A GGUF file
   carries no `config.json`, tokenizer or scheduler: its config is probed beside the file first,
   then in EVERY installed klein package (`components.installed_klein_package_roots`, the
@@ -457,17 +440,26 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   - The decode owns `torch.no_grad()` (it is not inside `pipeline.__call__`) and decodes on the
     VAE's own device; `_require_execution_device` checks the denoise call computes where the
     transformer was placed.
-- **The prompt-embedding cache is always on in memory** (`_prompt_cache`, LRU,
-  `PROMPT_EMBED_CACHE_ENTRIES`; a 9B entry is ~12.6 MB). Its key is (library, text,
+- **The prompt-embedding cache is always on in memory** (`runtime/prompt_cache_service.EmbeddingMemory`,
+  LRU, `PROMPT_EMBED_CACHE_ENTRIES`, no byte cap; a 9B entry is ~12.6 MB). Its key is (library, text,
   `max_sequence_length`, encoder fingerprint, precision id, origin file or `encoded`); its
   provenance (`MemoryEmbedding`) sits in a copy-on-write index the lock-free plan reads. Not keyed by
   where the encoder ran. Entries live on the HOST and `unload()` keeps them.
 - **The prompt LIBRARY (protocol 23)** is the model-agnostic `runtime/prompt_library.py`, one library
   per MODEL: `<program root>/prompt_cache/<library id>/` with `params.prompt_library` =
   `flux2_klein_9b` / `flux2_klein_4b` (Rust `Flux2Variant::prompt_library_id`, directory names,
-  frozen). Any encoder variant of the model may serve its entries.
-  - **One owner of "is this text served": `service._prompt_plan`.** Per text the run needs (the
-    prompt, plus `""` under effective classifier-free guidance — `_texts_needed`) the candidates are
+  frozen). Any encoder variant of the model may serve its entries. The ORCHESTRATION (memory, the
+  plan, `.status` keys, build / list / export / import) is the model-agnostic
+  `runtime/prompt_cache_service.py` (`PromptCacheOrchestrator`); FLUX.2 plugs in through
+  `prompt_cache.Flux2PromptCacheAdapter` (its texts, preference, width filter, encoder identity,
+  v1 migration and v1 import) and keeps its encoder session, progress steps, answer keys and
+  refusals in `service.py`. FLUX.3 klein is the second model: one library `flux3_klein` (every
+  encoder format), TEXT encoder mode only, through `flux3_klein/prompt_cache.Flux3PromptCacheAdapter`
+  (no migration, no legacy import; the memory is also byte-capped); its rules are
+  `flux3_klein/MODULE_README.md` "Prompt cache".
+  - **One owner of "is this text served": `service._prompt_plan`** (`PromptCacheOrchestrator.plan`).
+    Per text the run needs (the prompt, plus `""` under effective classifier-free guidance —
+    `Flux2PromptCacheAdapter.texts_needed`) the candidates are
     memory and library entries with the EXACT text (the backend-normalized `strip()`ed text, case and
     inner whitespace significant) and length, minus every candidate whose width the transformer does
     not accept (`joint_attention_dim`, `prompt_cache.transformer_text_width`), ranked by
@@ -477,7 +469,7 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
     `.status` (`prompt_cached` = every needed text served, `prompt_cache_entry` = the prompt's
     choice as `EntryInfo`), `_encoder_need` and the forecast all derive from it, so status and run
     cannot diverge (the guidance `""` text included).
-  - **The run reads a chosen file lazily** (`_serve_locked`: «Промпт взят из кэша»; the tensor then
+  - **The run reads a chosen file lazily** (`PromptCacheOrchestrator.serve_locked`: «Промпт взят из кэша»; the tensor then
     stays in memory). A file that vanished or changed since the plan (`LibraryEntryGone`) re-plans
     once; a text still unserved is encoded when an encoder is available, else the run is refused
     naming the file.
@@ -679,99 +671,27 @@ client-facing half. What this module owns:
   re-checks the action against the current list BEFORE any session is acquired — a session that is
   finished unused moves the model to its between-runs state, which would perform the refused action.
 
-### Backend Hugging Face download (`hf_gated_download.py`)
-The model-agnostic machinery behind `inpaint.flux3_klein.download.*` (`flux3_download.py` owns only
-the format table and the manifest). The backend downloads no FLUX.2 klein weight: the app's Rust
-model catalog owns every one. The wire shapes are in `ipc/PROTOCOL.md` ("Gated Hugging Face
-download", §5.4).
-
-- **Every repository is gated, so every request needs a token.** `hf_gated_download` serves
-  gated repositories only: an empty token is `no_token` (`.check`) or the target's
-  `no_token_message` (`.start`) before any network call, and a present token is sent at all three
-  network sites — `probe_repo_access`, `repo_listing` and `_fetch_one`'s transfer. `HfApi` is given
-  `token or None` so an empty string never reaches it. A public repository is not a case the
-  machinery handles: a model that needs one gets its own rule (or the Rust catalog).
-- **The manifest is PREFIXES resolved against the live listing, never hard-coded shard names**
-  (`DownloadTarget.manifest` -> `resolve_plan`). A prefix that resolves to no file is a
-  `RuntimeError` naming the prefix and the repository: a repo that was re-sharded must fail loudly,
-  not produce half a model. A file no rule names is never planned.
-- **Excluded files** (`EXCLUDED_SUFFIXES` / `EXCLUDED_NAMES`) are filtered whatever rule pulled them
-  in: llama.cpp `*.gguf` quants the `transformers` loaders cannot read, sample images, `README.md`,
-  `.gitattributes`. A licence file is not excluded; a model that needs it names it explicitly.
-- **A repository listing is NOT an access check.** `HfApi.model_info()` answers for the
-  `gated: auto` repositories with no token at all, so access is probed with `HfApi.auth_check()`.
-  `classify_repo_error` consults the HTTP STATUS before the exception type, deliberately: on a gated
-  repo a wrong token raises `GatedRepoError` with status 401 and the user must be told the token is
-  wrong, not that they failed to accept the conditions — and `GatedRepoError` SUBCLASSES
-  `RepositoryNotFoundError`, so type order alone separates nothing. The six `state` values are a wire
-  contract: the Rust UI gives three of them three different links.
-- **A staged file is published only after its length matches the announced size**
-  (`item.size` -> the shared primitive's `expected_size` gate, checked before the rename), and
-  `is_complete_on_disk` treats a file as present only at that same length. Neither `requests` nor
-  a plain streaming loop treats a SHORT body that ends cleanly as an error, so without both
-  halves a truncated shard is renamed to its final name and then skipped by every later run —
-  reproduced during review (100 bytes announced, 7 delivered, ended normally) and surfacing much
-  later as corrupt weights. The length check on the planning side is also what REPAIRS a file an
-  earlier run already left behind. A listing that announces no size falls back to the non-empty
-  rule and logs why: a missing size must neither disable the check silently nor force an endless
-  re-download.
-- **An interrupted file RESUMES; it does not restart.** `_fetch_one` delegates to
-  `../engines/model_download.download_bearer_to_path`, so a connection dropped at 8 of 9.8 GB parks
-  those bytes as `<name>.part` and the transfer continues from them with `Range: bytes=<n>-` — within
-  the same call after a backoff wait (transient failures are retried, the budget resetting after
-  progress), or on the next run once the budget ran out or the user cancelled. A body that ends
-  cleanly but short is resumed the same way: a short body is not proof of wrong bytes.
-- **The listing size is the integrity gate (`item.size`), and only proven-wrong bytes are
-  discarded**: more bytes than announced, a `206` announcing another total, or leftovers already
-  longer than the file (dropped and refetched). There is deliberately no ETag/`If-Range` sidecar: a
-  same-size change of a parked partial's remote blob stays undetectable, which the size gate bounds.
-- **A retry is a progress frame, not a failure.** `_retry_reporter` sends one FORCED frame (bypassing
-  the throttle) with the staged bytes as `step` / `file_step` and the retry text as `label`; no
-  field is added. `step` is monotone: a resumed file's `file_step` and the overall `step` both begin
-  at the resumed offset, so a consumer deriving speed from consecutive frames never sees a bogus
-  first delta; only a restart from zero after proven-wrong bytes moves it backwards.
-- **The free-space guard subtracts what is already staged** (`staged_bytes`), or it would refuse a
-  download that plainly fits when 8 of 9.8 GB are on the disk already.
-- **`check_access`'s `plan` is NULLABLE and zeros are never synthesised.** Auth and listing are two
-  different network operations; a plan of zeros beside `ok` states reads as "everything is already
-  downloaded" and was observed rendering a complete installation on an empty machine. A listing
-  that fails after a successful probe yields `plan: None` plus a scrubbed `plan_error`, and
-  deliberately no repo state of its own — access really did succeed, and `network_error` would send
-  the user to the wrong link. `no_token` and an inaccessible repo also yield `plan: None`, with an
-  EMPTY `plan_error`, because their `state` already explains it.
-- **The token is a request field.** Never read from the environment here, never persisted, never
-  logged, never interpolated into an error; messages that came back from `huggingface_hub` are
-  scrubbed of it (`_scrub`) before they leave the module. That is also why the bearer fetch lives in
-  `../engines/model_download.download_bearer_to_path` and takes the token as an argument —
-  `flux_fill.py` reads `HF_TOKEN` from the environment and this module must not.
-- **Progress is two-level and throttled.** `step`/`total` stay the OVERALL byte counts (so every
-  existing single-level consumer keeps working) and `file_step`/`file_total`/`file_label` are
-  additive and optional; `ProgressThrottle` requires BOTH ~100 ms and 4 MiB to have passed, and the
-  terminal frame is forced so the last thing a consumer sees is the completed count. `flux_fill`
-  reports on every chunk; at 35 GB that would be 35 000 frames.
-- **Cancellation reaches the socket.** `should_cancel` is polled before each file, at every chunk
-  boundary and every 100 ms of a retry wait, and the run ends with `DownloadCanceled` (the shared
-  primitive's `DownloadCancelled` is translated in `_fetch_one`). The bytes of the file in flight
-  are parked for the next run; files already published stay: they are complete and were renamed
-  atomically.
-- **Free space is checked before the first byte** (`require_free_space`), and the refusal names both
-  the required and the available number of bytes. A filesystem that cannot be queried is not treated
-  as full.
-- **Nothing here runs under a service lock**, for the same reason `ensure_model` does not: a
-  multi-gigabyte transfer must never block `health()`, `unload()` or an eviction callback.
-
 ### FLUX.3 klein (`flux3_klein/`)
 - Wired since protocol v15: `AppState.flux3_klein`, `inpaint.flux3_klein` (region editing:
   `flux3_klein/region.py`; mid-run cancel through the observer and the denoise step callback,
-  `Flux3Canceled`), `.status`, `.unload`, `.download.*` (`flux3_download.py`; the weights' licence
-  is accepted by the user on Hugging Face, the repository is gated), and `large_models.profiles`
-  with `model: "flux3_klein"`. Wire: `ipc/PROTOCOL.md` "FLUX.3 klein".
+  `Flux3Canceled`), `.status`, `.unload`, the prompt library `.prompt_cache.{build,list,export,
+  import}` (TEXT mode; a served caption runs without the encoder handle, whose weights may then be
+  absent) and `large_models.profiles` with `model: "flux3_klein"`.
+  Wire: `ipc/PROTOCOL.md` "FLUX.3 klein".
+- The backend downloads no FLUX.2 or FLUX.3 klein weight: the application's Rust model catalog
+  owns every one (pinned files, gated-repository access preflight, resume, adoption by hash) and
+  sends the package root as `source_root`; the GGUF candidates arrive as absolute paths
+  (protocol 24, `dit_formats` / `text_encoder_formats`).
 - «Энкодер на CPU» (`encoder_on_cpu`, wire default `true`, shared with FLUX.2): the text encoder
   is pinned to host execution through the spec's host pin (`runtime/large_models` "Host pin").
-- A large-model manager handle, not a small-pool service: no small-pool lease. One handle per run,
-  admitted by `LargeModelManager.acquire(steps=...)` BEFORE the service lock (the large-pool
-  lease and reservation); every load and move is a manager `Session` step under the lock, driven
-  by the user's two resource steps (`Flux3Options.vram_step` x `ram_step`). `health()` reads the
+- Large-model manager handles, not a small-pool service: no small-pool lease. Two handles per run,
+  the pipeline (DiT + AE) and the text encoder (only when the run encodes), both admitted by
+  `LargeModelManager.acquire(steps=...)` UNDER the service lock, pipeline before encoder (the
+  stated exception of the manager's "acquire before the service lock" rule: FLUX.3 registers no
+  reclaim callback that takes its lock; `flux3_klein/test_service.py::LockOrderTests`); the
+  encoder is admitted beside the pipeline under the shared two-handle rule
+  (`runtime/large_models/paired.py`). Every load and move is a manager `Session` step under the
+  lock, driven by the user's two resource steps (`Flux3Options.vram_step` x `ram_step`). `health()` reads the
   published fields from a `HealthSnapshot` and where each component is from the manager's ledger
   (`LargeModelManager.placements`). The lease contract is pinned by `flux3_klein/test_characterization.py`
   (`LeaseContract`) and `flux3_klein/test_service.py`, not by `test_lease_protocol.py`.
@@ -850,20 +770,16 @@ no network wait, no inference. Everything is a strict no-op off ROCm.
   `_component_action_locked`: every action is a manager session or `unload` — never a hand-made
   move. Keep the wire literals in step with `dev-docs/flux2_component_residency.md` and
   `ipc/PROTOCOL.md §5.4`.
-- To change how the backend Hugging Face download behaves, see `hf_gated_download.py`: the access
-  states in `classify_repo_error` (status before type); the frame shape or the throttle in
-  `_chunk_reporter` / `ProgressThrottle`; the excluded files in `EXCLUDED_SUFFIXES` /
-  `EXCLUDED_NAMES`; how a file is fetched in `_fetch_one` / `_retry_reporter` — retry, resume, the
-  size gate, staging, claiming and parking themselves belong to `../engines/model_download.py` and
-  are shared, so do not re-implement them here. WHICH files a model fetches is its own module's
-  manifest (`flux3_download.manifest_entries`), never a hard-coded shard name. Keep every wire
-  literal in step with `ipc/PROTOCOL.md`.
-- To change the prompt phase, see `_prompt_embeds_locked` / `_serve_locked` / `_encode_prompts_locked`
-  (the encoder session) / `_encode_prompt_phase`, and `_prompt_plan` for which embedding serves a text.
+- To change the prompt phase, see `_prompt_embeds_locked` / `_encode_prompts_locked`
+  (the encoder session) / `_encode_prompt_phase`, and `_prompt_plan` for which embedding serves a
+  text (both over `../runtime/prompt_cache_service.py`: `plan`, `serve_locked`, `remember_locked`).
 - To change the prompt LIBRARY, see the service's `prompt_cache_build` / `_list` / `_export` /
-  `_import`; FLUX.2's library ids, encoder provenance, width filter and the v1 migration are
+  `_import` (FLUX.2's frames, refusals and answer keys) over the shared
+  `../runtime/prompt_cache_service.py` (what is served, built, listed, exported, imported);
+  FLUX.2's library ids, encoder provenance, width filter, the v1 migration and its adapter are
   `flux2_klein/prompt_cache.py`; the container, index, file names and the selection rule are
-  `../runtime/prompt_library.py` (model-agnostic: a FLUX.3 library reuses it with its own id). To
+  `../runtime/prompt_library.py` (model-agnostic: a FLUX.3 library reuses both with its own id and
+  adapter). To
   change what identifies an encoder, see `text_encoder_fingerprint` — and keep it metadata-only. To
   change what an ABSENT encoder makes possible, see `text_encoder_available` /
   `require_text_encoder`.
@@ -899,7 +815,8 @@ no network wait, no inference. Everything is a strict no-op off ROCm.
   small-pool services at once and extend `test_lease_protocol.py` — the protocol is a cross-service
   contract (FLUX.2 klein is a large-model manager handle: its sessions follow the manager's).
 - To change FLUX.3 klein (run order, its model spec, observer phases, loaders, the region editor
-  and its wire), see `flux3_klein/MODULE_README.md`; its download manifest: `flux3_download.py`.
+  and its wire), see `flux3_klein/MODULE_README.md`; which files make up its package: the Rust
+  catalog (`ms_sysprobe::ai_models::external_catalog::flux3_klein`).
 - To add a new inpaint backend, copy the service shape above, wire it in `server.py` + `AppState`,
   add an `ipc/handlers/` method and a `METHOD_INPAINT_*` constant in `ipc/protocol.py`, and route any
   GPU weight move through `runtime/rocm_mmap_transfer.py`.

@@ -31,6 +31,10 @@ Notes:
   later plan).
 - `--ref-max-pixels auto` caps every reference at the combo's explicit output
   area (`Flux3Options.reference_max_pixels`); `none` keeps the reference rule.
+- Every combo's caption gets the suffix `(calibration run <index>)`
+  (`combo_caption`), as FLUX.2's driver does: the service keeps TEXT-mode
+  caption embeddings in memory, and a repeated caption would skip the encoder
+  phases this tool measures.
 """
 
 from __future__ import annotations
@@ -51,6 +55,12 @@ from .common import parse_list, parse_sizes, resolve_out, setup_logging
 from .measure import DEFAULT_ENCODER_LABELS, ENCODER_SETTINGS, Combo
 
 log = logging.getLogger(__name__)
+
+
+def combo_caption(caption: str, index: int) -> str:
+    """The caption combo `index` runs: `caption` made unique, so no combo is served by the service's prompt-embedding memory."""
+    return f"{caption} (calibration run {index})"
+
 
 #: Environment variable that may name the model package root.
 MODEL_ROOT_ENV = "MS_FLUX3_DIR"
@@ -317,7 +327,7 @@ def _measure(args: argparse.Namespace, model_root: Path, refs_root: Path, out_di
             measure_device=device,
             fp8_compute=fp8_compute,
             vl_ref_max_pixels=args.vl_ref_max_pixels,
-            caption=args.caption or combo.case.caption,
+            caption=combo_caption(args.caption or combo.case.caption, index),
             seed=args.seed,
             steps=args.steps,
             image_path=out_dir / "images" / f"{combo.combo_id}.png",

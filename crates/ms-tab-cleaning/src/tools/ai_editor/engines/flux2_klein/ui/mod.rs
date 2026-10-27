@@ -11,7 +11,8 @@ Main responsibilities:
   frame, with the intents the controls raise travelling back as plain flags;
 - draw the body in its designed ORDER: the prompt block (field, preset name with
   «Кэшировать» / «Переименовать», the cache line, the two unfolding toggles; the library fold
-  holds the shared preset picker, «Экспорт» and «Импорт»), «Сила изменения», the readiness line, the three sibling
+  holds the shared preset picker, «Экспорт» and «Импорт» — all of it the shared prompt-cache
+  block of `../../shared/prompt_cache_ui.rs`, fed with FLUX.2's context and notes), «Сила изменения», the readiness line, the three sibling
   collapsible sections, the mask hint and, docked at the bottom, the shared
   «Постобработка» section (`draw_postprocess_section`);
 - draw the two PINNED parts the host places outside the panel's scroll: the progress with
@@ -141,21 +142,10 @@ pub(super) struct Flux2PanelCtx<'a> {
     /// The entry `.status` named for the prompt in the field (same staleness guard as
     /// `prompt_cache_state`): the encoder the cache line names first.
     pub(super) prompt_cache_status_entry: Option<&'a PromptLibraryEntry>,
-    pub(super) prompt_cache_status: Option<&'a str>,
-    pub(super) prompt_cache_warning: Option<&'a str>,
-    /// The model's shared library listing; `None` until `.list` answers.
-    pub(super) prompt_cache_library: Option<&'a PromptLibraryListing>,
-    pub(super) prompt_cache_list_error: Option<&'a str>,
-    pub(super) prompt_cache_list_busy: bool,
-    pub(super) prompt_cache_busy: bool,
-    /// The preset name field beside «Кэшировать» and the preset text it was last filled for
-    /// ([`sync_preset_name`]).
-    pub(super) prompt_cache_name_input: &'a mut String,
-    pub(super) prompt_cache_name_synced_for: &'a mut Option<String>,
-    /// Session flag of the «Библиотека промптов» toggle — see
-    /// [`Flux2KleinEngine::prompt_library_open`]. The toggle writes it directly, which is
-    /// why it is a `&mut bool` and not one more intent field.
-    pub(super) prompt_library_open: &'a mut bool,
+    /// The model's prompt library (the shared controller): the listing, the name field, the
+    /// outcome lines and the session-only «Библиотека промптов» fold flag, which the toggle
+    /// writes directly.
+    pub(super) prompt_cache: &'a mut PromptCacheController,
     /// Session flag of «Установка модели» — see [`Flux2KleinEngine::install_section_seeded`].
     pub(super) install_section_seeded: &'a mut bool,
     /// The fold state that section was left in last frame — see
@@ -174,7 +164,7 @@ pub(super) struct Flux2PanelCtx<'a> {
     /// A secret-store save or delete is in flight; both buttons are closed meanwhile.
     pub(super) hf_token_busy: bool,
     /// The gated repositories of the current bundle not known to be installed
-    /// ([`flux2_gated_repos_missing`]); the token row is drawn while it is non-empty.
+    /// ([`catalog_gated_repos_missing`]); the token row is drawn while it is non-empty.
     pub(super) gated_repos: &'a [&'static str],
     /// The line a source switch left under the uncensored toggle — see
     /// [`Flux2KleinEngine::encoder_format_notice`]. Written by the toggle directly.
@@ -198,7 +188,7 @@ pub(super) struct Flux2PanelCtx<'a> {
     /// Set when the user pressed the "translate into English" arrow.
     pub(super) translate_requested: &'a mut bool,
     /// The one prompt-cache control the user pressed this frame, if any.
-    pub(super) prompt_cache_action: &'a mut Option<Flux2PromptCacheAction>,
+    pub(super) prompt_cache_action: &'a mut Option<PromptCacheAction>,
     /// The one per-component action button the user pressed this frame, if any.
     pub(super) component_action: &'a mut Option<(Flux2ComponentId, Flux2ComponentAction)>,
     /// At most one file dialog request per frame.
@@ -295,7 +285,9 @@ impl Flux2PanelCtx<'_> {
     /// `horizontal_wrapped`: the panel is a dock tab and is often ~300 px wide, so a row of two
     /// captions must be allowed to wrap rather than clip. «Перевод» is the persisted
     /// `translate_prompt` setting; «Библиотека промптов» is session-only (see
-    /// [`Flux2KleinEngine::prompt_library_open`]).
+    /// [`PromptCacheController::library_open`]). The cache row, the line, the library toggle and
+    /// fold are the shared prompt-cache block (`../../shared/prompt_cache_ui.rs`); this method
+    /// supplies FLUX.2's gate context, encoder caption, id salts and migration notes.
     pub(super) fn draw_prompt(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.label(t!("cleaning.tools.flux2_klein.prompt_label"));
@@ -310,25 +302,35 @@ impl Flux2PanelCtx<'_> {
         if prompt_edited {
             self.note_prompt_changed();
         }
-        // Copied out: the listing reference lives for the frame, not for this borrow of `self`.
-        let listing = self.prompt_cache_library;
-        *self.uncached_changed |= track_uncached(&mut self.settings.uncached_prompt, listing, &self.settings.prompt);
-        let hit = listing.and_then(|listing| listing.text_for(&self.settings.prompt));
-        sync_preset_name(self.prompt_cache_name_input, self.prompt_cache_name_synced_for, hit);
-        let gates = flux2_prompt_cache_gates(
-            self.settings,
+        *self.uncached_changed |= track_uncached(&mut self.settings.uncached_prompt, self.prompt_cache.library.as_ref(), &self.settings.prompt);
+        {
+            let ctl = &mut *self.prompt_cache;
+            let hit = ctl.library.as_ref().and_then(|listing| listing.text_for(&self.settings.prompt));
+            sync_preset_name(&mut ctl.name_input, &mut ctl.name_synced_for, hit);
+        }
+        let text_encoder_available = self.text_encoder_available();
+        let hit = self.prompt_cache.hit(&self.settings.prompt);
+        let gates = prompt_cache_gates(
+            &flux2_cache_context(self.settings),
             hit,
-            self.prompt_cache_name_input,
+            &self.prompt_cache.name_input,
             self.prompt_cache_state,
-            self.text_encoder_available(),
+            text_encoder_available,
             self.ai_backend_available,
-            // NOT `prompt_cache_busy`: a generation and a component action hold the same
+            // NOT the cache job alone: a generation and a component action hold the same
             // pipeline and the same progress bar, so starting a cache operation under one of
             // them would both queue behind it and steal its bar.
             self.pipeline_busy,
         );
-        self.draw_cache_row(ui, &gates.build);
-        self.draw_prompt_cache_line(ui, hit);
+        // The ONE compact line under the cache row says what the next run will cost. It stays
+        // OUTSIDE the collapsible library on purpose: a cached prompt skips the encoder read
+        // and also waives the encoder in the run gate, so this is everyday information.
+        let line = prompt_cache_line(hit.map(|text| &text.selected), self.prompt_cache_status_entry, self.prompt_cache_state, text_encoder_available, &flux2_encoder_caption);
+        let notes = self.prompt_library_notes();
+        if let Some(action) = draw_cache_row(ui, &mut self.prompt_cache_view(&gates, &notes)) {
+            *self.prompt_cache_action = Some(action);
+        }
+        draw_prompt_cache_line(ui, &line);
 
         ui.horizontal_wrapped(|ui| {
             *self.settings_changed |= ui
@@ -338,18 +340,20 @@ impl Flux2PanelCtx<'_> {
                 )
                 .on_hover_text(t!("cleaning.tools.flux2_klein.translate_prompt_hint"))
                 .changed();
-            ui.toggle_value(
-                self.prompt_library_open,
-                t!("cleaning.tools.flux2_klein.prompt_library_label"),
-            )
-            .on_hover_text(t!("cleaning.tools.flux2_klein.prompt_library_hint"));
+            draw_prompt_library_toggle(ui, &mut self.prompt_cache.library_open);
         });
 
         if self.settings.translate_prompt {
             self.draw_translator(ui);
         }
-        if *self.prompt_library_open {
-            self.draw_prompt_cache_library(ui, &gates);
+        if self.prompt_cache.library_open {
+            let output = draw_prompt_cache_library(ui, &mut self.prompt_cache_view(&gates, &notes));
+            if output.prompt_changed {
+                self.note_prompt_changed();
+            }
+            if let Some(action) = output.action {
+                *self.prompt_cache_action = Some(action);
+            }
         }
     }
 
@@ -360,73 +364,6 @@ impl Flux2PanelCtx<'_> {
     fn note_prompt_changed(&mut self) {
         *self.settings_changed = true;
         *self.want_status = true;
-    }
-
-    /// Draws the preset NAME field and «Кэшировать» / «Переименовать» ([`flux2_cache_button`]),
-    /// with the reason on hover when it is closed — and, when it is closed because the library
-    /// already holds a better or the current encoder's entry, that reason as a line too, since
-    /// it is not a fault the user could fix but a fact about their library.
-    fn draw_cache_row(&mut self, ui: &mut egui::Ui, button: &Flux2CacheButton) {
-        let (enabled, caption, tooltip) = match button {
-            Flux2CacheButton::Cache => (
-                true,
-                t!("cleaning.tools.flux2_klein.prompt_cache_build_button"),
-                t!("cleaning.tools.flux2_klein.prompt_cache_build_tooltip"),
-            ),
-            Flux2CacheButton::Rename => (
-                true,
-                t!("cleaning.tools.flux2_klein.prompt_cache_rename_button"),
-                t!("cleaning.tools.flux2_klein.prompt_cache_rename_tooltip"),
-            ),
-            Flux2CacheButton::Closed(_) => (
-                false,
-                t!("cleaning.tools.flux2_klein.prompt_cache_build_button"),
-                t!("cleaning.tools.flux2_klein.prompt_cache_build_tooltip"),
-            ),
-        };
-        let (disabled_tooltip, library_note) = match button {
-            Flux2CacheButton::Cache | Flux2CacheButton::Rename => (String::new(), None),
-            Flux2CacheButton::Closed(Flux2CacheBlock::NotReady | Flux2CacheBlock::NothingToEncode) => {
-                (t!("cleaning.tools.flux2_klein.prompt_cache_build_disabled_tooltip").to_string(), None)
-            }
-            Flux2CacheButton::Closed(Flux2CacheBlock::NoEncoder) => {
-                (t!("cleaning.tools.flux2_klein.prompt_cache_encoder_missing_disabled_tooltip").to_string(), None)
-            }
-            Flux2CacheButton::Closed(Flux2CacheBlock::MorePrecise(entry)) => {
-                let note = tf!("cleaning.tools.flux2_klein.prompt_cache_build_more_precise_status", format = flux2_encoder_caption(entry));
-                (note.clone(), Some(note))
-            }
-            Flux2CacheButton::Closed(Flux2CacheBlock::AlreadyCached) => {
-                let note = t!("cleaning.tools.flux2_klein.prompt_cache_build_current_exists_status").to_string();
-                (note.clone(), Some(note))
-            }
-        };
-        let mut pressed = false;
-        ui.horizontal(|ui| {
-            let field_width = (ui.available_width() - FLUX2_CACHE_NAME_BUTTON_RESERVE).max(80.0);
-            ui.add(
-                egui::TextEdit::singleline(self.prompt_cache_name_input)
-                    .id_salt("cleaning_flux2_klein_prompt_cache_name")
-                    .hint_text(t!("cleaning.tools.flux2_klein.prompt_cache_name_hint"))
-                    .char_limit(MAX_PRESET_NAME_CHARS)
-                    .desired_width(field_width),
-            )
-            .on_hover_text(t!("cleaning.tools.flux2_klein.prompt_cache_name_tooltip"));
-            pressed = gated_button(ui, enabled, caption, tooltip, &disabled_tooltip);
-            if self.prompt_cache_busy {
-                ui.spinner();
-                ui.ctx().request_repaint();
-            }
-        });
-        if let Some(note) = library_note {
-            ui.small(note);
-        }
-        if pressed {
-            *self.prompt_cache_action = Some(match button {
-                Flux2CacheButton::Rename => Flux2PromptCacheAction::Rename,
-                Flux2CacheButton::Cache | Flux2CacheButton::Closed(_) => Flux2PromptCacheAction::Build,
-            });
-        }
     }
 
     /// Draws the machine-translation sub-block: the user-language field with the translate
@@ -516,128 +453,41 @@ impl Flux2PanelCtx<'_> {
         }
     }
 
-    /// Draws the ONE compact line under the cache row that says what the next run will cost:
-    /// whether the prompt is served from the cache — naming the encoder that made the entry in
-    /// use — or whether this machine has no encoder to make it with.
-    ///
-    /// It stays OUTSIDE the collapsible library on purpose. Encoding a new prompt costs a read
-    /// of the Qwen3 encoder, where a cached one costs almost nothing, and a cached prompt is also
-    /// what waives the encoder in the run gate — so this is everyday information.
-    /// [`flux2_prompt_cache_line`] decides which line that is, and an unknown state draws
-    /// nothing at all.
-    pub(super) fn draw_prompt_cache_line(&mut self, ui: &mut egui::Ui, hit: Option<&PromptLibraryText>) {
-        match flux2_prompt_cache_line(hit.map(|text| &text.selected), self.prompt_cache_status_entry, self.prompt_cache_state, self.text_encoder_available()) {
-            Flux2PromptCacheLine::Silent => {}
-            Flux2PromptCacheLine::Cached { encoder, memory } => {
-                let mut line = match encoder {
-                    Some(encoder) => tf!("cleaning.tools.flux2_klein.prompt_cached_with_encoder_status", encoder = encoder),
-                    None => t!("cleaning.tools.flux2_klein.prompt_cached_status").to_string(),
-                };
-                if memory {
-                    line.push(' ');
-                    line.push_str(t!("cleaning.tools.flux2_klein.prompt_cache_memory_suffix"));
-                }
-                ui.colored_label(ms_theme::status::SUCCESS, line);
-            }
-            Flux2PromptCacheLine::NotCached => {
-                ui.colored_label(
-                    ms_theme::status::WARNING,
-                    t!("cleaning.tools.flux2_klein.prompt_not_cached_status"),
-                );
-            }
-            // A WARNING, not an error: without an encoder the tool still generates from
-            // ready caches, and only encoding a new prompt is closed.
-            Flux2PromptCacheLine::NoEncoder => {
-                ui.colored_label(
-                    ms_theme::status::WARNING,
-                    t!("cleaning.tools.flux2_klein.text_encoder_missing_warning"),
-                );
-            }
+    /// The shared prompt-cache block's borrow for one draw call: the controller, the prompt
+    /// field and the «Нет» stash, with FLUX.2's encoder caption and its two stable id salts
+    /// (literals, never localized: the name field's text cursor and the picker's popup live
+    /// under them).
+    fn prompt_cache_view<'b>(&'b mut self, gates: &'b PromptCacheGates, notes: &'b [PromptCacheNote]) -> PromptCacheBlockView<'b> {
+        PromptCacheBlockView {
+            ctl: &mut *self.prompt_cache,
+            prompt: &mut self.settings.prompt,
+            uncached: &self.settings.uncached_prompt,
+            gates,
+            caption: &flux2_encoder_caption,
+            name_id_salt: "cleaning_flux2_klein_prompt_cache_name",
+            library_id_salt: "cleaning_flux2_klein_prompt_library",
+            notes,
         }
     }
 
-    /// Draws the prompt LIBRARY, unfolded by the «Библиотека промптов» toggle: the preset
-    /// picker (row «Нет» plus the model's named presets; choosing one puts its text into the
-    /// prompt field at once — the embeddings are read only by the run), «Экспорт» / «Импорт»,
-    /// and the outcome, error, migration and skipped-file lines under them.
-    pub(super) fn draw_prompt_cache_library(&mut self, ui: &mut egui::Ui, gates: &Flux2PromptCacheGates) {
-        let listing = self.prompt_cache_library;
-        let pick = draw_prompt_library_picker(
-            ui,
-            "cleaning_flux2_klein_prompt_library",
-            listing,
-            &self.settings.prompt,
-            &self.settings.uncached_prompt,
-            &flux2_encoder_caption,
-        );
-        if let Some(pick) = pick
-            && apply_pick(pick, listing, &self.settings.uncached_prompt, &mut self.settings.prompt)
-        {
-            self.note_prompt_changed();
-        }
-
-        // Collected from the row below and written once: an `Option` keeps "at most one
-        // action per frame" a property of the code rather than a convention.
-        let mut action: Option<Flux2PromptCacheAction> = None;
-        ui.horizontal_wrapped(|ui| {
-            for (enabled, caption, tooltip, disabled_tooltip, requested) in [
-                (
-                    gates.export,
-                    t!("cleaning.tools.flux2_klein.prompt_cache_export_button"),
-                    t!("cleaning.tools.flux2_klein.prompt_cache_export_tooltip"),
-                    t!("cleaning.tools.flux2_klein.prompt_cache_export_disabled_tooltip"),
-                    Flux2PromptCacheAction::Export,
-                ),
-                (
-                    gates.import,
-                    t!("cleaning.tools.flux2_klein.prompt_cache_import_button"),
-                    t!("cleaning.tools.flux2_klein.prompt_cache_import_tooltip"),
-                    t!("cleaning.tools.flux2_klein.prompt_cache_import_disabled_tooltip"),
-                    Flux2PromptCacheAction::Import,
-                ),
-            ] {
-                if gated_button(ui, enabled, caption, tooltip, disabled_tooltip) {
-                    action = Some(requested);
-                }
-            }
-            if self.prompt_cache_list_busy {
-                ui.spinner();
-                ui.ctx().request_repaint();
-            }
-        });
-        if let Some(action) = action {
-            *self.prompt_cache_action = Some(action);
-        }
-        if let Some(error) = self.prompt_cache_list_error {
-            ui.colored_label(
-                ms_theme::status::ERROR,
-                tf!("cleaning.tools.flux2_klein.prompt_cache_list_error", err = error),
-            );
-        }
-        if let Some(status) = self.prompt_cache_status {
-            ui.small(status);
-        }
-        if let Some(warning) = self.prompt_cache_warning {
-            ui.colored_label(ms_theme::status::WARNING, warning);
-        }
-        if let Some(listing) = listing {
-            if let Some(legacy) = listing.legacy.as_ref().filter(|legacy| !legacy.is_empty()) {
-                ui.small(tf!(
-                    "cleaning.tools.flux2_klein.prompt_cache_legacy_status",
-                    migrated = legacy.migrated,
-                    deleted = legacy.deleted
-                ));
-                if legacy.left_in_place > 0 {
-                    ui.colored_label(
-                        ms_theme::status::WARNING,
-                        tf!("cleaning.tools.flux2_klein.prompt_cache_legacy_left_status", count = legacy.left_in_place),
-                    );
-                }
-            }
-            if listing.skipped > 0 {
-                ui.small(tf!("cleaning.tools.flux2_klein.prompt_cache_skipped_status", count = listing.skipped));
+    /// FLUX.2's own lines of the library fold: the report of the one-time migration of the old
+    /// per-encoder caches (how many were carried over or deleted, and — as a warning — how many
+    /// could not be carried over and were left in place). Drawn by the shared fold after its
+    /// outcome lines.
+    fn prompt_library_notes(&self) -> Vec<PromptCacheNote> {
+        let mut notes = Vec::new();
+        let legacy = self.prompt_cache.library.as_ref().and_then(|listing| listing.legacy.as_ref()).filter(|legacy| !legacy.is_empty());
+        if let Some(legacy) = legacy {
+            notes.push(PromptCacheNote::Small(tf!(
+                "cleaning.tools.flux2_klein.prompt_cache_legacy_status",
+                migrated = legacy.migrated,
+                deleted = legacy.deleted
+            )));
+            if legacy.left_in_place > 0 {
+                notes.push(PromptCacheNote::Warning(tf!("cleaning.tools.flux2_klein.prompt_cache_legacy_left_status", count = legacy.left_in_place)));
             }
         }
+        notes
     }
 
     /// Whether a text encoder is installed on this machine, as the backend reports it.
@@ -650,7 +500,9 @@ impl Flux2PanelCtx<'_> {
         self.status
             .and_then(|status| status.text_encoder_available)
             .or_else(|| {
-                self.prompt_cache_library
+                self.prompt_cache
+                    .library
+                    .as_ref()
                     .and_then(|library| library.text_encoder_available)
             })
     }
@@ -1023,7 +875,7 @@ mod tests {
             // actionable only while it names the parts that are missing.
             "cleaning.tools.flux2_klein.model_missing_status",
         ];
-        const PLAIN: [&str; 21] = [
+        const PLAIN: [&str; 20] = [
             "cleaning.tools.flux2_klein.guidance_label",
             // The two halves of the ONE disabled control in this panel. A language that
             // lacks either leaves the user with a grey dial and no reason for it, which is
@@ -1046,8 +898,7 @@ mod tests {
             "cleaning.tools.flux2_klein.advanced_heading",
             "cleaning.tools.flux2_klein.translate_prompt_label",
             "cleaning.tools.flux2_klein.translate_prompt_hint",
-            "cleaning.tools.flux2_klein.prompt_library_label",
-            "cleaning.tools.flux2_klein.prompt_library_hint",
+            "cleaning.tools.prompt_library.prompt_library_label",
             "cleaning.tools.flux2_klein.model_ready_status",
             "cleaning.tools.flux2_klein.model_readiness_unknown_status",
             "cleaning.tools.flux2_klein.install_hint",
@@ -1086,6 +937,9 @@ mod tests {
 
     /// The shared prompt library (protocol 23): the reference catalogs carry every new line
     /// with the placeholders the code fills, and none of the retired save / load / family keys.
+    /// The ids whose text was reworded under a new id (an install's on-disk catalog never
+    /// overwrites an existing key) are gone from EVERY shipped catalog; es / fr / pt fall back
+    /// to en for the new ones.
     #[test]
     fn the_reference_catalogs_carry_the_prompt_library_keys_and_not_the_retired_ones() {
         const RETIRED: [&str; 16] = [
@@ -1106,21 +960,43 @@ mod tests {
             "cleaning.tools.flux2_klein.prompt_cache_library_none",
             "cleaning.tools.flux2_klein.prompt_cache_import_foreign_warning",
         ];
+        // Old id -> the id its reworded text lives under now.
+        const RENAMED: [(&str, &str); 9] = [
+            ("cleaning.tools.flux2_klein.prompt_cache_build_disabled_tooltip", "cleaning.tools.prompt_library.prompt_library_save_disabled_tooltip"),
+            ("cleaning.tools.flux2_klein.prompt_cache_build_tooltip", "cleaning.tools.prompt_library.prompt_library_save_tooltip"),
+            ("cleaning.tools.flux2_klein.prompt_cache_built_status", "cleaning.tools.prompt_library.prompt_library_saved_status"),
+            ("cleaning.tools.flux2_klein.prompt_cache_encoder_missing_disabled_tooltip", "cleaning.tools.prompt_library.prompt_library_no_encoder_disabled_tooltip"),
+            ("cleaning.tools.flux2_klein.prompt_cache_export_disabled_tooltip", "cleaning.tools.prompt_library.prompt_library_export_disabled_tooltip"),
+            ("cleaning.tools.flux2_klein.prompt_cache_export_tooltip", "cleaning.tools.prompt_library.prompt_library_export_tooltip"),
+            ("cleaning.tools.flux2_klein.prompt_cache_import_tooltip", "cleaning.tools.prompt_library.prompt_library_import_tooltip"),
+            ("cleaning.tools.flux2_klein.prompt_cache_name_hint", "cleaning.tools.prompt_library.prompt_library_preset_name_hint"),
+            ("cleaning.tools.flux2_klein.prompt_library_hint", "cleaning.tools.prompt_library.prompt_library_toggle_hint"),
+        ];
+        for (tag, source) in ms_i18n::embedded_locales() {
+            let catalog: Value = serde_json::from_str(source).unwrap_or_else(|error| panic!("locale `{tag}` is not valid JSON: {error}"));
+            for (old, new) in RENAMED {
+                assert!(catalog.get(old).is_none(), "locale `{tag}` still carries the renamed `{old}`");
+                if matches!(*tag, "en" | "ru") {
+                    let value = catalog.get(new).and_then(Value::as_str).unwrap_or_else(|| panic!("locale `{tag}` lacks `{new}`"));
+                    assert!(!value.trim().is_empty(), "locale `{tag}`: `{new}` is empty");
+                }
+            }
+        }
         const WITH_PLACEHOLDERS: [(&str, &[&str]); 14] = [
-            ("cleaning.tools.flux2_klein.prompt_cached_with_encoder_status", &["{encoder}"]),
-            ("cleaning.tools.flux2_klein.prompt_cache_memory_suffix", &[]),
+            ("cleaning.tools.prompt_library.prompt_cached_with_encoder_status", &["{encoder}"]),
+            ("cleaning.tools.prompt_library.prompt_cache_memory_suffix", &[]),
             ("cleaning.tools.flux2_klein.encoder_caption", &["{source}", "{format}"]),
             ("cleaning.tools.flux2_klein.encoder_source_stock", &[]),
             ("cleaning.tools.flux2_klein.encoder_source_uncensored", &[]),
-            ("cleaning.tools.flux2_klein.prompt_cache_build_more_precise_status", &["{format}"]),
-            ("cleaning.tools.flux2_klein.prompt_cache_build_current_exists_status", &[]),
-            ("cleaning.tools.flux2_klein.prompt_cache_rename_button", &[]),
-            ("cleaning.tools.flux2_klein.prompt_cache_rename_tooltip", &[]),
-            ("cleaning.tools.flux2_klein.prompt_cache_name_tooltip", &[]),
+            ("cleaning.tools.prompt_library.prompt_cache_build_more_precise_status", &["{format}"]),
+            ("cleaning.tools.prompt_library.prompt_cache_build_current_exists_status", &[]),
+            ("cleaning.tools.prompt_library.prompt_cache_rename_button", &[]),
+            ("cleaning.tools.prompt_library.prompt_cache_rename_tooltip", &[]),
+            ("cleaning.tools.prompt_library.prompt_cache_name_tooltip", &[]),
             ("cleaning.tools.flux2_klein.prompt_cache_legacy_status", &["{migrated}", "{deleted}"]),
             ("cleaning.tools.flux2_klein.prompt_cache_legacy_left_status", &["{count}"]),
-            ("cleaning.tools.flux2_klein.prompt_cache_import_already_present_status", &["{name}"]),
-            ("cleaning.tools.flux2_klein.prompt_cache_skipped_status", &["{count}"]),
+            ("cleaning.tools.prompt_library.prompt_cache_import_already_present_status", &["{name}"]),
+            ("cleaning.tools.prompt_library.prompt_cache_skipped_status", &["{count}"]),
         ];
         for (tag, source) in ms_i18n::embedded_locales().iter().filter(|(tag, _)| matches!(*tag, "en" | "ru")) {
             let catalog: Value = serde_json::from_str(source)

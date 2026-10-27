@@ -12,8 +12,7 @@ Key functions:
 - `progress_forwarder()` — the request's `ProgressEmitter` as a service
   `progress_callback` (`{phase, step, total, label}` plus the optional
   `file_step` / `file_total` / `file_label` / `file_component` and `stage`; a dead peer never
-  aborts the work, the first failure is logged once);
-- `read_hf_token()` — the `hf_token` field (absent = empty; never logged).
+  aborts the work, the first failure is logged once).
 """
 
 from __future__ import annotations
@@ -116,19 +115,3 @@ def progress_forwarder(ctx: HandlerContext, method: str) -> "Any":
                 log.warning("%s: progress frame not delivered (%s: %s), phase=%s step=%s/%s; the work continues, later failures of this request are not logged again", method, type(exc).__name__, exc, fields["phase"], fields["step"], fields["total"])
 
     return on_progress
-
-
-def read_hf_token(header: dict[str, Any]) -> str:
-    """Read the `hf_token` request field. Absent or `null` means an empty token.
-
-    An empty token is a legal request: `download.check` answers `no_token` for it
-    without touching the network, and `download.start` refuses it with a readable
-    message. The value is NEVER logged, echoed back, or interpolated into an
-    error — the exception raised here deliberately names only the field.
-    """
-    value = header.get("hf_token")
-    if value is None:
-        return ""
-    if not isinstance(value, str):
-        raise ValueError("Field 'hf_token' must be a string.")
-    return value

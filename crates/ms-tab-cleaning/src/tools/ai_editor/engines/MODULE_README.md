@@ -81,7 +81,7 @@ functions with unit tests, not conditionals inside the drawing code.
   field with «Кэшировать» / «Переименовать», then ONE compact line about the PROMPT CACHE: whether
   the prompt is served (`.status.prompt_cached`, three-state, shown only while that answer still
   describes the field; or a preset of the typed text in the listing) and the encoder of the entry
-  in use; which fact takes that line is the pure `flux2_prompt_cache_line`, and an unknown state
+  in use; which fact takes that line is the pure shared `prompt_cache_line`, and an unknown state
   draws NOTHING. The cached prompts form ONE LIBRARY PER MODEL (protocol 23, backend-side, named
   presets; any encoder variant of the model may serve an entry): a run uses an entry
   automatically when the typed text matches it exactly, choosing by the request's encoder source,
@@ -132,23 +132,25 @@ functions with unit tests, not conditionals inside the drawing code.
   (`ui/` draws, `decisions.rs` decides, `engine/` owns the state) and exactly ONE picker entry
   (`flux3_klein`, «С промптом»); its own `MODULE_README.md` is the map. IPC methods
   `inpaint.flux3_klein` (streaming, cancelled MID-RUN through `CallHandle::cancel`), `.status`,
-  `.unload`, `.download.check` and `.download.start` (streaming), plus the forecast
-  `large_models.profiles` with `model: "flux3_klein"`. FLUX.3 has no mask input: the REGION is
+  `.unload`, plus the forecast `large_models.profiles` with `model: "flux3_klein"`. FLUX.3 has no mask input: the REGION is
   reference #0 and the output is the region's size; the painted mask is permission to change
   (the backend composites inside it) and an empty one is the whole-region mode (`mask_for_run`).
   Up to nine extra reference images (session state) follow as #1 and up, the marks reference is
   one more of them. Size contract: multiple of 16, shortest side >= 128 px, area <= 4 MP, aspect
   not steeper than 4:1 — declared through `constraints()` and re-checked on the run path through
-  the shared `region_size_refusal` (validity is `region_edit_v2::geometry::check_size`). Three
-  weight formats (BF16 / FP8 / NVFP4, default FP8) are a parameter of the one entry; the model
-  comes from a manual package folder or the gated Hugging Face download (`config::flux3_klein_dir`).
+  the shared `region_size_refusal` (validity is `region_edit_v2::geometry::check_size`). The DiT
+  format (BF16 / FP8 / NVFP4 / GGUF Q8_0..Q4_K_M, default FP8) and the text-encoder format (BF16
+  / GGUF Q8_0 / Q4_K_M; `ms_config::{Flux3DitFormat, Flux3EncoderFormat}`) are parameters of the
+  one entry; the model comes from a manual package folder or the app's model catalog
+  (`flux3_klein_package_specs`, into `config::flux3_klein_dir`), the same controller pattern as
+  FLUX.2 klein below.
 
 - `shared/`: the MODEL-AGNOSTIC building blocks of the large-model engines (FLUX.2 klein and
   FLUX.3 klein), re-exported flat: the streamed progress bar with its generation guard,
-  rate window, frame parser and `stream_call`; the Hugging Face download (per-repository
-  verdicts and links, the nullable plan, `hf_download_readiness`, the two calls,
-  `HfTokenControl`) and its drawing (`draw_hf_token_row`, `draw_hf_download_controls`,
-  `gated_button`); the settings-file rules re-exported from `region_edit_v2::engine_settings_file`
+  rate window, frame parser and `stream_call`; the Hugging Face token field (`HfTokenControl`)
+  and its row (`draw_hf_token_row`, `gated_button`); the catalog-download decisions
+  (`catalog_gated_repos_missing`, `catalog_bundle_missing`, `catalog_job_running`,
+  `catalog_switch_block_reason`); the settings-file rules re-exported from `region_edit_v2::engine_settings_file`
   (`read_settings_file` quarantines a damaged file, `SettingsSaver` debounces, retries with
   backoff and flushes at teardown); `mask_for_run`. Nothing there names
   a model. Own `MODULE_README.md`.
@@ -445,8 +447,9 @@ functions with unit tests, not conditionals inside the drawing code.
     klein packages (`modules/ai_backend/inpaint/MODULE_README.md`).
 - **Both FLUX.2 klein variants download through the app's model catalog**
   (`ms_sysprobe::ai_models::external_catalog`, `flux2_klein_package_specs`); the backend's
-  `.download.*` pair was retired at protocol 22 and the backend fetches no FLUX.2 file. What
-  this side owns:
+  `.download.*` pair was retired at protocol 22 and the backend fetches no FLUX.2 file. FLUX.3
+  klein follows the same pattern (`flux3_klein_package_specs`, its `.download.*` pair retired
+  at protocol 24; `flux3_klein/MODULE_README.md`). What this side owns:
   - **The engine holds an `OcrModelDownloadController`** (`ms_tab_translation::ocr_model_download`)
     and polls it from `AiEngine::poll`: it probes the bundle of the SELECTED variant, source and
     formats (`flux2_catalog_bundle`), runs the download / verify job and automatically adopts
@@ -459,48 +462,53 @@ functions with unit tests, not conditionals inside the drawing code.
   - **The token is NOT this engine's.** It is the process-wide `ms_sysprobe::hf_token` global,
     kept in the OS secret store and seeded at startup; this panel only edits it through the
     shared token row (`shared/`, `HfTokenControl`), drawn while a gated spec of the bundle is
-    not installed (`flux2_gated_repos_missing`: 9B's BFL repository and the uncensored
+    not installed (the shared `catalog_gated_repos_missing`: 9B's BFL repository and the uncensored
     encoder; 4B's repositories are open). It is never a `Flux2KleinSettings` field, never
     reaches a settings JSON or the backend, and never appears in a log line.
   - **The catalog download does not claim the engine's progress bar**: it has its own
     progress in its block, and `flux2_pipeline_busy` spans the three backend operations (a
     generation, a prompt-cache build, a component action). A running catalog job blocks the
-    engine picker (`flux2_catalog_switch_block_reason`).
+    engine picker (the shared `catalog_switch_block_reason`).
   - **Only ONE variant is resident at a time.** The backend keeps one pipeline and one text
     encoder, keyed by the component paths, so selecting the other engine unloads the previous
     model. This side orchestrates nothing and only says so, in one line at the top of
     «Установка модели» (`variant_residency_hint`).
 - Every `t!` key of FLUX.3 klein lives under `cleaning.tools.flux3_klein.*` (stage names
-  `cleaning.tools.flux3_klein.stage_<id>`).
+  `cleaning.tools.flux3_klein.stage_<id>`); the catalog block's own texts are
+  `translation.ocr_model.*` and `cleaning.tools.catalog_download.*`.
 - Every `t!` key of FLUX.2 klein lives under `cleaning.tools.flux2_klein.*` (its own download
   sentences under `cleaning.tools.flux2_klein.download.*`); the texts of `shared/` live under
-  `cleaning.tools.engine_progress.*` (the bar, speed, ETA) and `cleaning.tools.hf_download.*` (the
-  verdicts, the token row, the check / download controls); the run/cancel wording shared with the
+  `cleaning.tools.engine_progress.*` (the bar, speed, ETA), `cleaning.tools.hf_download.*` (the
+  token row) and `cleaning.tools.catalog_download.*` (the engine-picker block of a catalog job);
+  the run/cancel wording shared with the
   older editors stays under `cleaning.mask_editor.*`. The `hf_token` module has its own `hf_token.*` namespace,
   because the token is not a cleaning-tool concept.
 
 ## Editing map
 - To add an engine: a module here plus one line in `mod.rs::all_engines`; the trait it must satisfy
   is `../../region_edit_v2/engine.rs`. A large-model engine composes `shared/` (progress, HF
-  download, settings file, mask rule) and `../large_model_resources/` (`ResourcesController` +
+  token row, catalog-download decisions, settings file, mask rule) and `../large_model_resources/` (`ResourcesController` +
   the widget) instead of copying FLUX.2 klein's.
-- To change the progress bar, the HF download verdicts / token row / controls, the settings-file
+- To change the progress bar, the HF token row, the catalog-download decisions, the settings-file
   quarantine or save backoff for every large-model engine at once: `shared/`.
 - To change which paths a run uses, or to add a third source mode:
   `Flux2KleinSettings::effective_paths` and `Flux2SourceMode` — never a second computation at a
   call site.
-- To change FLUX.3 klein's parameters, references, weight formats, download or panel:
-  `flux3_klein/`, whose `MODULE_README.md` says which file owns which; its size contract is
+- To change FLUX.3 klein's parameters, references, weight formats, catalog block or panel:
+  `flux3_klein/`, whose `MODULE_README.md` says which file owns which (which files a format
+  needs and where they lie: `ms_sysprobe::ai_models::external_catalog::flux3_klein`); its size contract is
   `Flux3KleinEngine::frame_constraints` (pinned against the backend's `validate_region_size` by a
   test).
 - To change FLUX.2 klein's parameters, prompt block, prompt-cache library, memory steps or
   model-download block: `flux2_klein/`, whose `MODULE_README.md` says which
   file owns which of them. The wire names of its methods live in `backend_ipc::protocol`. The
   model-agnostic half of the prompt library (listing shapes, exact-text preset match, «Нет»
-  stash, the preset picker) is `shared/prompt_library*`, ready for another engine's library.
+  stash, the preset picker) is `shared/prompt_library*`, and its controller (gates, cache line,
+  jobs, the cache row and library fold) is `shared/prompt_cache*`, ready for another engine's
+  library.
 - To change what one of FLUX.2 klein's lines SAYS, edit its pure function and its test, never the
   drawing code (`flux2_klein/decisions.rs`): `flux2_readiness_line` (the readiness line),
-  `flux2_prompt_cache_line` (the one line under the prompt), `flux2_component_rows` / `flux2_component_row_tooltip` (a row of the
+  `shared/prompt_cache.rs` `prompt_cache_line` (the one line under the prompt, every engine's), `flux2_component_rows` / `flux2_component_row_tooltip` (a row of the
   merged component list), `large_model_resources::forecast_line` (the forecast, printed by two
   surfaces).
 - To move a control between FLUX.2 klein's sections: `Flux2PanelCtx::draw` (`flux2_klein/ui/mod.rs`)

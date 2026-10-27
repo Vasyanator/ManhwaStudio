@@ -497,7 +497,10 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   the region as reference #0) run on it. A model service may pin components to host execution
   per request (`LargeModelSpec.host_pin`; «Энкодер на CPU», `encoder_on_cpu`, default on for both
   klein models): a pinned component runs on the CPU at every VRAM step and only the RAM step
-  places it; the pin is part of the residency and learned-floor keys. Detail:
+  places it; the pin is part of the residency and learned-floor keys. Both klein models run as two
+  handles, pipeline and text encoder (one rule, `runtime/large_models/paired.py`); a TEXT-mode run
+  whose prompts are all served by the prompt library (`runtime/prompt_cache_service.py`) never
+  acquires the encoder handle. Detail:
   `modules/ai_backend/runtime/large_models/MODULE_README.md`.
 - **One ONNX selection** (`General.ai_onnx_build` / `ai_onnx_provider` / `ai_onnx_device_id`)
   drives both runtimes. An unavailable accelerator falls back to the CPU build with a log; a
@@ -519,8 +522,9 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   download is explicit (never implicit on use), resumable and cancellable. The main model repo is
   unpinned (size + server identity, LFS sha256 when announced). Third-party models — Baberu OCR,
   the PaddleOCR-VL variants, EasyOCR (one shared dir, detector stored once), Surya, the SDXL configs,
-  the one curated SDXL inpaint repo and FLUX.2 klein 4B and 9B (the BFL packages, the GGUF
-  transformer and Qwen3 encoder quants, the 9B uncensored encoder; existing unmarked files are
+  the one curated SDXL inpaint repo, FLUX.2 klein 4B and 9B (the BFL packages, the GGUF
+  transformer and Qwen3 encoder quants, the 9B uncensored encoder) and FLUX.3 klein (the BFL package,
+  the unsloth DiT and Qwen3-VL encoder GGUF quants; existing unmarked files are
   adopted by hash, never re-downloaded) — come from the pinned external catalog
   (`ai_models::external_catalog`: source, commit/URL, per-file size + sha256; regenerated with
   `tools/model_pins/`), the one owner of those facts. Rust sends the backend absolute paths and the
@@ -528,7 +532,7 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   library versions are pinned to match the catalog. Gated Hugging Face repositories get an
   access preflight (`ai_models::hf_access`: no token / token rejected / terms not accepted) before
   any transfer, and a 401/403 maps to the same typed answer. The backend itself still downloads
-  only FLUX.3 klein and FLUX.1 Fill, watermark and Reline weights, through
+  only FLUX.1 Fill, watermark and Reline weights, through
   `engines/model_download.py` (same network rules).
 - **GGUF weights.** FLUX.2 klein's (4B and 9B) transformer and text encoder may be GGUF files (format ids
   from `ms_config::Flux2WeightFormat`, opaque to the backend, which reads the quant from the file).

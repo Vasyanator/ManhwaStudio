@@ -10,8 +10,8 @@ the `engine` module; the long-operation plumbing it starts and drains lives in
 Main responsibilities:
 - own `Flux2KleinEngine` — the settings and their saver (the shared `SettingsSaver`), the
   cached `.status` catalog, the large-model forecast / caps / floor reset (the shared
-  `ResourcesController`), the token field (`HfTokenControl`), the progress, the session and
-  every worker channel;
+  `ResourcesController`), the token field (`HfTokenControl`), the prompt library (the shared
+  `PromptCacheController`), the progress, the session and every worker channel;
 - implement `AiEngine`: the sections the host draws, the mask layer it declares, the
   frame constraints it validates against, the marks modes it accepts (a separate reference
   by preference, or composited onto the region — never a transparent layer), the run it
@@ -136,31 +136,12 @@ pub struct Flux2KleinEngine {
     /// answer is about files the user has already typed away from, and the honest verdict
     /// is `Unknown` ([`flux2_status_for_paths`]).
     pub(super) status_paths: Option<Flux2EffectivePaths>,
-    /// The one prompt-cache operation (build / rename / export / import) that may be in
-    /// flight. All share the channel because only one can run at a time.
-    pub(super) prompt_cache_rx: Option<Receiver<Result<Flux2PromptCacheOutcome, String>>>,
-    /// User-facing outcome of the last prompt-cache operation, shown in the library fold.
-    pub(super) prompt_cache_status: Option<String>,
-    /// A warning about the LAST prompt-cache operation ("the imported entry belongs to another
-    /// model's library"), shown beside its status line. Cleared when the next operation starts,
-    /// so it is a remark about a result and never a standing banner.
-    pub(super) prompt_cache_warning: Option<String>,
-    /// The model's shared library listing (protocol 23); `None` until `.list` answers.
-    pub(super) prompt_cache_library: Option<PromptLibraryListing>,
-    pub(super) prompt_cache_list_rx: Option<Receiver<Result<PromptLibraryListing, String>>>,
-    pub(super) prompt_cache_list_error: Option<String>,
-    /// Same one-shot arming as `status_wanted`; re-armed after a build or an import, after a
-    /// catalog job and whenever the encoder changes (`current_encoder` follows it).
-    pub(super) prompt_cache_list_wanted: bool,
-    /// The preset NAME field beside «Кэшировать»: filled with the typed text's preset name
-    /// ([`sync_preset_name`]), editable, sent as the build's `name` (empty: the default
-    /// derived from the text). Session state.
-    pub(super) prompt_cache_name_input: String,
-    /// The preset text the name field was last filled for ([`sync_preset_name`]).
-    pub(super) prompt_cache_name_synced_for: Option<String>,
-    /// The library FILE an export dialog was opened for, captured when it started so a prompt
-    /// changed while it is open cannot export another entry.
-    pub(super) prompt_cache_export_file: Option<String>,
+    /// The model's prompt LIBRARY between frames (the shared controller): the one operation in
+    /// flight (build / rename / export / import, one channel because only one can run), the
+    /// `.list` query with its one-shot arming (re-armed after a build or an import, after a
+    /// catalog job and whenever the encoder changes), the preset-name field, the export file
+    /// captured when its dialog opened, the outcome lines and the session-only fold flag.
+    pub(super) prompt_cache: PromptCacheController,
     /// The `large_models.profiles` forecast (at most one request in flight, latest wins) and
     /// its one-shot arming, the «Пределы» caps buffer with its debounced writer, and the
     /// learned-floor reset. Armed whenever a parameter changed and, for the geometry, only by
@@ -202,14 +183,6 @@ pub struct Flux2KleinEngine {
     pub(super) picker: Option<(Flux2PickerPurpose, ms_platform::file_dialog::PendingDialog)>,
     pub(super) progress: Arc<Mutex<EngineProgress>>,
     pub(super) ai_backend_available: bool,
-    /// Whether the prompt-cache LIBRARY is unfolded under the prompt block.
-    ///
-    /// SESSION state and deliberately not a persisted setting: the library is a workbench
-    /// the user opens to save, load or carry a `.msprompt` and closes again, so remembering
-    /// it across launches would re-expand an expert surface on every start. What the library
-    /// EXPLAINS — whether the current prompt is cached — is drawn outside it either way,
-    /// because that one line is what predicts a full encoder read.
-    pub(super) prompt_library_open: bool,
     /// Whether the FIRST definite model verdict has already chosen the initial state of
     /// «Установка модели».
     ///
@@ -316,16 +289,7 @@ impl Flux2KleinEngine {
             status_prompt: None,
             status_query_paths: None,
             status_paths: None,
-            prompt_cache_rx: None,
-            prompt_cache_status: None,
-            prompt_cache_warning: None,
-            prompt_cache_library: None,
-            prompt_cache_list_rx: None,
-            prompt_cache_list_error: None,
-            prompt_cache_list_wanted: true,
-            prompt_cache_name_input: String::new(),
-            prompt_cache_name_synced_for: None,
-            prompt_cache_export_file: None,
+            prompt_cache: PromptCacheController::default(),
             resources: ResourcesController::new(FLUX2_LARGE_MODEL, FLUX2_LOG_LABEL),
             unload_rx: None,
             unload_status: None,
@@ -340,7 +304,6 @@ impl Flux2KleinEngine {
             progress: Arc::new(Mutex::new(EngineProgress::default())),
             mask_painted: false,
             ai_backend_available: false,
-            prompt_library_open: false,
             install_section_seeded: false,
             install_section_open_prev: None,
             downloads: None,
@@ -512,8 +475,8 @@ impl Flux2KleinEngine {
     /// nobody has answered yet would be a guess, and the wrong one most of the time.
     pub(super) fn prompt_cache_state(&self) -> Option<bool> {
         prompt_cache_state_for(
-            self.status.as_ref(),
             self.status_prompt.as_deref(),
+            self.status.as_ref().and_then(|status| status.prompt_cached),
             &self.settings.prompt,
         )
     }
@@ -657,11 +620,11 @@ impl Flux2KleinEngine {
         let mut repaint = downloads.poll() || downloads.is_active();
         // An empty bundle (manual mode) still sees another bundle's job as `other_download`,
         // so a download left running across a mode switch is not missed.
-        let running = flux2_catalog_job_running(&downloads.panel_snapshot(&bundle));
+        let running = catalog_job_running(&downloads.panel_snapshot(&bundle));
         if self.catalog_job_running && !running {
             self.installed_formats_wanted = true;
             self.status_wanted = true;
-            self.prompt_cache_list_wanted = true;
+            self.prompt_cache.arm_list();
             self.invalidate_forecast();
         }
         self.catalog_job_running = running;
@@ -759,7 +722,7 @@ impl Flux2KleinEngine {
         }
         self.installed_formats_wanted = true;
         if encoder_changed {
-            self.prompt_cache_list_wanted = true;
+            self.prompt_cache.arm_list();
         }
     }
 
@@ -807,7 +770,7 @@ impl Flux2KleinEngine {
     pub(super) fn pipeline_busy(&self) -> bool {
         flux2_pipeline_busy(
             self.session.run_rx.is_some(),
-            self.prompt_cache_rx.is_some(),
+            self.prompt_cache.busy(),
             self.component_action_rx.is_some(),
         ) || self.session.abandoned.busy()
     }
@@ -825,7 +788,7 @@ impl Flux2KleinEngine {
     pub(super) fn non_run_pipeline_busy(&self) -> bool {
         flux2_pipeline_busy(
             false,
-            self.prompt_cache_rx.is_some(),
+            self.prompt_cache.busy(),
             self.component_action_rx.is_some(),
         ) || self.session.abandoned.busy()
     }
@@ -1028,7 +991,7 @@ impl AiEngine for Flux2KleinEngine {
         let mut resources_actions: Vec<ResourcesAction> = Vec::new();
         let mut unload_requested = false;
         let mut translate_requested = false;
-        let mut prompt_cache_action: Option<Flux2PromptCacheAction> = None;
+        let mut prompt_cache_action: Option<PromptCacheAction> = None;
         let mut component_action: Option<(Flux2ComponentId, Flux2ComponentAction)> = None;
         let mut picker_requested: Option<Flux2PickerPurpose> = None;
         let mut hf_token_action: Option<HfTokenAction> = None;
@@ -1056,11 +1019,11 @@ impl AiEngine for Flux2KleinEngine {
         // format combos or the toggle may move the bundle this frame; the block is drawn only
         // while the snapshot still describes the bundle the selection needs.
         let catalog_snapshot = self.catalog_snapshot();
-        let bundle_missing = catalog_snapshot.as_ref().is_some_and(|snapshot| flux2_catalog_bundle_missing(&snapshot.state));
+        let bundle_missing = catalog_snapshot.as_ref().is_some_and(|snapshot| catalog_bundle_missing(&snapshot.state));
         let mut catalog_action = ModelDownloadAction::None;
         // The gated repositories the token row is drawn for: those of the bundle's specs the
         // controller has not seen installed (its last probe; nothing here touches the disk).
-        let gated_repos = flux2_gated_repos_missing(&flux2_catalog_bundle(&self.settings), |spec| {
+        let gated_repos = catalog_gated_repos_missing(&flux2_catalog_bundle(&self.settings), |spec| {
             self.downloads.as_ref().is_some_and(|downloads| matches!(downloads.state_for(spec.id), OcrModelDownloadState::Installed))
         });
         let selection_before = self.settings.weight_selection();
@@ -1076,15 +1039,7 @@ impl AiEngine for Flux2KleinEngine {
                 component_action_status,
                 translate_status,
                 translate_rx,
-                prompt_cache_rx,
-                prompt_cache_status,
-                prompt_cache_warning,
-                prompt_cache_library,
-                prompt_cache_list_rx,
-                prompt_cache_list_error,
-                prompt_cache_name_input,
-                prompt_cache_name_synced_for,
-                prompt_library_open,
+                prompt_cache,
                 install_section_seeded,
                 install_section_open_prev,
                 hf_token,
@@ -1107,15 +1062,7 @@ impl AiEngine for Flux2KleinEngine {
                 translate_busy: translate_rx.is_some(),
                 prompt_cache_state,
                 prompt_cache_status_entry: prompt_cache_status_entry.as_ref(),
-                prompt_cache_status: prompt_cache_status.as_deref(),
-                prompt_cache_warning: prompt_cache_warning.as_deref(),
-                prompt_cache_library: prompt_cache_library.as_ref(),
-                prompt_cache_list_error: prompt_cache_list_error.as_deref(),
-                prompt_cache_list_busy: prompt_cache_list_rx.is_some(),
-                prompt_cache_busy: prompt_cache_rx.is_some(),
-                prompt_cache_name_input,
-                prompt_cache_name_synced_for,
-                prompt_library_open,
+                prompt_cache,
                 install_section_seeded,
                 install_section_open_prev,
                 readiness,
@@ -1179,21 +1126,16 @@ impl AiEngine for Flux2KleinEngine {
             self.start_translate();
         }
         match prompt_cache_action {
-            Some(Flux2PromptCacheAction::Build) => self.start_prompt_cache_build(false),
-            Some(Flux2PromptCacheAction::Rename) => self.start_prompt_cache_build(true),
+            Some(PromptCacheAction::Build) => self.start_prompt_cache_build(false),
+            Some(PromptCacheAction::Rename) => self.start_prompt_cache_build(true),
             // The dialog is opened here and the entry's file is captured with it, so a prompt
             // changed while it is open cannot redirect the export to another entry.
-            Some(Flux2PromptCacheAction::Export) => {
-                self.prompt_cache_export_file = self
-                    .prompt_cache_library
-                    .as_ref()
-                    .and_then(|library| library.text_for(&self.settings.prompt))
-                    .map(|text| text.selected.file.clone());
-                if self.prompt_cache_export_file.is_some() {
+            Some(PromptCacheAction::Export) => {
+                if self.prompt_cache.arm_export(&self.settings.prompt) {
                     self.start_picker(Flux2PickerPurpose::PromptCacheExport);
                 }
             }
-            Some(Flux2PromptCacheAction::Import) => {
+            Some(PromptCacheAction::Import) => {
                 self.start_picker(Flux2PickerPurpose::PromptCacheImport);
             }
             None => {}
@@ -1263,7 +1205,7 @@ impl AiEngine for Flux2KleinEngine {
     }
 
     /// Refuses the switch while a job of THIS engine's catalog controller runs (download,
-    /// verify or automatic adoption, [`flux2_catalog_switch_block_reason`]).
+    /// verify or automatic adoption, [`catalog_switch_block_reason`]).
     ///
     /// The download is the reason the hook exists: it is a multi-gigabyte transfer with its
     /// own free-space budget and no frame state at all, and the host polls only the selected
@@ -1274,7 +1216,7 @@ impl AiEngine for Flux2KleinEngine {
     /// backend's one pipeline, which the newly selected engine would queue behind rather
     /// than duplicate.
     fn switch_block_reason(&self) -> Option<String> {
-        flux2_catalog_switch_block_reason(self.downloads.as_ref().and_then(OcrModelDownloadController::running_job))
+        catalog_switch_block_reason(self.downloads.as_ref().and_then(OcrModelDownloadController::running_job))
     }
 
     /// Validates the host's request and starts the run.
@@ -1439,6 +1381,7 @@ impl AiEngine for Flux2KleinEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use crate::tools::region_edit_v2::engine_settings::settings_save_due;
 
     /// A run in flight describes the rectangle it started from, so a frame that moves or
@@ -1461,7 +1404,7 @@ mod tests {
     }
 
     /// Only a running catalog job closes the engine picker
-    /// ([`flux2_catalog_switch_block_reason`], tested per job kind in `decisions.rs`): an idle
+    /// ([`catalog_switch_block_reason`], tested per job kind in `../shared/catalog_download.rs`): an idle
     /// engine blocks nothing.
     #[test]
     fn an_idle_engine_and_a_generation_do_not_close_the_engine_picker() {
@@ -2015,9 +1958,10 @@ mod tests {
         // in the middle of a run — and it would have stolen the run's progress bar.
         let mut engine = Flux2KleinEngine::default();
         assert!(!engine.pipeline_busy());
-        let gates = |busy| flux2_prompt_cache_gates(&cacheable_settings(), None, "", Some(false), Some(true), true, busy);
+        let settings = cacheable_settings();
+        let gates = |busy| prompt_cache_gates(&flux2_cache_context(&settings), None, "", Some(false), Some(true), true, busy);
         let open = gates(engine.pipeline_busy());
-        assert!(open.build == Flux2CacheButton::Cache && open.import);
+        assert!(open.build == CacheButton::Cache && open.import);
 
         // Each of the three long operations closes them, and each on its own.
         let (_run_tx, run_rx) = mpsc::channel();
@@ -2025,7 +1969,7 @@ mod tests {
         assert!(engine.pipeline_busy(), "a generation holds the pipeline");
         assert_eq!(
             gates(engine.pipeline_busy()),
-            Flux2PromptCacheGates { build: Flux2CacheButton::Closed(Flux2CacheBlock::NotReady), export: false, import: false }
+            PromptCacheGates { build: CacheButton::Closed(CacheBlock::NotReady), export: false, import: false }
         );
         engine.session.run_rx = None;
 
@@ -2038,7 +1982,7 @@ mod tests {
         engine.component_action_rx = None;
 
         let (_cache_tx, cache_rx) = mpsc::channel();
-        engine.prompt_cache_rx = Some(cache_rx);
+        engine.prompt_cache.rx = Some(cache_rx);
         assert!(engine.pipeline_busy());
     }
 
@@ -2078,10 +2022,11 @@ mod tests {
             "«Обработать» must say the pipeline is busy, not that a path is missing"
         );
         // The prompt-cache controls close on the same rule, on a real receiver.
-        let gates = flux2_prompt_cache_gates(&cacheable_settings(), None, "", Some(false), Some(true), true, engine.pipeline_busy());
+        let settings = cacheable_settings();
+        let gates = prompt_cache_gates(&flux2_cache_context(&settings), None, "", Some(false), Some(true), true, engine.pipeline_busy());
         assert_eq!(
             gates,
-            Flux2PromptCacheGates { build: Flux2CacheButton::Closed(Flux2CacheBlock::NotReady), export: false, import: false }
+            PromptCacheGates { build: CacheButton::Closed(CacheBlock::NotReady), export: false, import: false }
         );
         engine.component_action_rx = None;
 
@@ -2113,7 +2058,7 @@ mod tests {
             settings_loaded: true,
             status_paths: Some(asked_about),
             status_wanted: false,
-            prompt_cache_list_wanted: false,
+            prompt_cache: PromptCacheController { list_wanted: false, ..PromptCacheController::default() },
             installed_formats_wanted: false,
             dirty: false,
             ..Flux2KleinEngine::default()
@@ -2145,7 +2090,7 @@ mod tests {
         assert!(engine.dirty && engine.resources.wanted, "a save is owed and the forecast re-armed");
         assert!(engine.status_wanted, "the transformer path moved to the GGUF file");
         assert!(engine.installed_formats_wanted, "the installed formats are probed again");
-        assert!(!engine.prompt_cache_list_wanted, "the encoder family did not change");
+        assert!(!engine.prompt_cache.list_wanted, "the encoder family did not change");
     }
 
     /// A backend format SUGGESTION is written by the fold itself (the widget does not).
@@ -2169,7 +2114,7 @@ mod tests {
         engine.settings.text_encoder_format = Flux2WeightFormat::Q80.wire().to_string();
         engine.note_settings_changed();
         engine.fold_resources_and_formats(Vec::new(), stock_selection(Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16));
-        assert!(engine.prompt_cache_list_wanted && engine.status_wanted && engine.resources.wanted);
+        assert!(engine.prompt_cache.list_wanted && engine.status_wanted && engine.resources.wanted);
     }
 
     /// 9B downloads from the catalog too: in download mode a format action is applied, and
@@ -2192,7 +2137,7 @@ mod tests {
         toggled.note_settings_changed();
         toggled.fold_resources_and_formats(Vec::new(), before);
         assert!(toggled.status_wanted, "the encoder path moved to text_encoder_uncensored/");
-        assert!(toggled.resources.wanted && toggled.installed_formats_wanted && toggled.prompt_cache_list_wanted);
+        assert!(toggled.resources.wanted && toggled.installed_formats_wanted && toggled.prompt_cache.list_wanted);
         assert!(toggled.downloads.is_none() && toggled.catalog_snapshot().is_none(), "a test build has no controller");
     }
 

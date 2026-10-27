@@ -261,15 +261,10 @@ pub(super) fn flux2_picker_request(purpose: Flux2PickerPurpose) -> FileDialogReq
         }
         Flux2PickerPurpose::TextEncoderFile => FileDialogRequest::new(DialogKind::OpenFile)
             .filter(t!("cleaning.tools.flux2_klein.weights_files_filter"), FLUX2_TEXT_ENCODER_FILE_EXTENSIONS),
-        Flux2PickerPurpose::PromptCacheExport => FileDialogRequest::new(DialogKind::SaveFile)
-            .title(t!("cleaning.tools.flux2_klein.prompt_cache_export_dialog_title"))
-            .filter(t!("cleaning.tools.flux2_klein.prompt_cache_files_filter"), &[FLUX2_PROMPT_CACHE_EXTENSION])
-            // The extension is part of the file's identity, so the suggested name already
-            // carries it; the stem is a plain identifier and stays literal.
-            .suggested_name(format!("prompt.{FLUX2_PROMPT_CACHE_EXTENSION}")),
-        Flux2PickerPurpose::PromptCacheImport => FileDialogRequest::new(DialogKind::OpenFile)
-            .title(t!("cleaning.tools.flux2_klein.prompt_cache_import_dialog_title"))
-            .filter(t!("cleaning.tools.flux2_klein.prompt_cache_files_filter"), &[FLUX2_PROMPT_CACHE_EXTENSION]),
+        // The two prompt-cache dialogs are the shared controller's (title, filter, suggested
+        // name): every large-model engine carries a `.msprompt` the same way.
+        Flux2PickerPurpose::PromptCacheExport => prompt_cache_export_dialog(),
+        Flux2PickerPurpose::PromptCacheImport => prompt_cache_import_dialog(),
     }
 }
 

@@ -61,8 +61,8 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
   saves a named preset into the model's prompt library, encoding without generating anything when
   needed, and reading the text encoder takes tens of seconds, so a silent wait is not acceptable.
   `prompt_cache.list` / `.export` / `.import` are plain request/response (protocol 23; `.save` /
-  `.load` are gone). The preset `name` (optional, `_optional_str`), entry `file` and `path` are
-  forwarded VERBATIM — `_require_non_empty_str` only checks that a required field arrived as a
+  `.load` are gone); their bodies are `prompt_cache_handlers.py`'s. The preset `name` (optional,
+  `optional_str`), entry `file` and `path` are forwarded VERBATIM — `require_non_empty_str` only checks that a required field arrived as a
   non-empty string; what makes a path, a file name or a name acceptable is the service's business
   (`prompt_library.require_entry_source` / `require_entry_file_name` / `normalize_preset_name`),
   and duplicating those rules here would give two answers to one question.
@@ -78,29 +78,29 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
   load reads, and `stage`) as keyword-only optionals and omits each one it
   was not given, so `step`/`total` keep meaning the overall level and every four-positional-argument
   caller emits exactly the frame it always did. See `PROTOCOL.md`.
-- `flux3_klein.py`: `inpaint.flux3_klein` (+ `.status`, `.unload`, `.download.check`,
-  `.download.start`) — FLUX.3 klein region editing over `ctx.state.flux3_klein`. The run's blob
+- `flux3_klein.py`: `inpaint.flux3_klein` (+ `.status`, `.unload` and the four `.prompt_cache.*`
+  methods) — FLUX.3 klein region editing over `ctx.state.flux3_klein`. The run's blob
   is `region ++ mask ++ references` split by `image_len` / `mask_len` / `reference_lens` (0..9
   positive lengths, strict sum; `MAX_REFERENCES` mirrors `wire.MAX_EXTRA_REFERENCES`); `params` is
   forwarded verbatim to `inpaint/flux3_klein/region.py` (whose `wire.py` is the one params owner).
   The run streams `load` / `generate` frames with a stable `stage` and is canceled MID-RUN:
   `cancel_event.is_set` is the region editor's `should_cancel` (checked at every stage begin and
-  denoise step), `Flux3Canceled` becomes `Interrupted`. `.download.check` / `.download.start`
-  acquire the package from Hugging Face and are deliberate exceptions to the service shape:
-  * they reach `../../inpaint/flux3_download.py` through a lazy import (`_download_module`) instead
-    of a `ctx.state` field, because that module is stateless — no resident weights, no lease — so
-    it is not an `AppState` service (precedent: `sdxl.py`'s lazy `from ...inpaint.sdxl import …`);
-  * `download.start` observes cancellation INSIDE the work: `cancel_event.is_set` is handed to the
-    downloader, which polls it at every chunk boundary and retry wait — a cancel that only stopped
-    the progress frames while the socket kept pulling gigabytes would be a lie;
-  * the token is the `hf_token` REQUEST FIELD (`streaming.read_hf_token`), never an environment
-    variable or a `params` key, and nothing here logs or echoes it; `format` is forwarded VERBATIM
-    (the vocabulary, the default and the refusal are `flux3_download.resolve_format`'s), and the
-    nullable `plan` / `plan_error` reach the client unchanged.
+  denoise step), `Flux3Canceled` becomes `Interrupted`. The group downloads nothing: the FLUX.3
+  klein package comes from the app's model catalog, and the former `.download.check` /
+  `.download.start` are unknown methods since protocol 24. The `.prompt_cache.*` bodies are
+  `prompt_cache_handlers.py`'s; the build passes `_RegionPromptBuild` as the service, which runs
+  `region.build_prompt_cache` (the run's frame builder: stages `prepare` / `encoder_load` /
+  `encode` / `encoder_release`, the cancel checked at every stage begin too).
 - `streaming.py`: helpers shared by the region-editor groups (`flux2_klein.py`, `flux3_klein.py`),
-  registering no method: `require_segment_len`, `require_params`, `progress_forwarder` (a dead peer
-  never aborts the work; the first failed frame of a request is logged once) and `read_hf_token`.
+  registering no method: `require_segment_len`, `require_params` and `progress_forwarder` (a dead peer
+  never aborts the work; the first failed frame of a request is logged once).
   Not imported by `__init__.py` (it is not a group).
+- `prompt_cache_handlers.py`: the bodies of the four `<model>.prompt_cache.*` methods
+  (`handle_build` streaming, `handle_list`, `handle_export`, `handle_import`) and the header readers
+  `require_non_empty_str` / `optional_str`, registering no method: a group registers its own method
+  names and passes its service (duck-typed `prompt_cache_build(params, *, name, progress_callback)`,
+  `prompt_cache_list` / `_export` / `_import`) and its method name (the cancel texts and the progress
+  frames name it). Used by `flux2_klein.py` and `flux3_klein.py`. Not imported by `__init__.py` (it is not a group).
 - `watermark.py`: `watermark.detect` / `.remove` / `.status` / `.unload` — visible-watermark removal
   (`ctx.state.watermark`). Same two-phase streaming contract as `flux_fill.py`; `.remove` is the only
   method whose RESPONSE blob concatenates two PNGs (`clean ++ mask`, split by `image_len`/`mask_len`).
@@ -129,12 +129,10 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
 ## Contracts and invariants
 - A handler never constructs a service and never imports `server.py` or a service package. It reads
   `ctx.state.<field>`; those `AppState` field names are the cross-layer contract with `server.py`.
-  There are exactly TWO documented exceptions, both stateless helpers with no `AppState`
-  counterpart and both imported INSIDE a function so this package stays torch-free at import time:
-  `sdxl.py`'s `_encode_png_bytes_rgb` from `../../inpaint/sdxl.py` (a pure byte helper), and
-  `flux3_klein.py`'s `_download_module()` -> `../../inpaint/flux3_download.py` (a function module
-  that owns no resident state, so a service field for it would be an empty object in the composition
-  root). Do not grow that list: a helper that acquires state belongs on `AppState`.
+  There is exactly ONE documented exception, a stateless helper with no `AppState` counterpart,
+  imported INSIDE a function so this package stays torch-free at import time: `sdxl.py`'s
+  `_encode_png_bytes_rgb` from `../../inpaint/sdxl.py` (a pure byte helper). Do not grow that list:
+  a helper that acquires state belongs on `AppState`.
   (`large_models.py` importing the pure value types `RequestShape` / `VramStep` / `RamStep` / `Steps`
   from `runtime/large_models/` is not a service import: those modules are stdlib-only and hold no
   state.)
@@ -148,9 +146,9 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
 - Long work must observe `cancel_event` and raise `Interrupted` so the dispatcher can answer
   `response{status:"interrupted"}`; a handler that ignores it makes the method uncancellable.
   Checking it only around the service call is enough where the work is a bounded weight read;
-  where the work is an unbounded network transfer the event itself must reach the work
-  (`inpaint.flux3_klein.download.start` is the one method that does this today), or the method is
-  cancellable only on paper.
+  where the work is an unbounded network transfer or a long multi-phase run the event itself must
+  reach the work (the region editors' runs hand `cancel_event.is_set` in as `should_cancel`), or
+  the method is cancellable only on paper.
 - Raw bytes only: request/response blobs carry PNG bytes, never base64. Two-image inpaint requests
   arrive as one concatenated blob split by the `image_len`/`mask_len` header fields; the same
   convention is used in the response direction by `watermark.remove`.

@@ -11,6 +11,8 @@ reference order (the region is #0), `seed: null` drawn and echoed, the
 progress frames (stable `stage` ids), cancellation at a phase begin and at a
 denoise step with no session left in use and a follow-up run that succeeds,
 a generated image of the wrong size refused, and the pre-run refusals;
+the prompt library's fields reaching the service and the build's frames over
+the same `progress_sinks` (`PromptCacheFrameTests`);
 the disk-read frames (`DiskReadProgressTests`: one component-labelled `load`
 frame stream per checkpoint read, in the stage that reads, at the manager's
 cadence under an injected clock; re-reads labelled the same; the
@@ -204,6 +206,48 @@ class RegionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     call()
         self.assertEqual(self.rig.dits, [], "no refusal read a weight")
+
+
+class PromptCacheFrameTests(unittest.TestCase):
+    """`progress_sinks` shared by the run and `build_prompt_cache`; the run forwards the wire's prompt-library fields."""
+
+    def test_the_run_forwards_the_prompt_library_fields(self) -> None:
+        rig = ServiceRig(self, variants=(WeightFormat.FP8R,))
+        seen: list[Any] = []
+        real = rig.service.generate
+
+        def generate(*args: Any, **kwargs: Any) -> Any:
+            seen.append(kwargs["prompt_cache"])
+            return real(*args, **kwargs)
+
+        params = {"source_root": str(rig.root), "prompt": "x", "steps": 2, "prompt_library": "flux3_klein", "prompt_cache_precision_order": ["q8_0"]}
+        with patch.object(rig.service, "generate", generate):
+            region.edit_region_bytes(rig.service, _png(_region(), "RGB"), _png(_mask(), "L"), (), params)
+        self.assertEqual(seen, [region.normalize_flux3_params(params, require_prompt=True).prompt_cache])
+
+    def test_the_build_emits_prepare_then_the_observer_stages_and_checks_the_cancel(self) -> None:
+        frames: list[tuple[str, int, int, str]] = []
+
+        class FakeService:
+            def prompt_cache_build(self, params: Any, *, name: Any, observer: Any, load_progress: Any) -> dict[str, Any]:
+                self.args = (params, name, load_progress is not None)
+                for phase in (Phase.ENCODER_LOAD, Phase.ENCODE, Phase.ENCODER_RELEASE):
+                    observer(phase, "begin", {})
+                    observer(phase, "end", {})
+                return {"ok": True}
+
+        fake = FakeService()
+
+        def callback(phase: str, step: int, total: int, label: str, *, stage: str, **_extra: Any) -> None:
+            frames.append((phase, step, total, stage))
+
+        answer = region.build_prompt_cache(fake, {"prompt": "x"}, name="n", progress_callback=callback)  # type: ignore[arg-type]
+        self.assertEqual(answer, {"ok": True})
+        self.assertEqual(fake.args, ({"prompt": "x"}, "n", True))
+        stages = region.progress_stages()
+        self.assertEqual(frames, [("load", stages.index(stage), len(stages) - 1, stage) for stage in ("prepare", "encoder_load", "encode", "encoder_release")])
+        with self.assertRaises(service.Flux3Canceled):
+            region.build_prompt_cache(fake, {}, should_cancel=lambda: True)  # type: ignore[arg-type]
 
 
 class _TickingClock:

@@ -28,13 +28,23 @@ docstring:
   deliberately, with the diff reviewed:
   `python -m modules.ai_backend.inpaint.flux2_klein.test_characterization --write-golden`
   from the repository root rewrites the file from the current code.
+- GOLDEN (live) - the LIVE `large_model_profiles` answers (the two-handle
+  composition over a REAL manager with fake budgets: every step pair x the
+  encoder counted / left out / resident, on the tiny real models and on
+  header-only klein 9B files) and the device cap each real run passes to the
+  encoder's `acquire`, stored in `fixtures/profiles_golden.json`, recorded
+  before the rule moved to `runtime.large_models.paired`. Same update rule,
+  with `--write-profiles-golden`.
 
 Main responsibilities:
 - `ProgressNumberingContract`, `RetiredWireContract`, `StatusWireContract`,
   `HealthWireContract`, `InpaintRunContract`, `DecodeFallbackOrderContract` -
   the contracts;
 - `ForecastGoldenTests` - the golden snapshot, plus `_compute_golden` and the
-  `--write-golden` entry point that share the case tables.
+  `--write-golden` entry point that share the case tables;
+- `ProfilesGoldenTests` - the live-profiles snapshot, plus
+  `_compute_profiles_golden` and `--write-profiles-golden` (case tables
+  `PROFILE_STEPS`, `*_PROFILE_BUDGETS`, `*_ENCODER_STATES`).
 
 Notes:
 - Harness (rebuilt in WP6, assertions unchanged except the two re-pins
@@ -84,7 +94,8 @@ import numpy as np
 from PIL import Image
 
 from modules.ai_backend.inpaint import flux2_klein as svc
-from modules.ai_backend.inpaint.flux2_klein import components, hardware, memory
+from modules.ai_backend.inpaint.flux2_klein import components, hardware, large_model, memory
+from modules.ai_backend.runtime.large_models.tiers import AUTO_STEPS, RAM_ORDER, VRAM_ORDER, RamStep, Steps, VramStep
 from modules.ai_backend.runtime.model_manager import SmallModelManager
 
 from ._test_fixtures import (
@@ -160,13 +171,29 @@ def _split(total_bytes: int, parts: int, rest_name: str, part_names: list[str], 
     return tensors
 
 
-@contextmanager
-def _golden_environment() -> Iterator[dict[str, str]]:
-    """A temporary klein 9B-shaped tree of header-only files with the real file sizes; yields its three paths.
+def _make_klein9b_tree(root: Path) -> dict[str, str]:
+    """A klein 9B-shaped tree of header-only files under `root` with the real file sizes; returns its three paths.
 
     Transformer: BFL layout, 8 double + 24 single blocks; encoder: 36 Qwen3
-    layers plus embedding and head (causal-LM keys); VAE: one tensor. The
-    reference calibration table is used whatever GPU the test host has, and the
+    layers plus embedding and head (causal-LM keys); VAE: one tensor.
+    """
+    paths = _make_model_tree(root)
+    blocks = [f"double_blocks.{index}.img_mlp.0.weight" for index in range(8)] + [f"single_blocks.{index}.linear1.weight" for index in range(24)]
+    _write_header_only(Path(paths["transformer_path"]) / "diffusion_pytorch_model.safetensors", _split(TRANSFORMER_BYTES, len(blocks), "img_in.weight", blocks))
+    head = 151936 * 4096 * 2
+    layers = [f"model.layers.{index}.mlp.up_proj.weight" for index in range(36)]
+    encoder = {"model.embed_tokens.weight": ("BF16", (151936, 4096)), "lm_head.weight": ("BF16", (151936, 4096))}
+    encoder.update(_split(TEXT_ENCODER_BYTES - 2 * head, len(layers), "model.norm.weight", layers))
+    _write_header_only(Path(paths["text_encoder_path"]) / "model.safetensors", encoder)
+    _write_header_only(Path(paths["vae_path"]) / "diffusion_pytorch_model.safetensors", {"decoder.conv_in.weight": ("BF16", (VAE_BYTES // 2,))})
+    return paths
+
+
+@contextmanager
+def _golden_environment() -> Iterator[dict[str, str]]:
+    """A temporary klein 9B-shaped tree (`_make_klein9b_tree`); yields its three paths.
+
+    The reference calibration table is used whatever GPU the test host has, and the
     free memory of a case comes from the case itself. The tree, and every
     patch, is gone when the block exits.
     """
@@ -174,15 +201,7 @@ def _golden_environment() -> Iterator[dict[str, str]]:
 
     with ExitStack() as stack:
         root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="flux2_golden_")))
-        paths = _make_model_tree(root)
-        blocks = [f"double_blocks.{index}.img_mlp.0.weight" for index in range(8)] + [f"single_blocks.{index}.linear1.weight" for index in range(24)]
-        _write_header_only(Path(paths["transformer_path"]) / "diffusion_pytorch_model.safetensors", _split(TRANSFORMER_BYTES, len(blocks), "img_in.weight", blocks))
-        head = 151936 * 4096 * 2
-        layers = [f"model.layers.{index}.mlp.up_proj.weight" for index in range(36)]
-        encoder = {"model.embed_tokens.weight": ("BF16", (151936, 4096)), "lm_head.weight": ("BF16", (151936, 4096))}
-        encoder.update(_split(TEXT_ENCODER_BYTES - 2 * head, len(layers), "model.norm.weight", layers))
-        _write_header_only(Path(paths["text_encoder_path"]) / "model.safetensors", encoder)
-        _write_header_only(Path(paths["vae_path"]) / "diffusion_pytorch_model.safetensors", {"decoder.conv_in.weight": ("BF16", (VAE_BYTES // 2,))})
+        paths = _make_klein9b_tree(root)
         reference = load_tables(REFERENCE_DEVICE_CLASS)
         stack.enter_context(patch.object(memory, "_tables_for", lambda _device: reference))
         stack.enter_context(patch.object(hardware, "_resolve_selected_backend_device", lambda _fallback: "cuda:0"))
@@ -214,6 +233,165 @@ def _compute_golden() -> dict[str, Any]:
 def _load_golden() -> dict[str, Any]:
     """The stored snapshot. A missing file is a FAILURE, not a skip: it is tracked."""
     return json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
+
+
+#: The live-profiles golden file (`ProfilesGoldenTests`). Tracked; regenerate only through `--write-profiles-golden`.
+PROFILES_GOLDEN_PATH = Path(__file__).resolve().parent / "fixtures" / "profiles_golden.json"
+
+#: The requested step pairs of the live-profiles golden: the 12 explicit pairs and «Авто».
+PROFILE_STEPS: dict[str, Steps] = {**{f"{vram.value}_{ram.value}": Steps(vram, ram) for vram in VRAM_ORDER for ram in RAM_ORDER}, "auto_auto": AUTO_STEPS}
+
+#: Budgets of the tiny-real-model profiles: name -> (device total, host available) bytes.
+#: Chosen so the encoder's combined ceiling binds differently per budget.
+TINY_PROFILE_BUDGETS: dict[str, tuple[int, int]] = {
+    "roomy": (64 * GIB, 64 * GIB),
+    "device_2mib": (2 << 20, 64 * GIB),
+    "device_1mib_host_3mib": (1 << 20, 3 << 20),
+}
+
+#: Budgets of the klein 9B header-only profiles (planned, never loaded): name -> (device total, host available) bytes.
+KLEIN9B_PROFILE_BUDGETS: dict[str, tuple[int, int]] = {
+    "vram32_ram64": (32 * GIB, 64 * GIB),
+    "vram24_ram48": (24 * GIB, 48 * GIB),
+    "vram16_ram32": (16 * GIB, 32 * GIB),
+    # Host-short: the encoder is refused beside a fitting pipeline (the refusal merge).
+    "vram24_ram20": (24 * GIB, 20 * GIB),
+}
+
+#: The encoder states of a profiles case: `counted` (prompt not cached, encoder
+#: not resident), `cached` (prompt cached, encoder not resident: left out),
+#: `resident_cached` (prompt cached, encoder resident: counted; tiny model only,
+#: header-only weights cannot be loaded) and `counted_on_cpu` (as `counted`
+#: with «Энкодер на CPU»). Every other case runs with the encoder placed by the steps.
+TINY_ENCODER_STATES = ("counted", "cached", "resident_cached", "counted_on_cpu")
+KLEIN9B_ENCODER_STATES = ("counted", "cached", "counted_on_cpu")
+
+
+def _fresh_service(probes: Any, tables: Any) -> tuple[Any, Any]:
+    """A new FLUX.2 service over a new large-model manager (the `_ManagedRunFixture` wiring) on `probes` and `tables`; `(service, manager)`."""
+    from modules.ai_backend.runtime.large_models.loader import TorchTransport
+    from modules.ai_backend.runtime.large_models.manager import LargeModelManager, MemoryLimitsStore
+    from modules.ai_backend.runtime.residency.arbiter import ResidencyArbiter
+
+    arbiter = ResidencyArbiter(probes, admission_wait_s=0.0)
+    large = LargeModelManager(
+        arbiter,
+        limits_store=MemoryLimitsStore(),
+        tables=lambda _device: tables,
+        probes=probes,
+        transport_factory=lambda _device: TorchTransport("cpu"),
+        device_class=lambda _device: "test",
+    )
+    return svc.Flux2KleinInpaintService(SmallModelManager(arbiter=arbiter), large_models=large), large
+
+
+def _jsonable(value: Any) -> Any:
+    """`value` as it round-trips through JSON (tuples become lists), so a fresh answer compares equal to the stored one."""
+    return json.loads(json.dumps(value))
+
+
+def _profiles_cases(case: _ManagedRunFixture, paths: dict[str, str], budgets: dict[str, tuple[int, int]], states: tuple[str, ...], tables: Any, shape: Any) -> dict[str, Any]:
+    """`large_model_profiles` of every (budget, encoder state, step pair) over `paths`, each (budget, state) on a fresh service.
+
+    The `cached` / `resident_cached` states seed the prompt into the memory
+    cache (`seed_memory`); `resident_cached` then loads the encoder through the
+    «load» action (its outcome, or its refusal, is part of the snapshot).
+    """
+    import torch
+
+    from ._test_fixtures import _RoomyProbes, seed_memory
+
+    answers: dict[str, Any] = {}
+    for budget_name, (device_total, host_available) in budgets.items():
+        for state in states:
+            service, _large = _fresh_service(_RoomyProbes(device_total=device_total, host_available=host_available), tables)
+            params = {**paths, "prompt": "a cat", "encoder_on_cpu": state == "counted_on_cpu"}
+            entry: dict[str, Any] = {}
+            if state in ("cached", "resident_cached"):
+                seed_memory(service, params, tensor=torch.zeros((1, 512, 24)))
+                assert service._prompt_cached(params), "the seeded prompt must be served"
+            if state == "resident_cached":
+                try:
+                    service.component_action(params, component="text_encoder", action="load")
+                    entry["encoder_load"] = "ok"
+                except (RuntimeError, ValueError) as exc:
+                    entry["encoder_load"] = f"{type(exc).__name__}: {exc}"
+            for step_name, steps in PROFILE_STEPS.items():
+                entry[step_name] = _jsonable(service.large_model_profiles(params, shape, format=None, steps=steps))
+            answers[f"{budget_name}/{state}"] = entry
+    return answers
+
+
+def _run_encoder_caps(case: _ManagedRunFixture, budgets: dict[str, tuple[int, int]]) -> dict[str, Any]:
+    """Per (budget, step pair): the `(model, device_cap_bytes)` of every `acquire` one real run makes, and its effective steps (or its error).
+
+    Each run is on a fresh service (nothing cached, nothing resident), so it
+    encodes: the encoder's acquire carries the combined-rule ceiling.
+    """
+    from ._test_fixtures import _RoomyProbes, _flat_tables
+
+    region = np.full((128, 128, 3), 90, dtype=np.uint8)
+    mask = np.zeros((128, 128), dtype=np.uint8)
+    mask[48:80, 48:80] = 255
+    caps: dict[str, Any] = {}
+    for budget_name, (device_total, host_available) in budgets.items():
+        for step_name, steps in PROFILE_STEPS.items():
+            service, large = _fresh_service(_RoomyProbes(device_total=device_total, host_available=host_available), _flat_tables())
+            acquired: list[list[Any]] = []
+            real = large.acquire
+
+            def spy(model: str, *args: Any, _real: Any = real, _acquired: list[list[Any]] = acquired, **kwargs: Any) -> Any:
+                _acquired.append([model, kwargs.get("device_cap_bytes")])
+                return _real(model, *args, **kwargs)
+
+            params: dict[str, Any] = {**case.paths, "prompt": "a cat", "encoder_on_cpu": False}
+            if steps.vram is not VramStep.AUTO:
+                params["vram_step"] = steps.vram.value
+            if steps.ram is not RamStep.AUTO:
+                params["ram_step"] = steps.ram.value
+            entry: dict[str, Any] = {}
+            with patch.object(large, "acquire", spy):
+                try:
+                    answer = service.inpaint_image_bytes(_png_bytes(region, "RGB"), _png_bytes(mask, "L"), params=params)
+                    entry["effective"] = [answer["vram_step_effective"], answer["ram_step_effective"]]
+                except (RuntimeError, ValueError) as exc:
+                    entry["error"] = f"{type(exc).__name__}: {exc}"
+            entry["acquired"] = acquired
+            caps[f"{budget_name}/{step_name}"] = entry
+    return caps
+
+
+def _compute_profiles_golden(case: _ManagedRunFixture) -> dict[str, Any]:
+    """Today's live `large_model_profiles` answers and run encoder ceilings, as the JSON document (`case` is a set-up `_ManagedRunFixture`)."""
+    from modules.ai_backend.runtime.large_models.cost_tables import REFERENCE_DEVICE_CLASS, load_tables
+
+    from ._test_fixtures import _flat_tables
+
+    with patch.object(hardware, "memory_snapshot", lambda *_a, **_k: {"vram_total": 0, "vram_free": 0, "ram_total": 0, "ram_free": 0}):
+        tiny_shape = large_model.request_shape(128, 128, with_reference=False, max_sequence_length=64, steps=1)
+        tiny = _profiles_cases(case, dict(case.paths), TINY_PROFILE_BUDGETS, TINY_ENCODER_STATES, _flat_tables(), tiny_shape)
+        caps = _run_encoder_caps(case, TINY_PROFILE_BUDGETS)
+        klein9b_paths = _make_klein9b_tree(case.root / "klein9b")
+        klein9b_shape = large_model.request_shape(512, 512, with_reference=False, max_sequence_length=512, steps=4)
+        klein9b = _profiles_cases(case, klein9b_paths, KLEIN9B_PROFILE_BUDGETS, KLEIN9B_ENCODER_STATES, load_tables(REFERENCE_DEVICE_CLASS), klein9b_shape)
+    return {
+        "_note": (
+            "GOLDEN snapshot of FLUX.2 klein large_model_profiles (the live two-handle composition over a "
+            "real large-model manager with fake budgets) and of the device ceiling a real run passes to the "
+            "encoder's acquire. `tiny`: the tiny real models with a flat table; `klein9b`: header-only klein 9B "
+            "files with the reference calibration table. Regenerate deliberately with "
+            "`python -m modules.ai_backend.inpaint.flux2_klein.test_characterization --write-profiles-golden` "
+            "and review the diff. Case tables: PROFILE_STEPS, *_PROFILE_BUDGETS, *_ENCODER_STATES in that module."
+        ),
+        "tiny": tiny,
+        "run_encoder_caps": caps,
+        "klein9b": klein9b,
+    }
+
+
+def _load_profiles_golden() -> dict[str, Any]:
+    """The stored live-profiles snapshot. A missing file is a FAILURE, not a skip: it is tracked."""
+    return json.loads(PROFILES_GOLDEN_PATH.read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -641,16 +819,55 @@ class ForecastGoldenTests(unittest.TestCase):
                 self.assertEqual(self.current["forecast_memory"][name], self.golden["forecast_memory"][name])
 
 
+class ProfilesGoldenTests(_ManagedRunFixture):
+    """GOLDEN: today's live `large_model_profiles` answers and the encoder ceiling a run admits with.
+
+    Pins the two-handle composition (pipeline alone, encoder beside its
+    reservation under the combined VRAM-axis ceiling, pipeline again with the
+    encoder's claim; the encoder rule `EncoderNeed.counted`; the refusal merge;
+    `host_baseline`) over a REAL manager with fake budgets. Expected to change
+    only with a deliberate behaviour or calibration change: regenerate with
+    `--write-profiles-golden` and review the diff; never edit the JSON by hand.
+    """
+
+    maxDiff = None
+
+    def test_the_live_profiles_match_the_snapshot(self) -> None:
+        golden = _load_profiles_golden()
+        current = _compute_profiles_golden(self)
+        for section in ("tiny", "run_encoder_caps", "klein9b"):
+            self.assertEqual(set(current[section]), set(golden[section]), section)
+            for name in current[section]:
+                with self.subTest(section=section, case=name):
+                    self.assertEqual(current[section][name], golden[section][name])
+
+
+def _write_profiles_golden() -> None:
+    """Rewrite `fixtures/profiles_golden.json`: runs `_compute_profiles_golden` on a set-up `ProfilesGoldenTests` and cleans it up."""
+    case = ProfilesGoldenTests("test_the_live_profiles_match_the_snapshot")
+    case.setUp()
+    try:
+        document = _compute_profiles_golden(case)
+    finally:
+        case.doCleanups()
+    PROFILES_GOLDEN_PATH.write_text(json.dumps(document, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"written {PROFILES_GOLDEN_PATH}")  # noqa: T201 - CLI output of a developer tool
+
+
 def _main(argv: list[str]) -> int:
-    """`--write-golden`: rewrite `fixtures/forecast_golden.json` from the current code."""
+    """`--write-golden`: rewrite `fixtures/forecast_golden.json`; `--write-profiles-golden`: rewrite `fixtures/profiles_golden.json`; both from the current code."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1] if __doc__ else None)
-    parser.add_argument("--write-golden", action="store_true", help="rewrite the golden snapshot file")
+    parser.add_argument("--write-golden", action="store_true", help="rewrite the forecast golden snapshot file")
+    parser.add_argument("--write-profiles-golden", action="store_true", help="rewrite the live-profiles golden snapshot file")
     args = parser.parse_args(argv)
-    if not args.write_golden:
-        parser.error("nothing to do: pass --write-golden (tests run under pytest)")
-    GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    GOLDEN_PATH.write_text(json.dumps(_compute_golden(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"written {GOLDEN_PATH}")  # noqa: T201 - CLI output of a developer tool
+    if not args.write_golden and not args.write_profiles_golden:
+        parser.error("nothing to do: pass --write-golden and/or --write-profiles-golden (tests run under pytest)")
+    if args.write_golden:
+        GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        GOLDEN_PATH.write_text(json.dumps(_compute_golden(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"written {GOLDEN_PATH}")  # noqa: T201 - CLI output of a developer tool
+    if args.write_profiles_golden:
+        _write_profiles_golden()
     return 0
 
 

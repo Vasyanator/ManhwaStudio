@@ -3,7 +3,8 @@ File: modules/ai_backend/inpaint/flux2_klein/test_runtime_extraction.py
 
 Purpose:
 Characterization tests for the FLUX.2 klein names whose implementation lives in
-`../../runtime/` (`safetensors_stream`, `memory_probe`, `encoder_truncation`).
+`../../runtime/` (`safetensors_stream`, `memory_probe`, `encoder_truncation`,
+`qwen3_gguf`).
 They were written against the code BEFORE it moved and pin what FLUX.2 must keep
 seeing afterwards: the same refusals, the same log wording on the same loggers,
 the same constants, the same names on the same modules, and the same patch
@@ -15,6 +16,11 @@ Main responsibilities:
   `hardware.is_torch_available` as its patch point;
 - the constants (`ENCODER_KEEP_LAYERS`, the header ceiling) keep their values;
 - every moved name stays reachable on its old module AND on the package.
+- the GGUF text-encoder refusals (foreign architecture, foreign tensor,
+  missing kept weight) keep their exact FLUX.2 wording, and their error
+  records stay in the package's logger tree (`runtime.qwen3_gguf` takes the
+  owner name and logger from `large_model`); the four bridge names stay on the
+  package. Needs gguf, torch, transformers and accelerate (skips without).
 
 The streaming single-file loader these tests also pinned is gone (WP6: the
 large-model manager's loader reads every component tensor by tensor); its
@@ -29,12 +35,16 @@ from __future__ import annotations
 
 import builtins
 import logging
+import tempfile
 import unittest
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 from modules.ai_backend.inpaint import flux2_klein as svc
-from modules.ai_backend.inpaint.flux2_klein import components, hardware
+from modules.ai_backend.inpaint.flux2_klein import components, hardware, large_model
+
+from ._test_fixtures import load_9b_header_fixture, write_header_only_gguf
 
 
 def _import_blocking(*blocked: str) -> Any:
@@ -115,10 +125,77 @@ class SurfaceCharacterizationTests(unittest.TestCase):
                     self.assertTrue(hasattr(module, name))
                     self.assertIs(getattr(svc, name), getattr(module, name))
 
+    def test_the_qwen3_gguf_bridge_is_reachable_on_the_package(self) -> None:
+        from modules.ai_backend.runtime import qwen3_gguf
+
+        for name in ("encoder_state_key_of_gguf", "gguf_encoder_quant_types", "is_gguf_encoder_name", "require_known_encoder_names"):
+            with self.subTest(name=name):
+                self.assertIs(getattr(svc, name), getattr(qwen3_gguf, name))
+
     def test_memory_snapshot_is_defined_by_hardware(self) -> None:
         # A wrapper def owned by `hardware`, not a re-bound import: that is what
         # keeps `hardware.memory_snapshot` the one patch point.
         self.assertEqual(hardware.memory_snapshot.__module__, hardware.__name__)
+
+
+
+def _has_gguf_stack() -> bool:
+    try:
+        import accelerate  # noqa: F401 - availability probe
+        import gguf  # noqa: F401 - availability probe
+        import torch  # noqa: F401 - availability probe
+        import transformers  # noqa: F401 - availability probe
+    except ImportError:
+        return False
+    return True
+
+
+@unittest.skipUnless(_has_gguf_stack(), "needs gguf, torch, transformers and accelerate")
+class Qwen3GgufRefusalCharacterizationTests(unittest.TestCase):
+    """The GGUF text-encoder refusals FLUX.2 shows, pinned word for word through `large_model` (the bridge lives in `runtime.qwen3_gguf`)."""
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.folder = Path(directory.name)
+        self.header = load_9b_header_fixture("unc_q8.head")
+
+    def _write(self, name: str, *, metadata: dict[str, object] | None = None, tensors: list[list[object]] | None = None) -> Path:
+        merged = {**self.header["metadata"], **(metadata or {})}  # type: ignore[dict-item]
+        return write_header_only_gguf(self.folder / name, merged, tensors if tensors is not None else self.header["tensors"])  # type: ignore[arg-type]
+
+    def test_a_foreign_architecture_is_refused_with_the_flux2_wording(self) -> None:
+        path = self._write("llama.gguf", metadata={"general.architecture": "llama"})
+        with self.assertRaises(ValueError) as caught:
+            large_model._require_loadable_gguf_encoder(path, fp8=False)
+        self.assertEqual(
+            str(caught.exception),
+            "Текстовый энкодер llama.gguf: это GGUF модели «llama», а нужен Qwen3 "
+            "(general.architecture = «qwen3») — возьмите GGUF текстового энкодера FLUX.2 klein.",
+        )
+
+    def test_a_foreign_tensor_is_refused_and_logged_in_the_flux2_tree(self) -> None:
+        path = self._write("extra.gguf", tensors=[*self.header["tensors"], ["rope_freqs.weight", [64], 0]])  # type: ignore[list-item]
+        with self.assertLogs(svc.log, level=logging.ERROR) as captured, self.assertRaises(ValueError) as caught:
+            large_model._require_loadable_gguf_encoder(path, fp8=False)
+        self.assertEqual(
+            str(caught.exception),
+            "Текстовый энкодер extra.gguf: тензоры rope_freqs.weight не относятся к модели Qwen3 — "
+            "это не GGUF текстового энкодера FLUX.2 klein (нужен Qwen3 в формате llama.cpp).",
+        )
+        self.assertEqual([record.getMessage() for record in captured.records], [f"FLUX.2 klein: GGUF текстового энкодера {path} содержит тензоры вне Qwen3: ['rope_freqs.weight']"])
+
+    def test_a_missing_kept_weight_is_refused_and_logged_in_the_flux2_tree(self) -> None:
+        tensors = [tensor for tensor in self.header["tensors"] if tensor[0] != "blk.5.ffn_up.weight"]  # type: ignore[union-attr, index]
+        path = self._write("short.gguf", tensors=tensors)
+        with self.assertLogs(svc.log, level=logging.ERROR) as captured, self.assertRaises(ValueError) as caught:
+            large_model._require_loadable_gguf_encoder(path, fp8=False)
+        self.assertEqual(
+            str(caught.exception),
+            "Текстовый энкодер short.gguf: в файле нет весов layers.5.mlp.up_proj.weight — файл неполный "
+            "или это не Qwen3. Скачайте файл энкодера заново.",
+        )
+        self.assertEqual([record.getMessage() for record in captured.records], [f"FLUX.2 klein: в GGUF текстового энкодера {path} нет весов ['layers.5.mlp.up_proj.weight']"])
 
 
 if __name__ == "__main__":

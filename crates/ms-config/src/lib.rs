@@ -25,9 +25,13 @@ Main items:
 - `AiInstallType`: installed AI dependency level recorded in `user_config.json`.
 - `torch_choice` (module): `TorchFlavour`, `GfxArch` and the installer's `TorchChoiceRecord`
   (`General.torch_flavour` / `General.torch_rocm_gfx`, never in the defaults tree).
-- `flux3_klein_dir` / `flux3_klein_settings_path`: the FLUX.3 klein model package root the
-  download fills (mirrors the backend's `flux3_download.model_root`) and that engine's
-  settings file.
+- `flux3_klein_dir` / `flux3_klein_settings_path`: the FLUX.3 klein model package root (mirrors
+  the model catalog's FLUX.3 package dir, `ms_sysprobe::ai_models::external_catalog`) and that
+  engine's settings file.
+- `flux3_weight_format` (module): `Flux3DitFormat` / `Flux3EncoderFormat`, the ONE list of
+  FLUX.3 klein weight formats (native bf16 / fp8r / nvfp4 + GGUF DiT quants; bf16 + GGUF
+  encoder quants), the prompt-library id `FLUX3_PROMPT_LIBRARY_ID` and the prompt cache's
+  precision order (`flux3_prompt_cache_precision_order` / `_rank`).
 - `Flux2Variant`: which FLUX.2 klein checkpoint an «ИИ-редактор области» engine works with
   (9B / 4B). It keys the package directory (`flux2_klein_dir`, `flux2_klein_vae_dir`; every
   weight path inside it is the model catalog's `flux2_klein_weights_path`), the engine's
@@ -175,6 +179,11 @@ pub mod version_format;
 // and the pinned catalog in `ms-sysprobe` (below the UI, above this crate) need the one list.
 pub mod flux2_weight_format;
 pub use flux2_weight_format::{Flux2EncoderSource, Flux2WeightAxis, Flux2WeightFormat, flux2_prompt_cache_precision_order, flux2_prompt_cache_precision_rank};
+
+// The FLUX.3 klein weight-format lists (DiT and text encoder). Here for the same reason as the
+// FLUX.2 list: the engine settings and the pinned catalog in `ms-sysprobe` need the one list.
+pub mod flux3_weight_format;
+pub use flux3_weight_format::{FLUX3_PROMPT_LIBRARY_ID, Flux3DitFormat, Flux3EncoderFormat, flux3_prompt_cache_precision_order, flux3_prompt_cache_precision_rank};
 
 use crate::bubble_status::default_bubble_status_rules_value;
 use anyhow::{Context, Result};
@@ -1212,13 +1221,16 @@ pub fn flux2_klein_vae_dir(variant: Flux2Variant) -> PathBuf {
     flux2_klein_dir(variant).join("vae")
 }
 
-/// FLUX.3 klein: root of the model package the «ИИ-редактор области» download fills
-/// (`ae.safetensors`, `text_encoder/`, and per weight format `model.safetensors` (bf16) or
-/// `variants/<format>/`), laid out like the Hugging Face repository.
+/// FLUX.3 klein: root of the model package under [`side_models_dir`], which the app's pinned
+/// model catalog fills (`ms_sysprobe::ai_models::external_catalog`, `flux3_klein_package_specs`:
+/// `ae.safetensors`, root `config.json`, `text_encoder/`, per DiT format `model.safetensors`
+/// (bf16) or `variants/<format>/`, the GGUF quants under `transformer_gguf/` /
+/// `text_encoder_gguf/`), laid out like the BFL Hugging Face repository.
 ///
-/// The directory name mirrors `model_root()` in `modules/ai_backend/inpaint/flux3_download.py`;
-/// the two must not drift. The backend creates and fills it; this side needs the path because
-/// in download mode it is the `source_root` every FLUX.3 request names.
+/// The directory name mirrors the catalog's FLUX.3 package dir (a catalog test checks every
+/// spec's files against this root). In download mode it is the `source_root` every FLUX.3
+/// request names; where each component lives inside it is the catalog's answer
+/// (`flux3_klein_dit_relative_path`, `flux3_klein_encoder_relative_path`).
 #[must_use]
 pub fn flux3_klein_dir() -> PathBuf {
     side_models_dir().join("FLUX.3-image-klein")
@@ -3381,8 +3393,8 @@ mod tests {
     }
 
     /// The FLUX.3 klein package directory and settings file are the backend's and existing
-    /// installations' contract: the directory name mirrors `flux3_download.model_root`, and
-    /// neither may collide with a FLUX.2 klein one.
+    /// installations' contract: the directory name mirrors the catalog's FLUX.3 package dir,
+    /// and neither may collide with a FLUX.2 klein one.
     #[test]
     fn the_flux3_klein_paths_are_frozen_and_distinct() {
         assert!(flux3_klein_dir().ends_with("FLUX.3-image-klein"));

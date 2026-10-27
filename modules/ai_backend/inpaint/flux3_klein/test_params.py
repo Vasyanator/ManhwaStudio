@@ -4,7 +4,8 @@ File: modules/ai_backend/inpaint/flux3_klein/test_params.py
 Purpose:
 Unit tests for `flux3_klein/params.py`: request normalization (defaults and
 every refusal), the reference default seed, and the `Flux3Options` defaults and
-validation.
+validation, including the DiT / encoder sources (`variant`, `dit_formats`,
+`encoder`, the GGUF-encoder-is-TEXT-only rule).
 
 Notes:
 Torch- and PIL-free: references are stand-in objects, since `normalize_request`
@@ -20,7 +21,7 @@ from typing import Any
 
 from ...runtime.large_models.tiers import RamStep, Steps, VramStep
 from . import params as p
-from .config import MAX_REFERENCES, SamplerConfig, WeightFormat
+from .config import ENCODER_BF16_SOURCE, MAX_REFERENCES, NATIVE_DIT_FORMATS, EncoderSource, GgufDit, SamplerConfig, WeightFormat
 
 SAMPLER = SamplerConfig(steps=16, alpha=6.93, default_size=(1024, 1024))
 
@@ -147,6 +148,60 @@ class Flux3OptionsTests(unittest.TestCase):
                     p.Flux3Options(
                         model_root=Path("/fictional/flux3"), variant=WeightFormat.BF16, vl_ref_max_pixels=value  # type: ignore[arg-type]
                     )
+
+
+
+class SourceTests(unittest.TestCase):
+    """`Flux3Options.variant` / `dit_formats` / `encoder` and the `config` source types."""
+
+    ROOT = Path("/fictional/flux3")
+    Q8 = GgufDit("q8_0", Path("/fictional/flux3/transformer_gguf/q8.gguf"))
+    ENC = EncoderSource("q8_0", Path("/fictional/flux3/text_encoder_gguf/enc.gguf"))
+
+    def test_defaults_are_the_natives_and_the_bf16_encoder(self) -> None:
+        options = p.Flux3Options(model_root=self.ROOT, variant=WeightFormat.NVFP4)
+        self.assertEqual((options.dit_formats, options.encoder), (NATIVE_DIT_FORMATS, ENCODER_BF16_SOURCE))
+        self.assertEqual(NATIVE_DIT_FORMATS, (WeightFormat.BF16, WeightFormat.FP8R, WeightFormat.NVFP4))
+
+    def test_a_gguf_variant_without_an_offer_is_appended_to_the_natives(self) -> None:
+        options = p.Flux3Options(model_root=self.ROOT, variant=self.Q8)
+        self.assertEqual(options.dit_formats, (*NATIVE_DIT_FORMATS, self.Q8))
+        self.assertEqual(options.variant.value, "q8_0")
+
+    def test_an_explicit_offer_is_kept_in_order(self) -> None:
+        offer = (self.Q8, WeightFormat.FP8R)
+        self.assertEqual(p.Flux3Options(model_root=self.ROOT, variant=WeightFormat.FP8R, dit_formats=offer).dit_formats, offer)
+
+    def test_refusals(self) -> None:
+        other_path = GgufDit("q8_0", Path("/fictional/other.gguf"))
+        refused: tuple[dict[str, Any], ...] = (
+            {"variant": WeightFormat.BF16, "dit_formats": (self.Q8,)},
+            {"variant": other_path, "dit_formats": (self.Q8,)},
+            {"variant": WeightFormat.BF16, "dit_formats": (WeightFormat.BF16, WeightFormat.BF16)},
+            {"variant": self.Q8, "dit_formats": (self.Q8, other_path)},
+            {"variant": WeightFormat.BF16, "dit_formats": (WeightFormat.BF16, "fp8r")},
+            {"variant": WeightFormat.BF16, "encoder": "bf16"},
+        )
+        for overrides in refused:
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                p.Flux3Options(model_root=self.ROOT, **overrides)
+
+    def test_a_gguf_encoder_serves_the_text_mode_only(self) -> None:
+        options = p.Flux3Options(model_root=self.ROOT, variant=WeightFormat.BF16, encoder=self.ENC)
+        self.assertTrue(options.encoder.is_gguf)
+        with self.assertRaises(ValueError) as caught:
+            p.Flux3Options(model_root=self.ROOT, variant=WeightFormat.BF16, encoder=self.ENC, encoder_mode=p.EncoderMode.VL_REFS)
+        self.assertIn("q8_0", str(caught.exception))
+        self.assertIs(p.Flux3Options(model_root=self.ROOT, variant=WeightFormat.BF16, encoder_mode=p.EncoderMode.VL_REFS).encoder, ENCODER_BF16_SOURCE)
+
+    def test_source_construction_rules(self) -> None:
+        for args in (("bf16", Path("/x.gguf")), ("Q8_0", Path("/x.gguf")), ("q8_0", Path("x.gguf")), ("", Path("/x.gguf"))):
+            with self.subTest(dit=args), self.assertRaises(ValueError):
+                GgufDit(*args)
+        for args in (("bf16", Path("/x.gguf")), ("q8_0", None), ("q8_0", Path("x.gguf")), ("q 8", Path("/x.gguf"))):
+            with self.subTest(encoder=args), self.assertRaises(ValueError):
+                EncoderSource(*args)
+        self.assertFalse(ENCODER_BF16_SOURCE.is_gguf)
 
 
 if __name__ == "__main__":

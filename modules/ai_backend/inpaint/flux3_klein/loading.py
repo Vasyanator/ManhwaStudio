@@ -2,8 +2,8 @@
 File: modules/ai_backend/inpaint/flux3_klein/loading.py
 
 Purpose:
-Load a FLUX.3 klein DiT checkpoint (bf16, fp8r or nvfp4 export) into a
-`Flux3Dit` on a device, streaming one tensor at a time.
+Load a FLUX.3 klein DiT checkpoint (bf16, fp8r or nvfp4 export, or a GGUF file)
+into a `Flux3Dit` on a device, streaming one tensor at a time.
 
 Main responsibilities:
 - refuse a wrong checkpoint from its header before any tensor byte is read
@@ -11,6 +11,11 @@ Main responsibilities:
   variant);
 - build the model on `meta`, swap in the quantized linears the header calls for,
   fill it through `runtime.safetensors_stream.fill_module_from_safetensors`;
+- a GGUF DiT (`GgufDit`, unsloth's export: the BFL state keys, norm scales F32,
+  a few plain BF16 tensors, the rest block-quantized): `require_gguf_dit` checks
+  its header against the meta model of the root `config.json` (flow map, key
+  set, shapes, dequantizable types) and `build_dit_meta` swaps
+  `runtime.gguf_layers.GgufLinear` in for every quantized linear (compute bf16);
 - resolve and apply the fp8 compute path;
 - the per-tensor conversion the large-model spec loads the DiT with
   (`convert_dit_tensor`, a key/dtype rule equal to `dit_tensor_cast` once
@@ -18,8 +23,10 @@ Main responsibilities:
 
 Key declarations:
 - `build_dit_meta()` (header checks + meta model, shared by both loaders)
-- `load_dit()` -> `LoadedDit` (the standalone loader: parity script, tests)
+- `load_dit()` -> `LoadedDit` (the standalone loader of the safetensors
+  exports: parity script, tests)
 - `require_flow_map()`, `dit_tensor_cast()`, `convert_dit_tensor()`
+- `require_gguf_dit()`, `gguf_dit_quant_types()` (GGUF header checks)
 
 Notes:
 - The cast rule follows black-forest-labs/flux-3-image-klein
@@ -36,14 +43,20 @@ Notes:
   `build_dit_meta`).
 - Where the DiT's bytes live during a run (device, RAM, disk, block by block)
   is the large-model manager's decision; nothing here moves a loaded DiT.
+- GGUF: the names are the BFL state keys verbatim (no name bridge), and
+  `convert_dit_tensor` already keeps `uint8` rows as stored and casts the F32
+  / BF16 plain tensors to bf16, so the large-model spec loads a GGUF DiT with
+  the same conversion. No `config.json` `quantization` rule applies (the root
+  config is the bf16 one).
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -55,8 +68,12 @@ from ...runtime.safetensors_stream import (
     fill_module_from_safetensors,
     read_safetensors_header,
 )
+from ...runtime.safetensors_stream import TensorSpan
+from ...runtime.tensor_container import ContainerLayout, read_container_layout
 from .config import (
     FLOW_MAP_KEY,
+    DitSource,
+    GgufDit,
     ModelFiles,
     PackageConfig,
     WeightFormat,
@@ -88,8 +105,11 @@ class LoadedDit:
     bytes_read: int
 
 
-def require_flow_map(header: Mapping[str, Any]) -> None:
+def require_flow_map(header: Mapping[str, Any] | frozenset[str]) -> None:
     """Refuse a checkpoint without `FLOW_MAP_KEY`: it is the CFG "base" model.
+
+    `header` is a safetensors header (keyed by tensor name) or the set of a
+    GGUF file's tensor names.
 
     # Raises
     `ValueError` saying the base/CFG checkpoint is out of scope.
@@ -170,10 +190,12 @@ def _require_quantized_dtypes(dit: nn.Module, header: Mapping[str, Any], source:
             raise ValueError(f"{_OWNER}: 8-битный тензор «{key}» ({token}) вне квантованного слоя ({source})")
 
 
-def build_dit_meta(files: ModelFiles, config: PackageConfig, *, variant: WeightFormat, fp8_compute_applied: Fp8Compute | None) -> Flux3Dit:
+def build_dit_meta(files: ModelFiles, config: PackageConfig, *, variant: DitSource, fp8_compute_applied: Fp8Compute | None) -> Flux3Dit:
     """The `Flux3Dit` of `files.dit_file` on `meta`, quantized linears swapped, checked against its header.
 
-    Steps: read the header; `require_flow_map`; detect the format and check it
+    A `GgufDit` goes through `require_gguf_dit` and gets a `GgufLinear` for
+    every block-quantized weight (`fp8_compute_applied` is ignored: a GGUF has
+    no fp8 layer). A native format: read the header; `require_flow_map`; detect the format and check it
     against `config.json` (`require_declared_format`) and against `variant`;
     build on `meta`, swap the quantized linears, check the quantized payload
     dtypes (`_require_quantized_dtypes`); for fp8r set `fp8_compute_applied`
@@ -184,8 +206,10 @@ def build_dit_meta(files: ModelFiles, config: PackageConfig, *, variant: WeightF
     `ValueError` for an unreadable/malformed header, a CFG checkpoint, an
     unrecognized format, a format other than `config.json` declares or
     `variant` asks for, mismatched quantized dtypes, or an fp8r checkpoint
-    without a concrete `fp8_compute_applied`.
+    without a concrete `fp8_compute_applied`; for GGUF see `require_gguf_dit`.
     """
+    if isinstance(variant, GgufDit):
+        return _build_gguf_dit_meta(files.dit_file, config, variant)
     path = files.dit_file
     header = read_safetensors_header(path)
     require_flow_map(header)
@@ -203,6 +227,127 @@ def build_dit_meta(files: ModelFiles, config: PackageConfig, *, variant: WeightF
         if fp8_compute_applied is None or fp8_compute_applied is Fp8Compute.AUTO:
             raise ValueError(f"{_OWNER}: для fp8r нужен выбранный путь вычисления (scaled_mm или dequant), получено {fp8_compute_applied}")
         set_fp8_compute(dit, fp8_compute_applied)
+    return dit
+
+
+#: Owner of the GGUF DiT refusals: the wire field that names the format.
+_GGUF_FIELD = "format"
+
+#: Plain (unquantized) GGUF tensor types a DiT may carry; each becomes bf16.
+_GGUF_PLAIN_TOKENS = frozenset({"F32", "F16", "BF16"})
+
+#: How many names a refusal lists.
+_NAMES_IN_MESSAGE = 5
+
+
+def _listed(names: Sequence[str]) -> str:
+    shown = ", ".join(names[:_NAMES_IN_MESSAGE])
+    return f"{shown} и ещё {len(names) - _NAMES_IN_MESSAGE}" if len(names) > _NAMES_IN_MESSAGE else shown
+
+
+def gguf_dit_layout(path: Path, *, format_id: str) -> ContainerLayout:
+    """The header layout of the GGUF DiT `path` (no tensor byte is read); `format_id` names it in a refusal.
+
+    # Raises
+    `ValueError` naming the format id and the wire field `format` for a file
+    that is not GGUF, or a malformed / unreadable one.
+    """
+    try:
+        layout = read_container_layout(path)
+    except (ValueError, RuntimeError) as exc:
+        log.error("%s: заголовок GGUF %s (формат «%s») не прочитан: %s", _OWNER, path, format_id, exc)
+        raise ValueError(f"{_OWNER}: формат «{format_id}» (поле «{_GGUF_FIELD}», {path.name}): заголовок не прочитан: {exc}") from exc
+    if layout.kind != "gguf":
+        log.error("%s: %s (формат «%s») — не файл GGUF", _OWNER, path, format_id)
+        raise ValueError(f"{_OWNER}: формат «{format_id}» (поле «{_GGUF_FIELD}», {path.name}): это не файл GGUF")
+    return layout
+
+
+def gguf_dit_quant_types(spans: Sequence[TensorSpan]) -> dict[str, int]:
+    """`{state key: ggml type}` of every block-quantized tensor of a GGUF DiT (the names ARE the state keys)."""
+    return {span.name: int(span.quant_type) for span in spans if span.quant_type is not None}
+
+
+def require_gguf_dit(spans: Sequence[TensorSpan], config: PackageConfig, *, source: Path, format_id: str) -> dict[str, int]:
+    """Refuse a GGUF DiT whose header does not describe the `Flux3Dit` of `config` (header facts only).
+
+    Checks, in order: the flow-map key (`require_flow_map`: the CFG base model
+    is out of scope); the key set equals the meta model's state keys (missing
+    and foreign tensors named); every plain tensor is F32 / F16 / BF16 with the
+    model's exact shape; every block-quantized one is a 2-D weight of an
+    `nn.Linear` with the model's row count and `bytes_per_row(type,
+    in_features)` bytes per row, in a type `runtime.gguf_layers` can
+    dequantize. Returns the quantized types (`gguf_dit_quant_types`). Each
+    refusal names `source`, the format id and the wire field `format`, and is
+    logged.
+
+    # Raises
+    `ValueError` as above.
+    """
+    from ...runtime.gguf_layers import bytes_per_row, dequantizable_types, quant_type_name
+
+    def refuse(reason: str) -> ValueError:
+        log.error("%s: GGUF %s (формат «%s») отклонён: %s", _OWNER, source, format_id, reason)
+        return ValueError(f"{_OWNER}: формат «{format_id}» (поле «{_GGUF_FIELD}», {source.name}): {reason}")
+
+    by_name = {span.name: span for span in spans}
+    try:
+        require_flow_map(frozenset(by_name))
+    except ValueError as exc:
+        raise refuse(str(exc)) from exc
+    with torch.device("meta"):
+        dit = Flux3Dit(config.dit)
+    expected = dit.state_dict()
+    missing = sorted(set(expected) - set(by_name))
+    if missing:
+        raise refuse(f"в файле нет весов модели {_listed(missing)} — файл неполный или это не FLUX.3 klein")
+    foreign = sorted(set(by_name) - set(expected))
+    if foreign:
+        raise refuse(f"тензоры {_listed(foreign)} не относятся к DiT FLUX.3 klein")
+    wrong: list[str] = []
+    undequantizable: set[int] = set()
+    for name, value in expected.items():
+        span = by_name[name]
+        if span.quant_type is None:
+            if span.dtype_token not in _GGUF_PLAIN_TOKENS or span.shape != tuple(value.shape):
+                wrong.append(f"{name}: {span.dtype_token}{list(span.shape)}, модель {list(value.shape)}")
+            continue
+        module = dit.get_submodule(name.rpartition(".")[0]) if name.endswith(".weight") else None
+        if not isinstance(module, nn.Linear):
+            wrong.append(f"{name}: квантованный тензор не является весом линейного слоя")
+            continue
+        if int(span.quant_type) not in dequantizable_types():
+            undequantizable.add(int(span.quant_type))
+            continue
+        try:
+            row_bytes = bytes_per_row(int(span.quant_type), module.in_features)
+        except ValueError as exc:
+            wrong.append(f"{name}: {exc}")
+            continue
+        if span.shape != (module.out_features, row_bytes):
+            wrong.append(f"{name}: {quant_type_name(int(span.quant_type))}{list(span.shape)}, модель {list(value.shape)}")
+    if undequantizable:
+        named = ", ".join(sorted(quant_type_name(qt) for qt in undequantizable))
+        raise refuse(f"типы квантования GGUF {named} не поддерживаются")
+    if wrong:
+        raise refuse(f"тензоры не совпадают с моделью config.json: {_listed(wrong)}")
+    return gguf_dit_quant_types(spans)
+
+
+def _build_gguf_dit_meta(path: Path, config: PackageConfig, variant: GgufDit) -> Flux3Dit:
+    """The meta `Flux3Dit` of `config` with a `GgufLinear` (compute bf16) for every block-quantized weight of `path`.
+
+    # Raises
+    `ValueError` from `gguf_dit_layout` / `require_gguf_dit` / `swap_gguf_modules`.
+    """
+    from ...runtime.gguf_layers import swap_gguf_modules
+
+    layout = gguf_dit_layout(path, format_id=variant.id)
+    quant_types = require_gguf_dit(layout.spans, config, source=path, format_id=variant.id)
+    with torch.device("meta"):
+        dit = Flux3Dit(config.dit)
+    swapped = swap_gguf_modules(dit, quant_types, compute_dtype=torch.bfloat16)
+    log.info("%s: GGUF %s (формат «%s») — %d слоёв GGUF, распаковка в bfloat16 при каждом проходе", _OWNER, path.name, variant.id, swapped)
     return dit
 
 
@@ -228,7 +373,7 @@ def load_dit(
     files: ModelFiles,
     config: PackageConfig,
     *,
-    variant: WeightFormat,
+    variant: DitSource,
     device: Any,
     fp8_compute: Fp8Compute,
     progress: ByteProgressCb | None = None,
@@ -246,9 +391,12 @@ def load_dit(
     unrecognized format, a format other than `config.json` declares or
     `variant` asks for, a missing / unexpected / mis-shaped / mis-typed tensor
     (see `fill_module_from_safetensors`, `dit_tensor_cast`); `RuntimeError` when
-    `SCALED_MM` is requested and does not run on `device`. On failure no model
-    is returned.
+    `SCALED_MM` is requested and does not run on `device`; `ValueError` for a
+    `GgufDit` (a GGUF DiT loads only through the large-model manager). On
+    failure no model is returned.
     """
+    if isinstance(variant, GgufDit):
+        raise ValueError(f"{_OWNER}: автономный загрузчик читает только экспорты safetensors; GGUF «{variant.id}» загружается через менеджер больших моделей")
     started = time.monotonic()
     path = files.dit_file
     # The fp8 path is resolved (probe) before the meta build and the fill.

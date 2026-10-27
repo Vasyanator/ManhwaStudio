@@ -7,7 +7,9 @@ where each of its bytes may live during each phase of a run (the user's two reso
 host peak, seconds) that both the UI and the guard use, the mechanics that move the bytes, and the
 manager that admits and drives a run (degrade ladder per axis, learned floors per axis, the large
 pool's policy under the residency arbiter). Model packages (FLUX.2 klein, FLUX.3 klein) contribute one
-`spec.LargeModelSpec` each; nothing here names a model family.
+`spec.LargeModelSpec` each; nothing here names a model family. A model that runs one operation over
+TWO handles (pipeline + text encoder) takes its combined memory rule from `paired`, parametrized
+by its phase names.
 
 The memory probes themselves (`MemAvailable`, cgroup v2, `RssAnon + RssShmem`, device
 free/total/reserve) are NOT here: they live in the neutral `../memory_budget.py`, shared with the
@@ -28,6 +30,7 @@ loader                    (-> ledger, inventory, ..safetensors_stream, ..memory_
 hooks, moves              (-> loader, ledger; hooks -> ..tensor_container; moves -> ..rocm_mmap_transfer in debug mode)
 degrade                   (-> planner, moves, tiers, ..memory_budget)              manager layer
 manager                   (-> every module above, ..residency, ..memory_budget)
+paired                    (-> manager, planner, forecast, spec, tiers)             two-handle rule
 ```
 Manager data flow of one run (`manager.LargeModelManager`, the large pool's `PoolPolicy` under the
 shared `..residency` arbiter): `acquire` takes the lease (`begin_use(LARGE)`, no hint), plans on
@@ -106,7 +109,8 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
   `rocm_gfx1201` (the reference) and `cuda_sm_120`, both FITTED by
   `tools/large_model_calibration` (`fit`) from real runs, with the fit rules in its `fit.py`.
 - `forecast.py`: `forecast(...) -> Forecast` (per phase, per transition, idle; `TimeForecast`;
-  `PlanLine`s; `calibrated` / `device_calibrated`, and `PhaseForecast.calibrated` per phase).
+  `PlanLine`s; `calibrated` / `device_calibrated`, and `PhaseForecast.calibrated` per phase;
+  `device_overhead`).
 - `planner.py`: `Budgets` (incl. `observed_deficit_bytes` of a degrading run and the per-handle
   `device_cap_bytes`), `Reclaimable`,
   `PlanFit` / `FitKind`, `plan`, `plan_grid`, `axis_rows`, `plan_axis`, `guarded_forecast`,
@@ -133,6 +137,14 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
   the large `PoolPolicy`, the errors (`LargeModelRefused`, `LargeModelRunFailed`),
   the store seam (`LimitsStore`, `JsonLimitsStore`, `MemoryLimitsStore`, `limits_store_path`) and
   `apply_oom_score_backstop` (Linux `oom_score_adj = 1000`, `General.large_models_oom_score_adj`).
+- `paired.py`: the two-handle rule of a service that admits a PIPELINE handle and then a
+  TEXT-ENCODER handle beside its reservation (FLUX.2 klein; FLUX.3 klein): `PairPhases` (the
+  pipeline phases that bound the run, the `rest` phase whose weights sit beside the encode, the
+  encoder's phase), `HandleRequest`, `EncoderNeed` (`counted`), the combined VRAM-axis ceiling
+  (`encode_moment_device`, `combined_device_peak`, `encoder_device_cap`, `combined_ceilings`, `live_ceilings`,
+  `encoder_cap_beside`), `reservation_of` / `host_baseline` / `with_host_baseline`, and
+  `plan_pair` -> `PairedReport` (`to_wire`: the two-handle `large_models.profiles` answer;
+  `run_device_peak` / `run_host_peak`). Read-only over the manager (`profiles` only).
 - `_test_fixtures.py`: header-only safetensors writer, the toy three-component spec, round-number
   tables, budget builders (tests only).
 - `_mechanics_test_fixtures.py`: the real-torch 6-block toy model, a safetensors writer with data,
@@ -143,6 +155,11 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
 - `test_degrade.py` (pure, header-only toy plans) and `test_manager.py` (real mechanics on CPU, the
   real arbiter and small pool, fake probes over the fake transports' byte pools): the manager
   contracts below.
+- `test_paired.py` (pure: synthetic forecasts, a scripted manager): the two-handle contracts for
+  both phase bindings, the `plan_pair` call sequence and the wire's refusal merge.
+  `test_manager.py` `BaselineTests` pins the baseline / room contract over the real manager
+  (two other large handles resident, a busy handle that is not reclaimable, `plan_pair`'s run
+  figure with a resident encoder).
 - `test_inventory.py` (also the spec validation), `test_tiers.py`, `test_cost_tables.py`,
   `test_forecast.py`, `test_planner.py`: the contracts below. `test_inventory.py` and
   `test_hooks.py` also cover a GGUF file (written with `.._gguf_test_fixtures`; skipped without
@@ -169,6 +186,21 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
   and restores count the device-tier bytes against the `HostWatch` (`LoadedComponent.device_is_host`).
 - **Never plan device memory above `total - reserve`** (`DeviceBudget.headroom`), and never on an
   unreadable device. The user's `vram_cap` bounds the whole device usage.
+- **Baseline RSS vs. host room.** Every host peak includes `Budgets.baseline_rss` = the
+  process RSS (`RssAnon + RssShmem`) with EVERY large-pool holding taken out (this handle's live
+  ledger bytes, its pair partner's, any other large model's published parts; the manager's
+  `_large_free_rss`); small-pool models, the runtime and the allocator cache stay in. A reported
+  host peak therefore reads "the backend with only this plan's large model loaded" (the user's
+  contract for the forecast line), and the two handles of a pair carry the same baseline, so
+  `paired.run_host_peak` / the client's sum count a resident encoder once. The guard does not
+  use that figure as room: a fit judges the host GROWTH (peak - baseline, baseline-independent)
+  against `Budgets.host_room` = probed headroom + own bytes - claims (+ `Reclaimable` idle
+  holdings), so other handles' bytes stay occupied unless the arbiter could reclaim them.
+- **A plan with nothing on the device** (no state holds a device byte: a whole-handle host pin
+  such as the CPU text encoder) forecasts device peak `0` everywhere — no margin, no runtime
+  overhead — and reserves no device memory; `Forecast.device_overhead` is then `0` (else the
+  table's runtime overhead). The device context of such an encode moment is the pipeline's:
+  `paired.encode_moment_device` adds the pipeline's `device_overhead` to its resting weights.
 - **Single-copy invariant (stated here, enforced by the ledger of the mechanics layer):** a
   block's weights exist in exactly one location (device, host or disk) except the
   `prefetch_depth + 1` blocks in flight. The forecast is written to this invariant: a component
@@ -296,9 +328,18 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
   callback that takes its lock, and (ii) opens several handles in one operation: it then acquires
   every session under its lock, in one fixed handle order (FLUX.2: pipeline, then encoder; a run
   lock is taken blocking, so acquiring outside the lock would invert the order with a concurrent
-  single-handle action). FLUX.3 (one handle) acquires before its lock. A handle's run lock
+  single-handle action). FLUX.3 likewise acquires under its lock, pipeline then encoder (the
+  encoder only when the run encodes). A handle's run lock
   serializes its sessions (taken after the lease, released before it); reclaim and `unload` only
   try it; the manager's `_lock` is a leaf over its dicts only. A session is driven by one thread.
+- **Two handles, one operation (`paired`).** The pipeline is admitted first, the encoder on what
+  the pipeline's reservation leaves, capped (`acquire(..., device_cap_bytes=)`) so that a lower
+  VRAM step never forecasts more device bytes for the two handles together than a higher one
+  (the ceiling chain is planned before the pipeline holds a reservation; a host run device has
+  no ceiling). The two-handle `profiles` answer is the pipeline planned alone, the encoder beside
+  it, the pipeline again with the encoder's claim (`selected` + `encoder`, each forecast with
+  its `host_baseline`; a refused encoder refuses `selected`); the encoder is left out only when
+  `EncoderNeed.counted` is false. A model binds it through its own `PairPhases`.
 - **Sysmem spill** (NVIDIA Windows only, `memory_budget.detect_sysmem_spill`): checked after every
   phase; a spilled phase keeps its result and degrades the remaining phases
   (`Session.hints` gets `nvidia_sysmem_fallback`).
@@ -319,6 +360,9 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
   judge a validation run with its `check` (see its `MODULE_README.md`; `parse_tables` documents
   the schema). A new device class is a new file.
 - To support a new model, write its `LargeModelSpec` in the model package; nothing here changes.
+  A two-handle model (pipeline + encoder) declares its `paired.PairPhases` and calls
+  `paired.plan_pair` / `live_ceilings` / `encoder_cap_beside`; the rule itself changes only in
+  `paired.py` (`test_paired.py`, FLUX.2 `ProfilesGoldenTests`).
 - To change how memory is probed or the reserves, edit `../memory_budget.py`, not this package.
 - To change the admission (planner inputs, Q-P1, the reservation), the session steps (incl.
   `finish` / `settle`), the load-progress sink, the placements or the pool offers, edit `manager.py`; the rung order, what

@@ -18,7 +18,7 @@ Main responsibilities:
     precision (bf16, or weight-only fp8 done by the conversion:
     `encoder_model_name`), computing on the run device or the CPU as the plan
     decides; its file is a safetensors folder or a llama.cpp GGUF (names
-    bridged by `encoder_gguf`, kept quantized like a GGUF transformer);
+    bridged by `runtime.qwen3_gguf`, kept quantized like a GGUF transformer);
 - `PipelineOptions` / `EncoderOptions` (the manager's `options`), built from a
   normalized request by `pipeline_options` / `encoder_options`, and
   `request_shape`;
@@ -92,12 +92,16 @@ from ...runtime.large_models.spec import (
     RequestShape,
     Role,
 )
+from ...runtime import qwen3_gguf
 from ...runtime.tensor_container import container_kind, read_container_layout
-from . import attention, components, conversion, encoder_gguf
+from . import attention, components, conversion
 from .params import REGION_SIZE_MULTIPLE, SAFETENSORS_FORMAT, effective_steps, text_encoder_dtype_name
 from .pipeline import EMERGENCY_TILE_LATENT_MIN_SIZE
 
 log = logging.getLogger(__name__)
+
+#: The service name the shared Qwen3 GGUF refusals (`runtime.qwen3_gguf`) print.
+_OWNER = "FLUX.2 klein"
 
 #: The calibration-table family of every FLUX.2 spec.
 FAMILY = "flux2_klein"
@@ -557,12 +561,7 @@ def _require_loadable_gguf_encoder(source: Path, *, fp8: bool) -> None:
 
     layout = components.gguf_layout(source)
     metadata = layout.gguf.metadata if layout.gguf is not None else {}
-    architecture = metadata.get(gguf.Keys.General.ARCHITECTURE)
-    if architecture != components.GGUF_ENCODER_ARCHITECTURE:
-        raise ValueError(
-            f"Текстовый энкодер {source.name}: это GGUF модели «{architecture}», а нужен Qwen3 "
-            f"(general.architecture = «{components.GGUF_ENCODER_ARCHITECTURE}») — возьмите GGUF текстового энкодера FLUX.2 klein."
-        )
+    qwen3_gguf.require_architecture(metadata, frozenset({components.GGUF_ENCODER_ARCHITECTURE}), source=source, owner=_OWNER)
     keep = components.ENCODER_KEEP_LAYERS
     blocks = components._config_int(metadata, gguf.Keys.LLM.BLOCK_COUNT.format(arch=components.GGUF_ENCODER_ARCHITECTURE))
     if blocks is not None and blocks < keep:
@@ -571,7 +570,7 @@ def _require_loadable_gguf_encoder(source: Path, *, fp8: bool) -> None:
             f"слоёв {', '.join(str(index) for index in components.TEXT_ENCODER_OUT_LAYER_INDICES)} и требует минимум {keep}."
         )
     _require_dequantizable_gguf(layout.spans, source=source, component="Текстовый энкодер")
-    encoder_gguf.require_known_encoder_names([span.name for span in layout.spans], keep, source=source)
+    qwen3_gguf.require_known_encoder_names([span.name for span in layout.spans], keep, source=source, owner=_OWNER, logger=log)
     components.text_encoder_config_kwargs(components.find_text_encoder_config_dir(source), keep)
 
 
@@ -717,7 +716,7 @@ def _encoder_state_key(file_key: str) -> str | None:
     """The `Qwen3Model` state key of a checkpoint key, `None` for weights the truncated model lacks.
 
     Two disjoint name spaces: an HF key (`model.` stripped; `lm_head.*`
-    dropped) and a llama.cpp GGUF name (`encoder_gguf.encoder_state_key_of_gguf`).
+    dropped) and a llama.cpp GGUF name (`qwen3_gguf.encoder_state_key_of_gguf`).
     The prefixed HF names are recognized first, so a safetensors encoder never
     builds the GGUF name tables.
 
@@ -726,8 +725,8 @@ def _encoder_state_key(file_key: str) -> str | None:
     """
     if file_key.startswith(components._ENCODER_LM_HEAD_PREFIX):
         return None
-    if not file_key.startswith(_ENCODER_PREFIX) and encoder_gguf.is_gguf_encoder_name(file_key):
-        return encoder_gguf.encoder_state_key_of_gguf(file_key, components.ENCODER_KEEP_LAYERS)
+    if not file_key.startswith(_ENCODER_PREFIX) and qwen3_gguf.is_gguf_encoder_name(file_key):
+        return qwen3_gguf.encoder_state_key_of_gguf(file_key, components.ENCODER_KEEP_LAYERS)
     key = file_key[len(_ENCODER_PREFIX):] if file_key.startswith(_ENCODER_PREFIX) else file_key
     match = _LAYER_RE.match(key)
     if match and int(match.group(1)) >= components.ENCODER_KEEP_LAYERS:
@@ -748,7 +747,7 @@ def _make_encoder_state_keys(fp8: bool) -> Any:
         if fp8 and _is_fp8_linear_weight(key):
             # D8: `encoder_options` refuses fp8 with a GGUF file before any spec
             # call; a GGUF linear reaching here would be quantized twice.
-            if not file_key.startswith(_ENCODER_PREFIX) and encoder_gguf.is_gguf_encoder_name(file_key):
+            if not file_key.startswith(_ENCODER_PREFIX) and qwen3_gguf.is_gguf_encoder_name(file_key):
                 raise ValueError(f"FLUX.2 klein: fp8 для текстового энкодера не применим к тензору GGUF «{file_key}»")
             stem = key[: -len(".weight")]
             return (f"{stem}.weight_fp8", f"{stem}.weight_scale")
@@ -874,7 +873,7 @@ def _make_build_encoder_meta(fp8: bool) -> Any:
         if gguf:
             from ...runtime.gguf_layers import swap_gguf_modules
 
-            quant_types = encoder_gguf.gguf_encoder_quant_types(components.gguf_layout(Path(path)).spans, keep)
+            quant_types = qwen3_gguf.gguf_encoder_quant_types(components.gguf_layout(Path(path)).spans, keep)
             swapped = swap_gguf_modules(model, quant_types, compute_dtype=dtype)
             log.info("FLUX.2 klein: текстовый энкодер %s (формат %s, конфиг %s) — %d слоёв GGUF, распаковка в %s при каждом проходе.", Path(path).name, weight_format, folder, swapped, text_encoder_dtype_name())
         return model

@@ -28,9 +28,8 @@ Strict one-directional layering. A module may import from any module ABOVE it in
 `../../runtime/`, never from a module below it:
 
 ```
-params, progress, conversion,           (no intra-package dependencies; params -> runtime tiers,
-encoder_gguf                                 runtime.tensor_container; encoder_gguf -> gguf,
-                                             transformers, accelerate lazily)
+params, progress, conversion            (no intra-package dependencies; params -> runtime tiers,
+                                             runtime.tensor_container)
 attention                               (-> params)
 components                              (-> params, runtime.torch_support, runtime.safetensors_stream,
                                              runtime.encoder_truncation, runtime.tensor_container,
@@ -38,15 +37,15 @@ components                              (-> params, runtime.torch_support, runti
 hardware                                (-> runtime.torch_support, runtime.memory_probe,
                                              runtime.torch_device)
 prompt_cache                            (-> components, params, runtime.paths, runtime.prompt_library,
-                                             runtime.safetensors_stream)
+                                             runtime.prompt_cache_service, runtime.safetensors_stream)
 pipeline                                (-> components)
-large_model                             (-> attention, components, conversion, encoder_gguf, params, pipeline,
-                                             runtime.large_models, runtime.tensor_container;
-                                             runtime.gguf_layers lazily)
+large_model                             (-> attention, components, conversion, params, pipeline,
+                                             runtime.large_models, runtime.qwen3_gguf,
+                                             runtime.tensor_container; runtime.gguf_layers lazily)
 memory                                  (-> attention, components, hardware, large_model,
                                              runtime.large_models, runtime.memory_budget)
 service                                 (-> all of the above, runtime.large_models, runtime.residency,
-                                             runtime.model_manager)
+                                             runtime.model_manager, runtime.prompt_cache_service)
 __init__                                (-> all of the above; re-export only)
 ```
 
@@ -56,8 +55,9 @@ model `flux2_klein` / `flux2_klein.float16`) and the TEXT ENCODER (`text_encoder
 plan decides, always on the CPU under «Энкодер на CPU»: `params.encoder_on_cpu`, default on,
 `EncoderOptions.on_cpu` -> the spec's host pin, its own residency key). `service.py` admits the pipeline first and
 the encoder second, under its lock, the encoder under a device ceiling that keeps the two handles
-together monotone on the VRAM axis (`memory.combined_ceilings` / `encoder_device_cap`, planned
-before the pipeline's admission; one rule for the run, `memory.forecast_memory` and
+together monotone on the VRAM axis (the two-handle rule of `../../runtime/large_models/paired.py`
+bound to FLUX.2 by `memory.FLUX2_PAIR`: the encoder runs beside the denoise state; planned before
+the pipeline's admission; one rule for the run, `memory.forecast_memory` and
 `large_model_profiles`).
 
 `__init__.py` defines no behaviour. It carries the package docstring and re-exports the package's
@@ -78,10 +78,6 @@ object itself.
   `LoadFrames` (the request's callback plus the manager's load-progress sink: a component read
   re-emits the CURRENT step frame with the byte level). A wire contract shared with the Rust client; imports nothing from the
   package.
-- `encoder_gguf.py`: the llama.cpp GGUF <-> HF Qwen3 name bridge of the text encoder
-  (`encoder_state_key_of_gguf`, `is_gguf_encoder_name`, `require_known_encoder_names`,
-  `gguf_encoder_quant_types`): the `gguf` package's QWEN3 map inverted over the real `Qwen3Model`
-  key set, no hand-written table, no Q/K row permutation.
 - `conversion.py`: the per-key BFL / diffusers layout rule of the transformer checkpoint
   (`is_bfl_key`), diffusers' own per-key converter on one tensor (`convert_bfl_tensor`), the
   `model.diffusion_model.` prefix refusal.
@@ -104,12 +100,16 @@ object itself.
   pre-admission refusals (`require_loadable`, `require_loadable_encoder`) and the model names.
 - `prompt_cache.py`: FLUX.2's side of the shared prompt library (`../../runtime/prompt_library.py`):
   encoder identity (`text_encoder_fingerprint` with the RoPE salt; `rope_salt=False` = the pre-fix
-  identity, for the migration only), `encoder_label` / `encoder_provenance` / `is_current_encoder`,
+  identity, for the migration only), `encoder_label` / `encoder_provenance` ("made by the current
+  encoder" is `prompt_library.same_encoder`),
   the libraries (`flux2_library_spec`, `library_of`, `prompt_cache_root`, `transformer_text_width`,
   `LEGACY_LIBRARY_BY_WIDTH` — a Rust test reads that literal), and the v1 migration
   (`classify_v1_entry`, `convert_v1_metadata`, `migrate_legacy_families`, `ensure_legacy_migrated`;
   links are never followed — `legacy_family_dirs` / `_family_files` refuse them — and a v1 file is
-  unlinked only after its v2 copy's directory is fsynced).
+  unlinked only after its v2 copy's directory is fsynced), and `Flux2PromptCacheAdapter` — FLUX.2's
+  adapter of the shared orchestration (`../../runtime/prompt_cache_service.py`): the texts a run
+  needs (prompt + `""` under effective guidance, through the service's `_effective_guidance_scale`),
+  the preference, the width filter, the current encoder, the v1 migration and the v1 import.
 - `attention.py`: the `text_attention_in_mask` contract — the token grid, the joint-sequence layout,
   the early empty-mask refusal, THE device-byte formula of the mask (shared by the run's log and the
   spec's denoise work) and the additive mask itself.
@@ -117,27 +117,45 @@ object itself.
   the calibration tool),
   `_resolve_selected_backend_device`, `_clear_torch_cache`, `_cuda_device_index`.
 - `memory.py`: the glue over the manager — `requested_steps` (the request's step pair),
-  `steps_fields` / `STEP_FIELD_KEYS` (the four step keys of an answer), the combined VRAM-axis
-  rule (`combined_device_peak`, `combined_ceilings`, `encoder_device_cap`), `forecast_memory`
+  `steps_fields` / `STEP_FIELD_KEYS` (the four step keys of an answer), `FLUX2_PAIR` (FLUX.2's
+  `paired.PairPhases`) and the combined VRAM-axis rule bound to it (`combined_device_peak`,
+  `encoder_device_cap`; `combined_ceilings` re-exported from `paired`), `forecast_memory`
   (the two-handle run forecast from the manager's planner + forecast; consumers: the calibration
   tool and the golden test), `is_host_run_device`. No arithmetic of its own.
 - `pipeline.py`: what a run does WITH the placed modules — the prompt encode, the warm-up decode,
   the execution-device check, ONE VAE decode attempt with its tiling options, and the residency
   vocabulary / action matrix (`residency_of`, `_component_actions`).
-- `service.py`: `Flux2KleinInpaintService` — the service lock, the in-memory prompt cache with its
-  provenance (`MemoryEmbedding`), `_prompt_plan` / `PromptPlan` (THE answer to which embedding serves
-  each needed text), the library methods (`prompt_cache_build` / `_list` / `_export` / `_import`), the tokenizer /
+- `service.py`: `Flux2KleinInpaintService` — the service lock, the in-memory prompt cache
+  (`EmbeddingMemory`) and the shared `PromptCacheOrchestrator` over it, `_prompt_plan` (THE answer
+  to which embedding serves each needed text, delegated), the library methods (`prompt_cache_build`
+  / `_list` / `_export` / `_import`: FLUX.2's encoder session, progress steps, refusals and answer
+  keys around the orchestrator; the test seams `_store_embeds`, `_prompt_cached`, `MemoryEmbedding`,
+  `_memory_key`, `_tensor_width` stay reachable here), the tokenizer /
   scheduler caches, the manager sessions of a run and of every action (acquired under the lock, pipeline
-  before encoder; `LockOrderTests`), `_encoder_need` / `EncoderNeed` (the one decision whether a
+  before encoder; `LockOrderTests`), `_encoder_need` (the one decision, as a `paired.EncoderNeed`
+  re-exported here, whether a
   request encodes and whether its forecast counts the encoder: not counted only when not resident
   AND fully cached), `_load_frames` (the request's `LoadFrames`; `_acquire` registers its sink on every session, so
   every checkpoint read of a session reports its bytes),
-  `large_model_profiles` (the `large_models.profiles` adapter:
+  `large_model_profiles` (the `large_models.profiles` adapter: `paired.plan_pair(...).to_wire()`,
   pipeline pickers with the encoder's claim; `large_model_name` / `large_model_inputs` its
-  single-handle fallback), `set_phase_observer` (the calibration hook) and
+  single-handle fallback), `_combined_ceilings` / `_encoder_cap` (the run's encoder ceiling,
+  `paired.live_ceilings` / `encoder_cap_beside`), `set_phase_observer` (the calibration hook) and
   `_effective_guidance_scale`.
 - `fixtures/forecast_golden.json`: the golden `forecast_memory` snapshot of
   `test_characterization.py`, one case per step pair (regenerate with its `--write-golden`).
+- `fixtures/profiles_golden.json`: the golden LIVE `large_model_profiles` answers of
+  `test_characterization.ProfilesGoldenTests` over a REAL manager with fake budgets (tiny real
+  models: every step pair x encoder counted / cached / resident-and-cached / on the CPU, plus the
+  device cap each real run passes to the encoder's `acquire`; header-only klein 9B files with the
+  reference table, a host-short budget included), recorded before the two-handle rule moved to
+  `runtime/large_models/paired.py`; a refactor keeps it byte-identical (`--write-profiles-golden`
+  only for a deliberate behaviour change).
+- `fixtures/prompt_cache_golden.json`: the golden prompt-library answers and refusal texts of
+  `test_prompt_cache_golden.py` (`.status` cache keys, build new / already / rename, list, export,
+  import of every kind, the v1 migration report), recorded before the orchestration moved to
+  `runtime/prompt_cache_service.py`; a refactor keeps it byte-identical (`--write-golden` only for
+  a deliberate behaviour change).
 - `fixtures/flux2_9b_gguf_headers.json`: recorded headers (names, GGUF dims, ggml types,
   metadata; no tensor data) of the klein 9B GGUF files — full tensor lists for the unsloth 9B
   Q4_K_M transformer and the uncensored Q8_0 encoder, metadata and type histograms for the
@@ -152,16 +170,16 @@ object itself.
   `_write_bfl_gguf_transformer`: the tiny real transformer as a BFL-layout GGUF plus the
   diffusers state dict it must load as), the 9B fixture loaders and the header-only GGUF writer.
 - `test_*.py`: one per module; `test_characterization.py` holds the CONTRACT tests of the wire (and
-  the GOLDEN forecast), `test_runtime_extraction.py` pins what FLUX.2 keeps seeing of names
+  the GOLDEN forecast and live profiles), `test_runtime_extraction.py` pins what FLUX.2 keeps seeing of names
   that live in `../../runtime/`, `test_real_gguf_header.py` is the opt-in check of real GGUF
   transformer files (skips unless `side_models/FLUX.2-klein-{4B,9B}/transformer_gguf/*.gguf`
   exists or `MS_FLUX2_KLEIN_GGUF_FILES` names files), `test_real_gguf_encoder_header.py` the same
   for Qwen3 GGUF encoders (`<package>/{text_encoder_gguf,text_encoder_uncensored_gguf}/*.gguf` or
   `MS_FLUX2_KLEIN_GGUF_ENCODER_FILES`; a Q8_0 file is also checked row by row against the
   package's unquantized `text_encoder/` or `text_encoder_uncensored/`), `test_encoder_gguf.py`
-  the name bridge, the tiny real Qwen3 GGUF through the manager and the recorded uncensored 9B
-  header. Torch / diffusers / transformers tests skip without them; no GPU,
-  no network. Run them with `python -m pytest modules/ai_backend/inpaint/ -q` from the repo root.
+  the GGUF encoder spec, the tiny real Qwen3 GGUF through the manager and the recorded
+  uncensored 9B header (the name bridge's own tests are `runtime/test_qwen3_gguf.py`).
+  Torch / diffusers / transformers tests skip without them; no GPU, no network. Run them with `python -m pytest modules/ai_backend/inpaint/ -q` from the repo root.
 
 ## Memory behaviour under the manager
 - The decode out-of-memory order is the manager ladder's: tiling, the lowered tile, then the next
@@ -269,6 +287,11 @@ up on the module that defines it:
 `components` and `hardware` each import it from there, so patching one does not reach the other's
 code path; a test patches the module whose path it exercises, or both.
 
+The Qwen3 GGUF name bridge (`../../runtime/qwen3_gguf`) is patched by no test. `large_model` reaches
+it as `qwen3_gguf.<name>` (module attribute, never a `from` import), so a test that needs to replace
+one of its functions patches `runtime.qwen3_gguf`; the names the package re-exports are separate
+bindings.
+
 Therefore a module that consumes one of these from ANOTHER module writes
 `hardware.memory_snapshot(...)`, `memory._tables_for(...)`, `components.installed_klein_package_roots()`,
 `attention.build_text_attention_mask(...)` — never `from .hardware import memory_snapshot`; and
@@ -307,14 +330,18 @@ which is what makes `assertLogs(svc.log)` capture records of the submodules.
 ## Editing map
 - To change a request parameter, a clamp, the region limits, the accepted step ids or the
   retired-field refusals, see `params.py`.
-- To change the step keys of an answer, the combined VRAM-axis rule or the two-handle forecast,
-  see `memory.py`.
+- To change the step keys of an answer, FLUX.2's phase binding of the two-handle rule or the
+  two-handle offline forecast, see `memory.py`; the rule itself (ceilings, caps, the three-step
+  profiles composition and its wire answer) is `../../runtime/large_models/paired.py`.
 - To change what the manager knows of a component — files, keys, blocks, dtype, fp8, a phase's
   work, a decode fallback, a pre-admission refusal, the transformer's formats — see
   `large_model.py`; the weight-format wire fields are `params._weight_formats`; the BFL key rule is
   `conversion.py`. The steps, the forecast, the planner, the loader and the ladder are
   `../../runtime/large_models/` (model-agnostic: never special-case FLUX.2 there).
-- To change the llama.cpp <-> HF names of the Qwen3 encoder, see `encoder_gguf.py`; the encoder's
+- To change the llama.cpp <-> HF names of the Qwen3 encoder or the wording of the GGUF encoder
+  refusals, see `../../runtime/qwen3_gguf.py` (shared with FLUX.3 klein; FLUX.2 passes the accepted
+  architecture `components.GGUF_ENCODER_ARCHITECTURE`, its owner name and its logger from
+  `large_model.py`, and `test_runtime_extraction.py` pins the resulting wording); the encoder's
   formats, GGUF build and the D8 rule, `large_model.py`.
 - To change where a component (or a GGUF file's config) is looked for on disk, which klein
   packages a GGUF file may borrow from, what a checkpoint may contain, the variant rule, how deep
@@ -328,9 +355,10 @@ which is what makes `assertLogs(svc.log)` capture records of the submodules.
   `_component_action_locked`); what a phase DOES with the modules (encode, warm-up, decode,
   device check) is `pipeline.py`.
 - To change the prompt library's container, index, file names or the selection rule, see
-  `../../runtime/prompt_library.py` (model-agnostic); FLUX.2's library ids, encoder provenance,
-  width filter or the v1 migration, `prompt_cache.py`; what a run / `.status` / the forecast take from
-  the library, `service._prompt_plan`.
+  `../../runtime/prompt_library.py` (model-agnostic); what is served, built, listed, exported or
+  imported, `../../runtime/prompt_cache_service.py` (shared with FLUX.3); FLUX.2's library ids,
+  encoder provenance, width filter, the v1 migration or its adapter, `prompt_cache.py`; what a run /
+  `.status` / the forecast take from the library, `service._prompt_plan`.
 - The latent-mask dilation, the colour match and the composite are not here: the backend answers
   the RAW decode and the Rust host post-processes it (`crates/ms-region-postprocess`). The wire
   codecs (region, L8 mask, solid-mask check, PNG answer) are `../region_imaging.py` (shared with

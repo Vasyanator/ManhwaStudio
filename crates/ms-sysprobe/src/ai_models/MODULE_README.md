@@ -8,7 +8,9 @@ opposed to the unpinned app-managed `Vasyanator2/ManhwaStudio_AI_Models` tree th
 GitHub release zips), Surya detection + recognition (the Surya model host), the SDXL
 diffusers configs, the curated SDXL inpainting model and the FLUX.2 klein 4B and 9B packages
 (BFL bf16 files + unsloth GGUF transformer and Qwen3 encoder quants; for 9B also the gated
-uncensored encoder with its GGUF quants, and the stock encoder's configs as their own spec). The Python backend never downloads
+uncensored encoder with its GGUF quants, and the stock encoder's configs as their own spec)
+and the FLUX.3 klein package (gated BFL base + native DiTs + bf16 Qwen3-VL encoder, unsloth
+GGUF DiT quants, official Qwen GGUF encoder quants). The Python backend never downloads
 these; it receives the resolved directory or file paths from Rust and loads offline. Plus
 `hf_url.rs`, the URLs BOTH downloaders use; the HTTP stream they share is the `ms-download`
 crate.
@@ -30,6 +32,14 @@ crate.
   (backend path), `flux2_klein_transformer_layout` (the one bf16 layout rule),
   `flux2_klein_spec_role` (id -> typed role). The format and source lists are `ms_config`'s
   (`Flux2WeightFormat::offered_for`, `Flux2EncoderSource::offered_for`), never repeated here.
+- FLUX.3 klein (`external_catalog/flux3_klein.rs`, re-exported likewise): 12 `Shared` specs
+  under `<side_models>/FLUX.3-image-klein/` (= `ms_config::flux3_klein_dir`) at the repository
+  paths the backend's former download wrote, so existing installs are adopted. Lookups:
+  `flux3_klein_dit_spec` / `flux3_klein_encoder_spec` (download targets),
+  `flux3_klein_package_specs` (base + root DiT config for bf16 / GGUF + DiT + encoder), `flux3_klein_dit_relative_path` /
+  `flux3_klein_encoder_relative_path` (package-root-relative component paths, valid for a
+  manual root too), `flux3_klein_spec_role`. The format lists are `ms_config`'s
+  (`Flux3DitFormat`, `Flux3EncoderFormat`).
 - `easyocr.rs` is the ONE owner of EasyOCR decisions: `normalize_easyocr_langs` (raw setting
   -> canonical codes sent to the backend), `easyocr_script_for` (mirror of easyocr 1.7.2
   `Reader.__init__`), `EasyOcrScript`, `easyocr_spec`. Every script spec lives in the ONE
@@ -126,6 +136,8 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
   model or move a pin.
 - `external_catalog/flux2_klein.rs`: the FLUX.2 klein 4B / 9B specs, lookups and their tests
   (see `external_catalog/MODULE_README.md`).
+- `external_catalog/flux3_klein.rs`: the FLUX.3 klein specs, lookups and their tests (same
+  readme).
 
 ## Contracts and invariants
 - The catalog (with `easyocr.rs` for EasyOCR) is the ONLY owner of source, revision, file
@@ -143,7 +155,8 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
   installed model, and it hands repair back to a normal download by deleting the wrong
   files and the affected markers.
 - Adoption (the one owner: `adopt_external_model`): for files on disk with NO completion
-  marker at all (e.g. the FLUX.2 klein 4B / 9B folders the backend used to download). A marker of
+  marker at all (e.g. the FLUX.2 klein 4B / 9B and FLUX.3 klein folders the backend used to
+  download). A marker of
   another identity is an older install: never adopted (`unmarked_files_present` reads `false`,
   the adoption refuses with `NotDownloaded`); its upgrade is the regular download, which
   retires that marker and cleans stale files of an Exclusive directory. Worker thread only,
@@ -215,6 +228,9 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
   `flux2_klein_9b_weights_spec` matches force it) plus its row in
   `tools/model_pins/sources.json`; the catalog tests require every offered combination to
   resolve to exactly one spec.
+- New FLUX.3 klein format: extend `ms_config::Flux3DitFormat` / `Flux3EncoderFormat`, then
+  `external_catalog/flux3_klein.rs` (its exhaustive matches force a spec and a relative path)
+  plus the row in `tools/model_pins/sources.json`.
 - Moving a pin: change revision and the changed file rows together; installs of the old pin
   then read `Missing` and a re-download keeps unchanged files.
 - Pinned-download behaviour (verification, marker, staging, gated preflight): `external.rs` +

@@ -93,7 +93,9 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   `crate::ocr_model_download::offered_download_label` (shared with the "not downloaded" errors);
   `external_model_display_name` names every catalog spec (the FLUX.2 klein parts of both variants
   through the catalog's reverse lookup `flux2_klein_spec_role`, with `{variant}` and a GGUF
-  part's `{quant}` / an unquantized encoder's `{dtype}`; tests walk `all_specs()`). `pub` items (`draw_ocr_model_download`,
+  part's `{quant}` / an unquantized encoder's `{dtype}`; the FLUX.3 klein parts through
+  `flux3_klein_spec_role`: base, the DiT with its `{format}` / `{quant}`, the text encoder with
+  its `{dtype}` / `{quant}`; tests walk `all_specs()`). `pub` items (`draw_ocr_model_download`,
   `load_blocked_reason`, `ModelDownloadAction`): the OCR and detector panels here and the
   Cleaning tab's SDXL engine draw it. The detector panel draws it for
   `text_detector::SURYA_DETECTOR_SPECS` while Surya is selected

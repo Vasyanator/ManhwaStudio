@@ -92,6 +92,16 @@ that defines the type.
   sends as `params.prompt_cache_precision_order` and the backend treats as opaque ids.
   The files of each offered format are pinned in `ms_sysprobe::ai_models::external_catalog`;
   the Python backend lists no quants (the ids are opaque to it).
+- `flux3_weight_format.rs`: `Flux3DitFormat` (native `bf16` / `fp8r` / `nvfp4` + GGUF `q8_0` /
+  `q6_k` / `q5_k_m` / `q4_k_m`; default `fp8r`; `all()` in quality order bf16 > fp8r > q8_0 >
+  q6_k > q5_k_m > nvfp4 > q4_k_m; `is_native` = the BFL formats the backend locates itself) and
+  `Flux3EncoderFormat` (`bf16` shards + GGUF `q8_0` / `q4_k_m`; default `bf16`): the ONE list of
+  FLUX.3 klein weight formats, with frozen wire ids and llama.cpp `quant_token`s. It also owns
+  the frozen prompt-library id `FLUX3_PROMPT_LIBRARY_ID` (`flux3_klein`, one library for every
+  encoder format) and the prompt cache's precision order
+  (`flux3_prompt_cache_precision_order`: the encoder format ids, best first; `_rank` places an id
+  in it, unknown last). The files of each
+  format are pinned in `ms_sysprobe::ai_models::external_catalog` (`flux3_klein.rs`).
 - `app_tab.rs`: `AppTab` — the editor tab set. `ALL` + `key()` (the persistence contract) and
   the localized `title()` (display only). Edit when a tab is added or removed.
 - `bubble_status.rs`: the GUI-free half of the bubble status rule model — kinds, fields,
@@ -233,7 +243,8 @@ binary that installs a UI locale). Those crates enable `test-support` from their
   `UserConfig`) unless `JsonConfig::with_kind` names it.
 - **Persisted spellings are frozen.** `AppTab::key()`, `Flux2Variant::wire()` /
   `dir_name()` / `settings_file_name()` / `prompt_library_id()` (a backend directory name), `Flux2WeightFormat::wire()`,
-  `Flux2EncoderSource::wire()`, `MemoryProfile::as_config_str()`,
+  `Flux2EncoderSource::wire()`, `Flux3DitFormat::wire()`, `Flux3EncoderFormat::wire()`,
+  `FLUX3_PROMPT_LIBRARY_ID`, `MemoryProfile::as_config_str()`,
   `StorageMode::as_config_str()` (A11), `TorchFlavour::as_token()`, the `GfxArch` spelling and the
   `bubble_status` field names are on disk in users' documents. They are byte-stable across
   releases AND across UI languages, and are never localized
@@ -291,3 +302,5 @@ binary that installs a UI locale). Those crates enable `test-support` from their
   `inpaint/flux2_klein/components.py` (guarded by a test in `lib.rs`).
 - A new FLUX.2 klein weight format or a change of which variant offers it:
   `flux2_weight_format.rs`, then its pinned spec in `ms_sysprobe::ai_models::external_catalog`.
+- A new FLUX.3 klein DiT or encoder format: `flux3_weight_format.rs`, then its pinned spec in
+  `ms_sysprobe::ai_models::external_catalog` (`flux3_klein.rs`; its exhaustive matches force it).

@@ -13,6 +13,12 @@ only (non-empty, or solid under `whole_region`).
 Key functions:
 - `edit_region_bytes(service, image_png, mask_png, reference_pngs, params, *,
   progress_callback, should_cancel)` -> the answer dict (module notes);
+- `build_prompt_cache(service, params, *, name, progress_callback,
+  should_cancel)` -> the `.prompt_cache.build` answer, with the same frames
+  (stages `prepare`, `encoder_load`, `encode`, `encoder_release`);
+- `progress_sinks(progress_callback, should_cancel)` -> `ProgressSinks`: THE
+  frame builder of both (observer, disk-read sink, denoise step sink, the
+  `prepare` frame);
 - `progress_stages()` — the stable `stage` ids of the progress frames, in run order.
 - `file_component_id()` / `file_label()` — the `file_component` id and the
   `file_label` of one disk-read frame.
@@ -40,6 +46,10 @@ Cancellation: `should_cancel()` is checked at every observer phase begin and
 after every denoise step; a raised `service.Flux3Canceled` ends the run (the
 service keeps whatever the manager's `finish` leaves, no unload).
 
+Prompt library: the run passes the wire's prompt-library fields
+(`wire.Flux3WireParams.prompt_cache`) to `service.generate`; a served caption
+still reports the encoder stages (the service's `cached` ENCODER_LOAD).
+
 Notes:
 - The seed: `params.seed` `null` draws `secrets.randbits(32)`; the answer
   echoes the seed that ran, so the client can pin it.
@@ -55,12 +65,13 @@ from __future__ import annotations
 import logging
 import secrets
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ..region_imaging import decode_image_rgb, decode_mask, encode_png_rgb, require_solid_mask
 from .large_model import COMPONENT_AE, COMPONENT_DIT, COMPONENT_ENCODER
 from .params import Flux3Request
-from .phases import Phase
+from .phases import Phase, PhaseObserver
 from .service import Flux3Canceled, Flux3KleinService
 from .wire import MAX_EXTRA_REFERENCES, normalize_flux3_params, validate_region_size
 
@@ -130,6 +141,83 @@ def file_label(progress: LoadProgress) -> str:
     return progress.file.name if progress.file is not None else ""
 
 
+@dataclass(frozen=True)
+class ProgressSinks:
+    """The progress plumbing of one call (`progress_sinks`).
+
+    `observer`: the service's `PhaseObserver` (checks the cancel and emits
+    the stage frame at every phase begin); `on_read`: the disk-read sink
+    (`None` without a callback, so the service skips the byte frames);
+    `on_step`: the denoise step sink (frame, then the cancel check);
+    `prepare()`: the cancel check and the `prepare` frame, before the service
+    is called.
+    """
+
+    observer: PhaseObserver
+    on_read: Callable[[LoadProgress], None] | None
+    on_step: Callable[[int, int], None]
+    prepare: Callable[[], None]
+
+
+def progress_sinks(progress_callback: ProgressCallback | None, should_cancel: Callable[[], bool] | None) -> ProgressSinks:
+    """THE frame builder of a run and of a prompt-cache build (module notes "Progress frames" / "Disk-read frames" / "Cancellation").
+
+    The sinks share the stage in force, so a disk-read frame names the
+    observer phase whose step performs the read.
+    """
+    stages = progress_stages()
+    last = len(stages) - 1
+    # The stage in force: a disk-read frame belongs to the observer phase whose step reads.
+    current_stage = STAGE_PREPARE
+
+    def report(phase: str, step: int, total: int, stage: str) -> None:
+        if progress_callback is not None:
+            progress_callback(phase, step, total, _LABELS[stage], stage=stage)
+
+    def on_read(progress: LoadProgress) -> None:
+        # Called synchronously on this thread by the session (the observer's thread
+        # too), so `current_stage` is the phase that performs this read.
+        if progress_callback is None:
+            return
+        stage = current_stage
+        progress_callback(
+            "load",
+            stages.index(stage),
+            last,
+            _LABELS[stage],
+            stage=stage,
+            file_step=int(progress.done_bytes),
+            file_total=int(progress.total_bytes),
+            file_label=file_label(progress),
+            file_component=file_component_id(progress.component),
+        )
+
+    def check_cancel() -> None:
+        if should_cancel is not None and should_cancel():
+            raise Flux3Canceled("FLUX.3 klein: генерация отменена")
+
+    def prepare() -> None:
+        check_cancel()
+        report("load", 0, last, STAGE_PREPARE)
+
+    def observer(phase: Phase, event: str, info: Mapping[str, Any]) -> None:
+        nonlocal current_stage
+        if event != "begin":
+            return
+        check_cancel()
+        current_stage = phase.value
+        if phase is Phase.DENOISE:
+            report("generate", 0, int(info["steps"]), phase.value)
+        else:
+            report("load", stages.index(phase.value), last, phase.value)
+
+    def on_step(step: int, total: int) -> None:
+        report("generate", step, total, Phase.DENOISE.value)
+        check_cancel()
+
+    return ProgressSinks(observer=observer, on_read=on_read if progress_callback is not None else None, on_step=on_step, prepare=prepare)
+
+
 def _decode_references(reference_pngs: Sequence[bytes]) -> list[Any]:
     """The user references as PIL RGB images (#1 and up).
 
@@ -190,59 +278,11 @@ def edit_region_bytes(
         raise ValueError("FLUX.3 klein: маска пуста — нечего менять. Закрасьте область изменения или включите режим «без маски».")
     references = _decode_references(reference_pngs)
     seed = wire.seed if wire.seed is not None else secrets.randbits(32)
-    stages = progress_stages()
-    last = len(stages) - 1
-
-    # The stage in force: a disk-read frame belongs to the observer phase whose step reads.
-    current_stage = STAGE_PREPARE
-
-    def report(phase: str, step: int, total: int, stage: str) -> None:
-        if progress_callback is not None:
-            progress_callback(phase, step, total, _LABELS[stage], stage=stage)
-
-    def on_read(progress: LoadProgress) -> None:
-        # Called synchronously on this thread by the session (the observer's thread
-        # too), so `current_stage` is the phase that performs this read.
-        if progress_callback is None:
-            return
-        stage = current_stage
-        progress_callback(
-            "load",
-            stages.index(stage),
-            last,
-            _LABELS[stage],
-            stage=stage,
-            file_step=int(progress.done_bytes),
-            file_total=int(progress.total_bytes),
-            file_label=file_label(progress),
-            file_component=file_component_id(progress.component),
-        )
-
-    def check_cancel() -> None:
-        if should_cancel is not None and should_cancel():
-            raise Flux3Canceled("FLUX.3 klein: генерация отменена")
-
-    check_cancel()
-    report("load", 0, last, STAGE_PREPARE)
-
-    def observer(phase: Phase, event: str, info: Mapping[str, Any]) -> None:
-        nonlocal current_stage
-        if event != "begin":
-            return
-        check_cancel()
-        current_stage = phase.value
-        if phase is Phase.DENOISE:
-            report("generate", 0, int(info["steps"]), phase.value)
-        else:
-            report("load", stages.index(phase.value), last, phase.value)
-
-    def on_step(step: int, total: int) -> None:
-        report("generate", step, total, Phase.DENOISE.value)
-        check_cancel()
-
+    sinks = progress_sinks(progress_callback, should_cancel)
+    sinks.prepare()
     request = Flux3Request(caption=wire.prompt, references=(Image.fromarray(region_rgb, "RGB"), *references), width=width, height=height, seed=seed, steps=wire.steps)
     log.info("FLUX.3 klein: правка области %dx%d, %d доп. референсов, сид %d, %s", width, height, len(references), seed, "вся область" if wire.whole_region else "по маске")
-    result = service.generate(request, wire.options, observer=observer, step_callback=on_step, load_progress=on_read if progress_callback is not None else None)
+    result = service.generate(request, wire.options, observer=sinks.observer, step_callback=sinks.on_step, load_progress=sinks.on_read, prompt_cache=wire.prompt_cache)
     generated = np.ascontiguousarray(np.asarray(result.image.convert("RGB"), dtype=np.uint8))
     if generated.shape[:2] != (height, width):
         raise ValueError(f"FLUX.3 klein вернул изображение {generated.shape[1]}x{generated.shape[0]} вместо области {width}x{height}")
@@ -268,3 +308,26 @@ def edit_region_bytes(
         "degraded": bool(applied.degraded),
         "degrade_reason": applied.degrade_reason,
     }
+
+
+def build_prompt_cache(
+    service: Flux3KleinService,
+    params: Mapping[str, Any] | None,
+    *,
+    name: str | None = None,
+    progress_callback: ProgressCallback | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """«Кэшировать» for the IPC `inpaint.flux3_klein.prompt_cache.build`: `service.prompt_cache_build` with this module's frames.
+
+    Frames: `prepare`, then (only when the caption must be encoded)
+    `encoder_load`, `encode`, `encoder_release` with their disk-read frames;
+    `should_cancel()` is checked before the call and at every phase begin.
+
+    # Raises
+    `Flux3Canceled` when `should_cancel()` turned true; whatever
+    `service.prompt_cache_build` raises.
+    """
+    sinks = progress_sinks(progress_callback, should_cancel)
+    sinks.prepare()
+    return service.prompt_cache_build(dict(params) if params is not None else None, name=name, observer=sinks.observer, load_progress=sinks.on_read)

@@ -8,7 +8,8 @@ operations live in `actions.rs` beside it.
 
 Main responsibilities:
 - own `Flux3KleinEngine` — the settings and their saver, the seed field, the `.status` answer,
-  the forecast (`ResourcesController`), the extra references, the token field, the download,
+  the forecast (`ResourcesController`), the extra references, the token field, the catalog
+  download controller (`downloads`), the prompt library (the shared `PromptCacheController`),
   the run channel and the progress bar;
 - implement `AiEngine`: one mask layer, the FLUX.3 frame constraints, marks as a separate
   reference while the reference list has room (else composited onto the region), the run it
@@ -17,14 +18,25 @@ Main responsibilities:
   (`postprocess_settings`);
 - validate a run request and turn it into the run's pixels (`run_input`);
 - keep the derived state honest: load the settings once, save them when they settle, re-ask
-  `.status` when the package root changes, re-arm the forecast on a settled region SIZE.
+  `.status` when the package root or the cache question (prompt, encoder mode) changes, re-ask
+  the library listing when the encoder or the root changes, re-arm the forecast on a settled
+  region SIZE;
+- answer whether the typed prompt is served from the cache (`prompt_cache_state`, guarded to
+  the prompt `.status` was asked about), which waives the text encoder in TEXT mode
+  (`model_readiness`);
+- drive the catalog download every frame (`poll_catalog_bundle`: probes, the automatic
+  adoption, the end of a job re-asks `.status` and the forecast) and apply the block's click
+  (`apply_catalog_action`).
 
 Key structures:
 - `Flux3KleinEngine`
 
 Key functions:
-- `AiEngine::{start, poll, cancel, draw_parameters, marks_support, postprocess_settings}`,
-  `Flux3KleinEngine::{run_input, frame_constraints, model_readiness, profiles_request}`
+- `AiEngine::{start, poll, cancel, draw_parameters, marks_support, postprocess_settings,
+  switch_block_reason}`,
+  `Flux3KleinEngine::{run_input, frame_constraints, model_readiness, prompt_cache_state,
+  prompt_cache_status_entry, profiles_request, catalog_snapshot, poll_catalog_bundle,
+  apply_catalog_action, fold_panel_frame}`
 
 Notes:
 Nothing here blocks the GUI thread: every start hands its work to an `ms_thread` worker and every
@@ -33,7 +45,7 @@ poll only drains a channel. The frame, the painted mask and the pending result a
 
 use super::*;
 
-// The start/poll pairs of the long operations: token, download, pickers, references, unload.
+// The start/poll pairs of the long operations: token, pickers, references, unload.
 mod actions;
 
 /// The file dialog a running picker serves.
@@ -43,6 +55,10 @@ pub(super) enum Flux3PickerPurpose {
     ModelRoot,
     /// One or more extra reference images.
     References,
+    /// Destination of `inpaint.flux3_klein.prompt_cache.export` (a save target).
+    PromptCacheExport,
+    /// Source of `inpaint.flux3_klein.prompt_cache.import`.
+    PromptCacheImport,
 }
 
 /// The FLUX.3 klein engine of the «ИИ-редактор области» tool.
@@ -58,8 +74,8 @@ pub struct Flux3KleinEngine {
     pub(super) last_seed: Option<u64>,
     /// The run in flight.
     pub(super) run_rx: Option<Receiver<Result<Flux3RunOutcome, String>>>,
-    /// Cancelled runs and downloads whose workers have not ended; while one is running nothing
-    /// new starts (`pipeline_busy`), so quick start/cancel cycles cannot stack backend requests.
+    /// Cancelled runs whose workers have not ended; while one is running nothing new starts
+    /// (`pipeline_busy`), so quick start/cancel cycles cannot stack backend requests.
     pub(super) abandoned: AbandonedJobs,
     pub(super) settings: Flux3KleinSettings,
     pub(super) settings_rx: Option<Receiver<Flux3SettingsLoad>>,
@@ -81,8 +97,19 @@ pub struct Flux3KleinEngine {
     pub(super) status_error: Option<String>,
     /// Arms exactly ONE `.status` query.
     pub(super) status_wanted: bool,
+    /// The cache question (trimmed prompt, TEXT mode in effect) the last `.status` query
+    /// carried, recorded when it was asked; `None` before the first and after a failed one. A
+    /// settings change that moves it re-asks `.status` (`note_settings_changed`): `prompt_cached`
+    /// is an answer about one prompt in one encoder mode.
+    pub(super) status_cache_question: Option<(String, bool)>,
     /// The forecast, the caps and the learned-floor reset.
     pub(super) resources: ResourcesController,
+    /// The model's prompt LIBRARY between frames (the shared controller): the one operation in
+    /// flight (build / rename / export / import), the `.list` query with its one-shot arming
+    /// (re-armed after a build or an import, after a catalog job and whenever the encoder or the
+    /// package root changes), the preset-name field, the export file captured when its dialog
+    /// opened, the outcome lines and the session-only fold flag.
+    pub(super) prompt_cache: PromptCacheController,
     /// The session's extra reference images.
     pub(super) references: Flux3References,
     /// Whether the next run would carry a marks reference, as the host last said
@@ -96,14 +123,20 @@ pub struct Flux3KleinEngine {
     pub(super) references_errors: Vec<String>,
     pub(super) unload_rx: Option<Receiver<Result<bool, String>>>,
     pub(super) unload_status: Option<String>,
-    /// The Hugging Face token field and its secret-store worker (never persisted here).
+    /// The Hugging Face token field and its secret-store worker (never persisted here); the
+    /// catalog download reads the stored token itself.
     pub(super) hf_token: HfTokenControl,
-    pub(super) download_check: Option<Flux3DownloadCheck>,
-    pub(super) download_check_rx: Option<Receiver<Result<Flux3DownloadCheck, String>>>,
-    pub(super) download_check_error: Option<String>,
-    /// The streaming `.download.start`; it claims the progress bar.
-    pub(super) download_rx: Option<Receiver<Result<Flux3DownloadOutcome, String>>>,
-    pub(super) download_status: Option<String>,
+    /// The explicit catalog download of the selection's bundle: status probes, the download /
+    /// verify job (with the gated-repository access check) and the automatic adoption of an
+    /// existing unmarked tree, all on its own workers; polled every frame by
+    /// [`Self::poll_catalog_bundle`].
+    ///
+    /// `Some` for the engine the product builds ([`Self::new`]); `None` in a TEST build, where a
+    /// real controller could adopt — hash and mark — the developer's real model files.
+    pub(super) downloads: Option<OcrModelDownloadController>,
+    /// Whether a catalog job (download, verify or adoption, of any bundle) was running at the
+    /// last poll; its falling edge is when files on disk may have changed.
+    pub(super) catalog_job_running: bool,
     /// The open file dialog and what it was opened for; at most one.
     pub(super) picker: Option<(Flux3PickerPurpose, ms_platform::file_dialog::PendingDialog)>,
     pub(super) progress: Arc<Mutex<EngineProgress>>,
@@ -122,6 +155,11 @@ impl Flux3KleinEngine {
     #[must_use]
     pub(in crate::tools::ai_editor::engines) fn new() -> Self {
         let mut engine = Self::at_rest();
+        // A test build gets no controller: its automatic adoption would hash and mark the
+        // developer's real model files.
+        if !cfg!(test) {
+            engine.downloads = Some(OcrModelDownloadController::new());
+        }
         engine.request_settings_load();
         engine
     }
@@ -150,7 +188,9 @@ impl Flux3KleinEngine {
             status_query_root: None,
             status_error: None,
             status_wanted: true,
+            status_cache_question: None,
             resources: ResourcesController::new(FLUX3_LARGE_MODEL, FLUX3_LOG_LABEL),
+            prompt_cache: PromptCacheController::default(),
             references: Flux3References::default(),
             marks_reference: false,
             references_rx: None,
@@ -158,11 +198,8 @@ impl Flux3KleinEngine {
             unload_rx: None,
             unload_status: None,
             hf_token: HfTokenControl::default(),
-            download_check: None,
-            download_check_rx: None,
-            download_check_error: None,
-            download_rx: None,
-            download_status: None,
+            downloads: None,
+            catalog_job_running: false,
             picker: None,
             progress: Arc::new(Mutex::new(EngineProgress::default())),
             ai_backend_available: false,
@@ -222,8 +259,11 @@ impl Flux3KleinEngine {
         );
     }
 
-    /// Drains the `.status` query and asks a new one when it is wanted, the backend is up and
-    /// nothing holds it. The answer is recorded with the root it was asked about.
+    /// Drains the `.status` query and asks a new one when it is wanted, the backend is up,
+    /// nothing holds it and an ABSOLUTE package root exists (`has_usable_root`; otherwise the
+    /// verdict is `NoRoot` / `RootNotAbsolute`, decided locally, and the GGUF candidate paths
+    /// would not be absolute). The answer is recorded
+    /// with the root it was asked about.
     pub(super) fn poll_and_maybe_query_status(&mut self) {
         if let Some(rx) = self.status_rx.as_ref() {
             match rx.try_recv() {
@@ -236,20 +276,23 @@ impl Flux3KleinEngine {
                 Ok(Err(err)) => {
                     self.status_error = Some(err);
                     self.status_query_root = None;
+                    self.status_cache_question = None;
                     self.status_rx = None;
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.status_query_root = None;
+                    self.status_cache_question = None;
                     self.status_rx = None;
                 }
                 Err(TryRecvError::Empty) => {}
             }
         }
-        if self.status_wanted && self.ai_backend_available && self.status_rx.is_none() && !self.pipeline_busy() {
+        if self.status_wanted && self.ai_backend_available && self.status_rx.is_none() && !self.pipeline_busy() && self.settings.has_usable_root() {
             self.status_wanted = false;
             let normalized = self.settings.normalized();
             // Taken from the value that builds the params, so what is recorded is what travelled.
             self.status_query_root = Some(normalized.effective_root());
+            self.status_cache_question = Some(Self::cache_question(&normalized));
             let params = normalized.to_params(false);
             let (tx, rx) = mpsc::channel();
             self.status_rx = Some(rx);
@@ -264,24 +307,50 @@ impl Flux3KleinEngine {
         flux3_status_for_root(self.status.as_ref(), self.status_root.as_deref(), &self.settings.effective_root())
     }
 
-    /// THE model verdict, guarded against a stale answer; read by the readiness line and the gate.
+    /// THE model verdict, guarded against a stale answer; read by the readiness line and the
+    /// gate. A prompt served from the cache waives the text encoder in TEXT mode.
     pub(super) fn model_readiness(&self) -> Flux3ModelReadiness {
-        flux3_model_readiness(&self.settings, self.status_for_current_root())
+        flux3_model_readiness(&self.settings, self.status_for_current_root(), self.prompt_cache_state())
     }
 
-    /// Whether the held check answer still describes the selected format.
-    pub(super) fn download_check_current(&self) -> bool {
-        download_check_matches_format(self.download_check.as_ref(), self.settings.format())
+    /// Whether the backend serves the prompt CURRENTLY in the field from the cache (memory or
+    /// library). `None` = not known: no answer about the current root, an answer about a prompt
+    /// the user has typed away from, or a backend without the field.
+    pub(super) fn prompt_cache_state(&self) -> Option<bool> {
+        let status = self.status_for_current_root()?;
+        prompt_cache_state_for(status.prompt_cache_asked_about.as_deref(), status.prompt_cached, &self.settings.prompt)
+    }
+
+    /// The entry `.status` named for the prompt in the field (the one a run would use), under
+    /// the same guard as [`Self::prompt_cache_state`].
+    pub(super) fn prompt_cache_status_entry(&self) -> Option<&PromptLibraryEntry> {
+        self.prompt_cache_state()?;
+        self.status_for_current_root()?.prompt_cache_entry.as_ref()
+    }
+
+    /// The cache question a `.status` asked with `settings` carries: the trimmed prompt and
+    /// whether TEXT mode is in effect (the cache serves that mode only).
+    fn cache_question(settings: &Flux3KleinSettings) -> (String, bool) {
+        (settings.prompt.trim().to_string(), settings.text_mode_in_effect())
     }
 
     /// Records a parameter change: a save is owed, the forecast is re-armed, a "moved aside"
-    /// notice retires, and `.status` is re-asked when the package root moved.
+    /// notice retires; `.status` is re-asked when the package root or the cache question
+    /// (prompt, encoder mode) moved — a prompt edit, a library pick and the «Референсы и в
+    /// текстовый энкодер» switch all land here — and a moved root also re-asks the library
+    /// listing (every entry's `current_encoder` is an answer about the encoder under it).
+    /// Re-arming the one-shot flags, never firing a query here, keeps a keystroke from becoming
+    /// a request.
     pub(super) fn note_settings_changed(&mut self) {
         self.note_postprocess_changed();
         self.resources.arm();
         let root = self.settings.effective_root();
         let asked = self.status_query_root.as_deref().or(self.status_root.as_deref());
         if asked != Some(root.as_str()) {
+            self.status_wanted = true;
+            self.prompt_cache.arm_list();
+        }
+        if self.status_cache_question.as_ref() != Some(&Self::cache_question(&self.settings)) {
             self.status_wanted = true;
         }
     }
@@ -297,13 +366,34 @@ impl Flux3KleinEngine {
         }
     }
 
-    /// Drains the forecast and asks the next question when one is armed. The gate also needs a
-    /// package root: the backend refuses a forecast without `source_root`.
+    /// Drains the forecast and asks the next question when one is armed. The gate also needs an
+    /// absolute package root (`has_usable_root`): the backend refuses a forecast without
+    /// `source_root` or with relative candidate paths.
     pub(super) fn poll_and_maybe_query_profiles(&mut self) {
         let region = self.region.map(|rect| [rect.w, rect.h]);
-        let gate_open = self.ai_backend_available && !self.pipeline_busy() && !self.settings.effective_root().is_empty();
+        let gate_open = self.ai_backend_available && !self.pipeline_busy() && self.settings.has_usable_root();
         let Self { resources, settings, references, marks_reference, .. } = self;
         resources.poll_query(region, gate_open, |size| Self::profiles_request(settings, references, *marks_reference, size));
+    }
+
+    /// Folds one drawn frame of the panel: its intents (`apply_intents`), then — when the
+    /// weight-format selection moved during the frame (the install pickers, the forecast's DiT
+    /// or encoder rows, a format suggestion) — re-probes the new catalog bundle and re-asks
+    /// `.status`. `selection_before` is [`Self::catalog_selection`] taken before the panel drew.
+    pub(super) fn fold_panel_frame(&mut self, intents: Flux3PanelIntents, selection_before: (Flux3DitFormat, Flux3EncoderFormat, Flux3SourceMode)) {
+        self.apply_intents(intents);
+        let selection = self.catalog_selection();
+        if selection != selection_before {
+            self.request_catalog_status();
+            // The per-format rows answer every candidate, but `text_encoder_present`,
+            // `available` and `prompt_cached` describe the selection the question carried: ask
+            // again.
+            self.status_wanted = true;
+            if selection.1 != selection_before.1 || selection.2 != selection_before.2 {
+                // Every listed entry's `current_encoder` follows the encoder.
+                self.prompt_cache.arm_list();
+            }
+        }
     }
 
     /// The forecast question for the current settings, references and a `size` region.
@@ -320,21 +410,87 @@ impl Flux3KleinEngine {
             params: normalized.to_params(false),
             region,
             steps: Some(normalized.steps),
-            format: Some(normalized.format().wire().to_string()),
+            format: Some(normalized.dit_format().wire().to_string()),
             choice: normalized.step_choice(),
             references: std::iter::once(region).chain(references.sizes()).chain(marks_reference.then_some(region)).collect(),
         }
     }
 
-    /// Whether an operation holds the backend and the shared progress bar (a run or a download).
+    /// Whether an operation holds the backend and the shared progress bar: a run, a cancelled
+    /// run still ending (the run gate names the latter itself, `cancel_pending_error`), or a
+    /// prompt-cache operation (a build streams on the same bar and reads the encoder). The
+    /// catalog download is not one: it runs in the app, not in the backend, and has its own
+    /// progress in its block.
     pub(super) fn pipeline_busy(&self) -> bool {
-        self.run_rx.is_some() || self.non_run_pipeline_busy()
+        self.run_rx.is_some() || self.abandoned.busy() || self.prompt_cache.busy()
     }
 
-    /// The same rule without the run: what the RUN gate reads, so a run never reports itself
-    /// as the reason it cannot start. A cancelled run or download still ending counts.
-    pub(super) fn non_run_pipeline_busy(&self) -> bool {
-        self.download_rx.is_some() || self.abandoned.busy()
+    /// The download block's view of the catalog bundle the current selection needs
+    /// ([`flux3_catalog_bundle`]); `None` without a controller (a test build) or in manual mode.
+    pub(super) fn catalog_snapshot(&self) -> Option<OcrModelPanelSnapshot> {
+        let downloads = self.downloads.as_ref()?;
+        let bundle = flux3_catalog_bundle(&self.settings);
+        (!bundle.is_empty()).then(|| downloads.panel_snapshot(&bundle))
+    }
+
+    /// Drives the catalog download every frame, panel visible or not: probes the current
+    /// bundle's never-probed specs (which also registers it for the automatic adoption),
+    /// applies the controller's worker events and notices the end of a catalog job. Returns
+    /// `true` while the GUI must keep repainting.
+    ///
+    /// A job's end (download, verify or adoption of ANY bundle) means files on disk may have
+    /// changed: `.status` (the presence marks and the verdict) and the forecast are asked again.
+    pub(super) fn poll_catalog_bundle(&mut self) -> bool {
+        let bundle = flux3_catalog_bundle(&self.settings);
+        let Some(downloads) = self.downloads.as_mut() else {
+            return false;
+        };
+        downloads.probe_unknown(&bundle);
+        let repaint = downloads.poll() || downloads.is_active();
+        // An empty bundle (manual mode) still sees another bundle's job as `other_download`,
+        // so a download left running across a mode switch is not missed.
+        let running = catalog_job_running(&downloads.panel_snapshot(&bundle));
+        if self.catalog_job_running && !running {
+            self.status_wanted = true;
+            self.resources.invalidate();
+            // The encoder files may have changed: the listing's `current_encoder` follows them.
+            self.prompt_cache.arm_list();
+        }
+        self.catalog_job_running = running;
+        repaint
+    }
+
+    /// What the catalog bundle follows: the two weight formats and the source mode.
+    pub(super) fn catalog_selection(&self) -> (Flux3DitFormat, Flux3EncoderFormat, Flux3SourceMode) {
+        (self.settings.dit_format(), self.settings.encoder_format(), self.settings.source_mode())
+    }
+
+    /// Re-probes the bundle the CURRENT selection needs (even specs probed before: the user may
+    /// have changed the disk). Called after the selection or the source mode changed in a
+    /// frame (`draw_parameters`) and on «Обновить».
+    pub(super) fn request_catalog_status(&mut self) {
+        let bundle = flux3_catalog_bundle(&self.settings);
+        if let Some(downloads) = self.downloads.as_mut()
+            && !bundle.is_empty()
+        {
+            downloads.request_bundle_status(&bundle);
+        }
+    }
+
+    /// Applies a click of the catalog download block to the bundle the current selection
+    /// needs. The block is drawn only while its snapshot describes that very bundle, so the
+    /// action can never land on another one.
+    pub(super) fn apply_catalog_action(&mut self, action: ModelDownloadAction) {
+        let bundle = flux3_catalog_bundle(&self.settings);
+        let Some(downloads) = self.downloads.as_mut() else {
+            return;
+        };
+        match action {
+            ModelDownloadAction::Download => downloads.start_download(&bundle),
+            ModelDownloadAction::Verify => downloads.start_verify(&bundle),
+            ModelDownloadAction::Cancel => downloads.cancel(),
+            ModelDownloadAction::None => {}
+        }
     }
 
     /// The frame rule (multiple of 16, side >= 128, area <= 4 MP, aspect <= 4:1), decided by
@@ -540,10 +696,29 @@ impl AiEngine for Flux3KleinEngine {
 
     fn draw_parameters(&mut self, ui: &mut egui::Ui) {
         let readiness = self.model_readiness();
-        let download_check_current = self.download_check_current();
+        // Whether the held answer describes the current root (computed before the destructure
+        // below borrows the fields apart): the presence marks read it guarded.
+        let status_current = self.status_for_current_root().is_some();
         let pipeline_busy = self.pipeline_busy();
         let hf_token_state = ms_sysprobe::hf_token::hf_token_state();
         let hf_token_busy = self.hf_token.busy();
+        // The catalog block (download mode): its snapshot is taken here, before the format
+        // pickers may move the bundle this frame; the block is drawn only while the snapshot
+        // still describes the bundle the selection needs.
+        let catalog_snapshot = self.catalog_snapshot();
+        let bundle_missing = catalog_snapshot.as_ref().is_some_and(|snapshot| catalog_bundle_missing(&snapshot.state));
+        // The gated repositories the token row is drawn for: those of the bundle's specs the
+        // controller has not seen installed (its last probe; nothing here touches the disk).
+        let gated_repos = catalog_gated_repos_missing(&flux3_catalog_bundle(&self.settings), |spec| {
+            self.downloads.as_ref().is_some_and(|downloads| matches!(downloads.state_for(spec.id), OcrModelDownloadState::Installed))
+        });
+        // The selection the frame began with: the pickers, the memory widget's format rows and
+        // a format suggestion may move it; a change re-probes the new bundle after the fold.
+        let selection_before = self.catalog_selection();
+        // The cache half of `.status`, guarded to the typed prompt (copied out before the
+        // destructure below borrows the fields apart).
+        let prompt_cache_state = self.prompt_cache_state();
+        let prompt_cache_status_entry = self.prompt_cache_status_entry().cloned();
         let mut intents = Flux3PanelIntents::default();
         {
             let Self {
@@ -560,11 +735,7 @@ impl AiEngine for Flux3KleinEngine {
                 saver,
                 unload_status,
                 hf_token,
-                download_check,
-                download_check_rx,
-                download_check_error,
-                download_rx,
-                download_status,
+                prompt_cache,
                 ai_backend_available,
                 install_section_seeded,
                 install_section_open_prev,
@@ -575,6 +746,7 @@ impl AiEngine for Flux3KleinEngine {
                 seed_input,
                 last_seed: *last_seed,
                 status: status.as_ref(),
+                current_status: status.as_ref().filter(|_| status_current),
                 status_error: status_error.as_deref(),
                 readiness,
                 resources: resources.view(*ai_backend_available),
@@ -588,13 +760,14 @@ impl AiEngine for Flux3KleinEngine {
                 hf_token_input: &mut hf_token.input,
                 hf_token_status: hf_token.status.as_deref(),
                 hf_token_busy,
-                download_check: download_check.as_ref().filter(|_| download_check_current),
-                download_check_error: download_check_error.as_deref(),
-                download_check_busy: download_check_rx.is_some(),
-                download_busy: download_rx.is_some(),
-                download_status: download_status.as_deref(),
+                gated_repos: &gated_repos,
+                catalog_snapshot: catalog_snapshot.as_ref(),
+                bundle_missing,
                 ai_backend_available: *ai_backend_available,
                 pipeline_busy,
+                prompt_cache,
+                prompt_cache_state,
+                prompt_cache_status_entry: prompt_cache_status_entry.as_ref(),
                 install_section_seeded,
                 install_section_open_prev,
                 intents: &mut intents,
@@ -602,7 +775,7 @@ impl AiEngine for Flux3KleinEngine {
             // One namespace over the whole body, so no widget state is shared with FLUX.2's.
             ui.push_id(FLUX3_ENGINE_ID, |ui| panel.draw(ui));
         }
-        self.apply_intents(intents);
+        self.fold_panel_frame(intents, selection_before);
     }
 
     /// Draws nothing: FLUX.3 has no per-run option. It only learns whether the next run would
@@ -627,32 +800,32 @@ impl AiEngine for Flux3KleinEngine {
         if self.abandoned.busy() {
             return Some(t!("cleaning.tools.flux3_klein.cancel_pending_error").to_string());
         }
-        if self.non_run_pipeline_busy() {
-            return Some(t!("cleaning.tools.flux3_klein.pipeline_busy_error").to_string());
-        }
         if self.references_rx.is_some() {
             return Some(t!("cleaning.tools.flux3_klein.references_loading_error").to_string());
+        }
+        // A prompt-cache operation holds the backend's pipeline and the one progress bar a
+        // starting run would steal (FLUX.2 klein's rule).
+        if self.prompt_cache.busy() {
+            return Some(t!("cleaning.tools.flux3_klein.prompt_cache_busy_error").to_string());
         }
         flux3_run_block_reason(&self.settings, &self.model_readiness(), parse_seed_input(&self.seed_input))
     }
 
-    /// Refuses the switch while the model download or its access check is in flight: a
-    /// multi-gigabyte transfer no frame state describes.
+    /// Refuses the switch while a job of THIS engine's catalog controller runs (download,
+    /// verify or automatic adoption, the shared [`catalog_switch_block_reason`]): a
+    /// multi-gigabyte transfer no frame state describes, and the host polls only the selected
+    /// engine, so a job left behind by a switch would run unseen.
     fn switch_block_reason(&self) -> Option<String> {
-        if self.download_rx.is_some() {
-            return Some(t!("cleaning.tools.flux3_klein.switch_blocked_download").to_string());
-        }
-        if self.download_check_rx.is_some() {
-            return Some(t!("cleaning.tools.flux3_klein.switch_blocked_check").to_string());
-        }
-        None
+        catalog_switch_block_reason(self.downloads.as_ref().and_then(OcrModelDownloadController::running_job))
     }
 
     /// Validates the request and starts the run on a worker.
     ///
     /// # Errors
-    /// A localized message when a run or a download is in flight, the references are still
-    /// loading, the seed field is invalid, or [`Flux3KleinEngine::run_input`] refuses it.
+    /// A localized message when a run is in flight or a cancelled one still ends, the
+    /// references are still loading, a prompt-cache operation holds the pipeline, the seed
+    /// field is invalid, or
+    /// [`Flux3KleinEngine::run_input`] refuses it.
     fn start(&mut self, request: EngineRunRequest) -> Result<(), String> {
         if self.run_rx.is_some() {
             return Err(t!("cleaning.mask_editor.processing_already_running_status").to_string());
@@ -688,8 +861,9 @@ impl AiEngine for Flux3KleinEngine {
         self.poll_and_maybe_query_status();
         self.poll_unload();
         self.poll_hf_token();
-        self.poll_download_check();
-        self.poll_download();
+        self.poll_prompt_cache();
+        self.poll_and_maybe_query_prompt_cache_list();
+        let catalog_repaint = self.poll_catalog_bundle();
         self.poll_picker();
         self.poll_references();
         self.resources.poll_side_jobs(Instant::now());
@@ -697,7 +871,7 @@ impl AiEngine for Flux3KleinEngine {
         self.poll_and_maybe_query_profiles();
         let now = Instant::now();
         self.poll_and_maybe_save(now);
-        if self.resources.wants_repaint() || self.references_rx.is_some() {
+        if self.resources.wants_repaint() || self.references_rx.is_some() || self.prompt_cache.list_busy() || catalog_repaint {
             ctx.request_repaint_after(LIMITS_EDIT_DEBOUNCE);
         }
         // The settings save debounce, a failed save's retry and a write in flight: the saver
@@ -705,8 +879,8 @@ impl AiEngine for Flux3KleinEngine {
         if let Some(after) = self.saver.wake_after(now) {
             ctx.request_repaint_after(after);
         }
-        if matches!(run, EnginePoll::Running) {
-            // The bar moves on backend frames, not on input.
+        if matches!(run, EnginePoll::Running) || self.prompt_cache.busy() {
+            // The bar moves on backend frames, not on input (a prompt-cache build drives it too).
             ctx.request_repaint();
         }
         run
@@ -849,8 +1023,8 @@ mod tests {
         assert!(engine.run_status.is_some());
     }
 
-    /// The run gate: a download blocks with its own line, an invalid seed field blocks, a fresh
-    /// engine with no answer yet does not.
+    /// The run gate: an invalid seed field blocks, a fresh engine with no answer yet does not;
+    /// a test engine has no catalog controller, so nothing closes the engine picker.
     #[test]
     fn the_run_gate_reads_the_engine_state() {
         let mut engine = Flux3KleinEngine::at_rest();
@@ -858,10 +1032,31 @@ mod tests {
         engine.seed_input = "not a number".to_string();
         assert!(engine.run_block_reason().is_some());
         engine.seed_input.clear();
-        let (_tx, rx) = mpsc::channel();
-        engine.download_rx = Some(rx);
+        assert!(engine.run_block_reason().is_none());
+        assert!(engine.switch_block_reason().is_none(), "no catalog job, no block");
+        assert!(engine.catalog_snapshot().is_none(), "a test build has no controller");
+        assert!(!engine.poll_catalog_bundle());
+    }
+
+    /// No `.status` question is asked without a package root (manual mode before a pick): the
+    /// verdict is `NoRoot` locally and the candidate paths would not be absolute.
+    #[test]
+    fn no_status_question_without_a_package_root() {
+        let mut engine = Flux3KleinEngine::at_rest();
+        engine.ai_backend_available = true;
+        engine.settings.source_mode = "manual".to_string();
+        engine.status_wanted = true;
+        engine.poll_and_maybe_query_status();
+        assert!(engine.status_rx.is_none(), "nothing asked");
+        assert!(engine.status_wanted, "still wanted once a folder is picked");
+        assert_eq!(engine.model_readiness(), Flux3ModelReadiness::NoRoot);
+        // A relative folder asks nothing either and blocks the run with its own line.
+        engine.settings.model_root = "models/flux3".to_string();
+        engine.poll_and_maybe_query_status();
+        assert!(engine.status_rx.is_none(), "nothing asked about a relative root");
+        assert_eq!(engine.model_readiness(), Flux3ModelReadiness::RootNotAbsolute);
+        engine.seed_input.clear();
         assert!(engine.run_block_reason().is_some());
-        assert!(engine.switch_block_reason().is_some(), "the picker is closed during a download");
     }
 
     /// A user edit outranks a settings load that lands after it; an untouched engine adopts the
@@ -893,7 +1088,7 @@ mod tests {
     #[test]
     fn a_root_change_re_asks_the_status() {
         let mut engine = Flux3KleinEngine::at_rest();
-        engine.status = Some(status_with(&[Flux3Format::Fp8r], true, true));
+        engine.status = Some(status_with(&[Flux3DitFormat::Fp8r], true, true));
         engine.status_root = Some(engine.settings.effective_root());
         engine.status_wanted = false;
         assert_eq!(engine.model_readiness(), Flux3ModelReadiness::Ready);
@@ -902,6 +1097,91 @@ mod tests {
         engine.note_settings_changed();
         assert!(engine.status_wanted);
         assert_eq!(engine.model_readiness(), Flux3ModelReadiness::Unknown, "an answer about another root is not used");
+    }
+
+    /// A text-encoder row picked in «Память и скорость» is the panel's frame like any other
+    /// edit: the setting is stored and owed a save, the forecast is re-armed, and the moved
+    /// selection re-asks `.status` (and re-probes the catalog bundle, the same branch).
+    #[test]
+    fn a_picked_encoder_row_saves_and_re_arms_the_status_and_the_forecast() {
+        let mut engine = Flux3KleinEngine::at_rest();
+        engine.dirty = false;
+        engine.status_wanted = false;
+        engine.resources.wanted = false;
+        let before = engine.catalog_selection();
+        let mut intents = Flux3PanelIntents::default();
+        intents.settings_changed |= flux3_apply_encoder_pick(&mut engine.settings, Flux3EncoderFormat::Q4KM.wire());
+        engine.fold_panel_frame(intents, before);
+        assert_eq!(engine.settings.encoder_format(), Flux3EncoderFormat::Q4KM);
+        assert!(engine.dirty, "a save is owed");
+        assert!(engine.resources.wanted, "the forecast is re-armed");
+        assert!(engine.status_wanted, "the moved selection re-asks `.status`");
+        // A frame that moved nothing asks nothing.
+        engine.dirty = false;
+        engine.status_wanted = false;
+        engine.resources.wanted = false;
+        let before = engine.catalog_selection();
+        engine.fold_panel_frame(Flux3PanelIntents::default(), before);
+        assert!(!engine.dirty && !engine.status_wanted && !engine.resources.wanted);
+    }
+
+    /// `prompt_cached` counts only for the prompt `.status` was asked about and for the current
+    /// root; served in TEXT mode it waives a missing encoder in the run gate, and an edit of the
+    /// prompt (or of the encoder mode) re-asks `.status`.
+    #[test]
+    fn a_cached_prompt_opens_the_run_gate_without_the_encoder() {
+        let mut engine = Flux3KleinEngine::at_rest();
+        let mut status = status_with(&[Flux3DitFormat::Fp8r], true, false);
+        status.prompt_cached = Some(true);
+        status.prompt_cache_asked_about = Some(engine.settings.prompt.trim().to_string());
+        engine.status = Some(status);
+        engine.status_root = Some(engine.settings.effective_root());
+        engine.status_cache_question = Some((engine.settings.prompt.trim().to_string(), true));
+        engine.status_wanted = false;
+        assert_eq!(engine.prompt_cache_state(), Some(true));
+        assert_eq!(engine.model_readiness(), Flux3ModelReadiness::Ready, "the encoder is waived");
+        assert!(engine.run_block_reason().is_none());
+        // Another prompt: the answer is about the old one, the encoder is needed again and
+        // `.status` is re-asked.
+        engine.settings.prompt.push_str(" now");
+        engine.note_settings_changed();
+        assert_eq!(engine.prompt_cache_state(), None);
+        assert!(matches!(engine.model_readiness(), Flux3ModelReadiness::Missing(_)));
+        assert!(engine.status_wanted, "a prompt edit re-asks `.status`");
+        // The references in the encoder: the same answer waives nothing and `.status` is re-asked.
+        engine.settings.prompt = FLUX3_DEFAULT_PROMPT.to_string();
+        engine.status_wanted = false;
+        engine.settings.vl_refs = true;
+        engine.note_settings_changed();
+        assert!(engine.status_wanted, "the encoder mode is part of the cache question");
+        assert_eq!(engine.prompt_cache_state(), Some(true));
+        assert!(matches!(engine.model_readiness(), Flux3ModelReadiness::Missing(_)), "VL_REFS always encodes");
+    }
+
+    /// A prompt-cache operation holds the pipeline: the run gate names it, the status and
+    /// forecast questions wait, and a picked encoder re-asks the library listing.
+    #[test]
+    fn a_prompt_cache_operation_holds_the_pipeline() {
+        let _locale = english();
+        let mut engine = Flux3KleinEngine::at_rest();
+        let (_tx, rx) = mpsc::channel();
+        engine.prompt_cache.rx = Some(rx);
+        assert!(engine.pipeline_busy());
+        assert_eq!(engine.run_block_reason().as_deref(), Some(t!("cleaning.tools.flux3_klein.prompt_cache_busy_error")));
+        assert!(engine.start(request(128, 128, true, RunMarks::None)).is_err());
+        engine.prompt_cache.rx = None;
+        engine.prompt_cache.list_wanted = false;
+        let before = engine.catalog_selection();
+        let mut intents = Flux3PanelIntents::default();
+        intents.settings_changed |= flux3_apply_encoder_pick(&mut engine.settings, Flux3EncoderFormat::Q80.wire());
+        engine.fold_panel_frame(intents, before);
+        assert!(engine.prompt_cache.list_wanted, "every entry's `current_encoder` follows the encoder");
+        // A finished build re-asks `.status` and the forecast.
+        engine.status_wanted = false;
+        engine.resources.wanted = false;
+        let (_line, effects) = engine.prompt_cache.apply_outcome(PromptCacheOutcome::Built { written: Vec::new(), renamed: false });
+        engine.apply_prompt_cache_effects(effects);
+        assert!(engine.status_wanted && engine.resources.wanted);
     }
 
     /// The forecast question lists exactly the references the run sends, marked or not: the
@@ -943,7 +1223,7 @@ mod tests {
         assert!(engine.marks_reference && engine.resources.wanted);
     }
 
-    /// A cancelled run is waited for: no new run (nor download) starts until its worker ended,
+    /// A cancelled run is waited for: no new run starts until its worker ended,
     /// and the gate says why; then it reopens by itself.
     #[test]
     fn a_cancelled_run_blocks_the_next_one_until_its_worker_ends() {
@@ -954,7 +1234,7 @@ mod tests {
         begin_progress_generation(&engine.progress);
         assert!(engine.cancel_run());
         assert!(engine.run_rx.is_none());
-        assert!(engine.pipeline_busy() && engine.non_run_pipeline_busy());
+        assert!(engine.pipeline_busy());
         let _locale = english();
         assert_eq!(engine.run_block_reason().as_deref(), Some(t!("cleaning.tools.flux3_klein.cancel_pending_error")));
         assert!(engine.start(request(128, 128, true, RunMarks::None)).is_err(), "start refuses as well");

@@ -55,8 +55,11 @@ and is reported (`settings.vram_cap`, per step `non_torch_end`).
   peaks (reset at each begin), `mem_get_info`, the in-step host peak (a sampler thread), and the
   manager's placements (`status()` components) at begin and end.
 - `measure.py`: `WorkCapture` (wraps the manager's `register` / `acquire` to learn each phase's
-  spec `PhaseWork` and cost-table key), the FLUX.3 `Combo`, `forecast_combo` / `selected_answer`
-  (the manager's full forecast of the requested cell, before the admission), `run_combo`.
+  spec `PhaseWork` and cost-table key; a FLUX.3 run admits two models, the pipeline and the text
+  encoder, and a step record is matched to the one that has its phase), the FLUX.3 `Combo`,
+  `forecast_combo` / `paired_answer` (the full forecast of the requested cell over both FLUX.3
+  handles, `Flux3KleinService.plan_pair`, before the admissions) / `selected_answer` (one
+  handle's, shared with FLUX.2), `run_combo`.
 - `flux3.py`: the FLUX.3 matrix (variants x sizes x cases x encoder modes x AE dtypes x the step
   grid) and the optional DiT parity check (`parity.py`); `cases.py` holds the named cases over
   the user's images in `<model-root>/refs/{edit,obj}`.
@@ -80,7 +83,8 @@ and is reported (`settings.vram_cap`, per step `non_torch_end`).
 ## Contracts and invariants
 - The drivers call the services' public entry points (`generate`, `inpaint_image_bytes`); no copy
   of a pipeline lives here. FLUX.3 `forecast_combo` reaches the service's private `_plan` (the
-  admission's own request shaping); keep it in step with `Flux3KleinService.generate`.
+  admission's own request shaping) and plans through the service's `plan_pair` (the run's own
+  two-handle composition); keep it in step with `Flux3KleinService.generate`.
 - Measurement output never goes into the repository; the tool never writes the backend's persisted
   limits or learned floors (`MemoryLimitsStore`); the floors are forgotten before every combo unless
   `--keep-learned-floors`, so each combo measures the steps it asks for.

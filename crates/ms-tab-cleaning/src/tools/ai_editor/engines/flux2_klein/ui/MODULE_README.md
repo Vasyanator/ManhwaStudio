@@ -35,8 +35,11 @@ never work started from inside a widget closure.
 ## Files and submodules
 - `mod.rs`: `Flux2PanelCtx` and the panel body, plus the two pinned parts. Edit it to move a
   control between blocks or to change the order of the panel. The prompt block matches the
-  field against the model's library every frame (`track_uncached`, `sync_preset_name`,
-  `flux2_prompt_cache_gates`) and draws the shared `draw_prompt_library_picker` in its fold; a
+  field against the model's library every frame (`track_uncached`, `sync_preset_name`, the shared
+  `prompt_cache_gates` over `flux2_cache_context`) and draws the shared prompt-cache block
+  (`draw_cache_row`, `draw_prompt_cache_line`, `draw_prompt_library_toggle`,
+  `draw_prompt_cache_library`, `../../shared/prompt_cache_ui.rs`) with FLUX.2's encoder caption,
+  its two id salts and its migration notes (`prompt_library_notes`); a
   pick writes the preset's TEXT through `apply_pick` and raises the settings change, a moved
   «Нет» stash alone raises `uncached_changed` (a save, nothing re-asked).
 - `install.rs`: the source-mode switch, the editable model-path rows and their pickers,
@@ -76,8 +79,9 @@ never work started from inside a widget closure.
 - **No literal user-visible strings.** Every caption, hover and message goes through
   `t!` / `tf!` / `tp!` under `cleaning.tools.flux2_klein.*` (the download block's own
   sentences under `cleaning.tools.flux2_klein.download.*`; the shared parts it draws use
-  `cleaning.tools.hf_download.*`, `cleaning.tools.engine_progress.*` and the catalog block's
-  `translation.ocr_model.*`). A widget whose `Id` comes from a localized
+  `cleaning.tools.hf_download.*`, `cleaning.tools.engine_progress.*`, the prompt-cache block's
+  `cleaning.tools.prompt_library.*` and the catalog block's `translation.ocr_model.*`; the
+  migration report stays `cleaning.tools.flux2_klein.prompt_cache_legacy_*`). A widget whose `Id` comes from a localized
   caption carries a stable `id_salt`, or switching language resets its state.
 - **`egui::Slider`, `egui::ComboBox` and `egui::DragValue` are forbidden** in product UI;
   use the `Wheel*` widgets. See `egui-docs/04-widgets.md` §0.2.

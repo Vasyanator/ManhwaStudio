@@ -2,17 +2,22 @@
 File: modules/ai_backend/inpaint/flux3_klein/test_large_model.py
 
 Purpose:
-Contract tests of `large_model.py`, the FLUX.3 klein `LargeModelSpec`s:
+Contract tests of `large_model.py`, the FLUX.3 klein `LargeModelSpec`s (the
+pipeline handle and the text-encoder handle):
 - the pure rules: block names and EXECUTION order of the DiT, device itemsizes,
-  the DiT conversion equal to `loading.dit_tensor_cast`, the residency key, the
-  four registered models, the formats (availability, quality, compute path),
-  the forecast inputs (caption / reference bounds, per-phase work);
+  the DiT conversion equal to `loading.dit_tensor_cast`, the two residency
+  keys, the four registered models (a pipeline per AE dtype, an encoder per
+  mode) and the two-handle phase names, the DiT formats (availability,
+  quality, compute path) and the encoder formats (one row per offered
+  encoder, a GGUF row unavailable in VL_REFS), the forecast inputs (caption /
+  reference bounds, per-phase work);
 - the spec over a REAL tiny package (tiny `Flux3Dit` in bf16 / fp8r / nvfp4,
   tiny Qwen3-VL encoder, tiny AE) through the real `LargeModelManager` on the
   CPU: the DiT juggled block by block (some blocks resident, the rest parked)
   computes exactly what the fully resident DiT and the standalone
   `loading.load_dit` compute, in every format; the encoder loaded by the manager
-  equals the standalone `load_text_encoder_model`, in both modes.
+  (its own handle) equals the standalone `load_text_encoder_model`, in both
+  modes.
 
 Notes:
 CPU only; files under a temporary directory removed by each class. The tiny
@@ -41,7 +46,7 @@ from ...runtime.residency.arbiter import ResidencyArbiter
 from . import autoencoder, large_model, loading, packing, quant
 from . import text_encoder as te
 from ._service_test_fixtures import FakeProbes
-from .config import WeightFormat, read_package_config, resolve_model_files
+from .config import ENCODER_BF16_SOURCE, EncoderSource, WeightFormat, read_package_config, resolve_model_files
 from .dit import Flux3Dit
 from .params import AeDtype, EncoderMode, Flux3Options, Fp8Compute
 from .test_dit import make_pack, tiny_dit_config
@@ -116,16 +121,22 @@ class RuleTests(unittest.TestCase):
                     expected = cast(key, tensor)
                     self.assertEqual((converted_key, converted.dtype), (key, expected.dtype))
 
-    def test_the_residency_key(self) -> None:
+    def test_the_residency_keys(self) -> None:
         root = Path("/fictional/flux3")
         base = _options(root)
-        key = large_model.residency_key(base, "nvfp4", "cuda:0")
-        self.assertEqual(key, "flux3_klein:nvfp4|cuda:0|auto|float32|text|/fictional/flux3")
-        same = (_options(root, reference_max_pixels=128 * 128), _options(root, vram_step=VramStep.MIN, ram_step=RamStep.RUN), _options(root, device="cuda:1"))
+        key = large_model.pipeline_key(base, "nvfp4", "cuda:0")
+        self.assertEqual(key, "flux3_klein:nvfp4|cuda:0|auto|float32|/fictional/flux3")
+        # The pipeline key ignores everything of the encoder handle and the request.
+        same = (
+            _options(root, reference_max_pixels=128 * 128),
+            _options(root, vram_step=VramStep.MIN, ram_step=RamStep.RUN),
+            _options(root, device="cuda:1"),
+            _options(root, encoder_mode=EncoderMode.VL_REFS),
+            _options(root, encoder_on_cpu=True),
+        )
         for options in same:
-            self.assertEqual(large_model.residency_key(options, "nvfp4", "cuda:0"), key)
+            self.assertEqual(large_model.pipeline_key(options, "nvfp4", "cuda:0"), key)
         different = (
-            (_options(root, encoder_mode=EncoderMode.VL_REFS), "nvfp4", "cuda:0"),
             (_options(root, ae_dtype=AeDtype.BFLOAT16), "nvfp4", "cuda:0"),
             (_options(root, fp8_compute=Fp8Compute.DEQUANT), "nvfp4", "cuda:0"),
             (_options(Path("/fictional/other")), "nvfp4", "cuda:0"),
@@ -133,17 +144,41 @@ class RuleTests(unittest.TestCase):
             (base, "nvfp4", "cuda:1"),
         )
         for options, weight_format, device in different:
-            self.assertNotEqual(large_model.residency_key(options, weight_format, device), key)
+            self.assertNotEqual(large_model.pipeline_key(options, weight_format, device), key)
+        encoder = large_model.encoder_key(base, "bf16", "cuda:0")
+        self.assertEqual(encoder, "flux3_klein_text_encoder:bf16|cuda:0|text|/fictional/flux3")
+        # The encoder key ignores the pipeline's choices; the host pin is the manager's suffix.
+        for options in (_options(root, ae_dtype=AeDtype.BFLOAT16), _options(root, variant=WeightFormat.FP8R), _options(root, fp8_compute=Fp8Compute.DEQUANT)):
+            self.assertEqual(large_model.encoder_key(options, "bf16", "cuda:0"), encoder)
+        self.assertEqual(large_model.encoder_key(_options(root, encoder_mode=EncoderMode.VL_REFS), "bf16", "cuda:0"), "flux3_klein_text_encoder:bf16|cuda:0|vl_refs|/fictional/flux3")
+        pinned = _model_options(root, encoder_on_cpu=True)
+        self.assertEqual(large_model.encoder_spec(EncoderMode.TEXT).key(pinned, "bf16", "cuda:0"), f"{encoder}|host_pin=encoder")
+        self.assertEqual(large_model.pipeline_spec(AeDtype.FLOAT32).key(pinned, "nvfp4", "cuda:0"), key)
+        with self.assertRaises(ValueError):
+            large_model.encoder_key(base, "q8_0", "cuda:0")
 
-    def test_one_model_per_mode_and_ae_dtype(self) -> None:
+    def test_two_pipeline_models_and_two_encoder_models(self) -> None:
         specs = large_model.model_specs()
-        self.assertEqual(set(specs), {large_model.model_name(mode, dtype) for mode in EncoderMode for dtype in AeDtype})
-        for spec in specs.values():
+        pipelines = {large_model.pipeline_model_name(dtype) for dtype in AeDtype}
+        encoders = {large_model.encoder_model_name(mode) for mode in EncoderMode}
+        self.assertEqual(pipelines, {"flux3_klein.ae_float32", "flux3_klein.ae_bfloat16"})
+        self.assertEqual(encoders, {"flux3_klein_text_encoder.text", "flux3_klein_text_encoder.vl_refs"})
+        self.assertEqual(set(specs), pipelines | encoders)
+        for name, spec in specs.items():
+            # One calibration family for both handles: the encode entries keep matching.
             self.assertEqual(spec.family, large_model.FAMILY)
-            self.assertEqual([phase.name for phase in spec.phases], ["encode", "ref_encode", "denoise", "decode"])
             self.assertEqual(spec.fallbacks, ())
-            self.assertEqual(spec.component("encoder").exec_devices_allowed, frozenset({ExecDevice.RUN_DEVICE, ExecDevice.CPU}))
-            self.assertEqual(spec.component("dit").exec_devices_allowed, frozenset({ExecDevice.RUN_DEVICE}))
+            if name in pipelines:
+                self.assertEqual([phase.name for phase in spec.phases], ["ref_encode", "denoise", "decode"])
+                self.assertEqual([component.name for component in spec.components], ["dit", "ae"])
+                self.assertEqual(spec.component("dit").exec_devices_allowed, frozenset({ExecDevice.RUN_DEVICE}))
+                self.assertEqual(spec.host_pin(_model_options(Path("/fictional/flux3"), encoder_on_cpu=True)), frozenset())
+            else:
+                self.assertEqual([phase.name for phase in spec.phases], ["encode"])
+                self.assertEqual(spec.component("encoder").exec_devices_allowed, frozenset({ExecDevice.RUN_DEVICE, ExecDevice.CPU}))
+                self.assertEqual(spec.host_pin(_model_options(Path("/fictional/flux3"), encoder_on_cpu=True)), frozenset({"encoder"}))
+        pair = large_model.FLUX3_PAIR
+        self.assertEqual((pair.pipeline, pair.rest, pair.encode), (("ref_encode", "denoise", "decode"), "ref_encode", "encode"))
 
     def test_compute_paths(self) -> None:
         self.assertEqual(large_model.compute_path(WeightFormat.BF16, Fp8Compute.SCALED_MM), "native")
@@ -172,22 +207,25 @@ class ShapeTests(unittest.TestCase):
 
     def test_phase_work(self) -> None:
         root = Path("/fictional/flux3")
-        spec = large_model.build_spec(EncoderMode.TEXT, AeDtype.FLOAT32)
         shape = large_model.request_shape(1024, 768, [(512, 512)], caption="a cat", steps=8)
-        work = {phase.name: phase.work(shape, _model_options(root)) for phase in spec.phases}
+
+        def works(mode: EncoderMode, ae_dtype: AeDtype, options: large_model.Flux3ModelOptions) -> dict[str, Any]:
+            phases = (*large_model.encoder_spec(mode).phases, *large_model.pipeline_spec(ae_dtype).phases)
+            return {phase.name: phase.work(shape, options) for phase in phases}
+
+        work = works(EncoderMode.TEXT, AeDtype.FLOAT32, _model_options(root))
         text = 80  # the 37-token bound pads to 80
         self.assertEqual((work["encode"].tokens, work["encode"].variant), (text, "text"))
         self.assertEqual((work["ref_encode"].pixels, work["ref_encode"].variant), (512 * 512, "float32"))
         self.assertEqual((work["denoise"].tokens, work["denoise"].passes), (64 * 48 + 32 * 32 + text, 8))
         self.assertEqual((work["decode"].pixels, work["decode"].variant), (1024 * 768, "float32"))
-        vl = large_model.build_spec(EncoderMode.VL_REFS, AeDtype.BFLOAT16)
         options = _model_options(root, encoder_mode=EncoderMode.VL_REFS, ae_dtype=AeDtype.BFLOAT16, vl_ref_max_pixels=64 * 64)
-        work = {phase.name: phase.work(shape, options) for phase in vl.phases}
+        work = works(EncoderMode.VL_REFS, AeDtype.BFLOAT16, options)
         # 37 caption tokens + 4096 / 1024 image tokens + 2 wrappers = 43 -> 80.
         self.assertEqual((work["encode"].tokens, work["encode"].variant), (80, "vl"))
         self.assertEqual(work["decode"].variant, "bfloat16")
         unknown = RequestShape(width=64, height=64)
-        self.assertEqual(spec.phases[0].work(unknown, _model_options(root)).tokens, 560)  # 512 -> padded
+        self.assertEqual(large_model.encoder_spec(EncoderMode.TEXT).phases[0].work(unknown, _model_options(root)).tokens, 560)  # 512 -> padded
 
 
 def _write_package(root: Path) -> None:
@@ -228,9 +266,16 @@ class _Package(unittest.TestCase):
             self.manager.register(spec, model=name)
 
     def _acquire(self, weight_format: WeightFormat, steps: Steps, **overrides: Any) -> Any:
+        """A pipeline session of `weight_format`."""
         options = _model_options(self.root, variant=weight_format, **overrides)
-        name = large_model.model_name(options.options.encoder_mode, options.options.ae_dtype)
+        name = large_model.pipeline_model_name(options.options.ae_dtype)
         return self.manager.acquire(name, options, SHAPE, device="cpu", format=weight_format.value, steps=steps)
+
+    def _acquire_encoder(self, steps: Steps, **overrides: Any) -> Any:
+        """A text-encoder session of the selected encoder format (bf16 unless overridden)."""
+        options = _model_options(self.root, **overrides)
+        name = large_model.encoder_model_name(options.options.encoder_mode)
+        return self.manager.acquire(name, options, SHAPE, device="cpu", format=options.options.encoder.id, steps=steps)
 
 
 def _tables() -> Any:
@@ -281,7 +326,7 @@ class ManagerDitTests(_Package):
 
     def _juggling_room(self, weight_format: WeightFormat) -> int:
         """A device size on which (HALF, KEEP) keeps some DiT blocks resident and parks the rest (binary searches)."""
-        name = large_model.model_name(EncoderMode.TEXT, AeDtype.FLOAT32)
+        name = large_model.pipeline_model_name(AeDtype.FLOAT32)
         options = _model_options(self.root, variant=weight_format)
 
         def dit_line(total: int) -> Any:
@@ -331,7 +376,7 @@ class ManagerEncoderTests(_Package):
         for mode in EncoderMode:
             with self.subTest(mode=mode):
                 reference, _report = te.load_text_encoder_model(self.root / "text_encoder", mode=mode, device="cpu", dtype=torch.bfloat16)
-                session = self._acquire(WeightFormat.BF16, _RESIDENT, encoder_mode=mode)
+                session = self._acquire_encoder(_RESIDENT, encoder_mode=mode)
                 with session:
                     state = session.run_phase("encode", lambda ctx: {key: value.clone() for key, value in ctx.module("encoder").state_dict().items()})
                 self.manager.unload()
@@ -345,6 +390,40 @@ class ManagerEncoderTests(_Package):
         self.assertEqual({name: (info.available, info.compute_path, info.quality_rank) for name, info in rows.items()}, {"bf16": (True, "native", 3), "fp8r": (True, "scaled_mm", 2), "nvfp4": (True, "dequant", 1)})
         self.assertTrue(all(info.dit_bytes > 0 for info in rows.values()))
         self.assertGreater(rows["bf16"].dit_bytes, rows["nvfp4"].dit_bytes)
+
+    def test_encoder_formats_report_every_offered_encoder(self) -> None:
+        gguf = EncoderSource("q8_0", self.root / "text_encoder_gguf" / "enc-Q8_0.gguf")
+        gguf.path.parent.mkdir(exist_ok=True)
+        gguf.path.write_bytes(b"x" * 9)
+        self.addCleanup(gguf.path.unlink)
+        absent = EncoderSource("q4_k_m", self.root / "text_encoder_gguf" / "absent.gguf")
+        offered = (ENCODER_BF16_SOURCE, gguf, absent)
+        rows = large_model.encoder_formats(_model_options(self.root, encoder_formats=offered))
+        self.assertEqual(list(rows), ["bf16", "q8_0", "q4_k_m"])
+        self.assertEqual({name: (info.available, info.compute_path, info.quality_rank) for name, info in rows.items()}, {"bf16": (True, "native", 3), "q8_0": (True, "gguf", 2), "q4_k_m": (False, "gguf", 1)})
+        self.assertEqual(rows["q8_0"].dit_bytes, 9)
+        self.assertGreater(rows["bf16"].dit_bytes, 0)
+        self.assertIn("absent.gguf", rows["q4_k_m"].reason)
+        # VL_REFS: a GGUF holds no vision tower, so its row is unavailable with the D6 reason.
+        vl = large_model.encoder_formats(_model_options(self.root, encoder_mode=EncoderMode.VL_REFS, encoder_formats=offered))
+        self.assertTrue(vl["bf16"].available)
+        self.assertFalse(vl["q8_0"].available)
+        self.assertIn("GGUF", vl["q8_0"].reason)
+        self.assertEqual(vl["q8_0"].dit_bytes, 0)
+        # Default: bf16 alone, plus a selected GGUF encoder.
+        self.assertEqual(list(large_model.encoder_formats(_model_options(self.root))), ["bf16"])
+        self.assertEqual(list(large_model.encoder_formats(_model_options(self.root, encoder=gguf))), ["bf16", "q8_0"])
+
+    def test_the_encoder_files_follow_the_planned_format(self) -> None:
+        gguf = EncoderSource("q8_0", self.root / "enc.gguf")
+        options = _model_options(self.root, encoder_formats=(ENCODER_BF16_SOURCE, gguf))
+        component = large_model.encoder_spec(EncoderMode.TEXT).component("encoder")
+        self.assertTrue(all(path.parent.name == "text_encoder" for path in component.files(options, "bf16")))
+        self.assertIs(large_model.encoder_source(options.options, "q8_0"), gguf)
+        with self.assertRaises(FileNotFoundError):
+            component.files(options, "q8_0")
+        with self.assertRaises(ValueError):
+            component.files(options, "q4_k_m")
 
     def test_a_missing_format_is_unavailable_with_its_reason(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

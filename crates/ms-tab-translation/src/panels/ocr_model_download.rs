@@ -5,7 +5,7 @@ Purpose:
 The download / verify block of an app-managed external model bundle (`ocr_model_download` bundles:
 Baberu OCR, the selected PaddleOCR-VL variant, the EasyOCR model of the selected languages,
 the two Surya OCR checkpoints, the Surya text-detection checkpoint; the Cleaning tab draws it
-for its SDXL configs): install status, the outcome of the last unsuccessful download, the
+for its SDXL configs and the FLUX.2 / FLUX.3 klein packages): install status, the outcome of the last unsuccessful download, the
 "Download (size)" / "Resume download" button, a "Verify files" button once the bundle is
 installed (hashes every file against its pin: the repair path for a damaged file the stat-only
 probe cannot see; it ends with an intact / N-files-removed notice), a progress bar with Cancel
@@ -26,7 +26,8 @@ Key items:
 - `draw_ocr_model_download()`: renders that view (`pub`: the Cleaning tab draws it too).
 - `load_blocked_reason()`: why a Load / Run button is disabled for the bundle's state.
 - `external_model_display_name()`: the user-facing name of every catalog spec (FLUX.2 klein
-  parts through the catalog's reverse lookup `flux2_klein_spec_role`).
+  and FLUX.3 klein parts through the catalog's reverse lookups `flux2_klein_spec_role` /
+  `flux3_klein_spec_role`).
 
 Notes:
 - Download / resume captions come from `ocr_model_download::offered_download_label`, the
@@ -45,8 +46,8 @@ use ms_config::{Flux2EncoderSource, Flux2WeightAxis};
 use ms_sysprobe::ai_models::easyocr::{EasyOcrScript, easyocr_spec};
 use ms_sysprobe::ai_models::external::{ExternalDownloadPhase, ExternalDownloadProgress, ExternalModelSpec};
 use ms_sysprobe::ai_models::external_catalog::{
-    BABERU_OCR, Flux2SpecRole, PaddleVlVariant, SDXL_CONFIG_BASE, SDXL_CONFIG_INPAINT, SDXL_INPAINT_FP16, SURYA_DETECTION_2025_05_07,
-    SURYA_RECOGNITION_2025_09_23, flux2_klein_spec_role,
+    BABERU_OCR, Flux2SpecRole, Flux3SpecRole, PaddleVlVariant, SDXL_CONFIG_BASE, SDXL_CONFIG_INPAINT, SDXL_INPAINT_FP16, SURYA_DETECTION_2025_05_07,
+    SURYA_RECOGNITION_2025_09_23, flux2_klein_spec_role, flux3_klein_spec_role,
 };
 use ms_sysprobe::ai_models::hf_access::HfAccess;
 
@@ -107,13 +108,17 @@ struct DownloadBlockView {
 /// Display name of an external model spec for user-facing text: the engine's product name
 /// for Baberu OCR, the localized variant label for a PaddleOCR-VL variant, "EasyOCR" with the
 /// recognizer file of its script, localized names for the Surya checkpoints, the SDXL
-/// downloads and the FLUX.2 klein package parts (each names its variant; a GGUF part its quant
-/// token, an unquantized encoder its dtype, the uncensored encoder says so); the
+/// downloads, the FLUX.2 klein package parts (each names its variant; a GGUF part its quant
+/// token, an unquantized encoder its dtype, the uncensored encoder says so) and the FLUX.3
+/// klein package parts (base, the DiT and the text encoder, each with its format); the
 /// spec id for a spec this table does not know (logged once per call site would be noise: the
 /// id is the diagnostic itself).
 #[must_use]
 pub fn external_model_display_name(spec: &ExternalModelSpec) -> String {
     if let Some(name) = flux2_klein_display_name(spec) {
+        return name;
+    }
+    if let Some(name) = flux3_klein_display_name(spec) {
         return name;
     }
     if spec.id == BABERU_OCR.id {
@@ -175,6 +180,27 @@ fn flux2_klein_display_name(spec: &ExternalModelSpec) -> Option<String> {
                 }
             }
         }
+    };
+    Some(name)
+}
+
+/// The display name of a FLUX.3 klein package spec, `None` for any other spec. The role comes
+/// from the catalog's own reverse lookup (`flux3_klein_spec_role`), so a new format is named
+/// without touching this function. The format is a technical literal substituted as is (i18n
+/// exclusions): the BFL dtype of a native DiT (`bf16`, `fp8r`, `nvfp4`), the quant token
+/// (`Q8_0`, …) of a GGUF file, `bf16` for the encoder shards.
+fn flux3_klein_display_name(spec: &ExternalModelSpec) -> Option<String> {
+    let name = match flux3_klein_spec_role(spec.id)? {
+        Flux3SpecRole::Base => t!("translation.ocr_model.flux3_klein_base_name").to_string(),
+        Flux3SpecRole::DitConfig => t!("translation.ocr_model.flux3_klein_dit_config_name").to_string(),
+        Flux3SpecRole::Dit(format) => match format.quant_token() {
+            Some(quant) => tf!("translation.ocr_model.flux3_klein_dit_gguf_name", quant = quant),
+            None => tf!("translation.ocr_model.flux3_klein_dit_name", format = format.wire()),
+        },
+        Flux3SpecRole::TextEncoder(format) => match format.quant_token() {
+            Some(quant) => tf!("translation.ocr_model.flux3_klein_text_encoder_gguf_name", quant = quant),
+            None => tf!("translation.ocr_model.flux3_klein_text_encoder_name", dtype = format.wire()),
+        },
     };
     Some(name)
 }
@@ -716,6 +742,30 @@ mod tests {
             names.push(name);
         }
         assert_eq!(names.len(), 28, "every FLUX.2 klein catalog spec is named");
+        let count = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), count, "names must be distinct: {names:?}");
+    }
+
+    /// Every FLUX.3 klein catalog spec has its own name, naming its format (the GGUF quant
+    /// token, the native DiT id, the encoder dtype).
+    #[test]
+    fn flux3_klein_parts_have_distinct_names_with_their_format() {
+        let _locale = crate::english_locale_for_test();
+        let mut names = Vec::new();
+        for spec in ms_sysprobe::ai_models::external_catalog::all_specs() {
+            let Some(role) = flux3_klein_spec_role(spec.id) else { continue };
+            let name = external_model_display_name(spec);
+            assert!(name.contains("FLUX.3 klein"), "{name}");
+            match role {
+                Flux3SpecRole::Base | Flux3SpecRole::DitConfig => {}
+                Flux3SpecRole::Dit(format) => assert!(name.contains(format.quant_token().unwrap_or(format.wire())), "{name}"),
+                Flux3SpecRole::TextEncoder(format) => assert!(name.contains(format.quant_token().unwrap_or(format.wire())), "{name}"),
+            }
+            names.push(name);
+        }
+        assert_eq!(names.len(), 12, "every FLUX.3 klein catalog spec is named");
         let count = names.len();
         names.sort();
         names.dedup();

@@ -269,6 +269,10 @@ pub(super) fn fetch_flux2_status(params: &Value) -> Result<Flux2Status, String> 
 pub(super) fn parse_flux2_status(header: &Value) -> Flux2Status {
     let components = header.get("components");
     let component = |name: &str| Flux2Component::parse(components.and_then(|c| c.get(name)));
+    // The cache half is the shared reader: `prompt_cached` is deliberately NOT defaulted to
+    // `false` (a backend that does not know the prompt cache must read as "unknown", never as
+    // "your prompt is not cached"), and a `null` / absent / malformed entry is "no entry".
+    let (prompt_cached, prompt_cache_entry) = parse_prompt_cache_status(header);
     Flux2Status {
         available: header
             .get("available")
@@ -293,11 +297,8 @@ pub(super) fn parse_flux2_status(header: &Value) -> Flux2Status {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        // Deliberately NOT defaulted to `false`: a backend that does not know about the
-        // prompt cache must read as "unknown", never as "your prompt is not cached".
-        prompt_cached: header.get("prompt_cached").and_then(Value::as_bool),
-        // `null` and an absent field are the same "no entry"; any object is read tolerantly.
-        prompt_cache_entry: header.get("prompt_cache_entry").and_then(parse_entry_info),
+        prompt_cached,
+        prompt_cache_entry,
         // Same rule, and it matters more here: `Some(false)` gates the encode buttons and
         // raises a warning, so a backend that never reports the field must not be read as
         // "you have no encoder".

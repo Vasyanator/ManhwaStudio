@@ -22,9 +22,11 @@ Every test class belongs to exactly ONE of two kinds, named in its docstring:
   so this class was REWRITTEN deliberately against the resource vocabulary,
   and re-derived again (by hand from `tiers.template_for`, then checked) when
   the single profile scale became the two axes `Flux3Options.vram_step` x
-  `ram_step`: the `action` of each move phase per step pair over two calls,
-  the info key set (the removed keys gone, the step / forecast keys added) and
-  the applied fields.
+  `ram_step`, and once more when FLUX.3 split into a pipeline handle and a
+  text-encoder handle (B3; the changed cells are named in the class): the
+  `action` of each move phase per step pair over two calls, the info key set
+  (the removed keys gone, the step / forecast keys added) and the applied
+  fields.
 
 Main responsibilities:
 - `PhaseListContract`, `ObserverSequenceContract`, `HealthContract`,
@@ -57,9 +59,12 @@ from .params import MIN_REFERENCE_PIXELS, AeDtype, EncoderMode, Flux3Options, Fl
 from .phases import Phase
 
 #: The observer `info` keys every phase carries that do NOT depend on the
-#: options B5 removes. CONTRACT.
+#: options B5 removes. CONTRACT. `text_encoder_format` (the encoder's format id,
+#: `bf16` or a GGUF id) joined with the GGUF encoder: a measurement row must say
+#: which encoder ran, because the encode cost differs per format.
 _STABLE_INFO_KEYS = {
     "variant",
+    "text_encoder_format",
     "encoder_mode",
     "fp8_compute",
     "ae_dtype",
@@ -80,7 +85,10 @@ _STABLE_INFO_KEYS = {
 _ACTION_VOCABULARY = {
     Phase.DIT_LOAD: {"loaded", "resident"},
     Phase.AE_LOAD: {"loaded", "resident"},
-    Phase.ENCODER_LOAD: {"loaded", "restored", "resident"},
+    # `cached`: a caption served by the prompt cache (B4) opens no encoder; the
+    # rig's encoder is unidentifiable (no `text_encoder/config.json`), so these
+    # contracts never see it — `test_prompt_cache.py` pins that sequence.
+    Phase.ENCODER_LOAD: {"loaded", "restored", "resident", "cached"},
     Phase.DIT_OFFLOAD: {"offloaded", "on_host", "skipped"},
     Phase.DIT_RESTORE: {"restored", "resident"},
     Phase.DIT_OFFLOAD_DECODE: {"offloaded", "on_host", "skipped"},
@@ -323,18 +331,21 @@ class LeaseContract(_ServiceCase):
 
     Observable through the pool's counters only (the large pool's since WP5),
     so the exact `mark_loaded` / `mark_load_failed` call pattern is not pinned
-    here.
+    here. Since B3 a run holds TWO large-pool handles — the pipeline (DiT +
+    AE) and the text encoder, each its own residency key — so a successful
+    run leaves two resident holdings where it left one (the default steps
+    keep both between runs).
     """
 
     def _assert_resolved(self, resident: int) -> None:
         resident_count, in_use, loading = self.rig.large_holdings()
         self.assertEqual((loading, in_use, resident_count), (0, 0, resident))
 
-    def test_success_registers_one_resident_pair(self) -> None:
+    def test_success_registers_the_pipeline_and_the_encoder(self) -> None:
         self._run(self._options())
-        self._assert_resolved(1)
+        self._assert_resolved(2)
         self._run(self._options())
-        self._assert_resolved(1)
+        self._assert_resolved(2)
 
     def test_a_failed_load_registers_nothing(self) -> None:
         self.fail_ae_load = True
@@ -348,7 +359,7 @@ class LeaseContract(_ServiceCase):
         self.dits[-1].fail = True
         with self.assertRaises(RuntimeError):
             self._run(self._options())
-        self._assert_resolved(1)
+        self._assert_resolved(2)
 
     def test_a_refusal_before_the_lease_touches_nothing(self) -> None:
         with self.assertRaises(ValueError):
@@ -367,6 +378,17 @@ class StepActionsGolden(_ServiceCase):
     table and re-derived for the two axes; a change here is a change of what a
     step pair does, to be reviewed. Under ample budgets «Не больше половины»
     plans like «Только текущий этап» (half of a huge card holds everything).
+
+    Re-derived for the two handles (B3): the pipeline's first phase is
+    `ref_encode`, which uses the AE, so where nothing is kept between runs
+    (PHASE / HALF / MIN VRAM with RAM RUN or MIN) AE_LOAD now READS the AE
+    into its `ref_encode` placement in the load scope (`loaded`), where it
+    sits while the encoder runs; before the split the AE was kept nowhere at
+    `encode` and was read by the encode->ref_encode transition (`resident`
+    here). Those twelve AE_LOAD cells (both calls of the six pairs) are the
+    only change; every other action and the after-run `health()` are as
+    before (the encoder's own `finish` at ENCODER_RELEASE leaves it where the
+    pair's between-runs state keeps it).
     """
 
     #: (vram, ram) -> two calls, each the `action` of (DIT_LOAD, AE_LOAD,
@@ -384,8 +406,8 @@ class StepActionsGolden(_ServiceCase):
         ("cpu", "cpu"),
     )
     _PHASE_DROPPED = (
-        ("resident", "resident", "skipped", "loaded", "restored", "offloaded"),
-        ("resident", "resident", "skipped", "loaded", "restored", "offloaded"),
+        ("resident", "loaded", "skipped", "loaded", "restored", "offloaded"),
+        ("resident", "loaded", "skipped", "loaded", "restored", "offloaded"),
         (None, None),
     )
     TABLE: dict[Steps, tuple[tuple[str, ...], tuple[str, ...], tuple[Any, Any]]] = {
@@ -398,8 +420,9 @@ class StepActionsGolden(_ServiceCase):
         Steps(VramStep.PHASE, RamStep.KEEP): _PHASE_KEPT_IN_RAM,
         Steps(VramStep.HALF, RamStep.KEEP): _PHASE_KEPT_IN_RAM,
         # Nothing kept between runs: before its first use a component holds
-        # nothing (read by the step that needs it), parked in RAM (RUN) or
-        # dropped (MIN) after it.
+        # nothing (read by the step that needs it; the AE by the load scope,
+        # its first use being the pipeline's first phase), parked in RAM (RUN)
+        # or dropped (MIN) after it.
         Steps(VramStep.PHASE, RamStep.RUN): _PHASE_DROPPED,
         Steps(VramStep.HALF, RamStep.RUN): _PHASE_DROPPED,
         Steps(VramStep.PHASE, RamStep.MIN): _PHASE_DROPPED,
@@ -412,8 +435,8 @@ class StepActionsGolden(_ServiceCase):
             ("cpu", "cpu"),
         ),
         Steps(VramStep.MIN, RamStep.RUN): (
-            ("resident", "resident", "skipped", "loaded", "restored", "on_host"),
-            ("resident", "resident", "skipped", "loaded", "restored", "on_host"),
+            ("resident", "loaded", "skipped", "loaded", "restored", "on_host"),
+            ("resident", "loaded", "skipped", "loaded", "restored", "on_host"),
             (None, None),
         ),
         # Both «Минимум»: the DiT (and the encoder) streamed from the file with

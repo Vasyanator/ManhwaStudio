@@ -40,7 +40,10 @@ poll_x()   -> try_recv, apply the outcome, clear the Receiver
   (`fold_resources_and_formats` over `Flux2WeightSelection`, `note_weight_formats_changed`).
 - `actions.rs`: the per-component load/unload actions, the Hugging Face token field, the
   prompt translation, the native file pickers, and the `.prompt_cache.*` jobs (build — also a
-  rename — export, import, and the library listing). Edit it to add an operation or to change
+  rename — export, import, and the library listing), which run through the shared
+  `PromptCacheController` (`prompt_cache` in `mod.rs`) with FLUX.2's header and methods; what an
+  answer invalidated comes back as `PromptCacheEffects` and is folded into `.status` and the
+  forecast (`apply_prompt_cache_effects`). Edit it to add an operation or to change
   what one does with its answer.
 
 ## Contracts and invariants
@@ -91,7 +94,8 @@ poll_x()   -> try_recv, apply the outcome, clear the Receiver
   (stat-only, still disk I/O); its answer lives in `settings.installed_formats`, which a
   settings load carries over because the file never holds it, and a changed layout re-asks
   `.status`. Any running job of the controller (download, verify, automatic adoption:
-  `running_job`) keeps the engine picker closed through `switch_block_reason`: the host polls
+  `running_job`) keeps the engine picker closed through `switch_block_reason` (the shared
+  `catalog_switch_block_reason`): the host polls
   only the selected engine, so a job left behind by a switch would run unseen.
 - The frame rectangle, the painted mask, the marks and the pending result belong to the
   HOST and reach this type only through `AiEngine`. The marks arrive already packaged per

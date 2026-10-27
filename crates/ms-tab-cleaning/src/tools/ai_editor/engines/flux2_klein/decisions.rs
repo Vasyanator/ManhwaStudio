@@ -9,8 +9,8 @@ disk. They live apart from the drawing precisely so the answers can be asserted 
 frame, which is what the tests at the end of this file do.
 
 Main responsibilities:
-- decide the at-most-one line under the prompt field (`flux2_prompt_cache_line`) and name the
-  encoder a cache entry was made by (`flux2_encoder_caption`);
+- name the encoder a cache entry was made by (`flux2_encoder_caption`), the caption the
+  shared prompt-cache line and picker show (the line itself is `../shared/prompt_cache.rs`);
 - decide whether the `guidance_scale` control is live at all (`flux2_guidance_supported`);
 - decide whether the «Внимание только к маске» run option is live
   (`flux2_text_attention_block_reason`);
@@ -18,11 +18,8 @@ Main responsibilities:
   memory forecast folded in as `Flux2MemorySummary` and a catalog bundle known to be
   incomplete as its own line;
 - name the catalog package the current selection needs (`flux2_catalog_bundle`: both
-  variants, download mode only) and the gated repositories among its specs not known to be
-  installed (`flux2_gated_repos_missing`, what draws the token row), and read the download
-  controller's
-  bundle state (`flux2_catalog_bundle_missing`, `flux2_catalog_job_running`) and say why its
-  running job keeps the engine picker closed (`flux2_catalog_switch_block_reason`);
+  variants, download mode only); the model-agnostic questions about it (gated repositories
+  still missing, bundle state, running job, engine-picker block) are `../shared/catalog_download.rs`;
 - caption each weight-format row with its size and installed mark, and say what it costs
   (`flux2_weight_format_label`, `flux2_weight_format_hint`);
 - name the first reason a run cannot start (`flux2_run_block_reason`);
@@ -30,15 +27,13 @@ Main responsibilities:
   check the run gate and the worker share so the two cannot disagree.
 
 Key structures:
-- `Flux2PromptCacheLine`, `Flux2ReadinessLine`, `Flux2LineTone`, `Flux2MemorySummary`
+- `Flux2ReadinessLine`, `Flux2LineTone`, `Flux2MemorySummary`
 
 Key functions:
-- `flux2_prompt_cache_line()`, `flux2_encoder_caption()`, `flux2_guidance_supported()`,
+- `flux2_encoder_caption()`, `flux2_guidance_supported()`,
   `flux2_readiness_line()`
 - `flux2_text_attention_block_reason()`
-- `flux2_catalog_bundle()`, `flux2_gated_repos_missing()`, `flux2_catalog_bundle_missing()`,
-  `flux2_catalog_job_running()`,
-  `flux2_catalog_switch_block_reason()`
+- `flux2_catalog_bundle()`
 - `flux2_weight_format_label()`, `flux2_weight_format_hint()`, `flux2_encoder_format_token()`
 - `flux2_run_block_reason()`, `region_block_reason()`
 
@@ -50,61 +45,6 @@ known" is exactly what these lines exist to keep apart. The limits themselves
 */
 
 use super::*;
-
-/// The at-most-one compact line drawn under the prompt field.
-///
-/// A separate decision from the drawing because it is a PRIORITY rule, not a formatting
-/// one: three facts compete for one line and only the most consequential may take it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Flux2PromptCacheLine {
-    /// Nothing is claimed. The answer is outstanding, which is not information.
-    Silent,
-    /// The prompt is served from the cache: the next run skips the encoder read entirely.
-    /// `encoder` names the encoder that made the entry in use (`None` when no entry was
-    /// reported); `memory` says the embeddings are only in the backend's memory, not saved.
-    Cached { encoder: Option<String>, memory: bool },
-    /// It is not: the next run pays for the encoder.
-    NotCached,
-    /// This machine has NO text encoder, so nothing can be encoded here and only ready
-    /// caches work. It outranks "not cached", which would read as a delay the user could
-    /// wait out rather than as a run that cannot start.
-    NoEncoder,
-}
-
-/// Decides which single line the prompt block shows about the cache.
-///
-/// `prompt_cached` / `text_encoder_available` are the project's three-state answers (`None` =
-/// not known, never `false`); `status_entry` is the entry the last `.status` named for the
-/// prompt, `listing_hit` the selected entry of the typed text's preset in the library listing.
-/// The priority is what the user can DO next:
-/// - a served prompt wins outright, because the run then works whether an encoder exists or
-///   not; the fresh `.status` entry names its encoder first (it also covers a memory-only
-///   encode), the listing's selection second;
-/// - while `.status` has not answered about this text, a preset of it in the listing is
-///   already a fact the line reports;
-/// - otherwise a missing encoder wins, because it changes what is POSSIBLE rather than what
-///   something costs;
-/// - "not cached" is left, and an outstanding answer says nothing at all.
-#[must_use]
-pub(super) fn flux2_prompt_cache_line(
-    listing_hit: Option<&PromptLibraryEntry>,
-    status_entry: Option<&PromptLibraryEntry>,
-    prompt_cached: Option<bool>,
-    text_encoder_available: Option<bool>,
-) -> Flux2PromptCacheLine {
-    let cached = |entry: Option<&PromptLibraryEntry>| Flux2PromptCacheLine::Cached {
-        encoder: entry.map(flux2_encoder_caption).filter(|caption| !caption.is_empty()),
-        memory: entry.is_some_and(PromptLibraryEntry::is_memory_only),
-    };
-    let uncached = if text_encoder_available == Some(false) { Flux2PromptCacheLine::NoEncoder } else { Flux2PromptCacheLine::NotCached };
-    match prompt_cached {
-        Some(true) => cached(status_entry.or(listing_hit)),
-        Some(false) => uncached,
-        None if listing_hit.is_some() => cached(listing_hit),
-        None if text_encoder_available == Some(false) => Flux2PromptCacheLine::NoEncoder,
-        None => Flux2PromptCacheLine::Silent,
-    }
-}
 
 /// The localized name of the encoder that made a library entry: its source («стандартный» /
 /// «расцензуренный») and precision (the format's technical token — `bf16` / `f16` / a GGUF
@@ -259,7 +199,7 @@ impl Flux2ReadinessLine {
 /// with the sentence that says why.
 ///
 /// `bundle_missing` is whether the catalog package the selected weight formats need is known
-/// to be not fully downloaded ([`flux2_catalog_bundle_missing`]; always `false` outside
+/// to be not fully downloaded ([`catalog_bundle_missing`]; always `false` outside
 /// download mode). It turns a `Ready` or `Unknown` verdict into
 /// [`Flux2ReadinessLine::BundleMissing`]; a `Missing` verdict keeps its own line, because it
 /// names the components. It never gates a run: that stays the `.status` readiness.
@@ -298,25 +238,6 @@ pub(super) fn flux2_catalog_bundle(settings: &Flux2KleinSettings) -> Vec<&'stati
         settings.encoder_source(),
         settings.weight_format(Flux2WeightAxis::TextEncoder),
     )
-}
-
-/// The GATED Hugging Face repositories (`ExternalModelSpec::gated_repo`, the catalog's one
-/// owner of that question) of the `bundle` specs that `installed` does not report installed, in bundle order and
-/// without repeats. Non-empty exactly while the token row and its access hint are drawn: a
-/// download of what is missing needs the token, and an installed gated spec needs nothing.
-/// `installed` is the controller's last probed state (an unprobed spec counts as missing).
-#[must_use]
-pub(super) fn flux2_gated_repos_missing(bundle: &[&'static ExternalModelSpec], installed: impl Fn(&ExternalModelSpec) -> bool) -> Vec<&'static str> {
-    let mut repos: Vec<&'static str> = Vec::new();
-    for spec in bundle {
-        if let Some(repo) = spec.gated_repo()
-            && !installed(spec)
-            && !repos.contains(&repo)
-        {
-            repos.push(repo);
-        }
-    }
-    repos
 }
 
 /// The row (and closed-combo) caption of one weight format in «Веса трансформера» /
@@ -372,56 +293,6 @@ pub(super) fn flux2_weight_format_hint(axis: Flux2WeightAxis, format: Flux2Weigh
         (false, Flux2WeightAxis::Transformer | Flux2WeightAxis::TextEncoder) => t!("cleaning.tools.flux2_klein.format_bf16_hint"),
         (true, Flux2WeightAxis::Transformer) => t!("cleaning.tools.flux2_klein.format_gguf_transformer_hint"),
         (true, Flux2WeightAxis::TextEncoder) => t!("cleaning.tools.flux2_klein.format_gguf_encoder_hint"),
-    }
-}
-
-/// Whether a catalog bundle's aggregated state says files are known to be absent: nothing
-/// usable, or an unfinished download. Every other state — not probed yet, probing, a job
-/// running, installed, a dead status worker — claims nothing.
-#[must_use]
-pub(super) fn flux2_catalog_bundle_missing(state: &OcrModelDownloadState) -> bool {
-    match state {
-        OcrModelDownloadState::Missing | OcrModelDownloadState::Partial { .. } => true,
-        OcrModelDownloadState::Unknown
-        | OcrModelDownloadState::Checking
-        | OcrModelDownloadState::Installed
-        | OcrModelDownloadState::Downloading(_)
-        | OcrModelDownloadState::Verifying(_)
-        | OcrModelDownloadState::Unavailable(_) => false,
-    }
-}
-
-/// Whether a controller job (download, verify or adoption) is running for ANY bundle, as one
-/// panel snapshot sees it: its own bundle's job, or another bundle's that blocks it. The
-/// falling edge of this is when files on disk may have changed, so the installed-formats
-/// probe, `.status` and the forecast are re-asked then.
-#[must_use]
-pub(super) fn flux2_catalog_job_running(snapshot: &OcrModelPanelSnapshot) -> bool {
-    snapshot.other_download.is_some()
-        || match snapshot.state {
-            OcrModelDownloadState::Downloading(_) | OcrModelDownloadState::Verifying(_) => true,
-            OcrModelDownloadState::Unknown
-            | OcrModelDownloadState::Checking
-            | OcrModelDownloadState::Missing
-            | OcrModelDownloadState::Partial { .. }
-            | OcrModelDownloadState::Installed
-            | OcrModelDownloadState::Unavailable(_) => false,
-        }
-}
-
-/// Why the engine picker must stay closed for a running catalog job of this engine's download
-/// controller ([`OcrModelDownloadController::running_job`]), or `None` when none runs.
-///
-/// Every kind blocks: the host polls only the
-/// SELECTED engine, so a job left behind by a switch would run with no progress, no cancel
-/// and no repaint, and a download would share the disk with the other checkpoint's download.
-/// A download names itself; a verify and an automatic adoption both hash files on disk and
-/// share one message.
-#[must_use]
-pub(super) fn flux2_catalog_switch_block_reason(running_job: Option<JobKind>) -> Option<String> {
-    match running_job? {
-        JobKind::Download => Some(t!("cleaning.tools.flux2_klein.download.switch_blocked_download").to_string()),
-        JobKind::Verify | JobKind::Adopt => Some(t!("cleaning.tools.flux2_klein.download.switch_blocked_verify").to_string()),
     }
 }
 
@@ -777,17 +648,17 @@ mod tests {
     /// the run cannot start rather than that it will be slow.
     #[test]
     fn the_prompt_line_reports_the_most_consequential_state_and_stays_silent_when_unsure() {
-        let line = |prompt_cached, encoder| flux2_prompt_cache_line(None, None, prompt_cached, encoder);
-        let plain_cached = Flux2PromptCacheLine::Cached { encoder: None, memory: false };
-        assert_eq!(line(None, None), Flux2PromptCacheLine::Silent);
+        let line = |prompt_cached, encoder| prompt_cache_line(None, None, prompt_cached, encoder, &flux2_encoder_caption);
+        let plain_cached = PromptCacheLine::Cached { encoder: None, memory: false };
+        assert_eq!(line(None, None), PromptCacheLine::Silent);
         assert_eq!(line(Some(true), None), plain_cached);
-        assert_eq!(line(Some(false), None), Flux2PromptCacheLine::NotCached);
+        assert_eq!(line(Some(false), None), PromptCacheLine::NotCached);
         // A served prompt survives a machine with no encoder — the run gate waives the encoder
         // on exactly this.
         assert_eq!(line(Some(true), Some(false)), plain_cached);
         // Without the embeddings AND without an encoder nothing can be produced here.
-        assert_eq!(line(Some(false), Some(false)), Flux2PromptCacheLine::NoEncoder);
-        assert_eq!(line(None, Some(false)), Flux2PromptCacheLine::NoEncoder);
+        assert_eq!(line(Some(false), Some(false)), PromptCacheLine::NoEncoder);
+        assert_eq!(line(None, Some(false)), PromptCacheLine::NoEncoder);
     }
 
     /// The line names the encoder of the entry in use: the fresh `.status` entry first, the
@@ -806,19 +677,19 @@ mod tests {
         let fresh = entry("uncensored", "q8_0", "memory");
         let caption = |entry: &PromptLibraryEntry| Some(flux2_encoder_caption(entry));
         assert_eq!(
-            flux2_prompt_cache_line(Some(&listed), Some(&fresh), Some(true), None),
-            Flux2PromptCacheLine::Cached { encoder: caption(&fresh), memory: true }
+            prompt_cache_line(Some(&listed), Some(&fresh), Some(true), None, &flux2_encoder_caption),
+            PromptCacheLine::Cached { encoder: caption(&fresh), memory: true }
         );
         assert_eq!(
-            flux2_prompt_cache_line(Some(&listed), None, Some(true), None),
-            Flux2PromptCacheLine::Cached { encoder: caption(&listed), memory: false }
+            prompt_cache_line(Some(&listed), None, Some(true), None, &flux2_encoder_caption),
+            PromptCacheLine::Cached { encoder: caption(&listed), memory: false }
         );
         assert_eq!(
-            flux2_prompt_cache_line(Some(&listed), None, None, Some(false)),
-            Flux2PromptCacheLine::Cached { encoder: caption(&listed), memory: false },
+            prompt_cache_line(Some(&listed), None, None, Some(false), &flux2_encoder_caption),
+            PromptCacheLine::Cached { encoder: caption(&listed), memory: false },
             "a preset of the typed text is a fact before `.status` answers"
         );
-        assert_eq!(flux2_prompt_cache_line(Some(&listed), None, Some(false), None), Flux2PromptCacheLine::NotCached);
+        assert_eq!(prompt_cache_line(Some(&listed), None, Some(false), None, &flux2_encoder_caption), PromptCacheLine::NotCached);
     }
 
     /// Every caption names the source and the precision it can; the unquantized token follows
@@ -1012,50 +883,18 @@ mod tests {
     fn the_token_row_names_the_gated_repositories_still_missing() {
         let bundle = |variant, source| flux2_catalog_bundle(&catalog_settings(variant, Flux2SourceMode::Download, source, Flux2WeightFormat::Bf16, Flux2WeightFormat::Bf16));
         let nothing_installed = |_: &ExternalModelSpec| false;
-        assert!(flux2_gated_repos_missing(&bundle(Flux2Variant::Klein4B, Flux2EncoderSource::Stock), nothing_installed).is_empty());
-        let stock = flux2_gated_repos_missing(&bundle(Flux2Variant::Klein9B, Flux2EncoderSource::Stock), nothing_installed);
+        assert!(catalog_gated_repos_missing(&bundle(Flux2Variant::Klein4B, Flux2EncoderSource::Stock), nothing_installed).is_empty());
+        let stock = catalog_gated_repos_missing(&bundle(Flux2Variant::Klein9B, Flux2EncoderSource::Stock), nothing_installed);
         assert_eq!(stock, ["black-forest-labs/FLUX.2-klein-9B"], "base, transformer and encoder share one repository");
-        let uncensored = flux2_gated_repos_missing(&bundle(Flux2Variant::Klein9B, Flux2EncoderSource::Uncensored), nothing_installed);
+        let uncensored = catalog_gated_repos_missing(&bundle(Flux2Variant::Klein9B, Flux2EncoderSource::Uncensored), nothing_installed);
         assert_eq!(uncensored, ["black-forest-labs/FLUX.2-klein-9B", "ponpoke/flux2-klein-9b-uncensored-text-encoder"]);
-        assert!(flux2_gated_repos_missing(&bundle(Flux2Variant::Klein9B, Flux2EncoderSource::Uncensored), |_| true).is_empty());
+        assert!(catalog_gated_repos_missing(&bundle(Flux2Variant::Klein9B, Flux2EncoderSource::Uncensored), |_| true).is_empty());
         // Only the uncensored encoder missing: only its repository.
         let only_encoder = |spec: &ExternalModelSpec| !spec.dir.ends_with("text_encoder_uncensored");
         assert_eq!(
-            flux2_gated_repos_missing(&bundle(Flux2Variant::Klein9B, Flux2EncoderSource::Uncensored), only_encoder),
+            catalog_gated_repos_missing(&bundle(Flux2Variant::Klein9B, Flux2EncoderSource::Uncensored), only_encoder),
             ["ponpoke/flux2-klein-9b-uncensored-text-encoder"]
         );
-    }
-
-    /// Only a state that says files are absent counts as a missing bundle; a job runs exactly
-    /// while a download / verify of this bundle, or any job of another one, is in flight.
-    #[test]
-    fn the_bundle_states_that_claim_missing_files_and_a_running_job() {
-        assert!(flux2_catalog_bundle_missing(&OcrModelDownloadState::Missing));
-        assert!(flux2_catalog_bundle_missing(&OcrModelDownloadState::Partial { bytes_present: 1 }));
-        for state in [OcrModelDownloadState::Unknown, OcrModelDownloadState::Checking, OcrModelDownloadState::Installed, OcrModelDownloadState::Unavailable("x".to_string())] {
-            assert!(!flux2_catalog_bundle_missing(&state), "{state:?}");
-        }
-        let snapshot = |state: OcrModelDownloadState| OcrModelPanelSnapshot { bundle_key: String::new(), state, missing_bytes: 0, notice: None, other_download: None, access: Vec::new() };
-        assert!(!flux2_catalog_job_running(&snapshot(OcrModelDownloadState::Installed)));
-        assert!(!flux2_catalog_job_running(&snapshot(OcrModelDownloadState::Missing)));
-    }
-
-    /// Every catalog job kind closes the engine picker: a download with the download message,
-    /// a verify and an automatic adoption with the file-check message; no job, no block.
-    #[test]
-    fn every_catalog_job_kind_blocks_the_engine_switch() {
-        assert_eq!(flux2_catalog_switch_block_reason(None), None);
-        assert_eq!(
-            flux2_catalog_switch_block_reason(Some(JobKind::Download)).as_deref(),
-            Some(t!("cleaning.tools.flux2_klein.download.switch_blocked_download"))
-        );
-        for kind in [JobKind::Verify, JobKind::Adopt] {
-            assert_eq!(
-                flux2_catalog_switch_block_reason(Some(kind)).as_deref(),
-                Some(t!("cleaning.tools.flux2_klein.download.switch_blocked_verify")),
-                "{kind:?}"
-            );
-        }
     }
 
     /// A format row names the format, its real dtype (bf16 / the uncensored encoder's f16) and

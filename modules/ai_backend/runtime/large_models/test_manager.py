@@ -30,7 +30,9 @@ load-progress sink (`LoadProgressTests`: loads triggered by transitions, the
 reload after a degrade retry, units re-read from disk, an explicit
 `load(progress=)` taking precedence);
 `placements` from
-the ledger; health / status / profiles shapes; the store (old profile floors
+the ledger; health / status / profiles shapes; the baseline RSS without any
+large-pool holding and the host room independent of it (`BaselineTests`,
+also the paired run figure counting a resident encoder once); the store (old profile floors
 and keep policy ignored); the Linux OOM backstop.
 
 Notes:
@@ -1079,6 +1081,174 @@ class LoadProgressTests(unittest.TestCase):
             again.set_load_progress(frames.append)
             rig.assert_outputs(self, rig.run(again))
         self._assert_stream(rig, frames, "dit", reread=True)
+
+
+@unittest.skipIf(torch is None, "torch not installed")
+class BaselineTests(unittest.TestCase):
+    """`Budgets.baseline_rss` takes EVERY large-pool holding out of the process RSS; the host room never depends on it.
+
+    The probe's RSS is the process model: `BASE` (runtime, small pool) plus
+    every handle's live host bytes, so a baseline that keeps any large
+    holding in shows up as a figure above `BASE`.
+    """
+
+    BASE = 3 << 20
+    PIN = {"pin": True}
+
+    def _rig(self) -> _Rig:
+        from dataclasses import replace
+
+        rig = _Rig(self)
+        rig.manager.register(replace(rig.spec, family="other"), model="other")
+        probes = rig.probes
+
+        def host() -> HostBudget:
+            # A host run device's "device" bytes are RAM too.
+            held = sum(handle.ledger.holdings().host_bytes + (handle.ledger.holdings().device_bytes if handle.host_device else 0) for handle in list(rig.manager._handles.values()))
+            return HostBudget(total=HUGE, available=probes.host_available, cgroup_limit=None, cgroup_used=None, rss_anon=self.BASE + held, rss_shmem=0, reserve=0)
+
+        probes.host = host  # type: ignore[method-assign]
+        return rig
+
+    def _warm(self, rig: _Rig, model: str, steps: Steps, options: dict[str, Any] | None = None) -> str:
+        with rig.manager.acquire(model, options or {}, SHAPE, device="cuda:0", format="f32", steps=steps) as session:
+            rig.run(session)
+        self.assertGreater(rig.handle(session.key).ledger.holdings().host_bytes, 0, f"{model} {steps.label} parks something in RAM")
+        return session.key
+
+    def _selected(self, rig: _Rig, options: dict[str, Any] | None = None, steps: Steps = PHASE_KEEP) -> Planned:
+        report = rig.manager.profiles("toy", options or {}, SHAPE, device="cuda:0", format="f32", steps=steps)
+        self.assertIsInstance(report.selected, Planned)
+        assert isinstance(report.selected, Planned)
+        return report.selected
+
+    def test_the_baseline_and_the_host_peak_exclude_every_large_holding(self) -> None:
+        from ..residency.holdings import Pool, Requester, Urgency
+        from .paired import host_baseline
+
+        rig = self._rig()
+        other = self._warm(rig, "other", PHASE_KEEP)
+        partner = self._warm(rig, "toy", MAX_KEEP, self.PIN)
+        own = self._warm(rig, "toy", PHASE_KEEP)
+        handle = rig.handle(own)
+        requester = Requester(pool=Pool.LARGE, key=own, owner=own, urgency=Urgency.ADMISSION, holds_lease=False)
+        inputs = rig.manager._inputs(handle, requester, own_reservation=None, with_reclaim=True)
+        self.assertEqual(inputs.budgets.baseline_rss, self.BASE, "another model's, the pair partner's and the own holdings are all out")
+        self.assertEqual(inputs.budgets.own_host_bytes, handle.ledger.holdings().host_bytes)
+        resident = self._selected(rig).full_forecast
+        self.assertEqual(host_baseline(resident), self.BASE)
+        # The reported peak is the clean baseline + this plan's own peak: it does
+        # not change when the other holdings go away.
+        self.assertTrue(rig.manager.unload_key(other))
+        self.assertTrue(rig.manager.unload_key(partner))
+        alone = self._selected(rig).full_forecast
+        self.assertEqual(host_baseline(alone), self.BASE)
+        self.assertEqual(resident.host_peak, alone.host_peak)
+        self.assertGreater(resident.host_peak, self.BASE)
+
+    def test_other_handles_bytes_never_widen_the_admission_room(self) -> None:
+        """An in-use handle of another model holds RAM: the host room stays probed availability - claims, the threshold of a fit is the plan's own growth."""
+        from ..residency.holdings import Pool, Requester, Urgency
+
+        rig = self._rig()
+        growth = self._selected(rig).forecast.host_peak - self.BASE
+        self.assertGreater(growth, 0)
+        with rig.manager.acquire("other", {}, SHAPE, device="cuda:0", format="f32", steps=PHASE_KEEP) as busy:
+            rig.run(busy)
+            held = rig.handle(busy.key).ledger.holdings().host_bytes
+            self.assertGreater(held, 0)
+            claimed = rig.arbiter.view(None).reserved_host
+            requester = Requester(pool=Pool.LARGE, key="toy", owner="toy", urgency=Urgency.ADMISSION, holds_lease=False)
+            rig.probes.host_available = growth + claimed
+            inputs = rig.manager._inputs(None, requester, own_reservation=None, with_reclaim=True, device="cuda:0")
+            self.assertEqual(inputs.budgets.baseline_rss, self.BASE)
+            self.assertEqual(inputs.budgets.host_room(), growth, "availability - claims: the busy handle's bytes are not room")
+            self.assertEqual(inputs.reclaimable.host_bytes, 0, "an in-use handle is not reclaimable")
+            fits = self._selected(rig)
+            self.assertEqual(fits.forecast.host_peak - self.BASE, growth)
+            rig.probes.host_available = growth + claimed - 1
+            refused = rig.manager.profiles("toy", {}, SHAPE, device="cuda:0", format="f32", steps=PHASE_KEEP).selected
+            self.assertIsInstance(refused, PlanRefusal)
+            assert isinstance(refused, PlanRefusal)
+            self.assertEqual(refused.shortest_resource, "host")
+
+    def test_a_host_run_device_subtracts_its_own_bytes_once_and_every_other_holding(self) -> None:
+        """`_host_device_inputs`: own device + host ledger bytes (all RAM) taken out once, another model's resident holding too."""
+        from ..residency.holdings import Pool, Requester, Urgency
+
+        rig = self._rig()
+        self._warm(rig, "other", PHASE_KEEP)
+        with rig.manager.acquire("toy", {}, SHAPE, device="cpu", format="f32", steps=AUTO_STEPS) as session:
+            rig.run(session)
+        handle = rig.handle(session.key)
+        own = handle.ledger.holdings()
+        self.assertTrue(handle.host_device)
+        self.assertGreater(own.device_bytes, 0)
+        requester = Requester(pool=Pool.LARGE, key=session.key, owner=session.key, urgency=Urgency.ADMISSION, holds_lease=False)
+        inputs = rig.manager._inputs(handle, requester, own_reservation=None, with_reclaim=True)
+        self.assertTrue(inputs.budgets.host_device)
+        self.assertEqual(inputs.budgets.own_host_bytes, own.device_bytes + own.host_bytes)
+        self.assertEqual(inputs.budgets.baseline_rss, self.BASE, "own bytes once, the other model's holding out")
+
+    def test_holdings_above_the_rss_clamp_the_baseline_to_zero(self) -> None:
+        from ..residency.holdings import Pool, Requester, Urgency
+
+        rig = self._rig()
+        other = self._warm(rig, "other", PHASE_KEEP)
+        own = self._warm(rig, "toy", PHASE_KEEP)
+        probes = rig.probes
+        probes.host = lambda: HostBudget(total=HUGE, available=probes.host_available, cgroup_limit=None, cgroup_used=None, rss_anon=1, rss_shmem=0, reserve=0)  # type: ignore[method-assign]
+        self.assertGreater(rig.handle(other).ledger.holdings().host_bytes + rig.handle(own).ledger.holdings().host_bytes, 1)
+        requester = Requester(pool=Pool.LARGE, key=own, owner=own, urgency=Urgency.ADMISSION, holds_lease=False)
+        inputs = rig.manager._inputs(rig.handle(own), requester, own_reservation=None, with_reclaim=True)
+        self.assertEqual(inputs.budgets.baseline_rss, 0)
+        self.assertEqual(rig.manager._large_free_rss(10, "nobody", 25), 0)
+
+    def test_a_reserved_but_not_resident_large_holding_is_not_subtracted_and_does_not_widen_the_room(self) -> None:
+        """A large lease still loading (parts reported, not resident) with an outstanding reservation: its bytes stay in the baseline, its reservation is a claim."""
+        from ..residency.arbiter import Reservation
+        from ..residency.holdings import Need, Part, Pool, Requester, Urgency
+        from ..residency.holdings import Tier as PartTier
+
+        rig = self._rig()
+        ghost_bytes = 1 << 20
+        reserved = 2 << 20
+        self.assertLess(ghost_bytes, self.BASE)
+        lease = rig.arbiter.begin_use(Pool.LARGE, "ghost")
+        self.addCleanup(lease.release)
+        self.addCleanup(lease.mark_load_failed)
+        rig.arbiter.update_parts(Pool.LARGE, "ghost", [Part(name="dit", device_bytes=0, host_bytes=ghost_bytes, tier=PartTier.HOST)])
+        self.assertFalse(rig.arbiter.holdings(Pool.LARGE)["ghost"].resident)
+        reservation = rig.arbiter.reserve(Requester(pool=Pool.LARGE, key="ghost", owner="ghost", urgency=Urgency.ADMISSION, holds_lease=True), Need(host_bytes=reserved))
+        assert isinstance(reservation, Reservation)
+        self.addCleanup(rig.arbiter.release_reservation, reservation)
+        rig.probes.host_available = 64 << 20
+        requester = Requester(pool=Pool.LARGE, key="toy", owner="toy", urgency=Urgency.ADMISSION, holds_lease=False)
+        inputs = rig.manager._inputs(None, requester, own_reservation=None, with_reclaim=True, device="cuda:0")
+        self.assertEqual(inputs.budgets.baseline_rss, self.BASE, "a holding that is not resident is not taken out")
+        self.assertEqual(inputs.budgets.claimed_host_bytes, reserved)
+        self.assertEqual(inputs.budgets.host_room(), (64 << 20) - reserved, "the reservation is a claim, never room")
+        self.assertEqual(inputs.reclaimable.host_bytes, 0)
+
+    def test_a_resident_encoder_is_counted_once_in_the_paired_run_peak(self) -> None:
+        """`paired.run_host_peak`: the pipeline's baseline no longer holds the resident encoder, so the run figure does not depend on residency."""
+        from .paired import HandleRequest, PairPhases, host_baseline, plan_pair
+
+        rig = self._rig()
+        phases = PairPhases(pipeline=("denoise", "decode"), rest="denoise", encode="encode")
+        pipeline = HandleRequest("toy", {}, "f32")
+        encoder = HandleRequest("toy", self.PIN, "f32")
+        encoder_key = self._warm(rig, "toy", MAX_KEEP, self.PIN)
+        self._warm(rig, "toy", PHASE_KEEP)
+        resident = plan_pair(rig.manager, pipeline, encoder, SHAPE, "cuda:0", PHASE_KEEP, phases)
+        assert isinstance(resident.alone.selected, Planned) and resident.encoder is not None and isinstance(resident.encoder.selected, Planned)
+        self.assertEqual(host_baseline(resident.alone.selected.full_forecast), self.BASE, "the resident encoder is not in the pipeline's baseline")
+        self.assertEqual(host_baseline(resident.encoder.selected.full_forecast), self.BASE)
+        expected = self.BASE + (resident.alone.selected.full_forecast.host_peak - self.BASE) + (resident.encoder.selected.full_forecast.host_peak - self.BASE)
+        self.assertEqual(resident.run_host_peak(), expected)
+        self.assertTrue(rig.manager.unload_key(encoder_key))
+        cold = plan_pair(rig.manager, pipeline, encoder, SHAPE, "cuda:0", PHASE_KEEP, phases)
+        self.assertEqual(resident.run_host_peak(), cold.run_host_peak(), "residency changes nothing in the run figure")
 
 
 def _hint(nbytes: int) -> Any:

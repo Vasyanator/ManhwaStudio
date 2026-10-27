@@ -4,10 +4,11 @@ File: cleaning/tools/ai_editor/engines/flux3_klein/mod.rs
 Purpose:
 The FLUX.3 klein ENGINE of the «ИИ-редактор области» tool. The HOST owns the on-canvas frame —
 the rectangle, the painted mask stack, the pending result and Применить/Отменить. This MODULE
-owns everything model-specific: the persisted parameters (model source, weight format, prompt,
-steps, seed, memory steps, expert switches), the session's extra reference images, the
-`inpaint.flux3_klein*` wire contracts, the Hugging Face download of the gated package, the
-worker threads and the engine's progress bar. It implements `region_edit_v2::engine::AiEngine`
+owns everything model-specific: the persisted parameters (model source, the DiT and text-encoder
+weight formats, prompt, steps, seed, memory steps, expert switches), the session's extra
+reference images, the `inpaint.flux3_klein*` wire contracts, the catalog bundle a selection
+needs (downloaded by the app's model catalog, not by the backend), the worker threads and the
+engine's progress bar. It implements `region_edit_v2::engine::AiEngine`
 and never touches `CanvasView`, `ProjectData` or the frame.
 
 This file is the MODULE ROOT and holds no logic: this header, the module declarations and the
@@ -29,23 +30,39 @@ How a region is edited (the backend's `inpaint/flux3_klein/region.py`):
   validity; the run path re-checks the actual region through the shared `region_size_refusal`.
 
 Submodules:
-- `settings.rs`: `Flux3KleinSettings` (persisted), its vocabularies, `normalized()`, the wire
-  `params`, `effective_root()` and the settings-file load/save (shared quarantine + retry).
+- `settings.rs`: `Flux3KleinSettings` (persisted), its vocabularies (the two weight formats are
+  `ms_config::{Flux3DitFormat, Flux3EncoderFormat}`), `normalized()`, the wire `params` (with
+  every offered format candidate), `effective_root()` and the settings-file load/save.
 - `references.rs`: the session's extra reference images, their capacity and the worker that
   reads a picked file into a wire PNG.
 - `status.rs`: the `.status` answer (`Flux3Status`) and the model verdict derived from it.
-- `wire.rs`: the run call and its request/response contract, `.status`, `.unload`.
-- `download.rs`: the FLUX.3 half of `.download.check` / `.download.start`.
+- `wire.rs`: the run call and its request/response contract, `.status`, `.unload`, and the
+  engine's `.prompt_cache.*` method family and header (`FLUX3_PROMPT_CACHE_METHODS`,
+  `flux3_prompt_cache_header`).
 - `decisions.rs`: the PURE decisions the panel renders (readiness line, run gate, seed field,
-  stage names, run outcome line).
+  stage names, run outcome line, the catalog bundle, the format-row captions, the prompt
+  library's gate context `flux3_cache_context` and encoder caption `flux3_encoder_caption`).
 - `engine/`: `Flux3KleinEngine`, its `AiEngine` impl and its long operations.
 - `ui/`: the parameter panel.
 - `test_support.rs`: `cfg(test)` fixtures.
 
-IPC (`backend_ipc::protocol`, PROTOCOL_VERSION 17, `modules/ai_backend/ipc/PROTOCOL.md` §5.4):
+IPC (`backend_ipc::protocol`, PROTOCOL_VERSION 24, `modules/ai_backend/ipc/PROTOCOL.md` §5.4):
 `inpaint.flux3_klein` (streaming, cancelled mid-run through `CallHandle::cancel`),
-`.status`, `.unload`, `.download.check`, `.download.start` (streaming), and the forecast
-`large_models.profiles` with `model: "flux3_klein"`.
+`.status`, `.unload`, `.prompt_cache.{build (streaming), list, export, import}` and the
+forecast `large_models.profiles` with `model: "flux3_klein"`.
+
+Prompt library (the FLUX.2 klein UX over the shared `../shared/prompt_cache*.rs`): one library
+`flux3_klein` for every encoder format, named presets keyed by their exact text, TEXT encoder
+mode only (in `vl_refs` the encoder also reads the images, so every run encodes and
+«Кэшировать» is closed with that reason). `.status` answers `prompt_cached` about the prompt
+that travelled with it; `Some(true)` in TEXT mode waives the text encoder in the run gate (its
+weights may be absent), and the backend's forecast leaves it out unless it is resident.
+
+Download: the package is pinned in the app's catalog
+(`ms_sysprobe::ai_models::external_catalog::flux3_klein_package_specs`: base + the root DiT
+config for bf16 / GGUF + DiT(format) + encoder(format)) and fetched by the engine's `OcrModelDownloadController` (resumable, access
+preflight of the gated BFL repository, adoption of an existing tree by hash, verify), drawn by
+the shared `draw_ocr_model_download`. The backend downloads nothing for FLUX.3.
 */
 use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MarksMode, MarksSupport, MaskLayerSpec, RawRegionResult, RunMarks, RunOptionsCtx, region_size_refusal};
 // The post-process settings the host applies to a raw run answer (one owner of defaults, ranges, UI).
@@ -53,6 +70,15 @@ use ms_region_postprocess::PostprocessSettings;
 use ms_backend_ipc as backend_ipc;
 use ms_canvas::OverlayRectPx;
 use ms_config as config;
+// The two weight-format vocabularies and the prompt library's id and precision order (one owner:
+// `ms_config::flux3_weight_format`).
+use ms_config::{FLUX3_PROMPT_LIBRARY_ID, Flux3DitFormat, Flux3EncoderFormat, flux3_prompt_cache_precision_order, flux3_prompt_cache_precision_rank};
+// The catalog package: its pinned specs per format and the files' paths under the package root,
+// and the explicit-download controller and panel block shared with the Translation tab.
+use ms_sysprobe::ai_models::external::ExternalModelSpec;
+use ms_sysprobe::ai_models::external_catalog::{FLUX3_KLEIN_BFL_REPO, flux3_klein_dit_relative_path, flux3_klein_dit_spec, flux3_klein_encoder_relative_path, flux3_klein_encoder_spec, flux3_klein_package_specs};
+use ms_tab_translation::ocr_model_download::{OcrModelDownloadController, OcrModelDownloadState, OcrModelPanelSnapshot, bundle_key};
+use ms_tab_translation::panels::ocr_model_download::{ModelDownloadAction, draw_ocr_model_download};
 use crate::tools::base::RegionEditToolBase;
 use crate::tools::region_edit_v2::geometry::{AspectLimit, FrameConstraints};
 use ms_local_ai::backend_health::ai_backend_offline_error;
@@ -60,8 +86,9 @@ use ms_local_ai::backend_health::ai_backend_offline_error;
 use ms_local_ai::large_models::{LIMITS_EDIT_DEBOUNCE, LargeModelStep, ProfilesRequest, RamStep, StepChoice, VramStep, format_gib};
 // The axes widget and its engine-side state, shared with FLUX.2 klein.
 use crate::tools::ai_editor::large_model_resources::{ResourcesAction, ResourcesController, ResourcesView, draw_large_model_resources, forecast_line};
-// The model-agnostic parts of the large-model engines: streamed progress, the Hugging Face
-// download, the settings-file rules and the mask -> working-mode rule.
+// The model-agnostic parts of the large-model engines: streamed progress, the Hugging Face token
+// row, the catalog-download decisions, the settings-file rules, the mask -> working-mode rule and
+// the prompt library (controller, gates, cache line and its drawing).
 use super::shared::*;
 use ms_widgets::{HfAccessHint, WheelComboBox, WheelSlider};
 use eframe::egui;
@@ -88,9 +115,6 @@ use status::*;
 // The run, `.status` and `.unload` calls and the run's request/response contract.
 mod wire;
 use wire::*;
-// The FLUX.3 half of the Hugging Face download.
-mod download;
-use download::*;
 // The pure decisions the panel renders.
 mod decisions;
 use decisions::*;
@@ -144,8 +168,9 @@ const FLUX3_LARGE_MODEL: &str = "flux3_klein";
 /// The stable engine id: a widget-id stem and a log token, never shown.
 const FLUX3_ENGINE_ID: &str = "flux3_klein";
 
-/// The gated Hugging Face repository the download fetches from (`flux3_download.REPO`).
-const FLUX3_REPO: &str = "black-forest-labs/flux-3-image-klein";
+/// The gated Hugging Face repository of the BFL package (the base, the native DiTs and the bf16
+/// encoder), as the catalog pins it. Named in the download block with its licence page.
+const FLUX3_REPO: &str = FLUX3_KLEIN_BFL_REPO;
 
 /// The prompt a fresh settings file starts from, and the one substituted for a blank one: an
 /// empty prompt blocks the run. A literal, like FLUX.2 klein's: a stored and transmitted value
@@ -153,8 +178,8 @@ const FLUX3_REPO: &str = "black-forest-labs/flux-3-image-klein";
 /// any language, since the model's encoder is multilingual.
 const FLUX3_DEFAULT_PROMPT: &str = "Remove any text and sound effects, and restore the background underneath them";
 
-/// Generation may first load ~20 GB of weights; the PER-FRAME timeout of every streaming
-/// call (restarted on each progress frame, so a multi-hour download shares it).
+/// Generation may first load ~20 GB of weights; the PER-FRAME timeout of the streaming run
+/// (restarted on each progress frame).
 const FLUX3_RUN_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
-/// `.status`, `.unload` and `.download.check` are bookkeeping calls.
+/// `.status` and `.unload` are bookkeeping calls.
 const FLUX3_QUERY_TIMEOUT: Duration = Duration::from_secs(60);

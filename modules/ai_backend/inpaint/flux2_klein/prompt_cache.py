@@ -20,6 +20,10 @@ Main responsibilities:
   `encoder_label`, `encoder_provenance` (the request's current encoder);
 - libraries: `flux2_library_spec`, `prompt_cache_root`, `library_of`,
   `transformer_text_width`;
+- `Flux2PromptCacheAdapter` - FLUX.2's `PromptCacheAdapter` for the shared
+  orchestration (`runtime/prompt_cache_service.py`): which texts a run needs,
+  the preference, the width filter, the current encoder, the v1 migration and
+  the v1 import;
 - v1: `read_v1_header`, `known_local_encoders`, `classify_v1_entry`,
   `convert_v1_metadata`, `migrate_legacy_families` / `ensure_legacy_migrated`.
 
@@ -48,12 +52,13 @@ import os
 import re
 import stat
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 from ...runtime import prompt_library as pl
+from ...runtime.prompt_cache_service import refuse_unknown_marker
 from ...runtime.paths import program_root
 from ...runtime.safetensors_stream import read_safetensors_header
 from . import components
@@ -89,7 +94,7 @@ PROMPT_EMBED_CACHE_ENTRIES = 8
 #: The library root in the program root, next to `fonts/`. Layout:
 #: `prompt_cache/<library id>/<entry>.msprompt` (+ `index.json`); protocol <= 22
 #: left `prompt_cache/<encoder family>/<name>.msprompt` (v1).
-PROMPT_CACHE_DIRNAME = "prompt_cache"
+PROMPT_CACHE_DIRNAME = pl.ROOT_DIRNAME
 
 #: The single tensor an entry carries.
 PROMPT_CACHE_TENSOR = "prompt_embeds"
@@ -241,11 +246,6 @@ def encoder_provenance(normalized: Mapping[str, Any]) -> pl.EncoderProvenance | 
         encoder_id=text_encoder_fingerprint(path),
         label=encoder_label(path),
     )
-
-
-def is_current_encoder(encoder: pl.EncoderProvenance, current: pl.EncoderProvenance | None) -> bool:
-    """Whether `encoder` IS the request's current encoder: same fingerprint and the same fp8 flag."""
-    return current is not None and encoder.encoder_id == current.encoder_id and encoder.fp8 == current.fp8
 
 
 # =====================================================================
@@ -694,3 +694,105 @@ def ensure_legacy_migrated(extra_encoders: Iterable[tuple[str, str]]) -> Migrati
 def migration_report() -> MigrationReport | None:
     """The report of this process's migration of `prompt_cache_root()`, `None` when it has not run."""
     return _MIGRATION_REPORTS.get(os.path.abspath(str(prompt_cache_root())))
+
+
+# =====================================================================
+#  The shared orchestration's adapter
+# =====================================================================
+class Flux2PromptCacheAdapter:
+    """FLUX.2 klein's `PromptCacheAdapter` (`runtime.prompt_cache_service`).
+
+    A request is a normalized params dict (`params.normalize_flux2_klein_params`)
+    for the plan, `.status` and the build, or the service's lenient library
+    request (`Flux2KleinInpaintService._lenient_library_request`) for `.list`,
+    `.export` and `.import`; both carry every key read here except the prompt
+    and the guidance scale, which only the first kind needs (`texts_needed`).
+    `effective_guidance` is the service's `_effective_guidance_scale`: the ONE
+    place a run learns whether classifier-free guidance happens, which decides
+    whether the empty negative prompt is needed.
+    """
+
+    owner = "FLUX.2 klein"
+
+    def __init__(self, effective_guidance: Callable[[dict[str, Any]], float]) -> None:
+        self._effective_guidance = effective_guidance
+
+    def library_of(self, library_id: str) -> pl.PromptLibrary:
+        """The FLUX.2 library `library_id` (`library_of`)."""
+        return library_of(library_id)
+
+    def accepts_library(self, library_id: str) -> bool:
+        """Whether a v2 file of `library_id` may be imported: only the FLUX.2 libraries (`FLUX2_LIBRARY_IDS`)."""
+        return library_id in FLUX2_LIBRARY_IDS
+
+    def library_id(self, request: Mapping[str, Any]) -> str | None:
+        """The request's `prompt_library` (`None` / `""` = no library)."""
+        return request.get("prompt_library") or None
+
+    def texts_needed(self, request: Mapping[str, Any]) -> list[str]:
+        """The texts a run of `request` embeds: the prompt, plus `""` under effective classifier-free guidance.
+
+        A distilled checkpoint never asks for `""`: the effective scale is
+        already pinned to 1.0 there, so the encoder is never read for an
+        embedding the denoise would ignore.
+        """
+        wanted = [request["prompt"]]
+        if self._effective_guidance(dict(request)) > 1.0 and request["prompt"] != "":
+            wanted.append("")
+        return wanted
+
+    def max_sequence_length(self, request: Mapping[str, Any]) -> int:
+        return int(request["max_sequence_length"])
+
+    def preference(self, request: Mapping[str, Any]) -> pl.Preference:
+        """The request's selected encoder source, then its precision order (both Rust-owned)."""
+        return pl.Preference(str(request.get("text_encoder_source") or ""), tuple(request.get("prompt_cache_precision_order") or ()))
+
+    def accepted_width(self, request: Mapping[str, Any]) -> int | None:
+        """The embedding width the request's transformer accepts (`transformer_text_width`); `None` when unknown."""
+        return transformer_text_width(str(request.get("transformer_path") or ""))
+
+    def current_provenance(self, request: Mapping[str, Any]) -> pl.EncoderProvenance | None:
+        """`encoder_provenance` (raises `ValueError` for an unidentifiable encoder)."""
+        return encoder_provenance(request)
+
+    def encoder_available(self, request: Mapping[str, Any]) -> bool:
+        return text_encoder_available(dict(request))
+
+    def migrate(self, request: Mapping[str, Any]) -> None:
+        """Run the one-time v1 migration (`ensure_legacy_migrated`) when the request names a library.
+
+        A request without one (the calibration tool, tests) never touches the
+        library root. The request's encoder joins the known encoders with its
+        source.
+        """
+        if not request.get("prompt_library"):
+            return
+        ensure_legacy_migrated([(str(request.get("text_encoder_path") or ""), str(request.get("text_encoder_source") or ""))])
+
+    def legacy_report(self) -> dict[str, Any] | None:
+        """The `.list` `legacy` object: this process's migration report when it found anything, else `None`."""
+        legacy = migration_report()
+        return legacy.to_wire() if legacy is not None and legacy.found_anything else None
+
+    def import_foreign(self, header: Mapping[str, Any], source: Path, request: Mapping[str, Any]) -> tuple[str, dict[str, str]]:
+        """A v1 file (protocol <= 22) converted by the migration rules (`classify_v1_entry`); any other marker is refused.
+
+        A file made before the RoPE fix, or by an uncensored encoder that
+        cannot be identified, or that cannot be migrated, is REFUSED naming
+        the reason.
+
+        # Raises
+        `ValueError` for a refused v1 file or an unknown marker.
+        """
+        raw_meta = header.get("__metadata__")
+        marker = raw_meta.get("format") if isinstance(raw_meta, dict) else None
+        if marker != V1_FORMAT:
+            return refuse_unknown_marker(source)
+        v1_meta, tensor = parse_v1_header(header, source)
+        family = str(v1_meta.get("text_encoder_family", ""))
+        known = known_local_encoders([(request["text_encoder_path"], request["text_encoder_source"]), (v1_meta.get("text_encoder_path", ""), "")])
+        verdict = classify_v1_entry(v1_meta, tensor, known, family=family)
+        if verdict.action != "migrate" or verdict.library_id is None:
+            raise ValueError(f"Файл кэша промпта {source} не импортирован: {verdict.reason}.")
+        return verdict.library_id, convert_v1_metadata(v1_meta, verdict, name=source.stem, migrated_from=f"{family}/{source.name}")

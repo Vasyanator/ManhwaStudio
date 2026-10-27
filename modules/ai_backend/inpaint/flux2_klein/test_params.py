@@ -323,6 +323,9 @@ class PromptLibraryParamsTests(_TempTreeCase):
             ("prompt_library", ""),
             ("prompt_library", 9),
             ("prompt_library", "x" * 41),
+            # Another model's library (FLUX.3's) and an unknown id of the right shape.
+            ("prompt_library", "flux3_klein"),
+            ("prompt_library", "other_model"),
             ("text_encoder_source", "Stock"),
             ("text_encoder_source", 1),
             ("prompt_cache_precision_order", "bf16"),

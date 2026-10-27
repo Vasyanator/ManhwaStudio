@@ -18,7 +18,7 @@ Key structures:
 Key functions:
 - `draw_large_model_resources()`: the widget.
 - `draw_encoder_formats()`: the text encoder's weight-format rows, drawn separately by an
-  engine whose encoder has several formats (FLUX.2 klein 4B).
+  engine whose encoder has several formats (FLUX.2 klein 4B, FLUX.3 klein).
 - `step_row_label()`, `auto_item_label()`, `run_forecast()`, `forecast_line()`,
   `format_row_label()`, `cap_changes_for()`: the PURE decisions (unit tested; `forecast_line`
   — the whole run, text encoder included — is also what an engine's readiness line prints).
@@ -162,9 +162,12 @@ pub(super) fn auto_item_label<S: LargeModelStep>(recommended: Option<S>) -> Stri
 /// Combined the way the backend's ADMISSION combines them (`service.py`
 /// `large_model_profiles` / `_reservation_of`): the pipeline is planned with the encoder's
 /// reservation CLAIMED beside it, so the two reservations add up. Device memory: the two
-/// device peaks add. Host memory: both host peaks include the backend's baseline RSS, which
-/// the process holds once, so the sum takes it out once (`Forecast::host_baseline`; a
-/// backend that does not report it counts it twice, an over-estimate, never an under one).
+/// device peaks add (a CPU-pinned encoder reports `0`). Host memory: both host peaks include
+/// the backend's baseline RSS, which the process holds once, so the sum takes it out once
+/// (`Forecast::host_baseline`; a backend that does not report it counts it twice, an
+/// over-estimate, never an under one). That baseline holds no large-model bytes (protocol 24),
+/// so each handle's resident bytes are counted once and the total reads "the backend with only
+/// this run's models loaded", whatever other large model is resident now.
 /// Time: encode and denoise run one after the other, so loads and totals add, and a step's
 /// time stays the pipeline's. Calibrated only when both halves are.
 #[must_use]
@@ -486,8 +489,7 @@ fn draw_formats(ui: &mut egui::Ui, profiles: &LargeModelProfiles, format: &mut S
 
 /// Draws the TEXT ENCODER's weight-format rows (`profiles.encoder_formats`) under their own
 /// heading, with the same row labels and visuals as the model's format rows. Draws nothing
-/// with fewer than two rows (one format offers no choice; older backends and FLUX.3 report
-/// none).
+/// with fewer than two rows (one format offers no choice; older backends report none).
 ///
 /// `format` is the engine's encoder-format choice; a picked row is written into it and its id
 /// returned (`None` when nothing new was picked). Separate from

@@ -9,8 +9,9 @@ places, partial residency staging and per-pass copy time (HOST vs DISK), CPU
 execution putting the activation on the host, margin and overhead, the
 `calibrated` / `device_calibrated` flags judged per phase, the cold / warm
 load split, the load transient (a steady reload and the first run's cold
-boundaries, host side only), and a host run device folding every device byte
-into the host.
+boundaries, host side only), a host run device folding every device byte
+into the host, and a plan with nothing on the device (a CPU-pinned encoder)
+carrying no device peak.
 """
 
 from __future__ import annotations
@@ -140,6 +141,31 @@ class ForecastTests(unittest.TestCase):
         result = self._forecast(_plan({"encode": all_device, "denoise": all_device, "decode": all_device}, _NOTHING), tables=tables)
         raw = _DIT + GIB
         self.assertEqual(result.phases["denoise"].device_peak, raw + min(GIB, int(raw * 0.03)) + GIB // 2)
+
+    def test_a_plan_with_nothing_on_the_device_has_no_device_peak(self) -> None:
+        """A whole-handle host pin (the CPU text encoder): no state puts a byte on the device, so no margin and no runtime overhead either."""
+        from dataclasses import replace
+
+        encoder_only = replace(self.spec, components=tuple(component for component in self.spec.components if component.name == "encoder"), phases=tuple(phase for phase in self.spec.phases if phase.name == "encode"))
+        inventories = {"encoder": self.inventories["encoder"]}
+        tables = simple_tables(overhead_gib=0.5, margin_fraction=0.03)
+
+        def one(tier: Tier, exec_device: ExecDevice, keep: Tier) -> ResidencyPlan:
+            state = (_cp("encoder", tier, exec_device=exec_device, keep=keep),)
+            return _plan({"encode": state}, (_cp("encoder", keep, exec_device=exec_device, keep=keep),))
+
+        for keep in (Tier.HOST, Tier.DROPPED):
+            with self.subTest(keep=keep):
+                result = forecast(encoder_only, one(Tier.HOST, _CPU, keep), inventories, _SHAPE, tables, compute_path="native", baseline_rss=2 * GIB)
+                every = (*result.phases.values(), *result.transitions.values())
+                self.assertEqual({entry.device_peak for entry in every}, {0})
+                self.assertEqual(result.device_peak, 0)
+                self.assertEqual(result.phases["encode"].host_peak, 2 * GIB + _ENC + GIB // 4, "the host side is unchanged")
+        # The same encoder executed on the device keeps margin and overhead in every state.
+        on_device = forecast(encoder_only, one(Tier.DEVICE, _RUN, Tier.DROPPED), inventories, _SHAPE, tables, compute_path="native", baseline_rss=2 * GIB)
+        raw = _ENC + GIB // 4
+        self.assertEqual(on_device.phases["encode"].device_peak, raw + min(GIB, int(raw * 0.03)) + GIB // 2)
+        self.assertEqual(on_device.phases["idle"].device_peak, GIB // 2, "a state with nothing resident still carries the overhead when the plan uses the device")
 
     def test_calibrated_flag(self) -> None:
         all_device = (_cp("dit", Tier.DEVICE), _cp("encoder", Tier.DEVICE), _cp("ae", Tier.DEVICE))

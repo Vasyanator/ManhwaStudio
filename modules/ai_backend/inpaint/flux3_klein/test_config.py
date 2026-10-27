@@ -5,7 +5,9 @@ Purpose:
 Unit tests for `flux3_klein/config.py`: parsing and validating `config.json`
 (the official package's shape as a literal fixture), weight-format detection
 from literal headers shaped like the bf16 / fp8r / nvfp4 exports, the declared
-vs detected check, and file resolution / availability over a temp tree.
+vs detected check, and file resolution / availability over a temp tree (the
+native exports, a GGUF DiT on the root `config.json`, and the text encoder per
+source: bf16 shards or a GGUF file).
 
 Notes:
 Torch-free; never touches a real model file. Temp files are removed by the test.
@@ -286,7 +288,9 @@ class ResolveModelFilesTests(_TempCase):
             cfg.resolve_model_files(self.root, cfg.WeightFormat.BF16)
         message = str(caught.exception)
         self.assertIn(str(self.root / "model.safetensors"), message)
-        self.assertIn(str(self.root / "text_encoder"), message)
+        # The encoder directory is not a DiT file: a cached caption runs without it.
+        self.assertNotIn(str(self.root / "text_encoder"), message)
+        self.assertEqual(cfg.resolve_model_files(self.root, cfg.WeightFormat.NVFP4).text_encoder_dir, self.root / "text_encoder")
 
     def test_availability_reports_each_variant_separately(self) -> None:
         self._full_package()
@@ -296,6 +300,55 @@ class ResolveModelFilesTests(_TempCase):
         self.assertIsNone(availability[cfg.WeightFormat.NVFP4])
         self.assertIn("model.safetensors", availability[cfg.WeightFormat.BF16] or "")
         self.assertIn("config.json", availability[cfg.WeightFormat.FP8R] or "")
+
+
+    def test_a_gguf_dit_reads_the_root_config(self) -> None:
+        self._full_package()
+        (self.root / "model.safetensors").unlink()  # the bf16 DiT is not needed
+        self._touch("transformer_gguf", "q8.gguf")
+        source = cfg.GgufDit("q8_0", self.root / "transformer_gguf" / "q8.gguf")
+        files = cfg.resolve_model_files(self.root, source)
+        self.assertEqual((files.dit_file, files.dit_config), (source.path, self.root / "config.json"))
+        missing = cfg.GgufDit("q4_k_m", self.root / "transformer_gguf" / "q4.gguf")
+        with self.assertRaises(FileNotFoundError) as caught:
+            cfg.resolve_model_files(self.root, missing)
+        self.assertIn("q4.gguf", str(caught.exception))
+        (self.root / "config.json").unlink()
+        with self.assertRaises(FileNotFoundError) as caught:
+            cfg.resolve_model_files(self.root, source)
+        self.assertIn(str(self.root / "config.json"), str(caught.exception))
+
+
+class TextEncoderSourceTests(_TempCase):
+    def _shards(self) -> None:
+        directory = self.root / "text_encoder"
+        directory.mkdir()
+        (directory / "model-1.safetensors").write_bytes(b"x" * 10)
+        (directory / "model-2.safetensors").write_bytes(b"x" * 5)
+        index = {"weight_map": {"a": "model-1.safetensors", "b": "model-2.safetensors", "c": "model-1.safetensors"}}
+        (directory / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
+
+    def test_bf16_reads_the_shards(self) -> None:
+        self._shards()
+        self.assertEqual(cfg.text_encoder_files(self.root, cfg.ENCODER_BF16_SOURCE), [self.root / "text_encoder" / "model-1.safetensors", self.root / "text_encoder" / "model-2.safetensors"])
+        self.assertEqual(cfg.text_encoder_availability(self.root, cfg.ENCODER_BF16_SOURCE), (None, 15))
+
+    def test_a_gguf_encoder_needs_its_file_and_the_directory_but_no_shards(self) -> None:
+        gguf = self.root / "text_encoder_gguf" / "enc.gguf"
+        source = cfg.EncoderSource("q4_k_m", gguf)
+        reason, size = cfg.text_encoder_availability(self.root, source)
+        self.assertEqual(size, 0)
+        self.assertIn("text_encoder", reason or "")
+        (self.root / "text_encoder").mkdir()
+        reason, _ = cfg.text_encoder_availability(self.root, source)
+        self.assertIn("q4_k_m", reason or "")
+        gguf.parent.mkdir()
+        gguf.write_bytes(b"x" * 7)
+        self.assertEqual(cfg.text_encoder_availability(self.root, source), (None, 7))
+        self.assertEqual(cfg.text_encoder_files(self.root, source), [gguf])
+        # The bf16 shards are absent: only the bf16 source is unavailable.
+        reason, _ = cfg.text_encoder_availability(self.root, cfg.ENCODER_BF16_SOURCE)
+        self.assertIn("model.safetensors.index.json", reason or "")
 
 
 if __name__ == "__main__":

@@ -426,7 +426,7 @@
           "ram_bytes": 30030367752
         },
         "encode_standalone": {
-          "vram_bytes": 600834048,
+          "vram_bytes": 0,
           "ram_bytes": 12423465992
         },
         "denoise": {
@@ -467,7 +467,7 @@
           "ram_bytes": 30030367752
         },
         "encode_standalone": {
-          "vram_bytes": 600834048,
+          "vram_bytes": 0,
           "ram_bytes": 12423465992
         },
         "denoise": {
@@ -590,7 +590,7 @@
           "ram_bytes": 12423465992
         },
         "encode_standalone": {
-          "vram_bytes": 600834048,
+          "vram_bytes": 0,
           "ram_bytes": 12423465992
         },
         "denoise": {
@@ -631,7 +631,7 @@
           "ram_bytes": 12423465992
         },
         "encode_standalone": {
-          "vram_bytes": 600834048,
+          "vram_bytes": 0,
           "ram_bytes": 12423465992
         },
         "denoise": {
@@ -672,7 +672,7 @@
           "ram_bytes": 12423465992
         },
         "encode_standalone": {
-          "vram_bytes": 600834048,
+          "vram_bytes": 0,
           "ram_bytes": 12423465992
         },
         "denoise": {

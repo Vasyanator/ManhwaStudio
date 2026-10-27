@@ -2,56 +2,82 @@
 File: modules/ai_backend/inpaint/flux3_klein/large_model.py
 
 Purpose:
-FLUX.3 klein as the large-model manager sees it: the `LargeModelSpec`s
-(components, residency blocks, phase table, weight formats, residency key) that
-`runtime.large_models.manager.LargeModelManager` plans, loads and drives a run
-with, plus the request-shape arithmetic the forecast needs.
+FLUX.3 klein as the large-model manager sees it: the two `LargeModelSpec`s
+of one run — the PIPELINE handle (DiT + AE) and the TEXT-ENCODER handle —
+(components, residency blocks, phase tables, weight formats, residency keys)
+that `runtime.large_models.manager.LargeModelManager` plans, loads and drives a
+run with, the two-handle phase names (`FLUX3_PAIR`, for
+`runtime.large_models.paired`), plus the request-shape arithmetic the forecast
+needs.
 
 Main responsibilities:
-- `Flux3ModelOptions` - what every spec callable receives (the user's
-  `Flux3Options`, the run device, the concrete fp8 path);
-- `model_name` / `model_specs` / `build_spec` - one registered model per
-  (encoder mode, AE dtype), all of family `FAMILY`;
-- `residency_key` - one manager handle per loaded byte set (the manager adds
-  the host pin, `LargeModelSpec.key`);
-- `formats` - bf16 / fp8r / nvfp4 with availability, DiT size, compute path,
-  quality rank (the user's choice; the manager never changes it);
+- `Flux3ModelOptions` - what every spec callable of both handles receives (the
+  user's `Flux3Options`, the run device, the concrete fp8 path);
+- `pipeline_model_name` / `pipeline_spec` - one registered pipeline model per
+  AE dtype (`flux3_klein.ae_<dtype>`); `encoder_model_name` / `encoder_spec` -
+  one registered encoder model per encoder mode
+  (`flux3_klein_text_encoder.<text|vl_refs>`); `model_specs` - all four, every
+  one of family `FAMILY`;
+- `pipeline_key` / `encoder_key` - one manager handle per loaded byte set of
+  each handle (the manager adds the encoder's host pin, `LargeModelSpec.key`);
+- `formats` - one row per offered DiT format (`Flux3Options.dit_formats`:
+  natives and GGUF files) with availability, DiT size, compute path, quality
+  rank = offer order (the user's choice; the manager never changes it);
+  `encoder_formats` - one row per offered encoder format
+  (`Flux3Options.encoder_formats`: bf16 and GGUF files), a GGUF row
+  unavailable in VL_REFS mode (D6);
+- `dit_source` / `encoder_source` - the offered source a format id names;
 - `request_shape`, `caption_token_bound`, `reference_pixel_bound` - the
   `RequestShape` of a request and the per-phase `PhaseWork` derived from it.
 
 Components (names `COMPONENT_*`):
-- `dit` (role DIT, run device only): blocks in EXECUTION order — per depth `d`
-  `content_mode_blocks.image.d`, `content_mode_blocks.image_cond.d`,
+- pipeline `dit` (role DIT, run device only): blocks in EXECUTION order — per
+  depth `d` `content_mode_blocks.image.d`, `content_mode_blocks.image_cond.d`,
   `txt_mode_blocks.d`, then `single_blocks.0..n` (the residency hooks prefetch
   the next block of that order); embedders, modulations and the final layer
   are non-block weights. Floats become bf16, quantized payloads stay as stored
-  (`loading.convert_dit_tensor`).
-- `encoder` (role ENCODER, run device or CPU): the truncated Qwen3-VL (33 of
-  36 layers), blocks = its decoder layers (`layers.N` in TEXT,
+  (`loading.convert_dit_tensor`): fp8r / nvfp4 payloads, and a GGUF DiT's
+  block-quantized `uint8` rows (`runtime.gguf_layers` modules, dequantized per
+  forward; compute path `gguf`).
+- pipeline `ae` (role AE, run device only): monolithic, in the model's AE
+  dtype (BatchNorm statistics stay float32).
+- encoder `encoder` (role ENCODER, run device or CPU): the truncated Qwen3-VL
+  (33 of 36 layers), blocks = its decoder layers (`layers.N` in TEXT,
   `language_model.layers.N` in VL_REFS; the vision tower is a non-block
-  weight), bf16.
-- `ae` (role AE, run device only): monolithic, in the model's AE dtype
-  (BatchNorm statistics stay float32).
+  weight), bf16. Its files are the planned FORMAT's (`encoder_source`): the
+  bf16 shards or a GGUF file; GGUF names (`blk.N.*`, `token_embd`, ...) are
+  bridged by `runtime.qwen3_gguf` onto the `Qwen3VLTextModel` keys (TEXT mode
+  only), quantized tensors stay `uint8` rows (`gguf_layers`), and the encode
+  work is variant `ENCODE_VARIANT_GGUF` (never a borrowed bf16 measurement).
 
-Phases, in run order: `encode` (encoder), `ref_encode` (ae: the reference AE
-encode), `denoise` (dit), `decode` (ae).
+Phases, in run order: encoder `encode`; pipeline `ref_encode` (ae: the
+reference AE encode), `denoise` (dit), `decode` (ae).
 
 Notes:
-- Why four models and not one: the manager caches a component inventory per
-  (model, format, files), and `ComponentSpec.convert` / `device_itemsize` see
-  no options. The encoder mode changes the encoder's state keys (a different
-  module) and the AE dtype its device bytes, so each (mode, AE dtype) pair is
-  its own registered model; the residency key keeps their handles apart too.
+- Why two handles: a run whose prompt needs no encode (the prompt cache, a
+  later package) must not acquire, read or forecast the encoder at all; and
+  the encoder handle is the second admission of the two-handle memory rule
+  (`runtime.large_models.paired`, phases `FLUX3_PAIR`: the encoder runs beside
+  the pipeline's `ref_encode`-state weights).
+- Why one registered model per AE dtype / encoder mode: the manager caches a
+  component inventory per (model, format, files), and `ComponentSpec.convert`
+  / `device_itemsize` see no options. The encoder mode changes the encoder's
+  state keys (a different module), the AE dtype its device bytes; the
+  residency keys keep their handles apart too.
 - No model-specific degrade rung (`fallbacks=()`): `reference_max_pixels` and
   the AE dtype are the user's quality choices, the port has no tiled AE, and
   "encoder on the CPU" is a step placement (`tiers.template_for`) or, under
-  `Flux3Options.encoder_on_cpu`, the spec's host pin (`_host_pin`).
+  `Flux3Options.encoder_on_cpu`, the encoder spec's host pin (`_host_pin`).
 - Forecast inputs are UPPER bounds where the exact figure needs the tokenizer
   (`caption_token_bound`) or the reference preparation (`reference_pixel_bound`):
-  a forecast may be high, never low because of them.
+  a forecast may be high, never low because of them. The encode work's
+  variant follows the SELECTED encoder (`options.encoder`; `PhaseWork`
+  callables see no format), so another encoder format's `formats` row is
+  planned with the selected one's activation cost (display only).
 - Torch-free at import: the loader callables import `loading` /
   `autoencoder` / `text_encoder` on call and look them up as
-  `<module>.<name>` (the tests patch them there).
+  `<module>.<name>` (the tests patch them there); `runtime.qwen3_gguf` builds
+  its name tables (transformers) only when a GGUF name is seen.
 """
 
 from __future__ import annotations
@@ -59,34 +85,43 @@ from __future__ import annotations
 import logging
 import math
 import re
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, assert_never
 
+from ...runtime import qwen3_gguf
 from ...runtime.encoder_truncation import keep_layers_for_hidden_states
+from ...runtime.large_models.paired import PairPhases
 from ...runtime.large_models.spec import ComponentSpec, ExecDevice, FormatInfo, LargeModelSpec, PhaseSpec, PhaseWork, RequestShape, Role
 from .config import (
     TEXT_MAX_TOKENS,
     TEXT_OUTPUT_LAYERS,
     TEXT_PAD_MULTIPLE,
+    DitSource,
+    EncoderSource,
+    GgufDit,
     SamplerConfig,
     WeightFormat,
     package_ae_file,
     package_text_encoder_dir,
     read_package_config,
     resolve_model_files,
-    text_encoder_shards,
+    text_encoder_availability,
+    text_encoder_files,
     text_mode_key_map,
-    variant_availability,
     vl_mode_key_map,
 )
 from .params import MAX_SIDE, MIN_SIDE, SIDE_MULTIPLE, AeDtype, EncoderMode, Flux3Options, Fp8Compute
 
 log = logging.getLogger(__name__)
 
-#: Calibration family of every FLUX.3 klein model (`calibration/*.json` keys).
+#: Calibration family of every FLUX.3 klein model of both handles
+#: (`calibration/*.json` keys), and the pipeline's model-name / key prefix.
 FAMILY = "flux3_klein"
+
+#: Model-name / residency-key prefix of the text-encoder handle.
+ENCODER_MODEL = "flux3_klein_text_encoder"
 
 COMPONENT_DIT = "dit"
 COMPONENT_ENCODER = "encoder"
@@ -97,13 +132,23 @@ PHASE_REF_ENCODE = "ref_encode"
 PHASE_DENOISE = "denoise"
 PHASE_DECODE = "decode"
 
+#: The two-handle rule's phase names (`runtime.large_models.paired`): the
+#: pipeline's phases bound the run; the encoder runs beside the pipeline's
+#: `ref_encode`-state weights (a run enters `ref_encode` placement before it
+#: encodes).
+FLUX3_PAIR = PairPhases(pipeline=(PHASE_REF_ENCODE, PHASE_DENOISE, PHASE_DECODE), rest=PHASE_REF_ENCODE, encode=PHASE_ENCODE)
+
 #: Compute paths (`FormatInfo.compute_path`, calibration keys).
 PATH_NATIVE = "native"
 PATH_SCALED_MM = "scaled_mm"
 PATH_DEQUANT = "dequant"
+PATH_GGUF = "gguf"
 
-#: Output quality order of the formats, higher = better.
-QUALITY_RANK: Mapping[WeightFormat, int] = {WeightFormat.BF16: 3, WeightFormat.FP8R: 2, WeightFormat.NVFP4: 1}
+#: `PhaseWork.variant` of the encode phase: the bf16 encoder in each mode, and
+#: a GGUF encoder (TEXT only), whose cost is its own calibration entry.
+ENCODE_VARIANT_TEXT = "text"
+ENCODE_VARIANT_VL = "vl"
+ENCODE_VARIANT_GGUF = "text_gguf"
 
 #: Decoder layers the encoder keeps (the rule: `runtime.encoder_truncation`).
 ENCODER_KEEP_LAYERS = keep_layers_for_hidden_states(TEXT_OUTPUT_LAYERS)
@@ -162,28 +207,81 @@ class Flux3ModelOptions:
             raise ValueError("Flux3ModelOptions: fp8_compute должен быть выбранным путём (scaled_mm или dequant), а не auto")
 
 
-def model_name(encoder_mode: EncoderMode, ae_dtype: AeDtype) -> str:
-    """The registered model name of (`encoder_mode`, `ae_dtype`): `flux3_klein.<mode>.ae_<dtype>`."""
-    return f"{FAMILY}.{encoder_mode.value}.ae_{ae_dtype.value}"
+def pipeline_model_name(ae_dtype: AeDtype) -> str:
+    """The registered pipeline model of `ae_dtype`: `flux3_klein.ae_<dtype>`."""
+    return f"{FAMILY}.ae_{ae_dtype.value}"
 
 
-def residency_key(options: Flux3Options, weight_format: str, device: str) -> str:
-    """The manager handle key of `options` loaded in `weight_format` on `device`.
+def encoder_model_name(encoder_mode: EncoderMode) -> str:
+    """The registered text-encoder model of `encoder_mode`: `flux3_klein_text_encoder.<mode>`."""
+    return f"{ENCODER_MODEL}.{encoder_mode.value}"
 
-    Changes whenever the loaded bytes or modules would: format, device, the
-    requested fp8 path (fp8 layers carry it), AE dtype, encoder mode, package
-    root. `reference_max_pixels`, the resource steps and the request do not change the
-    weights and are not in it.
+
+def dit_source(options: Flux3Options, weight_format: str) -> DitSource:
+    """The offered DiT format (`options.dit_formats`) whose id is `weight_format`.
+
+    # Raises
+    `ValueError` naming the offered ids when `weight_format` is not one of them.
     """
-    return (
-        f"{FAMILY}:{weight_format}|{device}|{options.fp8_compute.value}"
-        f"|{options.ae_dtype.value}|{options.encoder_mode.value}|{options.model_root.absolute()}"
-    )
+    for source in options.dit_formats:
+        if source.value == weight_format:
+            return source
+    raise ValueError(f"FLUX.3 klein: формат DiT «{weight_format}» не входит в предложенные {[source.value for source in options.dit_formats]}")
 
 
-def compute_path(weight_format: WeightFormat, fp8_compute: Fp8Compute) -> str:
-    """How `weight_format`'s matmuls run: bf16 native, nvfp4 dequant (no FP4 kernel), fp8r per `fp8_compute`."""
-    match weight_format:
+def encoder_source(options: Flux3Options, weight_format: str) -> EncoderSource:
+    """The offered encoder format (`options.encoder_formats`) whose id is `weight_format`.
+
+    # Raises
+    `ValueError` naming the offered ids when `weight_format` is not one of them.
+    """
+    for source in options.encoder_formats:
+        if source.id == weight_format:
+            return source
+    raise ValueError(f"FLUX.3 klein: формат текстового энкодера «{weight_format}» не входит в предложенные {[source.id for source in options.encoder_formats]}")
+
+
+def pipeline_key(options: Flux3Options, weight_format: str, device: str) -> str:
+    """The pipeline handle key of `options` loaded in DiT format `weight_format` on `device`.
+
+    `flux3_klein:{format}|{device}|{fp8 requested}|{ae dtype}|{root}`, then
+    `|dit=<path>` for a GGUF DiT (two files may share an id): everything that
+    changes the DiT's or the AE's loaded bytes or modules. The encoder (its
+    mode, format, pin) is the other handle's; `reference_max_pixels`, the
+    resource steps and the request do not change the weights.
+
+    # Raises
+    `ValueError` when `weight_format` is not offered (`dit_source`).
+    """
+    key = f"{FAMILY}:{weight_format}|{device}|{options.fp8_compute.value}|{options.ae_dtype.value}|{options.model_root.absolute()}"
+    source = dit_source(options, weight_format)
+    if isinstance(source, GgufDit):
+        key += f"|dit={source.path}"
+    return key
+
+
+def encoder_key(options: Flux3Options, weight_format: str, device: str) -> str:
+    """The text-encoder handle key of `options` loaded in encoder format `weight_format` on `device`.
+
+    `flux3_klein_text_encoder:{format}|{device}|{encoder mode}|{root}`, then
+    `|enc=<path>` for a GGUF encoder (two files may share an id); the manager
+    appends `|host_pin=encoder` under «Энкодер на CPU» (`LargeModelSpec.key`).
+
+    # Raises
+    `ValueError` when `weight_format` is not offered (`encoder_source`).
+    """
+    source = encoder_source(options, weight_format)
+    key = f"{ENCODER_MODEL}:{source.id}|{device}|{options.encoder_mode.value}|{options.model_root.absolute()}"
+    if source.path is not None:
+        key += f"|enc={source.path}"
+    return key
+
+
+def compute_path(source: DitSource, fp8_compute: Fp8Compute) -> str:
+    """How `source`'s matmuls run: bf16 native, nvfp4 dequant (no FP4 kernel), fp8r per `fp8_compute`, GGUF `gguf` (per-forward dequant)."""
+    if isinstance(source, GgufDit):
+        return PATH_GGUF
+    match source:
         case WeightFormat.BF16:
             return PATH_NATIVE
         case WeightFormat.NVFP4:
@@ -191,7 +289,7 @@ def compute_path(weight_format: WeightFormat, fp8_compute: Fp8Compute) -> str:
         case WeightFormat.FP8R:
             return PATH_SCALED_MM if fp8_compute is Fp8Compute.SCALED_MM else PATH_DEQUANT
         case _:
-            assert_never(weight_format)
+            assert_never(source)
 
 
 # =====================================================================
@@ -254,8 +352,14 @@ def _text_tokens(shape: RequestShape, options: Flux3Options) -> int:
 
 
 def _encode_work(shape: RequestShape, model_options: Flux3ModelOptions) -> PhaseWork:
-    variant = "vl" if model_options.options.encoder_mode is EncoderMode.VL_REFS else "text"
-    return PhaseWork(tokens=_text_tokens(shape, model_options.options), variant=variant)
+    options = model_options.options
+    if options.encoder.is_gguf:
+        variant = ENCODE_VARIANT_GGUF
+    elif options.encoder_mode is EncoderMode.VL_REFS:
+        variant = ENCODE_VARIANT_VL
+    else:
+        variant = ENCODE_VARIANT_TEXT
+    return PhaseWork(tokens=_text_tokens(shape, options), variant=variant)
 
 
 def _ref_encode_work(shape: RequestShape, model_options: Flux3ModelOptions) -> PhaseWork:
@@ -309,14 +413,16 @@ def dit_device_itemsize(file_key: str, dtype_token: str) -> int | None:
 
 
 def _dit_files(model_options: Flux3ModelOptions, weight_format: str) -> list[Path]:
-    return [resolve_model_files(model_options.options.model_root, WeightFormat(weight_format)).dit_file]
+    options = model_options.options
+    return [resolve_model_files(options.model_root, dit_source(options, weight_format)).dit_file]
 
 
 def _build_dit(model_options: Flux3ModelOptions, weight_format: str) -> Any:
     from . import loading
 
-    variant = WeightFormat(weight_format)
-    files = resolve_model_files(model_options.options.model_root, variant)
+    options = model_options.options
+    variant = dit_source(options, weight_format)
+    files = resolve_model_files(options.model_root, variant)
     fp8 = model_options.fp8_compute if variant is WeightFormat.FP8R else None
     return loading.build_dit_meta(files, read_package_config(files.dit_config), variant=variant, fp8_compute_applied=fp8)
 
@@ -337,15 +443,32 @@ def _encoder_layout(mode: EncoderMode) -> tuple[Callable[[str], str | None], re.
             assert_never(mode)
 
 
+def _is_gguf_name(file_key: str) -> bool:
+    """Whether an encoder file key is a llama.cpp GGUF name. The bf16 shards' keys all start with
+    `model.`, checked first, so a bf16 encoder never builds `qwen3_gguf`'s name tables."""
+    return not file_key.startswith("model.") and qwen3_gguf.is_gguf_encoder_name(file_key)
+
+
 def _encoder_component(mode: EncoderMode) -> ComponentSpec:
     key_map, layer = _encoder_layout(mode)
 
+    def state_key(file_key: str) -> str | None:
+        """The state key of one encoder file key (bf16 shard or GGUF name), `None` = never read."""
+        if _is_gguf_name(file_key):
+            if mode is not EncoderMode.TEXT:
+                # Unreachable through `Flux3Options` (it refuses VL_REFS with a
+                # GGUF encoder): a GGUF has no vision tower to fill.
+                raise ValueError(f"FLUX.3 klein: тензор GGUF «{file_key}» в режиме энкодера «{mode.value}» (GGUF — только текстовый режим)")
+            return qwen3_gguf.encoder_state_key_of_gguf(file_key, ENCODER_KEEP_LAYERS)
+        return key_map(file_key)
+
     def files(model_options: Flux3ModelOptions, weight_format: str) -> list[Path]:
-        return text_encoder_shards(package_text_encoder_dir(model_options.options.model_root))
+        options = model_options.options
+        return text_encoder_files(options.model_root, encoder_source(options, weight_format))
 
     def state_keys_of(file_key: str) -> tuple[str, ...]:
-        state_key = key_map(file_key)
-        return () if state_key is None else (state_key,)
+        found = state_key(file_key)
+        return () if found is None else (found,)
 
     def block_of(state_key: str) -> str | None:
         match = layer.match(state_key)
@@ -357,14 +480,21 @@ def _encoder_component(mode: EncoderMode) -> ComponentSpec:
     def build_meta(model_options: Flux3ModelOptions, weight_format: str) -> Any:
         from . import text_encoder
 
-        return text_encoder.build_text_encoder_meta(package_text_encoder_dir(model_options.options.model_root), mode=mode, keep_layers=ENCODER_KEEP_LAYERS)
+        options = model_options.options
+        directory = package_text_encoder_dir(options.model_root)
+        source = encoder_source(options, weight_format)
+        if source.path is not None:
+            return text_encoder.build_gguf_text_encoder_meta(directory, source.path, format_id=source.id, keep_layers=ENCODER_KEEP_LAYERS)
+        return text_encoder.build_text_encoder_meta(directory, mode=mode, keep_layers=ENCODER_KEEP_LAYERS)
 
     def convert(file_key: str, tensor: Any) -> Iterator[tuple[str, Any]]:
         import torch
 
-        state_key = key_map(file_key)
-        if state_key is not None:
-            yield state_key, tensor.to(torch.bfloat16) if tensor.is_floating_point() else tensor
+        # Floats (the shards' bf16, a GGUF's F32 norms) become bf16; a GGUF's
+        # block-quantized `uint8` rows stay as stored for `gguf_layers`.
+        found = state_key(file_key)
+        if found is not None:
+            yield found, tensor.to(torch.bfloat16) if tensor.is_floating_point() else tensor
 
     return ComponentSpec(
         COMPONENT_ENCODER,
@@ -420,24 +550,53 @@ def _ae_component(ae_dtype: AeDtype) -> ComponentSpec:
 #  Formats and the spec
 # =====================================================================
 def formats(model_options: Flux3ModelOptions) -> dict[str, FormatInfo]:
-    """Every weight format of the package under `model_options.options.model_root` (file checks only).
+    """One row per offered DiT format (`Flux3Options.dit_formats`, in offer order; file checks only).
 
-    `dit_bytes` is the DiT checkpoint's file size (quantized payloads stay
-    quantized on the device, other tensors are stored bf16), 0 when absent.
+    `available` = the format's DiT file, its `config.json` and the AE exist
+    (`resolve_model_files`; `reason` names what is missing; the encoder is the
+    other handle's and never makes a DiT row unavailable); `dit_bytes` is the DiT file's size (quantized payloads stay
+    quantized on the device, other tensors are stored bf16), 0 when absent;
+    `quality_rank` = count - index (the client offers best first: bf16 >
+    fp8r > q8_0 > ... in the catalog's order).
     """
-    root = model_options.options.model_root
-    availability = variant_availability(root)
+    options = model_options.options
+    count = len(options.dit_formats)
     result: dict[str, FormatInfo] = {}
-    for variant in WeightFormat:
-        reason = availability[variant]
+    for index, source in enumerate(options.dit_formats):
+        reason: str | None = None
         size = 0
-        if reason is None:
-            dit_file = resolve_model_files(root, variant).dit_file
+        try:
+            dit_file = resolve_model_files(options.model_root, source).dit_file
+        except FileNotFoundError as exc:
+            reason = str(exc)
+        else:
             try:
                 size = dit_file.stat().st_size
             except OSError as exc:
                 log.warning("FLUX.3 klein: размер %s не прочитан (%s)", dit_file, exc)
-        result[variant.value] = FormatInfo(available=reason is None, reason=reason, dit_bytes=size, compute_path=compute_path(variant, model_options.fp8_compute), quality_rank=QUALITY_RANK[variant])
+        result[source.value] = FormatInfo(available=reason is None, reason=reason, dit_bytes=size, compute_path=compute_path(source, model_options.fp8_compute), quality_rank=count - index)
+    return result
+
+
+def encoder_formats(model_options: Flux3ModelOptions) -> dict[str, FormatInfo]:
+    """One row per offered encoder format (`Flux3Options.encoder_formats`, in offer order; file checks only).
+
+    `available` = the format's weights and the `text_encoder/` directory exist
+    (`config.text_encoder_availability`; `reason` names what is missing) and,
+    in `EncoderMode.VL_REFS`, the format is not a GGUF file (D6: a GGUF holds
+    no vision tower); `dit_bytes` is the weight files' size (0 when absent);
+    `compute_path` `gguf` for a GGUF file, else `native`; `quality_rank` =
+    count - index (the client offers bf16 first).
+    """
+    options = model_options.options
+    count = len(options.encoder_formats)
+    result: dict[str, FormatInfo] = {}
+    for index, source in enumerate(options.encoder_formats):
+        reason, size = text_encoder_availability(options.model_root, source)
+        if reason is None and source.is_gguf and options.encoder_mode is EncoderMode.VL_REFS:
+            reason = f"FLUX.3 klein: текстовый энкодер «{source.id}» (GGUF) работает только в текстовом режиме: режим «{EncoderMode.VL_REFS.value}» показывает референсы зрительной части Qwen3-VL, которой в GGUF нет"
+            size = 0
+        result[source.id] = FormatInfo(available=reason is None, reason=reason, dit_bytes=size, compute_path=PATH_GGUF if source.is_gguf else PATH_NATIVE, quality_rank=count - index)
     return result
 
 
@@ -446,15 +605,19 @@ def _host_pin(model_options: Flux3ModelOptions) -> tuple[str, ...]:
     return (COMPONENT_ENCODER,) if model_options.options.encoder_on_cpu else ()
 
 
-def _key_of(model_options: Flux3ModelOptions, weight_format: str, device: str) -> str:
-    return residency_key(model_options.options, weight_format, device)
+def _pipeline_key_of(model_options: Flux3ModelOptions, weight_format: str, device: str) -> str:
+    return pipeline_key(model_options.options, weight_format, device)
 
 
-def build_spec(encoder_mode: EncoderMode, ae_dtype: AeDtype) -> LargeModelSpec:
-    """The `LargeModelSpec` of FLUX.3 klein with the `encoder_mode` encoder and an `ae_dtype` AE.
+def _encoder_key_of(model_options: Flux3ModelOptions, weight_format: str, device: str) -> str:
+    return encoder_key(model_options.options, weight_format, device)
+
+
+def pipeline_spec(ae_dtype: AeDtype) -> LargeModelSpec:
+    """The pipeline `LargeModelSpec` (DiT + `ae_dtype` AE; phases `ref_encode`, `denoise`, `decode`; formats = the offered DiT formats).
 
     Its callables take `Flux3ModelOptions` (the manager passes the options it
-    was given through unchanged).
+    was given through unchanged); it never pins a component to the host.
     """
     dit = ComponentSpec(
         COMPONENT_DIT,
@@ -468,20 +631,37 @@ def build_spec(encoder_mode: EncoderMode, ae_dtype: AeDtype) -> LargeModelSpec:
     )
     return LargeModelSpec(
         family=FAMILY,
-        components=(dit, _encoder_component(encoder_mode), _ae_component(ae_dtype)),
+        components=(dit, _ae_component(ae_dtype)),
         phases=(
-            PhaseSpec(PHASE_ENCODE, frozenset({COMPONENT_ENCODER}), COMPONENT_ENCODER, _encode_work),
             PhaseSpec(PHASE_REF_ENCODE, frozenset({COMPONENT_AE}), COMPONENT_AE, _ref_encode_work),
             PhaseSpec(PHASE_DENOISE, frozenset({COMPONENT_DIT}), COMPONENT_DIT, _denoise_work),
             PhaseSpec(PHASE_DECODE, frozenset({COMPONENT_AE}), COMPONENT_AE, _decode_work),
         ),
         formats=formats,
-        key_of=_key_of,
+        key_of=_pipeline_key_of,
+        fallbacks=(),
+    )
+
+
+def encoder_spec(encoder_mode: EncoderMode) -> LargeModelSpec:
+    """The text-encoder `LargeModelSpec` of `encoder_mode` (one component, phase `encode`; formats = the offered encoder formats).
+
+    Its callables take `Flux3ModelOptions`; the format the manager plans picks
+    the files (`encoder_source`). «Энкодер на CPU» is its host pin.
+    """
+    return LargeModelSpec(
+        family=FAMILY,
+        components=(_encoder_component(encoder_mode),),
+        phases=(PhaseSpec(PHASE_ENCODE, frozenset({COMPONENT_ENCODER}), COMPONENT_ENCODER, _encode_work),),
+        formats=encoder_formats,
+        key_of=_encoder_key_of,
         fallbacks=(),
         host_pin_of=_host_pin,
     )
 
 
 def model_specs() -> dict[str, LargeModelSpec]:
-    """Every FLUX.3 klein model to register with the manager, by `model_name`."""
-    return {model_name(mode, ae_dtype): build_spec(mode, ae_dtype) for mode in EncoderMode for ae_dtype in AeDtype}
+    """Every FLUX.3 klein model to register with the manager, by name: a pipeline per AE dtype, an encoder per encoder mode."""
+    specs = {pipeline_model_name(ae_dtype): pipeline_spec(ae_dtype) for ae_dtype in AeDtype}
+    specs.update({encoder_model_name(mode): encoder_spec(mode) for mode in EncoderMode})
+    return specs

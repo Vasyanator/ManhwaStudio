@@ -131,12 +131,18 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   backend memory budget (usable memory: `modules/ai_backend/runtime/memory_budget.py`; ledger and
   reclaim: `runtime/residency/`), large-model placement / forecast / degrade
   (`runtime/large_models/`: a model service declares specs and phases, never moves a weight),
+  the two-handle (pipeline + encoder) memory rule — combined VRAM-axis ceiling, encoder cap,
+  the two-handle profiles answer (`runtime/large_models/paired.py`, bound per model by `PairPhases`),
+  prompt-cache orchestration — memory embeddings, what serves each needed text, build / list /
+  export / import (`runtime/prompt_cache_service.py`; a model plugs in a `PromptCacheAdapter`), the
+  prompt-cache controller, its gates, cache line, jobs and UI (`ms-tab-cleaning`
+  `engines/shared/prompt_cache*`),
   checkpoint -> meta-module filling (`runtime.safetensors_stream.fill_module_from_safetensors`),
   weight-container dispatch (`runtime/tensor_container`; GGUF header parsing `runtime/gguf_stream`),
   GGUF dequantizing layers (`runtime/gguf_layers`; never set `DIFFUSERS_GGUF_CUDA_KERNELS`, ROCm
   reports a CUDA-like capability), the FLUX.2 weight-format list (`ms_config::Flux2WeightFormat`;
   Python lists no quants), llama.cpp <-> HF Qwen3 tensor names (the `gguf` package's own map via
-  `flux2_klein/encoder_gguf.py`), adoption of present-but-unmarked catalog files
+  `runtime/qwen3_gguf.py`, shared by FLUX.2 and FLUX.3), adoption of present-but-unmarked catalog files
   (`ms_sysprobe::ai_models::external::adopt_external_model`), the FLUX.2 encoder source and its
   offered formats (`ms_config::Flux2EncoderSource` + `Flux2WeightFormat::offered_for`), the
   Hugging Face gated-access check (`ms_sysprobe::ai_models::hf_access`), the uncensored encoder's
@@ -270,11 +276,11 @@ Reformatting is acceptable only once proven inert this way.
   `ru.json`. `es` / `fr` / `pt` are translated separately and fall back to `en`; do not block on
   them.
 - If a string's meaning or context is unclear, ask the user; never invent a translation.
-- Never change the `{placeholder}` set of an existing key: the editable on-disk catalog
+- Never reword an existing key or change its `{placeholder}` set: the editable on-disk catalog
   (`locale/*.json`, reconciled by `ms_config::locale_store`, which adds keys and never
-  overwrites) keeps the old text on every existing install, so the new arguments are not
-  substituted (seen: «Продолжить загрузку ({done} из {total})»). Add a key with a new id instead
-  and remove the old one.
+  overwrites) keeps the old text on every existing install — the new wording never shows and
+  new arguments are not substituted (seen: «Продолжить загрузку ({done} из {total})»). Add a key
+  with a new id instead and remove the old one (a pure typo fix may stay in place).
 - A message that names a button substitutes the button's label via `{button}`, never a literal
   copy.
 - Exceptions (logs, protocol ids, persistence keys, on-disk names, probes) only per

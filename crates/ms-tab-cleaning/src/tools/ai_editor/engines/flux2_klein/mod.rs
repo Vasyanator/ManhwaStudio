@@ -89,7 +89,8 @@ Submodules (each re-exported into this root with `use <name>::*;`):
 - `ui/`: the parameter panel. `mod.rs` is the body and its ORDER; `install.rs`,
   `components.rs`, `advanced.rs` and `mask_hint.rs` draw the blocks it calls into.
 - `decisions.rs`: the PURE decisions the panel renders — `flux2_readiness_line`,
-  `flux2_prompt_cache_line` (+ `flux2_encoder_caption`), `flux2_run_block_reason`,
+  `flux2_encoder_caption` (the caption the shared cache line and picker show),
+  `flux2_run_block_reason`,
   `region_block_reason` — kept apart
   from the drawing so they can be asserted without a frame.
 - `settings.rs`: `Flux2KleinSettings` and everything persisted with it — the dtype
@@ -99,9 +100,10 @@ Submodules (each re-exported into this root with `use <name>::*;`):
 - `status.rs`: the `.status` component catalog (`Flux2Status`) and every verdict derived
   from it — `Flux2ModelReadiness`, the merged component rows, the install-fold seed and
   `flux2_pipeline_busy`.
-- `prompt_cache.rs`: the FLUX.2 side of the model's shared prompt library — what
-  «Кэшировать» offers (`flux2_cache_button`), the export / import gates and the whole
-  `.prompt_cache.*` wire block (the listing shapes and preset rules are `../shared/`).
+- `prompt_cache.rs`: the FLUX.2 bindings of the shared prompt-cache controller — the
+  method family (`FLUX2_PROMPT_CACHE_METHODS`), the encoder context the «Кэшировать» gate
+  reads (`flux2_cache_context`) and the request header; the gates, the cache line, the jobs
+  and the drawing are `../shared/prompt_cache*.rs`.
 - The memory forecast is NOT a file here: it is `large_models.profiles`, asked through
   `ms_local_ai::large_models::ProfilesQuery` (latest wins, one in flight) and drawn by the
   shared `ai_editor::large_model_resources` widget.
@@ -123,7 +125,7 @@ Submodules (each re-exported into this root with `use <name>::*;`):
 
 Key items:
 - `Flux2KleinEngine`: the `AiEngine` implementation and its wiring.
-- `flux2_readiness_line` / `flux2_prompt_cache_line` / `flux2_component_rows`: the panel's
+- `flux2_readiness_line` / `flux2_component_rows` (and the shared `prompt_cache_line`): the panel's
   decisions, kept as PURE functions with unit tests. What a line says, which fact wins the
   one line the prompt block has for it, and how a component's two halves are joined are
   contracts; the drawing code only renders their answers.
@@ -188,7 +190,7 @@ IPC (`backend_ipc::protocol`):
   enough. The run gate waives the encoder path when `.status` says the prompt is served,
   and only then. What the absence costs is stated where it happens: the one line under the
   prompt takes the warning ("only ready caches work") unless the prompt is served, in which
-  case the affirmative wins (`flux2_prompt_cache_line`), and «Кэшировать» is closed (it must
+  case the affirmative wins (the shared `prompt_cache_line`), and «Кэшировать» is closed (it must
   ENCODE). The picker, «Экспорт» and «Импорт» keep working throughout.
 - `.prompt_cache.*` (protocol 23) — the model's shared prompt LIBRARY: one per checkpoint
   (`params.prompt_library` = `Flux2Variant::prompt_library_id`), any encoder variant may
@@ -265,7 +267,7 @@ Contracts:
   never empty: an empty prompt blocks the run, so `FLUX2_DEFAULT_PROMPT` is substituted
   both for a fresh settings file and for one whose prompt is missing or blank.
 - `.status` and `.prompt_cache.list` are re-queried through the SAME one-shot arming as
-  the memory forecast (`status_wanted`, `prompt_cache_list_wanted`): a change re-arms
+  the memory forecast (`status_wanted`, `prompt_cache.list_wanted`): a change re-arms
   the flag, and at most one query is ever in flight, so editing the prompt cannot turn
   a keystroke into a request. A `prompt_cached` answer is shown only while the prompt it
   was asked about still equals the one in the field.
@@ -300,7 +302,7 @@ use ms_config::{Flux2EncoderSource, Flux2Variant, Flux2WeightAxis, Flux2WeightFo
 // SDXL engine is the other cleaning consumer).
 use ms_sysprobe::ai_models::external::ExternalModelSpec;
 use ms_sysprobe::ai_models::external_catalog::{Flux2TransformerLayout, flux2_klein_package_specs, flux2_klein_spec};
-use ms_tab_translation::ocr_model_download::{JobKind, OcrModelDownloadController, OcrModelDownloadState, OcrModelPanelSnapshot, bundle_key};
+use ms_tab_translation::ocr_model_download::{OcrModelDownloadController, OcrModelDownloadState, OcrModelPanelSnapshot, bundle_key};
 use ms_tab_translation::panels::ocr_model_download::{ModelDownloadAction, draw_ocr_model_download};
 use crate::tools::base::RegionEditToolBase;
 use crate::tools::region_edit_v2::geometry::{AspectLimit, FrameConstraints};
@@ -322,7 +324,7 @@ use crate::tools::region_png::{encode_color_image_png_rgba, encode_mask_png_l8};
 use ms_thread as thread;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use web_time::{Duration, Instant};
@@ -337,7 +339,7 @@ use settings::*;
 // The `.status` component catalog and every verdict derived from it.
 mod status;
 use status::*;
-// The saved `.msprompt` library, its gates and the `.prompt_cache.*` wire block.
+// The FLUX.2 bindings of the shared prompt-cache controller (methods, encoder context, header).
 mod prompt_cache;
 use prompt_cache::*;
 // What one run answers with: the region, the written-back memory flag, a degraded run.
@@ -389,10 +391,6 @@ const FLUX2_STRENGTH_MAX: f32 = 1.0;
 /// Largest growth of the painted mask contour into the latent mask, pixels
 /// (`mask_dilate_px`). The feather and colour-match ranges are `ms_region_postprocess`'s.
 const FLUX2_DILATE_MAX: u32 = 64;
-
-/// Horizontal room left for «Кэшировать» / «Переименовать» beside the preset name field, points.
-/// The field takes whatever is left, so the button never wraps onto its own line.
-const FLUX2_CACHE_NAME_BUTTON_RESERVE: f32 = 140.0;
 
 /// Preview tint of the engine's single mask layer, i.e. of the edit-permission area.
 ///
@@ -511,21 +509,22 @@ mod tests {
         // And the answer only counts while it is about the prompt in the field.
         let status = parse_flux2_status(&json!({ "prompt_cached": true }));
         assert_eq!(
-            prompt_cache_state_for(Some(&status), Some("a prompt"), "  a prompt  "),
+            prompt_cache_state_for(Some("a prompt"), status.prompt_cached, "  a prompt  "),
             Some(true),
             "the comparison is on the trimmed prompt, which is what was sent"
         );
         assert_eq!(
-            prompt_cache_state_for(Some(&status), Some("a prompt"), "a different prompt"),
+            prompt_cache_state_for(Some("a prompt"), status.prompt_cached, "a different prompt"),
             None,
             "an answer about an older prompt must read as unknown"
         );
         assert_eq!(
-            prompt_cache_state_for(Some(&status), None, "a prompt"),
+            prompt_cache_state_for(None, status.prompt_cached, "a prompt"),
             None,
             "no answer has landed yet"
         );
-        assert_eq!(prompt_cache_state_for(None, Some("a prompt"), "a prompt"), None);
+        // No `.status` at all: nothing was answered.
+        assert_eq!(prompt_cache_state_for(Some("a prompt"), None, "a prompt"), None);
     }
 
 }

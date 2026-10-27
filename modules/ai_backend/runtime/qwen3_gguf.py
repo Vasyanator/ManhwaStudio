@@ -1,35 +1,47 @@
 """
-File: modules/ai_backend/inpaint/flux2_klein/encoder_gguf.py
+File: modules/ai_backend/runtime/qwen3_gguf.py
 
 Purpose:
-The name bridge between a llama.cpp GGUF of the Qwen3 text encoder
+The name bridge between a llama.cpp GGUF of a Qwen3 text encoder
 (`token_embd.weight`, `blk.N.attn_q.weight`, `output_norm.weight`, ...) and the
-state keys of the truncated `transformers.Qwen3Model` the encoder spec builds
-(`embed_tokens.weight`, `layers.N.self_attn.q_proj.weight`, `norm.weight`).
+state keys of a truncated `transformers.Qwen3Model` (`embed_tokens.weight`,
+`layers.N.self_attn.q_proj.weight`, `norm.weight`). Shared by every service
+whose text encoder is a Qwen3 decoder stack: FLUX.2 klein (Qwen3 4B / 8B,
+GGUF architecture `qwen3`) and FLUX.3 klein (the text half of Qwen3-VL 4B,
+GGUF architecture `qwen3vl`, whose `Qwen3VLTextModel` has exactly the
+`Qwen3Model` key set, pinned by `test_qwen3_gguf.py`).
 
 Main responsibilities:
 - `encoder_state_key_of_gguf(name, keep)` - one GGUF tensor name -> its
   `Qwen3Model` state key, `None` for what the truncated model does not load
   (`blk.N` with `N >= keep`, the tied `output.weight` head);
 - `is_gguf_encoder_name(name)` - whether a tensor name is in the GGUF name
-  space (the two name spaces are disjoint, so the encoder spec dispatches on it);
-- `require_known_encoder_names(names, keep, source=...)` - the pre-admission
-  refusal of a file with unknown names or missing weights;
+  space (the two name spaces are disjoint, so an encoder spec dispatches on it);
+- `require_known_encoder_names(names, keep, source=..., owner=..., logger=...)`
+  - the pre-admission refusal of a file with unknown names or missing weights;
 - `gguf_encoder_quant_types(spans, keep)` - `{state key: ggml type}` of every
-  block-quantized tensor, the input of `runtime.gguf_layers.swap_gguf_modules`.
+  block-quantized tensor, the input of `runtime.gguf_layers.swap_gguf_modules`;
+- `require_architecture(metadata, accepted, source=..., owner=...)` - the
+  refusal of a file whose `general.architecture` the caller does not accept.
 
 Notes:
 - There is NO hand-written name table: the mapping is the `gguf` package's own
   QWEN3 tensor-name map (`gguf.get_tensor_name_map`), used inverted over the
   REAL `Qwen3Model` key set (a tiny template model built on `meta`). The map
   alone is not invertible (several HF spellings map to one GGUF name), the key
-  set of the class we load is what picks the one spelling.
+  set of the class we load is what picks the one spelling. The `qwen3vl` GGUF
+  of a Qwen3-VL text model uses the same tensor names (gguf 0.17.1 has no
+  QWEN3VL map; the names are qwen3's), so one table serves both.
 - No Q/K row permutation: llama.cpp permutes Q/K rows only for the `llama`
-  architecture, never for `qwen3` (verified on real Qwen3-4B Q8_0 rows against
-  the bf16 checkpoint: identity rel. error 0.0056, permuted 1.41), so a GGUF
-  tensor is the HF tensor under another name.
+  architecture, never for `qwen3` / `qwen3vl` (verified on real Qwen3-4B and
+  Qwen3-VL-4B Q8_0 rows against the bf16 checkpoints), so a GGUF tensor is the
+  HF tensor under another name.
+- Service-agnostic: the refusal wording names the caller through `owner` and
+  its records go to the caller's `logger`, so each service keeps its prefix and
+  logger tree (the `runtime/` convention, `MODULE_README.md`).
 - `gguf`, torch, transformers and accelerate are imported lazily (the key set
-  is built once per process and cached).
+  is built once per process and cached by `_qwen3_name_tables`). Tests call the
+  functions directly; there is no patch point.
 """
 
 from __future__ import annotations
@@ -37,11 +49,9 @@ from __future__ import annotations
 import functools
 import logging
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
-
-log = logging.getLogger(__name__)
 
 #: The prefix of the HF causal-LM checkpoint names the `gguf` name map is
 #: written for (`model.layers.0.self_attn.q_proj`); `Qwen3Model`'s own state
@@ -53,6 +63,9 @@ _TRY_SUFFIXES = (".weight", ".bias")
 
 _GGUF_BLOCK_RE = re.compile(r"^blk\.(\d+)\.(.+)$")
 _LAYER_PREFIX_0 = "layers.0."
+
+#: The GGUF metadata key naming the file's model architecture (`gguf.Keys.General.ARCHITECTURE`).
+_ARCHITECTURE_KEY = "general.architecture"
 
 #: How many names a refusal lists before it says "and N more".
 _NAMES_IN_MESSAGE = 5
@@ -77,7 +90,7 @@ def _qwen3_name_tables() -> tuple[dict[str, str], frozenset[str], str]:
 
     # The template's sizes are irrelevant: only the structure (which modules
     # exist) decides the key set. `attention_bias` stays the Qwen3 default
-    # (False), as in every Qwen3 checkpoint FLUX.2 klein ships.
+    # (False), as in every Qwen3 / Qwen3-VL checkpoint the services ship.
     config = Qwen3Config(vocab_size=32, hidden_size=32, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1, head_dim=16)
     with init_empty_weights():
         template = Qwen3Model(config)
@@ -154,11 +167,13 @@ def _listed(names: Sequence[str]) -> str:
     return f"{shown} и ещё {rest}" if rest > 0 else shown
 
 
-def require_known_encoder_names(names: Iterable[str], keep: int, *, source: Path) -> None:
+def require_known_encoder_names(names: Iterable[str], keep: int, *, source: Path, owner: str, logger: logging.Logger) -> None:
     """Refuse a GGUF encoder file before any tensor is read: every name maps (or is skipped) and every kept weight is present.
 
     `names` are the file's tensor names, `keep` the decoder layers the model
-    keeps (`components.ENCODER_KEEP_LAYERS`).
+    keeps. `owner` is the service's user-facing name (`"FLUX.2 klein"`), used
+    as the log prefix and in the refusal text; the error record goes to the
+    caller's `logger`.
 
     # Raises
     `ValueError` naming `source` and the unknown tensors, or the state keys
@@ -175,14 +190,14 @@ def require_known_encoder_names(names: Iterable[str], keep: int, *, source: Path
         if state_key is not None:
             produced.add(state_key)
     if unknown:
-        log.error("FLUX.2 klein: GGUF текстового энкодера %s содержит тензоры вне Qwen3: %s", source, unknown)
+        logger.error("%s: GGUF текстового энкодера %s содержит тензоры вне Qwen3: %s", owner, source, unknown)
         raise ValueError(
             f"Текстовый энкодер {source.name}: тензоры {_listed(unknown)} не относятся к модели Qwen3 — "
-            "это не GGUF текстового энкодера FLUX.2 klein (нужен Qwen3 в формате llama.cpp)."
+            f"это не GGUF текстового энкодера {owner} (нужен Qwen3 в формате llama.cpp)."
         )
     missing = sorted(_expected_state_keys(keep) - produced)
     if missing:
-        log.error("FLUX.2 klein: в GGUF текстового энкодера %s нет весов %s", source, missing)
+        logger.error("%s: в GGUF текстового энкодера %s нет весов %s", owner, source, missing)
         raise ValueError(
             f"Текстовый энкодер {source.name}: в файле нет весов {_listed(missing)} — файл неполный "
             "или это не Qwen3. Скачайте файл энкодера заново."
@@ -207,3 +222,24 @@ def gguf_encoder_quant_types(spans: Sequence[Any], keep: int) -> dict[str, int]:
             found[state_key] = int(span.quant_type)
     return found
 
+
+def require_architecture(metadata: Mapping[str, Any], accepted: frozenset[str], *, source: Path, owner: str) -> None:
+    """Refuse a GGUF text-encoder file whose `general.architecture` is not one of `accepted`.
+
+    `metadata` is the file's GGUF metadata (`GgufHeader.metadata`; an empty
+    mapping for a file without one), `accepted` the architecture ids the
+    caller's encoder can be built from (`"qwen3"` for FLUX.2 klein, `"qwen3vl"`
+    for FLUX.3 klein), `owner` the service's user-facing name. Reads nothing
+    but the mapping and logs nothing: the caller's refusal path does.
+
+    # Raises
+    `ValueError` naming `source`, the file's architecture and the accepted ones.
+    """
+    architecture = metadata.get(_ARCHITECTURE_KEY)
+    if architecture in accepted:
+        return
+    wanted = " / ".join(f"«{name}»" for name in sorted(accepted))
+    raise ValueError(
+        f"Текстовый энкодер {source.name}: это GGUF модели «{architecture}», а нужен Qwen3 "
+        f"(general.architecture = {wanted}) — возьмите GGUF текстового энкодера {owner}."
+    )

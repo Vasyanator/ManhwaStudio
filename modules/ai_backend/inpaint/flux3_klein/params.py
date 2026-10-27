@@ -8,7 +8,8 @@ is validated and given its defaults (`normalize_request`).
 
 Key declarations:
 - `EncoderMode`, `Fp8Compute`, `AeDtype` (and `VramStep` / `RamStep` / `Steps`,
-  re-used from the large-model core)
+  re-used from the large-model core; `DitSource` / `GgufDit` / `EncoderSource`
+  from `config`)
 - `Flux3Options`, `Flux3Request`, `NormalizedRequest`
 - `normalize_request()`, `default_seed()`
 - `MIN_REFERENCE_PIXELS` (lower bound of `Flux3Options.reference_max_pixels`)
@@ -33,7 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...runtime.large_models.tiers import RamStep, Steps, VramStep
-from .config import MAX_REFERENCES, SamplerConfig, WeightFormat
+from .config import ENCODER_BF16_SOURCE, MAX_REFERENCES, NATIVE_DIT_FORMATS, DitSource, EncoderSource, GgufDit, SamplerConfig, WeightFormat
 
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -93,9 +94,17 @@ class AeDtype(Enum):
 class Flux3Options:
     """Per-load options: which package and weight format, and how the components run.
 
-    `variant` is the user's weight FORMAT choice (bf16 / fp8r / nvfp4); the
+    `variant` is the user's weight FORMAT choice: a native export
+    (`WeightFormat`: bf16 / fp8r / nvfp4) or a GGUF file (`GgufDit`); the
     large-model manager never changes it (a format that does not fit is
-    refused with the formats that would). `vram_step` («Видеопамять») and
+    refused with the formats that would). `dit_formats` is every format the
+    client offers, best first (the `formats` rows and their quality order);
+    empty = `NATIVE_DIT_FORMATS`, with a GGUF `variant` appended last, so a
+    direct caller need not repeat it. `encoder` is the text encoder's source
+    (default the bf16 shards; a GGUF encoder serves `EncoderMode.TEXT` only);
+    `encoder_formats` every encoder candidate the client offers, best first
+    (the encoder handle's `formats` rows and their quality order; empty =
+    `bf16`, with a GGUF `encoder` appended last). `vram_step` («Видеопамять») and
     `ram_step` («Оперативная память») are the user's two resource axes (`AUTO`
     = the first step that fits on that axis); where the DiT, the AE and the
     text encoder live and run during a run follows from the pair (`steps`),
@@ -112,15 +121,18 @@ class Flux3Options:
     the residency key.
 
     # Raises
-    `ValueError` (construction) when `variant` is not a `WeightFormat`,
-    `vram_step` not a `VramStep`, `ram_step` not a `RamStep`, `encoder_on_cpu`
+    `ValueError` (construction) when `variant` is neither a `WeightFormat` nor
+    a `GgufDit` or is not one of `dit_formats`, `dit_formats` holds another
+    type or a duplicate id, `encoder` is not an `EncoderSource` or is a GGUF
+    encoder in `EncoderMode.VL_REFS` or is not one of `encoder_formats`,
+    `encoder_formats` holds another type or a duplicate id, `vram_step` not a `VramStep`, `ram_step` not a `RamStep`, `encoder_on_cpu`
     not a bool, `vl_ref_max_pixels` not a positive int, or
     `reference_max_pixels` neither `None` nor an int of at least
     `MIN_REFERENCE_PIXELS`.
     """
 
     model_root: Path
-    variant: WeightFormat
+    variant: DitSource
     encoder_mode: EncoderMode = EncoderMode.TEXT
     fp8_compute: Fp8Compute = Fp8Compute.AUTO
     ae_dtype: AeDtype = AeDtype.FLOAT32
@@ -130,10 +142,43 @@ class Flux3Options:
     vram_step: VramStep = VramStep.AUTO
     ram_step: RamStep = RamStep.AUTO
     encoder_on_cpu: bool = False
+    dit_formats: tuple[DitSource, ...] = ()
+    encoder: EncoderSource = ENCODER_BF16_SOURCE
+    encoder_formats: tuple[EncoderSource, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.variant, WeightFormat):
-            raise ValueError(f"variant должен быть форматом весов ({[f.value for f in WeightFormat]}), а не {self.variant!r}")
+        if not isinstance(self.variant, (WeightFormat, GgufDit)):
+            raise ValueError(f"variant должен быть форматом весов ({[f.value for f in WeightFormat]} или GGUF), а не {self.variant!r}")
+        offered = tuple(self.dit_formats)
+        if not offered:
+            offered = NATIVE_DIT_FORMATS if isinstance(self.variant, WeightFormat) else (*NATIVE_DIT_FORMATS, self.variant)
+        if not all(isinstance(source, (WeightFormat, GgufDit)) for source in offered):
+            raise ValueError(f"dit_formats должен содержать только форматы DiT, а не {offered!r}")
+        ids = [source.value for source in offered]
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"dit_formats: повторяющиеся идентификаторы форматов {ids}")
+        if self.variant not in offered:
+            raise ValueError(f"variant «{self.variant.value}» не входит в предложенные форматы {ids}")
+        # Frozen dataclass: the normalized default is stored once, here.
+        object.__setattr__(self, "dit_formats", offered)
+        if not isinstance(self.encoder, EncoderSource):
+            raise ValueError(f"encoder должен быть источником текстового энкодера, а не {self.encoder!r}")
+        if self.encoder.is_gguf and self.encoder_mode is EncoderMode.VL_REFS:
+            raise ValueError(
+                f"Текстовый энкодер «{self.encoder.id}» (GGUF) работает только в текстовом режиме: режим «{EncoderMode.VL_REFS.value}» "
+                "показывает референсы зрительной части Qwen3-VL, которой в GGUF нет. Выберите энкодер bf16 или текстовый режим."
+            )
+        encoders = tuple(self.encoder_formats)
+        if not encoders:
+            encoders = (ENCODER_BF16_SOURCE, self.encoder) if self.encoder.is_gguf else (ENCODER_BF16_SOURCE,)
+        if not all(isinstance(source, EncoderSource) for source in encoders):
+            raise ValueError(f"encoder_formats должен содержать только источники текстового энкодера, а не {encoders!r}")
+        encoder_ids = [source.id for source in encoders]
+        if len(set(encoder_ids)) != len(encoder_ids):
+            raise ValueError(f"encoder_formats: повторяющиеся идентификаторы форматов {encoder_ids}")
+        if self.encoder not in encoders:
+            raise ValueError(f"encoder «{self.encoder.id}» не входит в предложенные форматы энкодера {encoder_ids}")
+        object.__setattr__(self, "encoder_formats", encoders)
         if not isinstance(self.vram_step, VramStep):
             raise ValueError(f"vram_step должен быть шагом видеопамяти ({[s.value for s in VramStep]}), а не {self.vram_step!r}")
         if not isinstance(self.encoder_on_cpu, bool):

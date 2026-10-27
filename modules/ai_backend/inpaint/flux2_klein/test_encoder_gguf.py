@@ -2,9 +2,9 @@
 File: modules/ai_backend/inpaint/flux2_klein/test_encoder_gguf.py
 
 Purpose:
-Unit tests for the GGUF text encoder of FLUX.2 klein: the llama.cpp <-> HF
-Qwen3 name bridge (`encoder_gguf.py`: full 398-name coverage, truncation, the
-dropped head, refusals), the encoder spec over a GGUF file (`large_model.py`:
+Unit tests for the GGUF text encoder of FLUX.2 klein (the name bridge itself,
+`runtime/qwen3_gguf.py`, is tested by `runtime/test_qwen3_gguf.py`): the encoder
+spec over a GGUF file (`large_model.py`:
 formats, keys, the D7 encode variant, the D8 fp8 refusal, the pre-admission
 refusals, the GGUF module swap), a tiny REAL Qwen3 written as a GGUF and
 loaded through the real manager on the CPU, which must compute exactly like
@@ -14,8 +14,8 @@ written header-only): its 399 names, its quantized keys, its strict match with
 the stock 9B config and the package fallback that picks the 9B package for it.
 
 Notes:
-The name-bridge tests need gguf, transformers and accelerate (the key set is
-the real `Qwen3Model`'s); the spec and load tests also torch. Each skips
+The tests need gguf, torch, transformers and accelerate (the bridge's key set
+is the real `Qwen3Model`'s). Each skips
 cleanly without them. No GPU, no network; files go to temporary directories.
 """
 
@@ -27,7 +27,8 @@ import unittest
 from pathlib import Path
 
 from modules.ai_backend.inpaint import flux2_klein as svc
-from modules.ai_backend.inpaint.flux2_klein import components, encoder_gguf, large_model
+from modules.ai_backend.inpaint.flux2_klein import components, large_model
+from modules.ai_backend.runtime import qwen3_gguf
 from modules.ai_backend.runtime.large_models.manager import LargeModelManager, MemoryLimitsStore
 from modules.ai_backend.runtime.residency.arbiter import ResidencyArbiter
 
@@ -44,80 +45,6 @@ def _has(*modules: str) -> bool:
 
 
 _NAME_STACK = ("gguf", "torch", "transformers", "accelerate")
-
-#: The eleven per-layer tensors of a llama.cpp Qwen3 GGUF.
-_LAYER_TENSORS = ("attn_k", "attn_k_norm", "attn_norm", "attn_output", "attn_q", "attn_q_norm", "attn_v", "ffn_down", "ffn_gate", "ffn_norm", "ffn_up")
-
-#: Recorded by hand from llama.cpp's `convert_hf_to_gguf.py` naming of Qwen3
-#: (independent of the `gguf` map the code inverts).
-_RECORDED_PAIRS = {
-    "token_embd.weight": "embed_tokens.weight",
-    "output_norm.weight": "norm.weight",
-    "blk.3.attn_q.weight": "layers.3.self_attn.q_proj.weight",
-    "blk.3.attn_k.weight": "layers.3.self_attn.k_proj.weight",
-    "blk.3.attn_v.weight": "layers.3.self_attn.v_proj.weight",
-    "blk.3.attn_output.weight": "layers.3.self_attn.o_proj.weight",
-    "blk.3.attn_q_norm.weight": "layers.3.self_attn.q_norm.weight",
-    "blk.3.attn_k_norm.weight": "layers.3.self_attn.k_norm.weight",
-    "blk.3.attn_norm.weight": "layers.3.input_layernorm.weight",
-    "blk.3.ffn_norm.weight": "layers.3.post_attention_layernorm.weight",
-    "blk.27.ffn_gate.weight": "layers.27.mlp.gate_proj.weight",
-    "blk.27.ffn_up.weight": "layers.27.mlp.up_proj.weight",
-    "blk.27.ffn_down.weight": "layers.27.mlp.down_proj.weight",
-}
-
-
-def _qwen3_4b_names() -> list[str]:
-    """The 398 tensor names of a real Qwen3-4B GGUF (36 layers x 11, the embedding, the final norm; no `output.weight`)."""
-    return ["token_embd.weight", "output_norm.weight", *(f"blk.{index}.{tensor}.weight" for index in range(36) for tensor in _LAYER_TENSORS)]
-
-
-@unittest.skipUnless(_has(*_NAME_STACK), "needs gguf, torch, transformers and accelerate")
-class KeyMapTests(unittest.TestCase):
-    def test_every_name_of_a_real_file_maps_or_is_skipped(self) -> None:
-        names = _qwen3_4b_names()
-        self.assertEqual(len(names), 398)
-        keep = svc.ENCODER_KEEP_LAYERS
-        mapped = {name: encoder_gguf.encoder_state_key_of_gguf(name, keep) for name in names}
-        skipped = [name for name, key in mapped.items() if key is None]
-        self.assertEqual(len(skipped), (36 - keep) * len(_LAYER_TENSORS), "exactly the blocks past the truncation")
-        self.assertTrue(all(int(name.split(".")[1]) >= keep for name in skipped))
-        keys = [key for key in mapped.values() if key is not None]
-        self.assertEqual(len(keys), len(set(keys)), "no two tensors share a state key")
-        self.assertEqual(set(keys), encoder_gguf._expected_state_keys(keep))
-        encoder_gguf.require_known_encoder_names(names, keep, source=Path("qwen3.gguf"))
-
-    def test_recorded_pairs_and_no_renaming_of_rows(self) -> None:
-        for name, key in _RECORDED_PAIRS.items():
-            with self.subTest(name=name):
-                self.assertEqual(encoder_gguf.encoder_state_key_of_gguf(name, 28), key)
-
-    def test_the_head_and_the_truncation_are_dropped(self) -> None:
-        self.assertIsNone(encoder_gguf.encoder_state_key_of_gguf("output.weight", 28))
-        self.assertIsNone(encoder_gguf.encoder_state_key_of_gguf("blk.28.attn_q.weight", 28))
-        self.assertEqual(encoder_gguf.encoder_state_key_of_gguf("blk.28.attn_q.weight", 30), "layers.28.self_attn.q_proj.weight")
-
-    def test_unknown_names_are_refused(self) -> None:
-        for name in ("rope_freqs.weight", "blk.0.attn_q.bias", "blk.0.attn_qkv.weight", "foo.weight"):
-            with self.subTest(name=name), self.assertRaises(ValueError):
-                encoder_gguf.encoder_state_key_of_gguf(name, 28)
-        with self.assertRaisesRegex(ValueError, "rope_freqs.weight"):
-            encoder_gguf.require_known_encoder_names([*_qwen3_4b_names(), "rope_freqs.weight"], 28, source=Path("x.gguf"))
-
-    def test_a_file_missing_kept_weights_is_refused(self) -> None:
-        names = [name for name in _qwen3_4b_names() if name != "blk.5.ffn_up.weight"]
-        with self.assertRaisesRegex(ValueError, "layers.5.mlp.up_proj.weight"):
-            encoder_gguf.require_known_encoder_names(names, 28, source=Path("x.gguf"))
-        # A missing tensor past the truncation is not needed at all.
-        names = [name for name in _qwen3_4b_names() if name != "blk.30.ffn_up.weight"]
-        encoder_gguf.require_known_encoder_names(names, 28, source=Path("x.gguf"))
-
-    def test_the_name_spaces_are_disjoint(self) -> None:
-        for name in ("blk.0.attn_q.weight", "token_embd.weight", "output_norm.weight", "output.weight"):
-            self.assertTrue(encoder_gguf.is_gguf_encoder_name(name), name)
-        for name in ("model.layers.0.self_attn.q_proj.weight", "lm_head.weight", "layers.0.mlp.up_proj.weight", "embed_tokens.weight", "norm.weight"):
-            self.assertFalse(encoder_gguf.is_gguf_encoder_name(name), name)
-
 
 class _GgufEncoderCase(_TempTreeCase):
     """A tree whose `text_encoder/config.json` is the tiny GGUF encoder's, plus that encoder as `<root>/text_encoder_gguf/qwen3-q8.gguf`."""
@@ -344,12 +271,12 @@ class UncensoredNineBEncoderHeaderTests(_TempTreeCase):
         names = [span.name for span in self.layout.spans]
         self.assertEqual(len(names), 399)
         self.assertIn("output.weight", names)
-        self.assertIsNone(encoder_gguf.encoder_state_key_of_gguf("output.weight", keep))
-        encoder_gguf.require_known_encoder_names(names, keep, source=self.path)
+        self.assertIsNone(qwen3_gguf.encoder_state_key_of_gguf("output.weight", keep))
+        qwen3_gguf.require_known_encoder_names(names, keep, source=self.path, owner="FLUX.2 klein", logger=svc.log)
 
     def test_the_quantized_keys_are_every_kept_linear_and_the_embedding(self) -> None:
         keep = svc.ENCODER_KEEP_LAYERS
-        quantized = encoder_gguf.gguf_encoder_quant_types(self.layout.spans, keep)
+        quantized = qwen3_gguf.gguf_encoder_quant_types(self.layout.spans, keep)
         linears = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
         expected = {"embed_tokens.weight", *(f"layers.{index}.{linear}.weight" for index in range(keep) for linear in linears)}
         self.assertEqual(set(quantized), expected)

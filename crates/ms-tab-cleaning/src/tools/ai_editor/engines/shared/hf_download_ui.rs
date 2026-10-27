@@ -2,28 +2,25 @@
 File: cleaning/tools/ai_editor/engines/shared/hf_download_ui.rs
 
 Purpose:
-The drawing half of a Hugging Face model download block, shared by the large-model engines:
-the token row, one repository's verdict row with the page it links to, the access-check /
-plan / «Скачать» / «Отмена» controls, and the gated action button every engine panel uses.
+The drawing half of the Hugging Face token controls shared by the large-model engines (whose
+gated downloads are the app's model catalog): the token row with its optional access hint, the
+caption of its save button, and the gated action button every engine panel uses.
 
 Key structures:
-- `HfTokenView`, `HfDownloadControlsView`
+- `HfTokenView`
 
 Key functions:
-- `draw_hf_token_row()`, `draw_hf_repo_row()`, `draw_hf_download_controls()`, `gated_button()`
+- `draw_hf_token_row()`, `token_save_button_label()`, `gated_button()`
 
 Notes:
-Drawing only: a pressed control leaves as an `HfTokenAction` / `HfDownloadAction` the engine
-folds back after the frame; nothing here starts work. The token never reaches this file's own
-state: `HfTokenView::input` is the entry field's buffer and no branch prints, logs or formats a
-token value. Every text is a `cleaning.tools.hf_download.*` key; what is model-specific (the
-block heading, the repository line, the download button's hover) is drawn or handed in by the
-engine.
+Drawing only: a pressed control leaves as an `HfTokenAction` the engine folds back after the
+frame; nothing here starts work. The token never reaches this file's own state:
+`HfTokenView::input` is the entry field's buffer and no branch prints, logs or formats a token
+value. Every text is a `cleaning.tools.hf_download.*` key.
 */
 
-use super::hf_download::{HfDownloadAction, HfDownloadCheck, HfDownloadReadiness, HfDownloadRepo, HfTokenAction, hf_download_readiness};
+use super::hf_download::HfTokenAction;
 use eframe::egui;
-use ms_local_ai::large_models::format_gib;
 use ms_sysprobe::hf_token::HfTokenState;
 use ms_widgets::HfAccessHint;
 use ms_widgets::hf_access_hint::HF_TOKEN_SETTINGS_URL;
@@ -135,189 +132,27 @@ pub(in crate::tools::ai_editor::engines) fn token_save_button_label() -> &'stati
     t!("cleaning.tools.hf_download.token_save_button")
 }
 
-/// Draws one repository's verdict row: its id, the localized state, and the link that
-/// makes the state actionable.
-///
-/// A state literal this build does not know degrades to "not known" with the literal on
-/// hover and offers NO link — the same rule the residency block follows, and for the same
-/// reason: guessing which of the six a new literal means would send the user to the wrong
-/// page.
-pub(in crate::tools::ai_editor::engines) fn draw_hf_repo_row(ui: &mut egui::Ui, repo: &HfDownloadRepo) {
-    ui.horizontal_wrapped(|ui| {
-        // The repository id is a backend identifier, so it stays literal.
-        ui.small(repo.repo.clone());
-        match repo.state {
-            Some(state) => {
-                let response = match state.color() {
-                    Some(color) => ui.colored_label(color, state.message()),
-                    None => ui.small(state.message()),
-                };
-                // The backend's own wording is the TECHNICAL half and lives on the hover:
-                // `network_error` has no localizable content, so without it the row would
-                // say only "the repository could not be reached" and nothing about why.
-                if !repo.message.is_empty() {
-                    response.on_hover_text(repo.message.clone());
-                }
-            }
-            None => {
-                let response = ui.small(t!("cleaning.tools.hf_download.state_unknown"));
-                if !repo.state_wire.is_empty() {
-                    response.on_hover_text(tf!("cleaning.tools.hf_download.state_unrecognized_hint", value = repo.state_wire));
-                }
-            }
-        }
-    });
-    if let Some((caption, url)) = repo.link() {
-        ui.hyperlink_to(caption, url);
-    }
-}
-
-/// What the access-check and download controls read for one frame.
-pub(in crate::tools::ai_editor::engines) struct HfDownloadControlsView<'a, Q> {
-    /// The last access check, ALREADY filtered to what the panel asks about right now (the
-    /// engine's staleness rule); `None` shows no rows and keeps «Скачать» closed.
-    pub(in crate::tools::ai_editor::engines) check: Option<&'a HfDownloadCheck<Q>>,
-    pub(in crate::tools::ai_editor::engines) check_error: Option<&'a str>,
-    pub(in crate::tools::ai_editor::engines) check_busy: bool,
-    /// A `.download.start` is in flight: it decides whether «Отмена» is open.
-    pub(in crate::tools::ai_editor::engines) download_busy: bool,
-    pub(in crate::tools::ai_editor::engines) download_status: Option<&'a str>,
-    pub(in crate::tools::ai_editor::engines) ai_backend_available: bool,
-    /// One of the engine's long operations holds the backend; check and download wait.
-    pub(in crate::tools::ai_editor::engines) pipeline_busy: bool,
-    /// The «Скачать» hover: what a finished download means is the engine's to say.
-    pub(in crate::tools::ai_editor::engines) download_tooltip: &'a str,
-}
-
-/// Draws «Проверить доступ» with the per-repository verdicts, the plan line, «Скачать» /
-/// «Отмена», the completion line and the last download's status.
-///
-/// A size is drawn ONLY from a plan that was actually computed ([`hf_download_readiness`]):
-/// an unpriced download gets the bare button caption and no size line, never "0.0 GiB".
-pub(in crate::tools::ai_editor::engines) fn draw_hf_download_controls<Q>(
-    ui: &mut egui::Ui,
-    view: &HfDownloadControlsView<'_, Q>,
-    action: &mut Option<HfDownloadAction>,
-) {
-    // --- the access check ----------------------------------------------------------
-    ui.horizontal_wrapped(|ui| {
-        if gated_button(
-            ui,
-            view.ai_backend_available && !view.check_busy && !view.pipeline_busy,
-            t!("cleaning.tools.hf_download.check_button"),
-            t!("cleaning.tools.hf_download.check_tooltip"),
-            t!("cleaning.tools.hf_download.check_disabled_tooltip"),
-        ) {
-            *action = Some(HfDownloadAction::Check);
-        }
-        if view.check_busy {
-            ui.small(t!("cleaning.tools.hf_download.checking_status"));
-        }
-    });
-    if let Some(error) = view.check_error {
-        ui.colored_label(ms_theme::status::ERROR, tf!("cleaning.tools.hf_download.check_error", err = error));
-    }
-    if let Some(check) = view.check {
-        for repo in &check.repos {
-            draw_hf_repo_row(ui, repo);
-        }
-    }
-
-    // --- the download --------------------------------------------------------------
-    let readiness = hf_download_readiness(view.check);
-    // A size line is drawn ONLY from a plan that was actually computed. Without one there
-    // is no number to show and none to invent: a zero would read as "nothing left to
-    // download" and is the exact lie the nullable plan exists to prevent.
-    if let Some(plan) = view.check.and_then(|check| check.plan) {
-        ui.small(tf!(
-            "cleaning.tools.hf_download.plan_status",
-            missing = format_gib(plan.missing_bytes),
-            files = plan.missing_files,
-            total = format_gib(plan.total_bytes)
-        ));
-    }
-    // The unpriced case gets a line only when the backend said WHY. A `plan_error` is sent
-    // exactly when access succeeded and the listing failed — the one situation the
-    // repository rows cannot explain, because every one of them reads `ok`. When it is
-    // empty the rows already say what is wrong (no token, an inaccessible repository) and a
-    // second line would only restate them.
-    if let Some(check) = view.check
-        && check.plan.is_none()
-        && !check.plan_error.is_empty()
-    {
-        // The localized sentence carries the meaning and the backend's own wording rides on
-        // the hover, exactly as a repository `message` does.
-        ui.colored_label(ms_theme::status::WARNING, t!("cleaning.tools.hf_download.plan_unknown_status"))
-            .on_hover_text(check.plan_error.clone());
-    }
-    ui.horizontal_wrapped(|ui| {
-        // The size goes on the button only when it is a size the user can act on. An
-        // unpriced download gets the bare caption — never "Download (0.0 GiB)", which is
-        // the same lie as the completion line.
-        let caption = match readiness {
-            HfDownloadReadiness::Priced { missing_bytes } => {
-                tf!("cleaning.tools.hf_download.download_sized_button", size = format_gib(missing_bytes))
-            }
-            HfDownloadReadiness::Blocked | HfDownloadReadiness::SizeUnknown | HfDownloadReadiness::Complete => {
-                t!("cleaning.tools.hf_download.download_button").to_string()
-            }
-        };
-        if gated_button(
-            ui,
-            view.ai_backend_available && !view.pipeline_busy && readiness.startable(),
-            &caption,
-            view.download_tooltip,
-            t!("cleaning.tools.hf_download.download_disabled_tooltip"),
-        ) {
-            *action = Some(HfDownloadAction::Start);
-        }
-        if gated_button(
-            ui,
-            view.download_busy,
-            t!("cleaning.tools.hf_download.cancel_button"),
-            t!("cleaning.tools.hf_download.cancel_tooltip"),
-            t!("cleaning.tools.hf_download.cancel_disabled_tooltip"),
-        ) {
-            *action = Some(HfDownloadAction::Cancel);
-        }
-    });
-    // Everything is already on disk: say so, rather than leaving a disabled button with
-    // no explanation of why it is disabled. Reached ONLY through a plan that was actually
-    // computed — never through a missing one.
-    if readiness == HfDownloadReadiness::Complete {
-        ui.colored_label(ms_theme::status::SUCCESS, t!("cleaning.tools.hf_download.complete_status"));
-    }
-    if let Some(status) = view.download_status {
-        ui.small(status);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
 
-    /// Every key this block and `hf_download.rs` spell is in every shipped catalog, with the
-    /// placeholders the code interpolates — which a `t!` call cannot check, because a unit
-    /// test runs with no catalog loaded.
+    /// The `cleaning.tools.hf_download.*` keys of the backend-download block (access check,
+    /// verdict rows, plan, «Скачать» / «Отмена»), retired with the last engine that used it.
+    const RETIRED_KEYS: [&str; 23] = [
+        "state_ok", "state_no_token", "state_invalid_token", "state_not_accepted", "state_not_found", "state_network_error",
+        "state_unknown", "state_unrecognized_hint", "repo_page_link", "check_button", "check_tooltip", "check_disabled_tooltip",
+        "checking_status", "check_error", "plan_status", "plan_unknown_status", "download_button", "download_sized_button",
+        "download_disabled_tooltip", "cancel_button", "cancel_tooltip", "cancel_disabled_tooltip", "complete_status",
+    ];
+
+    /// Every key the token row and `hf_download.rs` spell is in every shipped catalog — which a
+    /// `t!` call cannot check, because a unit test runs with no catalog loaded — and the keys of
+    /// the retired backend-download block are gone from all of them.
     #[test]
-    fn every_catalog_carries_the_download_block_strings() {
-        let interpolated = [
-            ("cleaning.tools.hf_download.state_unrecognized_hint", vec!["{value}"]),
-            ("cleaning.tools.hf_download.check_error", vec!["{err}"]),
-            ("cleaning.tools.hf_download.plan_status", vec!["{missing}", "{files}", "{total}"]),
-            ("cleaning.tools.hf_download.download_sized_button", vec!["{size}"]),
-        ];
+    fn every_catalog_carries_the_token_row_strings() {
         let plain = [
             "cleaning.tools.hf_download.no_token_hint",
             "cleaning.tools.hf_download.token_settings_link",
-            "cleaning.tools.hf_download.repo_page_link",
-            "cleaning.tools.hf_download.check_button",
-            "cleaning.tools.hf_download.checking_status",
-            "cleaning.tools.hf_download.download_button",
-            "cleaning.tools.hf_download.cancel_button",
-            "cleaning.tools.hf_download.complete_status",
-            "cleaning.tools.hf_download.state_unknown",
-            "cleaning.tools.hf_download.plan_unknown_status",
             "hf_token.empty_error",
         ];
         for (tag, source) in ms_i18n::embedded_locales() {
@@ -333,20 +168,6 @@ mod tests {
             for key in plain {
                 assert!(!entry(key).trim().is_empty(), "locale `{tag}`: `{key}` is empty");
             }
-            for (key, placeholders) in &interpolated {
-                let text = entry(key);
-                for placeholder in placeholders {
-                    assert!(text.contains(placeholder), "locale `{tag}`: `{key}` must carry `{placeholder}`, `{text}` does not");
-                }
-            }
-            // Six verdicts drawn with the same words would make the block unreadable, and
-            // three of them differ only in what the user is supposed to do next.
-            let mut wordings = Vec::new();
-            for suffix in ["ok", "no_token", "invalid_token", "not_accepted", "not_found", "network_error"] {
-                let text = entry(&format!("cleaning.tools.hf_download.state_{suffix}"));
-                assert!(!wordings.contains(&text), "locale `{tag}`: two download states share the wording `{text}`");
-                wordings.push(text);
-            }
             for key in [
                 "token_save_button",
                 "token_save_tooltip",
@@ -360,14 +181,13 @@ mod tests {
                 "token_hint_text",
                 "token_saved_status",
                 "token_deleted_status",
-                "check_tooltip",
-                "check_disabled_tooltip",
-                "download_disabled_tooltip",
-                "cancel_tooltip",
-                "cancel_disabled_tooltip",
             ] {
                 let key = format!("cleaning.tools.hf_download.{key}");
                 assert!(!entry(&key).trim().is_empty(), "locale `{tag}`: `{key}` is empty");
+            }
+            for key in RETIRED_KEYS {
+                let key = format!("cleaning.tools.hf_download.{key}");
+                assert!(catalog.get(&key).is_none(), "locale `{tag}`: the retired `{key}` is still there");
             }
         }
     }

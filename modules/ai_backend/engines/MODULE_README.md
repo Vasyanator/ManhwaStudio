@@ -11,9 +11,10 @@ All three current members earn their place:
   detector (`detection/paddle.py`);
 - `surya_checkpoints` is used by the Surya OCR service (`ocr/surya.py`) **and** the Surya text
   detector (`detection/surya.py`);
-- `model_download` is used by the FLUX.1-Fill service (`inpaint/flux_fill.py`), the FLUX.2 / FLUX.3 klein
-  downloads (`inpaint/hf_gated_download.py`), the watermark-removal domain (`watermark/service.py`
-  weights, `watermark/code_fetch.py` pinned source files) **and** Reline (`reline/service.py`).
+- `model_download` is used by the FLUX.1-Fill service (`inpaint/flux_fill.py`), the watermark-removal
+  domain (`watermark/service.py` weights, `watermark/code_fetch.py` pinned source files) **and** Reline
+  (`reline/service.py`). FLUX.2 / FLUX.3 klein weights are downloaded by the application's model
+  catalog in Rust, not by the backend.
 
 That is why none of them lives under `ocr/`, `detection/` or `inpaint/`: putting one in a single
 domain would make the other domain import across a sibling boundary for shared machinery.

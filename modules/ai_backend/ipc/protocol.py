@@ -147,8 +147,46 @@ from __future__ import annotations
 # already_present, origin}; `.prompt_cache.save` / `.load` are removed; v1
 # entries are migrated once (pre-RoPE-fix and unprovable uncensored ones are
 # deleted).
+# 24: FLUX.3 klein downloads move to the app's model catalog:
+# `inpaint.flux3_klein.download.check` / `.start` are removed (unknown methods).
+# FLUX.3 klein GGUF weights: the `inpaint.flux3_klein*` params and their
+# `large_models.profiles` params gain optional `dit_formats` ([{id, path?}], the
+# DiT formats the client offers, best first; a native id `bf16` / `fp8r` /
+# `nvfp4` carries no `path`, any other id is a GGUF file with an absolute `path`;
+# absent or null = the three natives), `text_encoder_format` (`bf16` = the
+# `text_encoder/` shards under `source_root`, else a listed GGUF id; absent =
+# `bf16`) and `text_encoder_formats` ([{id, path}], GGUF candidates only, absolute
+# paths, `bf16` reserved); ids match ^[a-z0-9_]{1,32}$ and are opaque except the
+# three natives. Refused by field name: a `format` / `text_encoder_format` that
+# is not offered, a malformed entry (`dit_formats[i].id` / `.path`, a native id
+# with a path, a GGUF id without an absolute one, a duplicate, an unknown key,
+# an empty list, `bf16` among the encoder candidates), `encoder_mode: "vl_refs"`
+# with a non-`bf16` encoder, and a GGUF header that does not fit the package
+# (before the admission). `.status` `formats` is keyed by every offered DiT id
+# with rows {available, reason, dit_bytes}, adds `text_encoder_formats: {id:
+# {available, reason, bytes}}` (`bf16` plus every candidate; available = weights
+# and `text_encoder/`), and `text_encoder_present` now means the SELECTED encoder
+# format's row is available (before: the bf16 shards). `health.variant`, the
+# answer's `applied.format` and the profiles rows may be a GGUF id; a GGUF DiT has
+# `compute_path: "gguf"`. The phase observer's info (backend log, not a frame
+# field) gains `text_encoder_format`.
+# FLUX.3 klein prompt library (TEXT encoder mode only): the params gain
+# `prompt_library` (null / absent = memory only, else exactly "flux3_klein") and
+# `prompt_cache_precision_order`; `.status` gains `prompt_cached` and
+# `prompt_cache_entry` (EntryInfo or null); new methods
+# `inpaint.flux3_klein.prompt_cache.{build,list,export,import}` with FLUX.2's
+# shapes (`build` streams `stage` frames prepare / encoder_load / encode /
+# encoder_release and is refused for `encoder_mode: "vl_refs"`; `import` takes
+# v2 files of the FLUX.3 library only). A served caption runs without the
+# encoder: its `large_models.profiles` answer has `encoder: null` unless the
+# encoder handle is resident.
+# `large_models.profiles` forecasts: `host_peak` (and `host_baseline`) now
+# exclude EVERY large-pool holding from the baseline RSS (before: only the
+# planned handle's own), so a resident encoder is no longer counted twice in
+# the two-handle sum; a plan with nothing on the device (a CPU-pinned encoder)
+# has `device_peak` 0.
 # ============================================================================
-PROTOCOL_VERSION = 23
+PROTOCOL_VERSION = 24
 
 # ============================================================================
 # FRAME SIZE GUARDS
@@ -272,12 +310,18 @@ METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT = "inpaint.flux2_klein.prompt_cac
 # FLUX.3 Image Klein region editing (`ipc/handlers/flux3_klein.py`, PROTOCOL.md
 # "FLUX.3 klein"): the region is reference #0, the composite stays inside the
 # mask. The run streams `load` / `generate` frames with a stable `stage` and
-# cancels mid-run; the package comes from the gated repository per format.
+# cancels mid-run. The package is downloaded by the app's model catalog (v24:
+# the `.download.check` / `.start` pair is gone).
 METHOD_INPAINT_FLUX3_KLEIN = "inpaint.flux3_klein"                    # streams load+gen progress
 METHOD_INPAINT_FLUX3_KLEIN_STATUS = "inpaint.flux3_klein.status"      # package files + health
 METHOD_INPAINT_FLUX3_KLEIN_UNLOAD = "inpaint.flux3_klein.unload"
-METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_CHECK = "inpaint.flux3_klein.download.check"
-METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_START = "inpaint.flux3_klein.download.start"
+# FLUX.3 klein prompt library (v24, TEXT encoder mode only): the FLUX.2 shape
+# of the four methods over the one library `prompt_cache/flux3_klein/`; a
+# cached caption runs without reading (or having) the text encoder.
+METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_BUILD = "inpaint.flux3_klein.prompt_cache.build"
+METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_LIST = "inpaint.flux3_klein.prompt_cache.list"
+METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_EXPORT = "inpaint.flux3_klein.prompt_cache.export"
+METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_IMPORT = "inpaint.flux3_klein.prompt_cache.import"
 
 # --- Visible watermark removal ---
 # Primary flow is `watermark.detect` (mask only, fed to the existing inpainters);
@@ -361,8 +405,10 @@ ALL_METHODS = frozenset(
         METHOD_INPAINT_FLUX3_KLEIN,
         METHOD_INPAINT_FLUX3_KLEIN_STATUS,
         METHOD_INPAINT_FLUX3_KLEIN_UNLOAD,
-        METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_CHECK,
-        METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_START,
+        METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_BUILD,
+        METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_LIST,
+        METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_EXPORT,
+        METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_IMPORT,
         METHOD_WATERMARK_DETECT,
         METHOD_WATERMARK_REMOVE,
         METHOD_WATERMARK_STATUS,

@@ -48,15 +48,18 @@ Module layout (this file re-exports the package's public surface):
 - `params.py`       - request normalization, region validation, coercion helpers.
 - `progress.py`     - `phase:"load"` step numbering and the progress callback type.
 - `conversion.py`   - the transformer checkpoint's BFL -> diffusers key rule.
-- `encoder_gguf.py` - llama.cpp GGUF <-> HF Qwen3 names of the text encoder.
 - `components.py`   - the five components as files on disk (and a GGUF file's config).
 - `attention.py`    - `text_attention_in_mask`: token grid, layout, the mask and its bytes.
 - `hardware.py`     - device resolution, memory snapshot, torch cache clearing.
 - `prompt_cache.py` - encoder identity and provenance, the FLUX.2 libraries over
-                      `runtime.prompt_library`, the v1 migration.
+                      `runtime.prompt_library`, the v1 migration, and FLUX.2's
+                      adapter of the shared orchestration
+                      (`runtime.prompt_cache_service`).
 - `pipeline.py`     - what a phase does with the placed modules; residency / actions.
-- `large_model.py`  - the manager specs, options, phase work, decode fallbacks.
-- `memory.py`       - step pair and step keys, the combined VRAM-axis rule, the two-handle forecast.
+- `large_model.py`  - the manager specs, options, phase work, decode fallbacks
+                      (llama.cpp GGUF <-> HF Qwen3 encoder names: `runtime.qwen3_gguf`).
+- `memory.py`       - step pair and step keys, FLUX.2's binding of the two-handle rule
+                      (`runtime.large_models.paired`), the two-handle forecast.
 - `service.py`      - `Flux2KleinInpaintService`: the lock, the sessions, the run.
 
 Notes:
@@ -187,7 +190,7 @@ from .components import (  # noqa: F401  - re-exported public surface
     _weight_bytes,
     read_safetensors_header_and_data_start,
 )
-from .encoder_gguf import (  # noqa: F401  - re-exported public surface
+from ...runtime.qwen3_gguf import (  # noqa: F401  - re-exported public surface (the name bridge lives in runtime/)
     encoder_state_key_of_gguf,
     gguf_encoder_quant_types,
     is_gguf_encoder_name,
@@ -216,7 +219,6 @@ from .prompt_cache import (  # noqa: F401  - re-exported public surface
     encoder_provenance,
     ensure_legacy_migrated,
     flux2_library_spec,
-    is_current_encoder,
     known_local_encoders,
     library_of,
     migrate_legacy_families,

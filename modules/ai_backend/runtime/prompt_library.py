@@ -6,7 +6,7 @@ The model-agnostic prompt-embedding LIBRARY: one directory per model
 (`<root>/<library id>/`), one `.msprompt` file per cached embedding (container
 v2, a safetensors file whose `__metadata__` is the source of truth), a
 rebuildable `index.json` beside them, and THE rule that picks which entry
-serves a prompt (`select_entry`). A model package (FLUX.2 klein today) owns
+serves a prompt (`select_entry`). A model package (FLUX.2 klein, FLUX.3 klein) owns
 everything model-specific: its library ids, how it identifies its text
 encoder, which tensor width it accepts, and what it does with the tensor.
 
@@ -16,7 +16,9 @@ Main responsibilities:
 - deterministic entry file names (`entry_file_name`) and preset names
   (`normalize_preset_name` over the explicit `NAME_REMOVED_RANGES` table the
   Rust client mirrors, `default_preset_name`);
-- the selection rule (`Preference`, `rank_key`, `select_entry`);
+- the selection rule (`Preference`, `rank_key`, `select_entry`) and the
+  "made by the current encoder" rule (`same_encoder`);
+- the root directory name (`ROOT_DIRNAME`);
 - `PromptLibrary`: lazy load + reconcile against the files, the published
   immutable `LibrarySnapshot`, entry writes, payload adds (import / migration),
   preset renames, validated tensor reads (`LibraryEntryGone`);
@@ -86,6 +88,11 @@ CONTAINER_VERSION = 2
 
 #: File suffix of an entry. Checked on every client-supplied path.
 ENTRY_SUFFIX = ".msprompt"
+
+#: The libraries' root directory name inside the program root (next to
+#: `fonts/`): `<program root>/prompt_cache/<library id>/`. Every model package
+#: joins it onto `runtime.paths.program_root()` itself (its tests' patch point).
+ROOT_DIRNAME = "prompt_cache"
 
 #: The rebuildable index beside the entries.
 INDEX_FILE = "index.json"
@@ -450,6 +457,15 @@ def select_entry(
     only ranks what is left.
     """
     return min(candidates, key=lambda item: rank_key(provenance(item), created(item), in_memory(item), name(item), pref), default=None)
+
+
+def same_encoder(encoder: EncoderProvenance, current: EncoderProvenance | None) -> bool:
+    """Whether `encoder` IS the request's `current` encoder: the same fingerprint and the same fp8 flag (`False` without a current one).
+
+    THE "made by the current encoder" rule: an entry's `current_encoder` flag,
+    and the build's "already saved for this encoder" check, both ask it.
+    """
+    return current is not None and encoder.encoder_id == current.encoder_id and encoder.fp8 == current.fp8
 
 
 def select_library_entry(entries: Iterable[LibraryEntry], pref: Preference) -> LibraryEntry | None:

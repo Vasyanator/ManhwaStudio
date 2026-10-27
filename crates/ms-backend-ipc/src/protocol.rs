@@ -74,7 +74,7 @@ use serde_json::{Map, Value, json};
 /// 15: FLUX.3 klein region editing: new methods [`METHOD_INPAINT_FLUX3_KLEIN`] (streaming, blob
 /// region ++ mask ++ references, frames with a stable `stage`),
 /// [`METHOD_INPAINT_FLUX3_KLEIN_STATUS`], [`METHOD_INPAINT_FLUX3_KLEIN_UNLOAD`],
-/// [`METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_CHECK`], [`METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_START`];
+/// `inpaint.flux3_klein.download.check`, `inpaint.flux3_klein.download.start` (removed in 24);
 /// [`METHOD_LARGE_MODELS_PROFILES`] serves `model: "flux3_klein"`; the `health` payload gains
 /// `inpaint.flux3_klein`; «Энкодер на CPU»: optional `encoder_on_cpu` (bool, absent = true) in
 /// the `inpaint.flux2_klein*` params, the FLUX.3 params and their `large_models.profiles` params
@@ -149,7 +149,35 @@ use serde_json::{Map, Value, json};
 /// already_present, origin}; `.prompt_cache.save` / `.load` are removed; v1
 /// entries are migrated once (pre-RoPE-fix and unprovable uncensored ones are
 /// deleted).
-pub const PROTOCOL_VERSION: u32 = 23;
+/// 24: FLUX.3 klein downloads move to the app's model catalog:
+/// `inpaint.flux3_klein.download.check` / `.start` are removed (the backend answers them as
+/// unknown methods). FLUX.3 klein GGUF weights: the `inpaint.flux3_klein*` params and their
+/// `large_models.profiles` params gain optional `dit_formats` (`[{id, path?}]`, the DiT formats
+/// the client offers, best first; a native id `bf16` / `fp8r` / `nvfp4` carries no `path`, any
+/// other id is a GGUF file with an absolute `path`; absent or null = the three natives),
+/// `text_encoder_format` (`bf16` = the `text_encoder/` shards under `source_root`, else a listed
+/// GGUF id; absent = `bf16`) and `text_encoder_formats` (`[{id, path}]`, GGUF candidates only,
+/// absolute paths, `bf16` reserved); ids match `^[a-z0-9_]{1,32}$` and are opaque to the backend
+/// except the three natives. Refused by field name: a `format` / `text_encoder_format` that is
+/// not offered, a malformed entry (`dit_formats[i].id` / `.path`, a native id with a path, a
+/// GGUF id without an absolute one, a duplicate, an unknown key, an empty list, `bf16` among
+/// the encoder candidates), `encoder_mode: "vl_refs"` with a non-`bf16` encoder, and a GGUF
+/// header that does not fit the package (before the admission). `.status` `formats` is keyed
+/// by every offered DiT id with rows `{available, reason, dit_bytes}`, adds
+/// `text_encoder_formats: {id: {available, reason, bytes}}` (`bf16` plus every candidate;
+/// available = weights and `text_encoder/`), and `text_encoder_present` now means the SELECTED
+/// encoder format's row is available (before: the bf16 shards). `health.variant`, the answer's
+/// `applied.format` and the profiles rows may be a GGUF id; a GGUF DiT has
+/// `compute_path: "gguf"`. The phase observer's info (backend log, not a frame field) gains
+/// `text_encoder_format`. FLUX.3 klein prompt library (TEXT encoder mode only, the FLUX.2 klein
+/// protocol-23 shapes): new methods `inpaint.flux3_klein.prompt_cache.{build, list, export,
+/// import}`; the `inpaint.flux3_klein*` params gain optional `prompt_library` (only
+/// `flux3_klein`) and `prompt_cache_precision_order`; `.status` gains `prompt_cached` and
+/// `prompt_cache_entry`. `large_models.profiles` forecasts: `host_peak` (and `host_baseline`)
+/// exclude EVERY large-pool holding from the baseline RSS (before: only the planned handle's
+/// own), so a resident encoder is no longer counted twice in the two-handle sum; a plan with
+/// nothing on the device (a CPU-pinned encoder) has `device_peak` 0.
+pub const PROTOCOL_VERSION: u32 = 24;
 
 // ============================================================================
 // FRAME SIZE GUARDS
@@ -287,23 +315,29 @@ pub const METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT: &str =
 /// RGB PNG of exactly the region size. Progress frames carry `phase` (`load` / `generate`),
 /// `step`, `total`, `label` and a stable `stage` id. Wire: `PROTOCOL.md` "FLUX.3 klein".
 pub const METHOD_INPAINT_FLUX3_KLEIN: &str = "inpaint.flux3_klein";
-/// Reports the FLUX.3 klein package files under `params.source_root` per format and the
-/// service health (free memory and forecasts are [`METHOD_LARGE_MODELS_PROFILES`]).
+/// Reports the FLUX.3 klein package files under `params.source_root` per DiT format (every
+/// `dit_formats` id) and per encoder format (`text_encoder_formats`), and the service health
+/// (free memory and forecasts are [`METHOD_LARGE_MODELS_PROFILES`]).
 pub const METHOD_INPAINT_FLUX3_KLEIN_STATUS: &str = "inpaint.flux3_klein.status";
 /// Releases every idle FLUX.3 klein handle.
 pub const METHOD_INPAINT_FLUX3_KLEIN_UNLOAD: &str = "inpaint.flux3_klein.unload";
-/// Checks Hugging Face access to the gated FLUX.3 klein repository and prices the download of
-/// one weight format, without transferring anything. Request header: `hf_token`, `format`
-/// (`bf16` / `fp8r` / `nvfp4`, default `fp8r`). The answer: `format` (echo), `repos` (one
-/// `{state, message}`, the state one of `ok` / `no_token` / `invalid_token` / `not_accepted` /
-/// `not_found` / `network_error`), `plan` (`{total_bytes, missing_bytes, missing_files}`, or
-/// `null` when it could not be computed) and `plan_error` (why a `null` plan is null after access
-/// succeeded; empty otherwise). The token is never logged on either side.
-pub const METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_CHECK: &str = "inpaint.flux3_klein.download.check";
-/// Downloads one weight format of the FLUX.3 klein package into `side_models/FLUX.3-image-klein/`
-/// (streaming two-level byte progress, cancel inside the transfer). Request header: `hf_token`,
-/// `format`. The answer: `root` (the package root), `downloaded_bytes`, `skipped_files`.
-pub const METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_START: &str = "inpaint.flux3_klein.download.start";
+/// FLUX.3 klein prompt library, TEXT encoder mode only (the FLUX.2 klein shape of
+/// [`METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD`]): makes the entry of the CURRENT encoder for
+/// `params.prompt` under the optional top-level `name`, streaming with `stage` frames; refused by
+/// field name with `encoder_mode: "vl_refs"` and without the encoder.
+pub const METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_BUILD: &str =
+    "inpaint.flux3_klein.prompt_cache.build";
+/// Lists the FLUX.3 klein library (`params.prompt_library` = `flux3_klein`), same answer as
+/// [`METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST`] without a `legacy` report. One-shot.
+pub const METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_LIST: &str =
+    "inpaint.flux3_klein.prompt_cache.list";
+/// Writes FLUX.3 klein library entry `file` (top-level) to the file `path`. One-shot.
+pub const METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_EXPORT: &str =
+    "inpaint.flux3_klein.prompt_cache.export";
+/// Takes the v2 `.msprompt` file `path` into the library it belongs to (`library_matches`,
+/// `already_present` as FLUX.2's; a v1 file is refused). One-shot.
+pub const METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_IMPORT: &str =
+    "inpaint.flux3_klein.prompt_cache.import";
 
 // --- Visible watermark removal ---
 /// Predicts a watermark mask for the request blob; responds with an L8 mask PNG

@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `23` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `24` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `crates/ms-backend-ipc/src/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -78,7 +78,7 @@ WebSocket is only a carrier.
 
 | Field             | Type   | Required on            | Meaning                                                                 |
 |-------------------|--------|------------------------|-------------------------------------------------------------------------|
-| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 23. Optional/ignored on others.  |
+| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 24. Optional/ignored on others.  |
 | `id`              | u64    | all framed messages    | Correlation id. `0` means a server-initiated frame (events, hello).     |
 | `kind`            | string | all                    | One of `hello`,`request`,`response`,`progress`,`event`,`cancel`,`error`.|
 | `method`          | string | `request`              | Method name, e.g. `ocr.manga`. See §5.                                  |
@@ -691,10 +691,9 @@ through the SAME admission (reserves, limits, reclaim) that a generation does.
   accounts for the steps `strength` drops).
 - A progress frame that cannot be written (the client is gone) never stops the
   work: the backend logs the first failure of the request at WARNING and keeps
-  going, so a disconnect does NOT cancel a FLUX.2 run, a component action, a
-  prompt-cache build or a download. `cancel` is observed before the work starts
-  and after it returns (`download.start` also polls it at every chunk); cancelling a
-  FLUX.2 run mid-way is not supported yet.
+  going, so a disconnect does NOT cancel a FLUX.2 run, a component action or a
+  prompt-cache build. `cancel` is observed before the work starts and after it
+  returns; cancelling a FLUX.2 run mid-way is not supported yet.
 
 **FLUX.2 klein prompt library** (v23). Encoding a prompt costs an encoder read of
 up to ~16 GB (tens of seconds) and yields ~12.6 MB (9B) / ~7.9 MB (4B) of
@@ -827,95 +826,55 @@ PNG (the decode clamped and ROUNDED half to even to 8 bits), with no colour
 match and no composite, and the client colour-matches and composites it inside
 the mask. Here the mask travels for validation only. The
 package (DiT of the chosen format, AE, Qwen3-VL text encoder) is a directory the
-client names (`source_root`); acquiring it is the separate `download.*` pair.
+client names (`source_root`); GGUF DiT / encoder files are named by absolute path
+(v24, `dit_formats` / `text_encoder_formats` below). The backend downloads none of
+it: the application's model catalog does (v24; the former
+`inpaint.flux3_klein.download.check` / `.start` are unknown methods).
 
 | method                               | request fields (inline)                                                                 | blob(req)                         | response fields (status=ok)                                                                 | blob(resp) | stream  | cancel |
 |--------------------------------------|------------------------------------------------------------------------------------------|-----------------------------------|----------------------------------------------------------------------------------------------|------------|---------|--------|
-| `inpaint.flux3_klein`                | `image_len: int`, `mask_len: int`, `reference_lens: int[]` (0..9 entries, each > 0; absent = `[]`), `params: object` (below) | region PNG ++ mask PNG ++ reference PNGs | `image_len`, `seed: int`, `steps: int`, `width`, `height`, `text_tokens: int`, `applied: {format, fp8_compute: string\|null, compute_path, encoder_mode, ae_dtype}`, `vram_step`, `ram_step`, `vram_step_effective`, `ram_step_effective`, `degraded: bool`, `degrade_reason: string\|null` (§5.10) | result PNG | **yes** | **mid-run** |
-| `inpaint.flux3_klein.status`         | `params: object={}` (may be partial; without `source_root` nothing is available)        | none                              | `available: bool`, `reason: string\|null` (the selected format), `formats: {bf16\|fp8r\|nvfp4: {available, reason, dit_bytes}}`, `ae_present: bool`, `text_encoder_present: bool`, plus the `health()` fields (`loaded`, `ready`, `device`, `model_key`, `variant`, `fp8_compute`, `compute_path`, `vram_step`, `ram_step`, `degraded`, `last_error`, `dit_device`, `encoder_resident`) | none | no | no |
+| `inpaint.flux3_klein`                | `image_len: int`, `mask_len: int`, `reference_lens: int[]` (0..9 entries, each > 0; absent = `[]`), `params: object` (below) | region PNG ++ mask PNG ++ reference PNGs | `image_len`, `seed: int`, `steps: int`, `width`, `height`, `text_tokens: int`, `applied: {format, fp8_compute: string\|null, compute_path, encoder_mode, ae_dtype}` (`format` the DiT id that ran, a GGUF id since v24; `compute_path` `native` / `scaled_mm` / `dequant` / `gguf`), `vram_step`, `ram_step`, `vram_step_effective`, `ram_step_effective`, `degraded: bool`, `degrade_reason: string\|null` (§5.10) | result PNG | **yes** | **mid-run** |
+| `inpaint.flux3_klein.status`         | `params: object={}` (may be partial; without `source_root` nothing is available)        | none                              | `available: bool`, `reason: string\|null` (the selected format), `formats: {<dit id>: {available: bool, reason: string\|null, dit_bytes: int}}` (v24: keyed by every OFFERED `dit_formats` id, natives and GGUF; `dit_bytes` the DiT file's size, 0 when absent), `ae_present: bool`, `text_encoder_formats: {<id>: {available: bool, reason: string\|null, bytes: int}}` (v24; `bf16` plus one row per `text_encoder_formats` candidate; available = the weights AND `<source_root>/text_encoder/` exist, `bytes` the weight files' total, 0 when unavailable), `text_encoder_present: bool` (v24: the SELECTED `text_encoder_format`'s row is available; before v24 it meant the bf16 shards), `prompt_cached: bool` and `prompt_cache_entry: EntryInfo\|null` (v24, prompt library below: `params.prompt` served by memory or the library; always `false` / `null` for an empty prompt, in `vl_refs` mode and without `source_root`), plus the `health()` fields (`loaded`, `ready`, `device`, `model_key`, `variant` (a GGUF id when a GGUF DiT ran, v24), `fp8_compute`, `compute_path` (`gguf` for a GGUF DiT), `vram_step`, `ram_step`, `degraded`, `last_error`, `dit_device`, `encoder_resident`). Without `source_root` the answer is unavailable with rows for the three native ids and `bf16` only; every OTHER supplied field is validated first, and any other invalid `params` is a request error naming the field, with or without `source_root` | none | no | no |
 | `inpaint.flux3_klein.unload`         | (none)                                                                                   | none                              | `unloaded: bool`                                                                              | none       | no      | no     |
-| `inpaint.flux3_klein.download.check` | `hf_token: string` (may be empty), `format: "bf16"\|"fp8r"\|"nvfp4"="fp8r"`              | none                              | `format: string` (echo), `repos: {"black-forest-labs/flux-3-image-klein": {state, message}}`, `plan: {total_bytes, missing_bytes, missing_files}\|null`, `plan_error: string` | none | no | no |
-| `inpaint.flux3_klein.download.start` | `hf_token: string`, `format` (as above)                                                  | none                              | `root: string` (the package root to send as `source_root`), `downloaded_bytes: int`, `skipped_files: int` | none | **yes** | yes |
-
-**Gated Hugging Face download** (`download.check` / `download.start`;
-`inpaint/flux3_download.py` over the model-agnostic `inpaint/hf_gated_download.py`).
-`hf_token` is a REQUEST FIELD of both methods. It never travels as an
-environment variable of the backend process, never sits inside `params`, and is
-never logged on either side; a message that must mention it says "the token" and
-nothing more. **Every repository the backend downloads from is gated**, so an
-empty token short-circuits to `no_token` (`.check`) or a refusal (`.start`) with
-no network call, and a present token is sent to every repository (access probe,
-listing and transfer).
-
-`download.check` reports one entry per repository the request needs and ECHOES
-its selection field (`format`), so a client can tell a fresh answer from one
-computed for what it was showing a moment ago. `state` is one of, and the
-mapping is FIXED:
-
-| state | when |
-|---|---|
-| `ok` | the token may download that repository |
-| `no_token` | `hf_token` was empty — no network call is made at all |
-| `invalid_token` | HTTP 401 |
-| `not_accepted` | HTTP 403 / `GatedRepoError` — the conditions were not accepted |
-| `not_found` | HTTP 404 |
-| `network_error` | anything else; `message` carries the detail verbatim |
-
-`message` is always present and is empty for `ok`. The access probe is
-`HfApi.auth_check`, NOT a repository listing: the metadata of a `gated: auto`
-repository is public and comes back for a request with no token at all, so a
-listing proves nothing about access.
-
-**`plan` is NULLABLE and a zeroed plan is never synthesised.** It is computed from
-the listings the check fetches once every needed repository answered `ok`;
-`missing_bytes` counts only files absent or the wrong length on disk. `plan` is
-`null` when the listing FAILED although every auth probe passed — `plan_error`
-then carries the message (scrubbed of the token), and the repo states stay `ok`,
-because auth genuinely succeeded; the client must render it as "size unknown",
-never as complete — and when there is no token or a repository the user cannot
-download from, where `plan_error` is EMPTY because the `state` already says what
-is wrong. `plan_error` is empty whenever `plan` is present.
-
-`download.start` streams `phase:"download"` frames that keep the four usual
-fields and ADD three optional ones:
-
-```json
-{ "phase": "download", "step": 12884901888, "total": 21474836480,
-  "label": "text_encoder/model-00001-of-00002.safetensors",
-  "file_step": 3221225472, "file_total": 4980000000,
-  "file_label": "model-00001-of-00002.safetensors" }
-```
-
-- `step`/`total` are OVERALL bytes across the files still to fetch, which keeps
-  every single-level consumer correct; `file_step`/`file_total`/`file_label`
-  describe the file in flight, and a frame that omits them (the terminal one) is
-  legal;
-- frames are throttled to at most ~10 per second AND at least 4 MiB apart, and
-  the last frame of a run always reports the completed byte count; a retry is an
-  ordinary forced frame whose `label` announces it;
-- **a staged file is published only after its length (and, for an LFS file, its
-  sha256) matches what the listing announced**, and a file already on disk counts
-  as present only at that same length; when the listing announces no size the
-  non-empty rule stands and the reason is logged;
-- an INTERRUPTED file resumes rather than restarts: its partial bytes are parked
-  beside the destination and continued with `Range: bytes=<n>-`, within the run
-  after a backoff wait or on the next `download.start`. `step` and `file_step` of
-  a resumed file both begin at the resumed offset; only a from-zero refetch after
-  proven-wrong bytes moves them backwards, once per file;
-- files already present at the announced size are skipped, so a re-run resumes at
-  file granularity;
-- free space (minus the bytes already staged) is checked BEFORE the first byte and
-  a refusal names both the required and the available number of bytes;
-- `cancel{id}` really stops the transfer: the cancel event is polled at every
-  chunk boundary and during every retry wait. Files already published stay; the
-  bytes of the one in flight are parked for the next run.
+| `inpaint.flux3_klein.prompt_cache.build`  | `params: object` (`prompt_library` required, `encoder_mode` `text`), `name: string?` | none                   | `prompt: string`, `name: string`, `encoded: bool`, `written: [EntryInfo]`, `renamed: bool`, `prompt_cached: true`, `device: string` | none | **yes** | yes |
+| `inpaint.flux3_klein.prompt_cache.list`   | `params: object` (`prompt_library` required; `source_root` optional)     | none                   | `library: string`, `directory: string`, `texts: [{prompt, name, selected: EntryInfo, entries: [EntryInfo]}]`, `skipped: [{file, reason}]`, `text_encoder_available: bool`, `legacy: null` | none | no | no |
+| `inpaint.flux3_klein.prompt_cache.export` | `params: object` (`prompt_library` required), `file: string`, `path: string` (`*.msprompt`) | none   | `library`, `file`, `path`, `size_bytes`                                   | none       | no      | no     |
+| `inpaint.flux3_klein.prompt_cache.import` | `params: object`, `path: string` (`*.msprompt`)                          | none                   | `library`, `file`, `prompt`, `name`, `library_matches: bool`, `already_present: bool`, `origin` | none | no | no |
 
 `params` (one mapping, `inpaint/flux3_klein/wire.py`; read by the run, `.status`
 and `large_models.profiles`). An UNKNOWN key, a wrong type or an out-of-range
 value is a request error naming the field — never clamped:
 - `source_root: string` (REQUIRED, the package root);
-- `format`: `bf16` | `fp8r` | `nvfp4` (default `fp8r`) — never changed by the backend;
-- `encoder_mode`: `text` | `vl_refs` (default `text`; `vl_refs` shows the references to the encoder);
+- `dit_formats: [{id: string, path?: string}]` (v24; the full DiT format order the
+  client offers, best first; absent = `[{id:"bf16"},{id:"fp8r"},{id:"nvfp4"}]`). An id
+  matches `^[a-z0-9_]{1,32}$` and is owned by the client; the backend reads only
+  the three NATIVE ids `bf16` / `fp8r` / `nvfp4`, which carry NO `path` (their
+  files are found under `source_root` by the package layout). Every other id is
+  a GGUF DiT file and MUST carry an absolute `path`. A native id with a `path`, a
+  GGUF id without one, a relative or empty path, an id outside the pattern, an
+  unknown entry key (only `id` / `path`), an empty list or a duplicate id is a
+  request error naming the entry (`dit_formats[<i>].path`, `dit_formats[<i>].id`; a duplicate is named at its second occurrence). The client sends every offered GGUF candidate, installed or
+  not; `.status` reports which are present;
+- `format: string` (default `fp8r`) — the selected DiT id, which must be one of
+  the OFFERED `dit_formats` ids (else a request error naming `format`; a
+  `dit_formats` without `fp8r` therefore needs an explicit `format`); never
+  changed by the backend. A GGUF file whose header does not fit the package is
+  refused before the admission, naming `format`. A GGUF DiT reads the
+  package's root `config.json` and computes through the dequantizing path
+  (`compute_path: "gguf"`; `fp8_compute` does not apply);
+- `text_encoder_format: string` (v24; default `bf16`) — `bf16` = the
+  `text_encoder/` shards under `source_root`; any other value must be a
+  `text_encoder_formats` id (a GGUF text-only Qwen3-VL encoder; the tokenizer and
+  configs still come from `<source_root>/text_encoder/`), else a request error
+  naming `text_encoder_format`; a GGUF encoder whose header does not fit is
+  refused before the admission, naming `text_encoder_format`;
+- `text_encoder_formats: [{id: string, path: string}]` (v24; GGUF encoder
+  candidates only, each with an absolute `path`; absent = none; same id rule and
+  refusals as `dit_formats`; `bf16` is reserved for the package shards and is a
+  request error here, naming `text_encoder_formats[<i>].id`);
+- `encoder_mode`: `text` | `vl_refs` (default `text`; `vl_refs` shows the references to the encoder;
+  v24: refused, naming `encoder_mode`, with a non-`bf16` `text_encoder_format` — the GGUF encoder is
+  the text half only, so the client sends `text` while one is selected);
 - `ae_dtype`: `float32` | `bfloat16` (default `float32`);
 - `fp8_compute`: `auto` | `scaled_mm` | `dequant` (default `auto`; fp8r only);
 - `reference_max_pixels: int|null` (`null` = the model's caps; else 4096..4194304);
@@ -924,7 +883,12 @@ value is a request error naming the field — never clamped:
 - `seed: int|null` (`null` = a random 32-bit seed, echoed in the answer; else 0..2^64-1);
 - `vram_step` / `ram_step` (§5.10; absent or `null` = `auto`);
 - `encoder_on_cpu: bool` (default `true`: «Энкодер на CPU», §5.10);
-- `whole_region: bool` (default `false`: the mask must be solid and the whole region is regenerated).
+- `whole_region: bool` (default `false`: the mask must be solid and the whole region is regenerated);
+- `prompt_library: string|null` (v24; absent or `null` = no library, the in-memory
+  cache only; otherwise exactly `flux3_klein`, else a request error naming the field);
+- `prompt_cache_precision_order: string[]` (v24; distinct precision ids, most
+  precise first — the client sends `["bf16","q8_0","q4_k_m"]`; absent = none).
+  FLUX.3 has no `text_encoder_source` (an unknown key): its source is always `stock`.
 The post-processing fields of v15-v16 (`mask_feather_px`, `color_match`,
 `color_match_local_pct`, `color_match_scale_px`) are unknown keys since v17 and
 refused like any other.
@@ -939,6 +903,41 @@ they become references #1 and up after the region (with two or more references
 in total each is capped at 1 MP by the model's own rule; the output stays the
 region's size).
 
+**FLUX.3 klein prompt library** (v24; `inpaint/flux3_klein/prompt_cache.py`,
+the FLUX.2 library rules above, one library `flux3_klein` for every encoder
+format). TEXT encoder mode only: in `vl_refs` mode the encoder sees the
+references, so nothing is read from or written to the library or the memory,
+`.status` answers `prompt_cached: false` and `.prompt_cache.build` is refused
+naming `encoder_mode`.
+- An entry is the caption's DiT text tokens: tensor `text_tokens`, `[L, 20480]`
+  bf16 (`L` the padded token count, a multiple of 80, at most 4096), keyed by
+  the exact stripped `prompt`, `max_sequence_length` 4096 and the encoder
+  provenance (`encoder_source` `stock`, `encoder_format` the
+  `text_encoder_format` id, `encoder_fp8` false; identity = SHA-256 of
+  `text_encoder/config.json`, `chat_template.json` and the weight files' names
+  and sizes). An entry of another DiT text width is ignored.
+- A run whose caption is served (memory, or the library ranked by
+  `prompt_cache_precision_order`) does not open the text encoder: the encoder
+  may be absent on disk (the whole `<source_root>/text_encoder/` directory
+  included: no DiT `formats` row depends on it), the `encoder_load` / `encode` / `encoder_release`
+  stages still stream (nothing is read; `text_real_tokens` in the backend log is
+  then the padded length), and `large_models.profiles` answers
+  `encoder: null` unless the encoder is resident. Every fresh `text` encode is
+  kept in memory (also without `prompt_library`). A library file that vanished
+  between the plan and the read is replaced by an encode, or the run is refused
+  naming the file when no encoder is installed. A run that must encode without
+  the selected encoder's weights is refused before any load, naming
+  `text_encoder_format`.
+- `.prompt_cache.build {params, name?}` encodes through the encoder alone (no
+  DiT is loaded; the encoder is released afterwards unless it was resident),
+  streaming `phase:"load"` frames of the stages `prepare`, `encoder_load`
+  (with its disk-read frames), `encode`, `encoder_release` (same `step` /
+  `total` numbering as a run); refused without the encoder. A cancel is
+  checked before the call, at every stage begin and after it.
+- `.prompt_cache.import` accepts a v2 file of the `flux3_klein` library only
+  (a FLUX.2 library's file or a v1 file is refused); `.list` answers
+  `legacy: null`.
+
 **FLUX.3 klein streaming detail.** Frames carry `phase`, `step`, `total`, `label`
 (Russian log text) and a stable `stage` id the client localizes:
 - `phase:"load"` — `stage` one of `prepare`, `dit_load`, `ae_load`,
@@ -949,8 +948,6 @@ region's size).
   (0..11) and `total` is `11`;
 - `phase:"generate"` — `stage:"denoise"`, `step` / `total` are flow-map steps
   (a `0/total` frame when the denoise begins). A degrade retry may repeat steps.
-- `phase:"download"` (download.start only) — the two-level byte frames of the
-  gated download above (`file_step` / `file_total` / `file_label`).
 - Disk reads (v21): every checkpoint read of the run adds a byte level to the
   `phase:"load"` frame of the stage in force (same `step` / `total` / `label` /
   `stage`; a reload during the denoise is a `load` frame of stage `denoise`):
@@ -959,23 +956,13 @@ region's size).
   (`transformer` = DiT, `text_encoder` = Qwen3-VL encoder, `vae` = AE). Re-reads
   of units brought back from disk are labelled the same. At most one frame per
   0.2 s per read, plus one 100% frame.
+- Frames never carry the service's phase-observer info: its keys (since v24 also
+  `text_encoder_format`, the encoder id in force) go to the backend log only.
 
 **Cancellation is mid-run**: the backend checks the request's `cancel` at every
 `stage` begin and after every denoise step and answers `Interrupted`; the weights
 stay wherever the manager's run end leaves them (nothing is unloaded for a cancel)
 and the next run starts normally. A cancel is not a memory failure (no degrade).
-
-**FLUX.3 download** (`inpaint/flux3_download.py` over `inpaint/hf_gated_download.py`):
-the repository `black-forest-labs/flux-3-image-klein` is GATED (FLUX Kommunity
-License; the user accepts its conditions on Hugging Face). One format per call:
-the shared `ae.safetensors` and `text_encoder/`, plus `model.safetensors` +
-`config.json` + `manifest.json` (`bf16`) or `variants/<format>/` (`fp8r`,
-`nvfp4`), into `ManhwaStudio_AI_Models/side_models/FLUX.3-image-klein/` (the
-package root `start` answers). The state taxonomy, the NULLABLE `plan`, the
-token rules (a request field, never logged; an empty token answers `no_token`
-without a network call), the publish gates and the resume behaviour are the
-FLUX.2 download's ("Model download from Hugging Face" above). An unknown `format` is a request error (never a
-downgrade to the default).
 
 All inpaint engines require Torch.
 
@@ -1144,6 +1131,19 @@ Notes:
   UI shows "= «…»"); `below_floor` marks a step faster than the learned floor;
   `recommended` is what `auto` on that axis resolves to with the other axis
   fixed. Forecasts here are the full ones (every activation counted).
+- Meaning of a forecast's `host_peak` (v24): the backend's RSS with NO
+  large-pool model loaded (every large handle's bytes taken out: other models',
+  this model's own and, for a two-handle model, the other handle's; small-pool
+  models and the runtime stay in) plus this plan's own host peak — what the
+  process would hold if the loaded large models were unloaded and this one
+  loaded. Before v24 the baseline took out only the planned handle's own bytes,
+  so other resident large models, and a resident encoder in the pipeline's
+  figure, were counted in. Whether the plan fits is judged on its growth above
+  that baseline against the probed free RAM (other models' bytes are not free
+  unless they could be reclaimed: `needs_reclaim`), which this does not change.
+  A forecast whose plan puts nothing on the device in any state (an encoder
+  handle under «Энкодер на CPU») has `device_peak` `0` (v24; before, the device
+  runtime overhead).
 - `limits` here also carries the probed figures: `vram_total`, `vram_free`,
   `vram_reserve`, `ram_total`, `ram_free`, `ram_cgroup_limit`, `ram_reserve`.
   `formats[]`: `{id, available, reason, dit_bytes, compute_path, quality_rank,
@@ -1198,11 +1198,35 @@ Notes:
   key suffix `|host_pin=<component>`) with its own learned floors; toggling the
   flag leaves the other handle idle, reclaimed like any idle holding. With
   `false` the steps place the encoder as before.
-- **`large_models.profiles` with `model: "flux3_klein"`** plans the registration
-  `flux3_klein.<encoder_mode>.ae_<ae_dtype>` the params select (the answer's
-  `model`); `params` is the FLUX.3 run's (`source_root` required, `prompt` not
-  needed) and `shape.references` should list the region itself plus the user
-  references. The `formats[]` rows are the package's three formats.
+- **`large_models.profiles` with `model: "flux3_klein"`** (v24: two handles,
+  FLUX.2's answer shape) plans the PIPELINE registration
+  `flux3_klein.ae_<ae_dtype>` the params select (DiT + AE; the answer's
+  `model`) with the text encoder's admission claimed, exactly as FLUX.2 below:
+  the encoder (`flux3_klein_text_encoder.<encoder_mode>`, in the selected
+  `text_encoder_format`) is planned on what the pipeline leaves, under the same
+  device ceiling a run gives it; `selected` stays the pipeline's plan, so the
+  run's total is `selected` + `encoder`, summed by the client, and both
+  forecasts carry `host_baseline`. `encoder` is the encoder's `selected`, `null`
+  exactly when the encoder is neither needed nor resident (a `text` caption
+  served by the prompt library or memory, or no installed encoder; the
+  params' `prompt` and prompt-library fields decide, so the client sends them); `encoder_formats` are its
+  `formats[]` rows, one per offered encoder (`bf16` plus every
+  `text_encoder_formats` candidate; in `vl_refs` a GGUF row is unavailable,
+  the GGUF holds no vision tower); an encoder that does not fit makes
+  `selected.fits` `false` with its `reason` / `shortest_resource`. `params` is
+  the FLUX.3 run's (`source_root` required, `prompt` not needed) and
+  `shape.references` should list the region itself plus the user references.
+  The `formats[]` rows are the request's `dit_formats` (v24; the package's
+  three native formats when absent), `quality_rank` following that order; a
+  GGUF row has `compute_path: "gguf"` and an uncalibrated forecast
+  (`calibrated: false`). «Энкодер на CPU» pins the encoder handle only (its
+  key gains `|host_pin=encoder`). The FLUX.3 registrations are
+  `flux3_klein.ae_float32`, `flux3_klein.ae_bfloat16` (pipelines) and
+  `flux3_klein_text_encoder.text`, `flux3_klein_text_encoder.vl_refs`
+  (encoders); learned floors stored for the single-handle registrations of
+  earlier builds (`flux3_klein.<mode>.ae_<dtype>`) stay in the floors cache
+  unused until a `learned.reset`. The `.status` `model_key` is the pipeline
+  handle's key, and `encoder_resident` reads the encoder handle.
 - **A host run device** (`cpu` / `mps`): FLUX.2 runs and `large_models.profiles`
   are planned on the host alone (`vram.applicable: false`).
 - **`large_models.profiles` with `model: "flux2_klein"`** plans the registration
@@ -1221,7 +1245,9 @@ Notes:
   prompt alone made it `null`). Both `selected.forecast` and `encoder.forecast`
   carry the additive `host_baseline: int` (v21; bytes): the backend's baseline
   RSS that each `host_peak` already includes, so a client summing the two host
-  peaks subtracts it once (`host_peak` + `encoder.host_peak` - `host_baseline`). The residency is read without waiting for the
+  peaks subtracts it once (`host_peak` + `encoder.host_peak` - `host_baseline`).
+  Since v24 that baseline holds no large-pool bytes (§5.10 `host_peak`), so the
+  sum counts a resident encoder once. The residency is read without waiting for the
   service lock, so the answer comes during a running generation — and an encoder
   that does not fit makes `selected.fits` `false` with the encoder's `reason` /
   `shortest_resource`. Since v21 the answer also carries the additive

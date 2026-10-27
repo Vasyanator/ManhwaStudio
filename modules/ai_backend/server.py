@@ -23,7 +23,8 @@ Main responsibilities:
   persisted in `user_config` through `AiDeviceService` and its learned floors in
   `<model cache root>/large_models/limits.json`; the FLUX.2 / FLUX.3 klein
   services are the `large_models.profiles` adapters of `flux2_klein` /
-  `flux3_klein` (`large_model_adapters`);
+  `flux3_klein` (`large_model_adapters`; both compose their two handles,
+  pipeline + text encoder, in `large_model_profiles`);
 - apply the Linux OOM backstop (`General.large_models_oom_score_adj`) at start;
 - maintain a non-blocking health snapshot and publish it as a `health` event on
   the IPC event bus (including the `torch` build facts of
@@ -141,9 +142,11 @@ class AppState:
     # The large-model pool (`large_models.*` IPC, FLUX services), sharing the
     # small pool's arbiter and memory probes.
     large_models: LargeModelManager
-    # `large_models.profiles` adapters: {model name registered with `large_models`:
-    # an object with `large_model_inputs(params: dict) -> (options, device)`} (the
-    # contract is `ipc/handlers/large_models.py`).
+    # `large_models.profiles` adapters: {model name: an object with
+    # `large_model_profiles(params, shape, *, format, steps) -> dict` (a
+    # multi-handle operation composing its own answer: FLUX.2, FLUX.3) or
+    # `large_model_inputs(params: dict) -> (options, device)`} (the contract is
+    # `ipc/handlers/large_models.py`).
     large_model_adapters: Mapping[str, Any]
     # Probes of the health snapshot's `model_manager.budget` only: no warm-up
     # matmul, so the health thread never synchronizes a device behind a running
@@ -373,8 +376,9 @@ def build_app_state(app_version: str, *, user_config: Any = None, large_models_c
         browser=BrowserService(),
         large_models=large_models,
         # A large model is servable by `large_models.profiles` when its service
-        # (registered with `large_models`) is listed here under its registered
-        # model name; the service implements `large_model_inputs(params)`.
+        # (registered with `large_models`) is listed here under its model name;
+        # the service implements `large_model_profiles(...)` (FLUX.2 and FLUX.3
+        # compose their pipeline + text-encoder handles) or `large_model_inputs(params)`.
         large_model_adapters={"flux2_klein": flux2_klein_service, "flux3_klein": flux3_klein_service},
         health_probes=MemoryBudgetProbes(device_probe=TorchDeviceProbe(warm_up=False)),
     )

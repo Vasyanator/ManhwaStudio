@@ -7,18 +7,22 @@ The long operations of `Flux3KleinEngine` and the fold of the panel's intents in
 runs on the GUI thread.
 
 Main responsibilities:
-- fold one frame's `Flux3PanelIntents` (`apply_intents`): settings changes, the forecast
-  widget's actions, the pickers, the reference list, the token, the download, the unload;
-- the Hugging Face token (`poll_hf_token`), the access check and the download with its cancel
-  (`start_download_check` .. `poll_download`);
+- fold one frame's `Flux3PanelIntents` (`apply_intents`): settings changes, the «Нет» stash,
+  the forecast widget's actions, the pickers, the reference list, the token, the catalog
+  block's click, the unload, the prompt-library press;
+- the Hugging Face token (`poll_hf_token`; the catalog download reads the stored token);
 - the file dialogs (`start_picker`, `poll_picker`) and the worker that reads picked
   reference files (`start_reference_read`, `poll_references`);
-- `.unload` (`start_unload`, `poll_unload`).
+- `.unload` (`start_unload`, `poll_unload`);
+- drive the shared `PromptCacheController` (`prompt_cache`) with FLUX.3's header and methods:
+  the build (`start_prompt_cache_build`), the export / import started from the dialogs, the
+  drains (`poll_prompt_cache`, `poll_and_maybe_query_prompt_cache_list`) and folding what an
+  answer invalidated back into `.status` and the forecast (`apply_prompt_cache_effects`).
 
 Notes:
-A second inherent `impl Flux3KleinEngine` block; the state lives in `mod.rs`. A download claims
-the shared progress bar by GENERATION, like a run, so the two are mutually exclusive
-(`pipeline_busy`).
+A second inherent `impl Flux3KleinEngine` block; the state lives in `mod.rs`. The catalog
+download is the controller's (`mod.rs`, `poll_catalog_bundle` / `apply_catalog_action`); it
+runs in the app and never claims the run's progress bar.
 */
 
 use super::*;
@@ -33,6 +37,7 @@ impl Flux3KleinEngine {
         let Flux3PanelIntents {
             mut settings_changed,
             postprocess_changed,
+            uncached_changed,
             want_status,
             want_forecast,
             resources_actions,
@@ -41,20 +46,21 @@ impl Flux3KleinEngine {
             remove_reference,
             clear_references,
             hf_token_action,
-            download_action,
+            catalog_action,
+            prompt_cache_action,
         } = intents;
         // The widget wrote a picked step pair (and the encoder flag) into the settings already;
         // a suggestion and a format row are written here, the caps and the reset go to the
         // controller.
         let mut choice = self.settings.step_choice();
         let before = choice;
-        let mut format = self.settings.format().wire().to_string();
+        let mut format = self.settings.dit_format().wire().to_string();
         settings_changed |= self.resources.fold(resources_actions, &mut choice, Some(&mut format));
         if choice != before {
             settings_changed |= self.settings.set_step_choice(choice);
         }
-        if let Some(picked) = Flux3Format::from_wire(&format)
-            && picked != self.settings.format()
+        if let Some(picked) = Flux3DitFormat::from_wire(&format)
+            && picked != self.settings.dit_format()
         {
             self.settings.format = picked.wire().to_string();
             settings_changed = true;
@@ -75,13 +81,18 @@ impl Flux3KleinEngine {
             self.note_settings_changed();
         } else if postprocess_changed {
             self.note_postprocess_changed();
+        } else if uncached_changed {
+            // Only the «Нет» stash moved (it follows the typed text): a save, nothing else.
+            self.dirty = true;
         }
         if want_status {
             self.status_wanted = true;
         }
         if want_forecast {
-            // The refresh button: the staleness it exists for is caused outside the app.
+            // The refresh button: the staleness it exists for is caused outside the app — and
+            // so are files that appeared on disk, so the catalog bundle is re-probed too.
             self.resources.invalidate();
+            self.request_catalog_status();
         }
         if let Some(purpose) = picker {
             self.start_picker(purpose);
@@ -89,145 +100,31 @@ impl Flux3KleinEngine {
         if let Some(action) = hf_token_action {
             self.hf_token.apply(action);
         }
-        match download_action {
-            Some(HfDownloadAction::Check) => self.start_download_check(),
-            Some(HfDownloadAction::Start) => self.start_download(),
-            Some(HfDownloadAction::Cancel) => self.cancel_download(),
-            None => {}
-        }
+        self.apply_catalog_action(catalog_action);
         if unload {
             self.start_unload();
         }
+        match prompt_cache_action {
+            Some(PromptCacheAction::Build) => self.start_prompt_cache_build(false),
+            Some(PromptCacheAction::Rename) => self.start_prompt_cache_build(true),
+            // The dialog is opened here and the entry's file is captured with it, so a prompt
+            // changed while it is open cannot redirect the export to another entry.
+            Some(PromptCacheAction::Export) => {
+                if self.prompt_cache.arm_export(&self.settings.prompt) {
+                    self.start_picker(Flux3PickerPurpose::PromptCacheExport);
+                }
+            }
+            Some(PromptCacheAction::Import) => self.start_picker(Flux3PickerPurpose::PromptCacheImport),
+            None => {}
+        }
     }
 
-    /// Drains the token field's secret-store worker; a changed token drops the held check (it
-    /// was computed for the previous one).
+    /// Drains the token field's secret-store worker (the shared `HfTokenControl`).
+    ///
+    /// Nothing else is reset here: the catalog controller notices a changed token by itself
+    /// and re-checks the gated repository's access.
     pub(super) fn poll_hf_token(&mut self) {
-        if self.hf_token.poll(FLUX3_LOG_LABEL) {
-            self.download_check = None;
-            self.download_check_error = None;
-        }
-    }
-
-    /// Starts the one-shot `.download.check` for the selected format. The token is the STORED
-    /// one (the process-wide cache), never the field's unsaved text.
-    pub(super) fn start_download_check(&mut self) {
-        if self.download_check_rx.is_some() || self.pipeline_busy() {
-            return;
-        }
-        let header = flux3_download_header(&ms_sysprobe::hf_token::hf_token(), self.settings.format());
-        let (tx, rx) = mpsc::channel();
-        self.download_check_rx = Some(rx);
-        self.download_check_error = None;
-        thread::spawn(move || {
-            let _ = tx.send(check_flux3_download(header));
-        });
-    }
-
-    /// Drains the access check; a refused repository is logged with the backend's message (the
-    /// row shows the localized verdict), a missing plan with its reason.
-    pub(super) fn poll_download_check(&mut self) {
-        let Some(rx) = self.download_check_rx.as_ref() else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(Ok(check)) => {
-                self.download_check_rx = None;
-                for repo in check.repos.iter().filter(|repo| repo.state != Some(HfDownloadState::Ok)) {
-                    ms_log::runtime_log::log_warn(format!(
-                        "[cleaning] {FLUX3_LOG_LABEL} download access check: repo {}, state {}, message: {}",
-                        repo.repo, repo.state_wire, repo.message
-                    ));
-                }
-                if check.plan.is_none() {
-                    ms_log::runtime_log::log_warn(format!(
-                        "[cleaning] {FLUX3_LOG_LABEL} download access check for format {} returned no plan: {}",
-                        check.question, check.plan_error
-                    ));
-                }
-                self.download_check = Some(check);
-            }
-            Ok(Err(err)) => {
-                self.download_check_rx = None;
-                self.download_check_error = Some(err);
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.download_check_rx = None;
-                self.download_check_error = Some(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string());
-            }
-            Err(TryRecvError::Empty) => {}
-        }
-    }
-
-    /// Starts the streaming `.download.start` of the selected format, claiming the progress bar
-    /// on the GUI thread so a cancel can retire it.
-    pub(super) fn start_download(&mut self) {
-        if self.pipeline_busy() {
-            return;
-        }
-        let header = flux3_download_header(&ms_sysprobe::hf_token::hf_token(), self.settings.format());
-        let claim = begin_progress_generation(&self.progress);
-        let progress = Arc::clone(&self.progress);
-        let (tx, rx) = mpsc::channel();
-        self.download_rx = Some(rx);
-        self.download_status = Some(t!("cleaning.tools.flux3_klein.download_running_status").to_string());
-        thread::spawn(move || {
-            let _ = tx.send(run_flux3_download(header, &progress, &claim));
-        });
-    }
-
-    /// Abandons the download: the answer is dropped, the bar retired, the backend told to stop
-    /// (sticky: also when the request id is not known yet). The worker is kept in `abandoned`
-    /// until it ends, so nothing new starts meanwhile. Staged bytes stay on disk and the next
-    /// download resumes them.
-    pub(super) fn cancel_download(&mut self) {
-        let Some(rx) = self.download_rx.take() else {
-            return;
-        };
-        self.abandoned.push(rx);
-        retire_progress_generation(&self.progress, FLUX3_LOG_LABEL);
-        self.download_status = Some(t!("cleaning.tools.flux3_klein.download_cancelled_status").to_string());
-    }
-
-    /// Drains the download. A finished one writes NOTHING into the settings (the download-mode
-    /// root is derived); an answered root that differs from the derived one is logged as drift
-    /// between the two halves. `.status` and the forecast are re-asked: the files changed.
-    pub(super) fn poll_download(&mut self) {
-        let Some(rx) = self.download_rx.as_ref() else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(Ok(outcome)) => {
-                self.download_rx = None;
-                let derived = config::flux3_klein_dir().to_string_lossy().to_string();
-                if !outcome.root.is_empty() && outcome.root != derived {
-                    ms_log::runtime_log::log_warn(format!(
-                        "[cleaning] {FLUX3_LOG_LABEL} download placed the package at {}, but this build derives it from {derived}; the two halves disagree about the layout",
-                        outcome.root
-                    ));
-                }
-                self.status_wanted = true;
-                self.resources.invalidate();
-                self.download_check = None;
-                self.download_status = Some(tf!(
-                    "cleaning.tools.flux3_klein.download_done_status",
-                    size = format_gib(outcome.downloaded_bytes),
-                    skipped = outcome.skipped_files
-                ));
-            }
-            Ok(Err(err)) => {
-                self.download_rx = None;
-                ms_log::runtime_log::log_warn(format!("[cleaning] {FLUX3_LOG_LABEL} model download failed: {err}"));
-                self.download_status = Some(tf!("cleaning.tools.flux3_klein.download_error", err = err));
-                // A partial download changed the files the status describes.
-                self.status_wanted = true;
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.download_rx = None;
-                self.download_status = Some(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string());
-            }
-            Err(TryRecvError::Empty) => {}
-        }
+        self.hf_token.poll(FLUX3_LOG_LABEL);
     }
 
     /// Opens a non-blocking file dialog for `purpose`; at most one at a time.
@@ -240,12 +137,15 @@ impl Flux3KleinEngine {
             Flux3PickerPurpose::References => FileDialogRequest::new(DialogKind::OpenFiles)
                 .title(t!("cleaning.tools.flux3_klein.references_dialog_title"))
                 .filter(t!("cleaning.tools.flux3_klein.references_files_filter"), &FLUX3_REFERENCE_EXTENSIONS),
+            Flux3PickerPurpose::PromptCacheExport => prompt_cache_export_dialog(),
+            Flux3PickerPurpose::PromptCacheImport => prompt_cache_import_dialog(),
         };
         self.picker = Some((purpose, file_dialog::request(request, None)));
     }
 
     /// Folds a finished pick: the package folder into the settings, picked images into a read
-    /// on a worker. A cancelled dialog is a no-op; a failure is shown where the pick belongs.
+    /// on a worker, a prompt-cache file into the export (with its save target) or the import. A
+    /// cancelled dialog is a no-op; a failure is shown where the pick belongs.
     pub(super) fn poll_picker(&mut self) {
         let Some(result) = self.picker.as_mut().and_then(|(_, dialog)| dialog.poll()) else {
             return;
@@ -261,6 +161,7 @@ impl Flux3KleinEngine {
                 match purpose {
                     Flux3PickerPurpose::ModelRoot => self.status_error = Some(err.user_message()),
                     Flux3PickerPurpose::References => self.references_errors = vec![err.user_message()],
+                    Flux3PickerPurpose::PromptCacheExport | Flux3PickerPurpose::PromptCacheImport => self.prompt_cache.status = Some(err.user_message()),
                 }
                 return;
             }
@@ -281,6 +182,25 @@ impl Flux3KleinEngine {
                     return;
                 };
                 self.start_reference_read(files.into_iter().map(|file| (file.path, file.display_name)).collect());
+            }
+            // These two carry a library entry in or out through a FILE: nothing is persisted.
+            // The export keeps its save TARGET: the backend writes the file, then the target is
+            // committed (`PromptCacheController::start_export`).
+            Flux3PickerPurpose::PromptCacheExport => {
+                let Some(target) = picked.into_save_target() else {
+                    mismatch();
+                    return;
+                };
+                let settings = self.settings.normalized();
+                self.prompt_cache.start_export(|extra| flux3_prompt_cache_header(&settings, extra), target, &FLUX3_PROMPT_CACHE_METHODS);
+            }
+            Flux3PickerPurpose::PromptCacheImport => {
+                let Some(file) = picked.into_file() else {
+                    mismatch();
+                    return;
+                };
+                let settings = self.settings.normalized();
+                self.prompt_cache.start_import(|extra| flux3_prompt_cache_header(&settings, extra), file.path, &FLUX3_PROMPT_CACHE_METHODS);
             }
         }
     }
@@ -319,6 +239,42 @@ impl Flux3KleinEngine {
             }
             Err(TryRecvError::Empty) => {}
         }
+    }
+
+    /// Starts the prompt-cache build (`renamed` = «Переименовать») through the shared
+    /// controller: the preset name is the name field, the header the normalized settings, and
+    /// it claims the shared progress bar exactly as a run does (its `stage` frames are named by
+    /// `flux3_stage_label`).
+    pub(super) fn start_prompt_cache_build(&mut self, renamed: bool) {
+        let settings = self.settings.normalized();
+        self.prompt_cache.start_build(|extra| flux3_prompt_cache_header(&settings, extra), renamed, &FLUX3_PROMPT_CACHE_METHODS, &self.progress);
+    }
+
+    /// Folds what a finished prompt-cache answer invalidated back into the engine: `.status`
+    /// (whether the prompt is served) and the memory forecast (whether the encoder counts).
+    pub(super) fn apply_prompt_cache_effects(&mut self, effects: PromptCacheEffects) {
+        if effects.status_wanted {
+            self.status_wanted = true;
+        }
+        if effects.forecast_invalidated {
+            self.resources.invalidate();
+        }
+    }
+
+    /// Polls the library listing and asks a new `.list` when one is wanted, the backend is up,
+    /// nothing holds the pipeline and an absolute package root exists (the backend refuses
+    /// relative candidate paths for the whole call, as for `.status`).
+    pub(super) fn poll_and_maybe_query_prompt_cache_list(&mut self) {
+        let gate_open = self.ai_backend_available && !self.pipeline_busy() && self.settings.has_usable_root();
+        let settings = &self.settings;
+        let effects = self.prompt_cache.poll_list(gate_open, |extra| flux3_prompt_cache_header(&settings.normalized(), extra), &FLUX3_PROMPT_CACHE_METHODS);
+        self.apply_prompt_cache_effects(effects);
+    }
+
+    /// Drains the prompt-cache operation into the outcome line of the library fold.
+    pub(super) fn poll_prompt_cache(&mut self) {
+        let effects = self.prompt_cache.poll(FLUX3_LOG_LABEL);
+        self.apply_prompt_cache_effects(effects);
     }
 
     /// Asks the backend to release the FLUX.3 weights, on a worker.
@@ -367,7 +323,11 @@ mod tests {
         engine.references.push_loaded(vec![Ok(test_reference("a", 1)), Ok(test_reference("b", 2))], 0);
         engine.resources.wanted = false;
         engine.apply_intents(Flux3PanelIntents { resources_actions: vec![ResourcesAction::ApplyFormat("bf16".to_string())], ..Flux3PanelIntents::default() });
-        assert_eq!(engine.settings.format(), Flux3Format::Bf16);
+        // A GGUF row of the widget is a format like any other.
+        engine.apply_intents(Flux3PanelIntents { resources_actions: vec![ResourcesAction::ApplyFormat("q5_k_m".to_string())], ..Flux3PanelIntents::default() });
+        assert_eq!(engine.settings.dit_format(), Flux3DitFormat::Q5KM);
+        engine.apply_intents(Flux3PanelIntents { resources_actions: vec![ResourcesAction::ApplyFormat("bf16".to_string())], ..Flux3PanelIntents::default() });
+        assert_eq!(engine.settings.dit_format(), Flux3DitFormat::Bf16);
         assert!(engine.dirty);
         engine.resources.wanted = false;
         engine.apply_intents(Flux3PanelIntents { remove_reference: Some(0), ..Flux3PanelIntents::default() });

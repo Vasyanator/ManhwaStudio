@@ -3,7 +3,9 @@ File: cleaning/tools/ai_editor/engines/flux3_klein/decisions.rs
 
 Purpose:
 The PURE decisions the FLUX.3 klein panel renders: which readiness line to show, whether a run
-may start, what the seed field means, how a backend stage is named, what a finished run says.
+may start, what the seed field means, how a backend stage is named, what a finished run says,
+which catalog bundle the selection needs, how a weight-format row is captioned, and what the
+shared prompt-cache gate knows about the typed text and the current encoder.
 None of them touches a `Ui`, a channel or the disk, so each is asserted without a frame.
 
 Key structures:
@@ -12,6 +14,12 @@ Key structures:
 Key functions:
 - `flux3_readiness_line()`, `flux3_run_block_reason()`, `parse_seed_input()`,
   `flux3_stage_label()`, `flux3_run_done_status()`
+- `flux3_catalog_bundle()`; the gated-repository / bundle-state / job rules over it are the
+  shared `../shared/catalog_download.rs`
+- `flux3_dit_format_name()`, `flux3_encoder_format_name()`, `flux3_dit_format_hint()`,
+  `flux3_encoder_format_hint()`, `flux3_dit_format_row()`, `flux3_encoder_format_row()`
+- `flux3_cache_context()`, `flux3_encoder_caption()` (the prompt library's FLUX.3 facts; the
+  gates, the line and the jobs are `../shared/prompt_cache.rs`)
 
 Notes:
 The size rule is NOT here: validity is `region_edit_v2::geometry::check_size` over
@@ -44,8 +52,15 @@ pub(super) enum Flux3ReadinessLine {
     Ready { memory: Option<Flux3MemorySummary> },
     /// Parts are missing (the localized list); «Установить» is offered.
     Missing { components: String },
+    /// `.status` names nothing missing (or has not answered), but the catalog bundle of the
+    /// selection is known to be incomplete (download mode): «Установить» opens the block that
+    /// fetches it.
+    BundleMissing,
     /// Manual mode without a folder; «Установить» is offered (it opens the section).
     NoRoot,
+    /// Manual mode with a folder that is not an absolute path; «Установить» is offered (it
+    /// opens the section, where the folder is fixed).
+    RootNotAbsolute,
     /// No answer yet: neutral, no button.
     Unknown,
 }
@@ -56,14 +71,14 @@ impl Flux3ReadinessLine {
         match self {
             Self::Ready { memory: Some(summary) } if !summary.fits => Flux3LineTone::Warn,
             Self::Ready { .. } => Flux3LineTone::Ok,
-            Self::Missing { .. } | Self::NoRoot => Flux3LineTone::Warn,
+            Self::Missing { .. } | Self::BundleMissing | Self::NoRoot | Self::RootNotAbsolute => Flux3LineTone::Warn,
             Self::Unknown => Flux3LineTone::Neutral,
         }
     }
 
     /// Whether «Установить» is offered beside the line.
     pub(super) fn offers_install(&self) -> bool {
-        matches!(self, Self::Missing { .. } | Self::NoRoot)
+        matches!(self, Self::Missing { .. } | Self::BundleMissing | Self::NoRoot | Self::RootNotAbsolute)
     }
 
     /// The localized text.
@@ -72,19 +87,28 @@ impl Flux3ReadinessLine {
             Self::Ready { memory: Some(summary) } => tf!("cleaning.tools.flux3_klein.model_ready_memory_status", memory = summary.line),
             Self::Ready { memory: None } => t!("cleaning.tools.flux3_klein.model_ready_status").to_string(),
             Self::Missing { components } => tf!("cleaning.tools.flux3_klein.model_missing_status", components = components),
+            Self::BundleMissing => t!("cleaning.tools.flux3_klein.bundle_missing_status").to_string(),
             Self::NoRoot => t!("cleaning.tools.flux3_klein.model_root_missing_status").to_string(),
+            Self::RootNotAbsolute => t!("cleaning.tools.flux3_klein.model_root_not_absolute_status").to_string(),
             Self::Unknown => t!("cleaning.tools.flux3_klein.model_readiness_unknown_status").to_string(),
         }
     }
 }
 
 /// Turns the model verdict into the readiness line; `memory` counts only for `Ready`.
+///
+/// `bundle_missing` is whether the catalog bundle of the selection is known to be not fully
+/// downloaded (`catalog_bundle_missing`; always `false` in manual mode). It turns a `Ready` or
+/// `Unknown` verdict into [`Flux3ReadinessLine::BundleMissing`]; a `Missing` verdict keeps its
+/// own line (it names the parts). It never gates a run: that stays the `.status` verdict.
 #[must_use]
-pub(super) fn flux3_readiness_line(readiness: &Flux3ModelReadiness, memory: Option<Flux3MemorySummary>) -> Flux3ReadinessLine {
+pub(super) fn flux3_readiness_line(readiness: &Flux3ModelReadiness, bundle_missing: bool, memory: Option<Flux3MemorySummary>) -> Flux3ReadinessLine {
     match readiness {
+        Flux3ModelReadiness::Ready | Flux3ModelReadiness::Unknown if bundle_missing => Flux3ReadinessLine::BundleMissing,
         Flux3ModelReadiness::Ready => Flux3ReadinessLine::Ready { memory },
         Flux3ModelReadiness::Missing(missing) => Flux3ReadinessLine::Missing { components: missing.names() },
         Flux3ModelReadiness::NoRoot => Flux3ReadinessLine::NoRoot,
+        Flux3ModelReadiness::RootNotAbsolute => Flux3ReadinessLine::RootNotAbsolute,
         Flux3ModelReadiness::Unknown => Flux3ReadinessLine::Unknown,
     }
 }
@@ -131,6 +155,7 @@ pub(super) fn parse_seed_input(text: &str) -> Flux3SeedInput {
 pub(super) fn flux3_run_block_reason(settings: &Flux3KleinSettings, readiness: &Flux3ModelReadiness, seed: Flux3SeedInput) -> Option<String> {
     match readiness {
         Flux3ModelReadiness::NoRoot => return Some(t!("cleaning.tools.flux3_klein.model_root_required_error").to_string()),
+        Flux3ModelReadiness::RootNotAbsolute => return Some(t!("cleaning.tools.flux3_klein.model_root_not_absolute_error").to_string()),
         Flux3ModelReadiness::Missing(missing) => {
             let components = missing.names();
             return Some(match settings.source_mode() {
@@ -196,9 +221,210 @@ pub(super) fn flux3_run_done_status(seed: u64, degraded: Option<&RunDegraded>) -
     }
 }
 
+/// The catalog bundle (`flux3_klein_package_specs`: base, root DiT config for bf16 / GGUF, DiT,
+/// encoder) the CURRENT selection
+/// needs in download mode; empty in manual mode, which never draws or probes a catalog block.
+/// Pure: no disk access.
+#[must_use]
+pub(super) fn flux3_catalog_bundle(settings: &Flux3KleinSettings) -> Vec<&'static ExternalModelSpec> {
+    match settings.source_mode() {
+        Flux3SourceMode::Download => flux3_klein_package_specs(settings.dit_format(), settings.encoder_format()),
+        Flux3SourceMode::Manual => Vec::new(),
+    }
+}
+
+/// The localized name of a DiT format: a native one by its own caption, a GGUF one as `GGUF`
+/// with its quant token (a technical literal, `dev-docs/i18n_exclusions.md`).
+#[must_use]
+pub(super) fn flux3_dit_format_name(format: Flux3DitFormat) -> String {
+    match format {
+        Flux3DitFormat::Bf16 => t!("cleaning.tools.flux3_klein.format_bf16_label").to_string(),
+        Flux3DitFormat::Fp8r => t!("cleaning.tools.flux3_klein.format_fp8r_label").to_string(),
+        Flux3DitFormat::Nvfp4 => t!("cleaning.tools.flux3_klein.format_nvfp4_label").to_string(),
+        Flux3DitFormat::Q80 | Flux3DitFormat::Q6K | Flux3DitFormat::Q5KM | Flux3DitFormat::Q4KM => {
+            tf!("cleaning.tools.flux3_klein.format_gguf_label", quant = format.quant_token().unwrap_or_default())
+        }
+    }
+}
+
+/// The hover of one DiT format row: what choosing it costs.
+#[must_use]
+pub(super) fn flux3_dit_format_hint(format: Flux3DitFormat) -> &'static str {
+    match format {
+        Flux3DitFormat::Bf16 => t!("cleaning.tools.flux3_klein.format_bf16_hint"),
+        Flux3DitFormat::Fp8r => t!("cleaning.tools.flux3_klein.format_fp8r_hint"),
+        Flux3DitFormat::Nvfp4 => t!("cleaning.tools.flux3_klein.format_nvfp4_hint"),
+        Flux3DitFormat::Q80 | Flux3DitFormat::Q6K | Flux3DitFormat::Q5KM | Flux3DitFormat::Q4KM => t!("cleaning.tools.flux3_klein.format_gguf_hint"),
+    }
+}
+
+/// The localized name of a text-encoder format: the bf16 shards by their caption, a GGUF file
+/// as `GGUF` with its quant token.
+#[must_use]
+pub(super) fn flux3_encoder_format_name(format: Flux3EncoderFormat) -> String {
+    match format.quant_token() {
+        None => t!("cleaning.tools.flux3_klein.text_encoder_format_bf16_label").to_string(),
+        Some(quant) => tf!("cleaning.tools.flux3_klein.format_gguf_label", quant = quant),
+    }
+}
+
+/// The hover of one text-encoder format row (a GGUF encoder also closes the references in the
+/// encoder, D6).
+#[must_use]
+pub(super) fn flux3_encoder_format_hint(format: Flux3EncoderFormat) -> &'static str {
+    if format.is_gguf() { t!("cleaning.tools.flux3_klein.text_encoder_format_gguf_hint") } else { t!("cleaning.tools.flux3_klein.text_encoder_format_bf16_hint") }
+}
+
+/// Appends the installed mark: a literal glyph, as in FLUX.2 klein's format rows.
+fn with_installed_mark(label: String, installed: bool) -> String {
+    if installed { format!("{label} ✓") } else { label }
+}
+
+/// The row (and closed-combo) caption of a DiT format: its name with the download size of its
+/// catalog spec, and a trailing ✓ when `status` (already guarded to the current root) says its
+/// file is there. No answer claims nothing.
+#[must_use]
+pub(super) fn flux3_dit_format_row(format: Flux3DitFormat, status: Option<&Flux3Status>) -> String {
+    let label = tf!("cleaning.tools.flux3_klein.format_sized_label", format = flux3_dit_format_name(format), size = format_gib(flux3_klein_dit_spec(format).total_bytes()));
+    with_installed_mark(label, status.is_some_and(|status| status.dit_available(format)))
+}
+
+/// The row caption of a text-encoder format: name, catalog download size, ✓ when present.
+#[must_use]
+pub(super) fn flux3_encoder_format_row(format: Flux3EncoderFormat, status: Option<&Flux3Status>) -> String {
+    let label = tf!(
+        "cleaning.tools.flux3_klein.format_sized_label",
+        format = flux3_encoder_format_name(format),
+        size = format_gib(flux3_klein_encoder_spec(format).total_bytes())
+    );
+    with_installed_mark(label, status.is_some_and(|status| status.encoder_available(format)))
+}
+
+/// The encoder source id of every FLUX.3 klein library entry: FLUX.3 has one encoder family
+/// (the stock Qwen3-VL in bf16 shards or a GGUF quant), so the source is always `stock` (D12).
+const FLUX3_PROMPT_ENCODER_SOURCE: &str = "stock";
+
+/// The precision id of a weight-only fp8 encode in the shared gate. FLUX.3 has no fp8 encoder,
+/// so no FLUX.3 entry carries it; an entry that did would rank after every known format
+/// (`flux3_prompt_cache_precision_rank`), exactly as the backend ranks an unknown id.
+const FLUX3_PROMPT_PRECISION_FP8: &str = "fp8";
+
+/// What the shared «Кэшировать» gate knows about the typed text and the encoder `settings`
+/// select:
+/// - an encoder is always configured (download mode derives it; manual mode reads it under the
+///   package folder, whose absence is the readiness line's business);
+/// - `current` is `(stock, <encoder format id>)` in DOWNLOAD mode, where the catalog names the
+///   encoder files, and `None` in manual mode (no "more precise" check then);
+/// - the ranking is `ms_config::flux3_prompt_cache_precision_rank`;
+/// - in `vl_refs` (`text_mode_in_effect` false) caching is closed with the VL reason: the
+///   encoder also reads the images there, so every run encodes and nothing is cached.
+#[must_use]
+pub(super) fn flux3_cache_context(settings: &Flux3KleinSettings) -> CacheContext<'_> {
+    let current = match settings.source_mode() {
+        Flux3SourceMode::Download => Some((FLUX3_PROMPT_ENCODER_SOURCE.to_string(), settings.encoder_format().wire().to_string())),
+        Flux3SourceMode::Manual => None,
+    };
+    CacheContext {
+        prompt: &settings.prompt,
+        encoder_configured: true,
+        current,
+        rank: flux3_prompt_cache_precision_rank,
+        fp8_id: FLUX3_PROMPT_PRECISION_FP8,
+        engine_block: (!settings.text_mode_in_effect()).then(|| t!("cleaning.tools.flux3_klein.prompt_cache_vl_refs_tooltip").to_string()),
+    }
+}
+
+/// The localized name of the encoder that made a library entry: the encoder format's own name
+/// (`BF16` shards / `GGUF <quant>`), an unknown format id verbatim, else the backend's
+/// `encoder_label`. Empty only when the entry says nothing at all (the shared line then names
+/// no encoder).
+#[must_use]
+pub(super) fn flux3_encoder_caption(entry: &PromptLibraryEntry) -> String {
+    let format = entry.encoder_format.trim();
+    if let Some(known) = Flux3EncoderFormat::from_wire(format) {
+        return flux3_encoder_format_name(known);
+    }
+    if !format.is_empty() {
+        return format.to_string();
+    }
+    entry.encoder_label.clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(file: &str, format: &str, current: Option<bool>) -> PromptLibraryEntry {
+        PromptLibraryEntry {
+            file: file.to_string(),
+            encoder_source: FLUX3_PROMPT_ENCODER_SOURCE.to_string(),
+            encoder_format: format.to_string(),
+            current_encoder: current,
+            ..PromptLibraryEntry::default()
+        }
+    }
+
+    fn preset(name: &str, entries: Vec<PromptLibraryEntry>) -> PromptLibraryText {
+        PromptLibraryText { prompt: FLUX3_DEFAULT_PROMPT.to_string(), name: name.to_string(), selected: entries[0].clone(), entries }
+    }
+
+    /// The shared gate over the FLUX.3 context of `settings`, backend ready.
+    fn flux3_cache_button(settings: &Flux3KleinSettings, hit: Option<&PromptLibraryText>, name: &str, prompt_cached: Option<bool>) -> CacheButton {
+        cache_button(&flux3_cache_context(settings), hit, name, prompt_cached, Some(true), true)
+    }
+
+    /// In `vl_refs` «Кэшировать» is closed with the VL reason, right after readiness; a GGUF
+    /// encoder (sent as `text`) keeps it open.
+    #[test]
+    fn caching_is_closed_in_vl_refs_mode_with_its_reason() {
+        let _locale = english();
+        let vl = Flux3KleinSettings { vl_refs: true, ..Flux3KleinSettings::default() };
+        assert_eq!(flux3_cache_button(&vl, None, "", None), CacheButton::Closed(CacheBlock::Engine(t!("cleaning.tools.flux3_klein.prompt_cache_vl_refs_tooltip").to_string())));
+        assert_eq!(cache_button(&flux3_cache_context(&vl), None, "", None, None, false), CacheButton::Closed(CacheBlock::NotReady));
+        let gguf = Flux3KleinSettings { vl_refs: true, text_encoder_format: "q8_0".to_string(), ..Flux3KleinSettings::default() };
+        assert_eq!(flux3_cache_button(&gguf, None, "", None), CacheButton::Cache);
+        assert_eq!(flux3_cache_button(&Flux3KleinSettings::default(), None, "", None), CacheButton::Cache);
+        let blank = Flux3KleinSettings { prompt: " ".to_string(), ..Flux3KleinSettings::default() };
+        assert_eq!(flux3_cache_button(&blank, None, "", None), CacheButton::Closed(CacheBlock::NothingToEncode));
+    }
+
+    /// A strictly more precise entry closes a download-mode build; manual mode knows no current
+    /// encoder and never closes for that reason.
+    #[test]
+    fn a_more_precise_entry_closes_caching_in_download_mode() {
+        let q4 = Flux3KleinSettings { text_encoder_format: "q4_k_m".to_string(), ..Flux3KleinSettings::default() };
+        let q8 = entry("q8.msprompt", "q8_0", Some(false));
+        let hit = preset("sfx", vec![q8.clone()]);
+        assert_eq!(flux3_cache_button(&q4, Some(&hit), "sfx", Some(true)), CacheButton::Closed(CacheBlock::MorePrecise(q8)));
+        let bf16 = Flux3KleinSettings::default();
+        assert_eq!(flux3_cache_button(&bf16, Some(&hit), "sfx", Some(true)), CacheButton::Cache, "a less precise entry keeps it open");
+        let manual = Flux3KleinSettings { source_mode: "manual".to_string(), model_root: "/m/flux3".to_string(), ..q4 };
+        assert_eq!(flux3_cache_button(&manual, Some(&hit), "sfx", Some(true)), CacheButton::Cache);
+        // `.status` says the prompt is not served: the build stays open whatever the library holds.
+        assert_eq!(flux3_cache_button(&Flux3KleinSettings { text_encoder_format: "q4_k_m".to_string(), ..Flux3KleinSettings::default() }, Some(&hit), "sfx", Some(false)), CacheButton::Cache);
+    }
+
+    /// The current encoder's own entry closes caching; a different name renames it.
+    #[test]
+    fn an_entry_of_the_current_encoder_offers_only_a_rename() {
+        let settings = Flux3KleinSettings::default();
+        let hit = preset("sfx", vec![entry("a.msprompt", "bf16", Some(true))]);
+        assert_eq!(flux3_cache_button(&settings, Some(&hit), "sfx", Some(true)), CacheButton::Closed(CacheBlock::AlreadyCached));
+        assert_eq!(flux3_cache_button(&settings, Some(&hit), "sound effects", Some(true)), CacheButton::Rename);
+    }
+
+    /// The caption names the encoder format; an unknown id is shown verbatim, an empty one
+    /// falls back to the backend's label.
+    #[test]
+    fn the_encoder_caption_names_the_format() {
+        let _locale = english();
+        assert_eq!(flux3_encoder_caption(&entry("a", "bf16", None)), flux3_encoder_format_name(Flux3EncoderFormat::Bf16));
+        assert!(flux3_encoder_caption(&entry("a", "q4_k_m", None)).contains("Q4_K_M"));
+        assert_eq!(flux3_encoder_caption(&entry("a", "q2_k", None)), "q2_k");
+        let labelled = PromptLibraryEntry { encoder_label: "text_encoder".to_string(), ..PromptLibraryEntry::default() };
+        assert_eq!(flux3_encoder_caption(&labelled), "text_encoder");
+        assert_eq!(flux3_encoder_caption(&PromptLibraryEntry::default()), "");
+    }
 
     /// Blank is random, a number is pinned (the full u64 range), anything else is refused.
     #[test]
@@ -224,6 +450,7 @@ mod tests {
         assert!(flux3_run_block_reason(&settings, &Flux3ModelReadiness::Unknown, Flux3SeedInput::Random).is_none());
         assert!(flux3_run_block_reason(&settings, &Flux3ModelReadiness::Ready, Flux3SeedInput::Pinned(1)).is_none());
         assert!(flux3_run_block_reason(&settings, &Flux3ModelReadiness::NoRoot, Flux3SeedInput::Random).is_some());
+        assert!(flux3_run_block_reason(&settings, &Flux3ModelReadiness::RootNotAbsolute, Flux3SeedInput::Random).is_some());
         let missing = Flux3ModelReadiness::Missing(Flux3MissingParts(vec![Flux3Part::Autoencoder]));
         let download = flux3_run_block_reason(&settings, &missing, Flux3SeedInput::Random).expect("missing blocks");
         let manual = Flux3KleinSettings { source_mode: "manual".to_string(), model_root: "/m".to_string(), ..Flux3KleinSettings::default() };
@@ -239,13 +466,86 @@ mod tests {
     #[test]
     fn the_readiness_line_follows_the_verdict() {
         let summary = |fits| Flux3MemorySummary { line: "≈ 8 GiB".to_string(), fits };
-        assert_eq!(flux3_readiness_line(&Flux3ModelReadiness::Ready, Some(summary(false))).tone(), Flux3LineTone::Warn);
-        assert_eq!(flux3_readiness_line(&Flux3ModelReadiness::Ready, Some(summary(true))).tone(), Flux3LineTone::Ok);
-        assert!(!flux3_readiness_line(&Flux3ModelReadiness::Ready, None).offers_install());
-        assert!(flux3_readiness_line(&Flux3ModelReadiness::NoRoot, None).offers_install());
-        let missing = Flux3ModelReadiness::Missing(Flux3MissingParts(vec![Flux3Part::TextEncoder]));
-        assert!(flux3_readiness_line(&missing, Some(summary(true))).offers_install());
-        assert_eq!(flux3_readiness_line(&Flux3ModelReadiness::Unknown, None).tone(), Flux3LineTone::Neutral);
+        assert_eq!(flux3_readiness_line(&Flux3ModelReadiness::Ready, false, Some(summary(false))).tone(), Flux3LineTone::Warn);
+        assert_eq!(flux3_readiness_line(&Flux3ModelReadiness::Ready, false, Some(summary(true))).tone(), Flux3LineTone::Ok);
+        assert!(!flux3_readiness_line(&Flux3ModelReadiness::Ready, false, None).offers_install());
+        assert!(flux3_readiness_line(&Flux3ModelReadiness::NoRoot, false, None).offers_install());
+        let relative = flux3_readiness_line(&Flux3ModelReadiness::RootNotAbsolute, false, None);
+        assert!(relative.offers_install());
+        assert_eq!(relative.tone(), Flux3LineTone::Warn);
+        let missing = Flux3ModelReadiness::Missing(Flux3MissingParts(vec![Flux3Part::TextEncoder(Flux3EncoderFormat::Bf16)]));
+        assert!(flux3_readiness_line(&missing, true, Some(summary(true))).offers_install());
+        assert_eq!(flux3_readiness_line(&Flux3ModelReadiness::Unknown, false, None).tone(), Flux3LineTone::Neutral);
+        // An incomplete catalog bundle takes a ready or unanswered line (and offers the block),
+        // but a `Missing` verdict keeps naming its parts.
+        for readiness in [Flux3ModelReadiness::Ready, Flux3ModelReadiness::Unknown] {
+            let line = flux3_readiness_line(&readiness, true, Some(summary(true)));
+            assert_eq!(line, Flux3ReadinessLine::BundleMissing);
+            assert!(line.offers_install());
+            assert_eq!(line.tone(), Flux3LineTone::Warn);
+        }
+        assert!(matches!(flux3_readiness_line(&missing, true, None), Flux3ReadinessLine::Missing { .. }));
+    }
+
+    /// The bundle is the catalog's bundle of the selected DiT + encoder (base, root DiT config
+    /// when the DiT reads it, DiT, encoder) in download mode, nothing in manual mode, for every
+    /// pair of formats.
+    #[test]
+    fn the_catalog_bundle_follows_the_selection_and_only_in_download_mode() {
+        for &dit in Flux3DitFormat::all() {
+            for &encoder in Flux3EncoderFormat::all() {
+                let settings = Flux3KleinSettings { format: dit.wire().to_string(), text_encoder_format: encoder.wire().to_string(), ..Flux3KleinSettings::default() };
+                let ids: Vec<&str> = flux3_catalog_bundle(&settings).iter().map(|spec| spec.id).collect();
+                let mut expected = vec!["flux3_klein_base"];
+                if dit == Flux3DitFormat::Bf16 || dit.is_gguf() {
+                    expected.push("flux3_klein_dit_config");
+                }
+                expected.extend([flux3_klein_dit_spec(dit).id, flux3_klein_encoder_spec(encoder).id]);
+                assert_eq!(ids, expected, "{dit:?} {encoder:?}");
+                let manual = Flux3KleinSettings { source_mode: "manual".to_string(), model_root: "/m".to_string(), ..settings };
+                assert!(flux3_catalog_bundle(&manual).is_empty(), "manual mode has no catalog block");
+            }
+        }
+    }
+
+    /// The token row is drawn for the gated BFL repository while a spec from it is not seen
+    /// installed: any bundle needs the base (gated), a GGUF DiT also the root DiT config
+    /// (gated); the open GGUF repositories never ask.
+    #[test]
+    fn the_token_row_follows_the_gated_specs_not_installed() {
+        let gguf = Flux3KleinSettings { format: "q8_0".to_string(), text_encoder_format: "q4_k_m".to_string(), ..Flux3KleinSettings::default() };
+        let bundle = flux3_catalog_bundle(&gguf);
+        assert_eq!(catalog_gated_repos_missing(&bundle, |_| false), [FLUX3_REPO]);
+        let base_installed = |spec: &ExternalModelSpec| spec.id == "flux3_klein_base";
+        assert_eq!(catalog_gated_repos_missing(&bundle, base_installed), [FLUX3_REPO], "the root DiT config is gated");
+        let bfl_installed = |spec: &ExternalModelSpec| spec.id == "flux3_klein_base" || spec.id == "flux3_klein_dit_config";
+        assert!(catalog_gated_repos_missing(&bundle, bfl_installed).is_empty(), "the GGUF repositories are open");
+        let native = flux3_catalog_bundle(&Flux3KleinSettings::default());
+        assert_eq!(catalog_gated_repos_missing(&native, base_installed), [FLUX3_REPO], "the fp8r DiT and the bf16 encoder are gated");
+        assert!(catalog_gated_repos_missing(&native, |_| true).is_empty());
+    }
+
+    /// A format row names the format and its catalog size, and carries ✓ exactly when the
+    /// guarded answer says its file is there.
+    #[test]
+    fn a_format_row_names_the_size_and_the_installed_mark() {
+        let _locale = english();
+        let status = status_with(&[Flux3DitFormat::Q80], true, true);
+        for &format in Flux3DitFormat::all() {
+            let row = flux3_dit_format_row(format, Some(&status));
+            assert!(row.contains(&format_gib(flux3_klein_dit_spec(format).total_bytes())), "{row}");
+            assert_eq!(row.ends_with('✓'), format == Flux3DitFormat::Q80, "{row}");
+            assert!(!flux3_dit_format_row(format, None).ends_with('✓'), "no answer claims nothing");
+            if let Some(quant) = format.quant_token() {
+                assert!(row.contains(quant), "{row}");
+            }
+        }
+        for &format in Flux3EncoderFormat::all() {
+            let row = flux3_encoder_format_row(format, Some(&status));
+            assert!(row.contains(&format_gib(flux3_klein_encoder_spec(format).total_bytes())), "{row}");
+            // `status_with` reports only the aggregate flag, which covers the selection.
+            assert!(row.ends_with('✓'), "{row}");
+        }
     }
 
     /// Every stage the backend sends has a name; an unknown one falls back to the label.

@@ -232,8 +232,9 @@ class EncoderOnCpuTests(unittest.TestCase):
     """«Энкодер на CPU» (`encoder_on_cpu`, the encoder spec's host pin) at the klein 9B sizes on an empty 32 GiB card.
 
     Every VRAM step's device forecast excludes the encoder (its standalone
-    encode puts only the runtime overhead on the card and the encode moment is
-    the pipeline's resting weights plus that), while the RAM step still
+    encode puts nothing on the card, not even the runtime overhead, and the
+    encode moment is the pipeline's resting weights plus the pipeline's
+    overhead: the device context counted once), while the RAM step still
     governs it: kept in RAM between runs under KEEP, not under RUN / MIN.
     """
 
@@ -249,7 +250,7 @@ class EncoderOnCpuTests(unittest.TestCase):
                         pinned = memory.forecast_memory(svc.normalize_flux2_klein_params({**paths, "vram_step": vram, "ram_step": ram}), 512, 512, memory=self.CARD, device="cuda:0")
                         self.assertTrue(pinned["fits"])
                         self.assertEqual((pinned["vram_step_effective"], pinned["ram_step_effective"]), (vram, ram))
-                        self.assertEqual(pinned["phases"]["encode_standalone"]["vram_bytes"], overhead)
+                        self.assertEqual(pinned["phases"]["encode_standalone"]["vram_bytes"], 0)
                         self.assertGreater(pinned["phases"]["encode_standalone"]["ram_bytes"], pinned["breakdown"]["text_encoder"])
                         self.assertEqual(pinned["phases"]["encode"]["vram_bytes"], pinned["resident"]["pipeline_device"] + overhead)
                         kept = pinned["resident"]["text_encoder_host"]

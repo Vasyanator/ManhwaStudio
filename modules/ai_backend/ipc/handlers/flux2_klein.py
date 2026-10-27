@@ -14,6 +14,10 @@ Methods hosted here:
 No method here downloads weights: every FLUX.2 klein download (4B and 9B) is
 owned by the application's model catalog (Rust `ms_sysprobe::ai_models`).
 
+The four `.prompt_cache.*` methods are registered here and run the bodies shared
+with every model library (`prompt_cache_handlers.py`) over
+`ctx.state.flux2_klein_inpaint`.
+
 Streaming: like ``inpaint.flux_fill`` the handler pushes ``progress{id}`` frames
 via the dispatcher's ``ProgressEmitter`` (``HandlerContext.progress_emitter``),
 with a ``phase`` header field that is ``"load"`` (component being built) or
@@ -61,6 +65,7 @@ from ..protocol import (
     METHOD_INPAINT_FLUX2_KLEIN_UNLOAD,
 )
 from ..registry import HandlerContext, Interrupted, register
+from .prompt_cache_handlers import handle_build, handle_export, handle_import, handle_list, require_non_empty_str
 from .streaming import progress_forwarder, require_params, require_segment_len
 
 #: The settings reported back as `applied` (`PROTOCOL.md §5.4`): the ones the
@@ -99,21 +104,6 @@ def _split_request_blob(
     if not mask_png:
         raise ValueError("inpaint.flux2_klein requires a non-empty mask in the blob.")
     return image_png, mask_png, reference_png
-
-
-def _require_non_empty_str(header: dict[str, Any], field: str) -> str:
-    """Read a required non-empty string header field.
-
-    The value itself is NOT validated here: a path or an entry file name is
-    untrusted input and the service is the single owner of what makes one
-    acceptable (`prompt_library.require_entry_source`,
-    `require_entry_file_name`). This layer only guarantees the field arrived
-    and is a string.
-    """
-    value = header.get(field)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"Field '{field}' must be a non-empty string.")
-    return value
 
 
 def _handle_inpaint_flux2_klein(
@@ -224,8 +214,8 @@ def _handle_inpaint_flux2_klein_component_action(
     if cancel_event.is_set():
         raise Interrupted("inpaint.flux2_klein.component_action canceled before start.")
     params_raw = require_params(header)
-    component = _require_non_empty_str(header, "component")
-    action = _require_non_empty_str(header, "action")
+    component = require_non_empty_str(header, "component")
+    action = require_non_empty_str(header, "action")
     try:
         result = ctx.state.flux2_klein_inpaint.component_action(
             params_raw,
@@ -249,57 +239,20 @@ register(METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION, _handle_inpaint_flux2_klei
 
 
 # ---------------------------------------------------------------------------
-# Prompt-cache library
+# Prompt-cache library (bodies shared with every model library:
+# `prompt_cache_handlers`; the cancel and error texts name the method)
 # ---------------------------------------------------------------------------
-def _optional_str(header: dict[str, Any], field: str) -> str | None:
-    """An optional string header field: `None` when absent or `null`, else the string (any content; the service judges it).
-
-    # Raises
-    `ValueError` when present and not a string.
-    """
-    value = header.get(field)
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise ValueError(f"Field '{field}' must be a string when present.")
-    return value
-
-
 def _handle_prompt_cache_build(
     ctx: HandlerContext,
     header: dict[str, Any],
     blob: bytes,
     cancel_event: threading.Event,
 ) -> tuple[dict[str, Any], bytes]:
-    """Save the prompt as a named preset of the model's library; no image is produced.
+    """Save the prompt as a named preset of the model's library (`prompt_cache_handlers.handle_build`).
 
-    `name` is optional (absent / empty: keep the preset's name, or derive one).
-    Streams the same `phase:"load"` frames as a generation when it encodes —
-    reading the text encoder takes tens of seconds and a silent wait is not
-    acceptable — but only the prompt phase's steps occur, because no pipeline
-    is built.
-
-    Cancellation follows the shared inpaint contract: checked before the call and
-    after it returns, never inside the encoder read.
+    Only the prompt phase's steps stream, because no pipeline is built.
     """
-    if cancel_event.is_set():
-        raise Interrupted("inpaint.flux2_klein.prompt_cache.build canceled before start.")
-    params_raw = require_params(header)
-    name = _optional_str(header, "name")
-    try:
-        result = ctx.state.flux2_klein_inpaint.prompt_cache_build(
-            params_raw, name=name, progress_callback=progress_forwarder(ctx, METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD)
-        )
-    except (ValueError, FileNotFoundError):
-        raise
-    except Exception:  # noqa: BLE001
-        if cancel_event.is_set():
-            raise Interrupted("inpaint.flux2_klein.prompt_cache.build canceled.") from None
-        traceback.print_exc()
-        raise
-    if cancel_event.is_set():
-        raise Interrupted("inpaint.flux2_klein.prompt_cache.build canceled.")
-    return dict(result), b""
+    return handle_build(ctx, header, cancel_event, service=ctx.state.flux2_klein_inpaint, method=METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD)
 
 
 register(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD, _handle_prompt_cache_build)
@@ -311,9 +264,8 @@ def _handle_prompt_cache_list(
     blob: bytes,
     cancel_event: threading.Event,
 ) -> tuple[dict[str, Any], bytes]:
-    """List the presets of the library named in `params.prompt_library`."""
-    params_raw = require_params(header)
-    return dict(ctx.state.flux2_klein_inpaint.prompt_cache_list(params_raw)), b""
+    """List the presets of the library named in `params.prompt_library` (`prompt_cache_handlers.handle_list`)."""
+    return handle_list(ctx, header, cancel_event, service=ctx.state.flux2_klein_inpaint, method=METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST)
 
 
 register(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_LIST, _handle_prompt_cache_list)
@@ -325,12 +277,8 @@ def _handle_prompt_cache_export(
     blob: bytes,
     cancel_event: threading.Event,
 ) -> tuple[dict[str, Any], bytes]:
-    """Copy the library entry `file` to the `.msprompt` path in `path`."""
-    params_raw = require_params(header)
-    file = _require_non_empty_str(header, "file")
-    path = _require_non_empty_str(header, "path")
-    result = ctx.state.flux2_klein_inpaint.prompt_cache_export(params_raw, file, path)
-    return dict(result), b""
+    """Copy the library entry `file` to the `.msprompt` path in `path` (`prompt_cache_handlers.handle_export`)."""
+    return handle_export(ctx, header, cancel_event, service=ctx.state.flux2_klein_inpaint, method=METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT)
 
 
 register(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT, _handle_prompt_cache_export)
@@ -342,16 +290,8 @@ def _handle_prompt_cache_import(
     blob: bytes,
     cancel_event: threading.Event,
 ) -> tuple[dict[str, Any], bytes]:
-    """Copy a `.msprompt` file into the library it belongs to.
-
-    `library_matches` in the answer tells the client whether that library is
-    the one the request names; the import never fails over that, because the
-    file is filed under ITS OWN library and would otherwise be lost.
-    """
-    params_raw = require_params(header)
-    path = _require_non_empty_str(header, "path")
-    result = ctx.state.flux2_klein_inpaint.prompt_cache_import(params_raw, path)
-    return dict(result), b""
+    """Copy a `.msprompt` file into the library it belongs to (`prompt_cache_handlers.handle_import`)."""
+    return handle_import(ctx, header, cancel_event, service=ctx.state.flux2_klein_inpaint, method=METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT)
 
 
 register(METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT, _handle_prompt_cache_import)

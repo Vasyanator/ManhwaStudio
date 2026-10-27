@@ -12,20 +12,32 @@ Main responsibilities:
 - `read_package_config` -> `PackageConfig` (`DitConfig`, `SamplerConfig`);
 - `detect_weight_format` (header -> `WeightFormat`) and
   `require_declared_format` (config vs header);
+- the DiT and text-encoder SOURCES a request names (`DitSource` =
+  `WeightFormat` | `GgufDit`, `EncoderSource`) and their id rule
+  (`FORMAT_ID_PATTERN`);
 - `resolve_model_files` -> `ModelFiles`, `variant_availability`,
   `package_ae_file` / `package_text_encoder_dir` (the variant-independent files);
 - the text encoder's checkpoint layout: `text_encoder_shards` (the shard files
-  of `model.safetensors.index.json`) and the checkpoint key -> state key maps of
-  the two encoder modes (`text_mode_key_map`, `vl_mode_key_map`).
+  of `model.safetensors.index.json`), `text_encoder_files` /
+  `text_encoder_availability` (per `EncoderSource`) and the checkpoint key ->
+  state key maps of the two encoder modes (`text_mode_key_map`,
+  `vl_mode_key_map`).
 
 Key declarations:
-- `WeightFormat`, `DitConfig`, `SamplerConfig`, `PackageConfig`, `ModelFiles`
+- `WeightFormat`, `GgufDit`, `DitSource`, `EncoderSource`, `DitConfig`,
+  `SamplerConfig`, `PackageConfig`, `ModelFiles`
 
 Package layout (the BFL export, `flux-3-image-klein`):
 - `<root>/model.safetensors` + `<root>/config.json` - the BF16 DiT;
 - `<root>/variants/<fp8r|nvfp4>/{model.safetensors,config.json}` - quantized DiTs;
 - `<root>/ae.safetensors` - the autoencoder;
-- `<root>/text_encoder/` - the Qwen3-VL text encoder directory.
+- `<root>/text_encoder/` - the Qwen3-VL text encoder directory (its
+  `config.json`, tokenizer and processor files serve every encoder format; the
+  weight shards only the bf16 one).
+A GGUF DiT (`GgufDit`) or GGUF text encoder (`EncoderSource` with a path) is a
+single llama.cpp file at an absolute path the client names (the Rust catalog
+puts them under `<root>/transformer_gguf/` and `<root>/text_encoder_gguf/`, but
+this module never derives a GGUF path): a GGUF DiT reads `<root>/config.json`.
 
 Notes:
 - Torch-free and stdlib-only; filesystem access is limited to reading
@@ -91,6 +103,97 @@ class WeightFormat(Enum):
     BF16 = "bf16"
     FP8R = "fp8r"
     NVFP4 = "nvfp4"
+
+
+#: A format / encoder id the client may send (owned by the Rust catalog; opaque
+#: here except the native `WeightFormat` values and `ENCODER_BF16`).
+FORMAT_ID_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
+
+#: The id of the bf16 text encoder: the shards of `<root>/text_encoder`.
+ENCODER_BF16 = "bf16"
+
+
+def _require_format_id(value: object, *, what: str) -> str:
+    """`value` as a format id, or `ValueError` naming `what` (`FORMAT_ID_PATTERN`)."""
+    if not isinstance(value, str) or FORMAT_ID_PATTERN.match(value) is None:
+        raise ValueError(f"{what}: идентификатор формата должен соответствовать {FORMAT_ID_PATTERN.pattern}, получено {value!r}")
+    return value
+
+
+def _require_absolute(path: object, *, what: str) -> Path:
+    """`path` as an absolute `Path`, or `ValueError` naming `what`."""
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise ValueError(f"{what}: путь к файлу должен быть абсолютным, получено {path!r}")
+    return path
+
+
+@dataclass(frozen=True)
+class GgufDit:
+    """A GGUF DiT candidate: the client's format `id` (`q8_0`, ...) and the absolute `path` of its file.
+
+    `value` equals `id`, so a `DitSource` names its format the same way
+    whether it is native (`WeightFormat.value`) or GGUF. The DiT config is the
+    package root's `config.json`.
+
+    # Raises
+    `ValueError` (construction) for an id outside `FORMAT_ID_PATTERN`, a
+    native id (`bf16` / `fp8r` / `nvfp4` are never GGUF), or a relative path.
+    """
+
+    id: str
+    path: Path
+
+    def __post_init__(self) -> None:
+        _require_format_id(self.id, what="GGUF DiT")
+        if self.id in {fmt.value for fmt in WeightFormat}:
+            raise ValueError(f"GGUF DiT: «{self.id}» — идентификатор собственного формата пакета, а не GGUF")
+        _require_absolute(self.path, what=f"GGUF DiT «{self.id}»")
+
+    @property
+    def value(self) -> str:
+        """The format id (the `WeightFormat.value` counterpart)."""
+        return self.id
+
+
+#: The DiT a request runs: a native export of the package or a GGUF file.
+DitSource = WeightFormat | GgufDit
+
+#: The native formats in quality order (best first): the candidate list of a
+#: request that names none.
+NATIVE_DIT_FORMATS: tuple[WeightFormat, ...] = (WeightFormat.BF16, WeightFormat.FP8R, WeightFormat.NVFP4)
+
+
+@dataclass(frozen=True)
+class EncoderSource:
+    """The text encoder a request runs: `ENCODER_BF16` (`path` `None`: the
+    `<root>/text_encoder` shards) or a GGUF file (`id` from the client, `path`
+    absolute). A GGUF encoder is the TEXT half of Qwen3-VL only (no vision
+    tower), so it cannot serve `EncoderMode.VL_REFS`.
+
+    # Raises
+    `ValueError` (construction) for an id outside `FORMAT_ID_PATTERN`, `bf16`
+    with a path, or another id without an absolute path.
+    """
+
+    id: str
+    path: Path | None = None
+
+    def __post_init__(self) -> None:
+        _require_format_id(self.id, what="текстовый энкодер")
+        if self.id == ENCODER_BF16:
+            if self.path is not None:
+                raise ValueError(f"текстовый энкодер «{ENCODER_BF16}» берётся из папки text_encoder пакета и не принимает путь ({self.path})")
+            return
+        _require_absolute(self.path, what=f"текстовый энкодер «{self.id}»")
+
+    @property
+    def is_gguf(self) -> bool:
+        """True for a GGUF file encoder (every id but `ENCODER_BF16`)."""
+        return self.path is not None
+
+
+#: The default encoder: the bf16 shards of the package.
+ENCODER_BF16_SOURCE = EncoderSource(ENCODER_BF16)
 
 
 @dataclass(frozen=True)
@@ -426,22 +529,33 @@ def package_text_encoder_dir(root: Path) -> Path:
     return root / "text_encoder"
 
 
-def resolve_model_files(root: Path, variant: WeightFormat) -> ModelFiles:
+def resolve_model_files(root: Path, variant: DitSource) -> ModelFiles:
     """Locate the files of `variant` under the package `root` (layout: module header).
 
+    A native format reads its export's `model.safetensors` + `config.json`; a
+    `GgufDit` its own file with the root's `config.json` (the bf16 config:
+    never checked against the GGUF header by `require_declared_format`, whose
+    `quantization` rule is a safetensors-export fact). The encoder directory
+    is NOT required: a run whose caption is served by the prompt cache never
+    reads it, so the encoder (directory included) may be absent; `text_encoder_dir`
+    is only where it would be, and an encode checks it
+    (`text_encoder_availability`).
+
     # Raises
-    `FileNotFoundError` naming every missing file or directory.
+    `FileNotFoundError` naming every missing file.
     """
-    dit_dir = root if variant is WeightFormat.BF16 else root / "variants" / variant.value
+    if isinstance(variant, GgufDit):
+        dit_file, dit_config = variant.path, root / "config.json"
+    else:
+        dit_dir = root if variant is WeightFormat.BF16 else root / "variants" / variant.value
+        dit_file, dit_config = dit_dir / "model.safetensors", dit_dir / "config.json"
     files = ModelFiles(
-        dit_file=dit_dir / "model.safetensors",
-        dit_config=dit_dir / "config.json",
+        dit_file=dit_file,
+        dit_config=dit_config,
         ae_file=package_ae_file(root),
         text_encoder_dir=package_text_encoder_dir(root),
     )
     missing = [str(path) for path in (files.dit_file, files.dit_config, files.ae_file) if not path.is_file()]
-    if not files.text_encoder_dir.is_dir():
-        missing.append(str(files.text_encoder_dir))
     if missing:
         raise FileNotFoundError(
             f"FLUX.3 klein ({variant.value}): не найдены файлы модели: {', '.join(missing)}"
@@ -501,6 +615,35 @@ def text_encoder_shards(directory: Path) -> list[Path]:
     if missing:
         raise FileNotFoundError(f"{_ENCODER_OWNER}: не найдены файлы весов: {', '.join(missing)}")
     return files
+
+
+def text_encoder_files(root: Path, encoder: EncoderSource) -> list[Path]:
+    """The weight files of `encoder` for the package under `root`: the bf16 shards, or the GGUF file.
+
+    # Raises
+    `FileNotFoundError` for a missing index, shard or GGUF file; `ValueError`
+    for a broken shard index (`text_encoder_shards`).
+    """
+    if encoder.path is None:
+        return text_encoder_shards(package_text_encoder_dir(root))
+    if not encoder.path.is_file():
+        raise FileNotFoundError(f"{_ENCODER_OWNER}: не найден файл формата «{encoder.id}»: {encoder.path}")
+    return [encoder.path]
+
+
+def text_encoder_availability(root: Path, encoder: EncoderSource) -> tuple[str | None, int]:
+    """`(reason, bytes)` of `encoder` under `root`: `reason` `None` when its weights AND the
+    `<root>/text_encoder` directory (config, tokenizer: every format needs it) are present,
+    `bytes` the weight files' total size (0 when unavailable). Presence only: no header is read.
+    """
+    directory = package_text_encoder_dir(root)
+    if not directory.is_dir():
+        return f"{_ENCODER_OWNER}: не найдена папка {directory}", 0
+    try:
+        files = text_encoder_files(root, encoder)
+        return None, sum(path.stat().st_size for path in files)
+    except (OSError, ValueError) as exc:
+        return str(exc), 0
 
 
 def _language_key(rest: str, keep_layers: int) -> str | None:

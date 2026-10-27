@@ -57,6 +57,14 @@ Contracts:
   side (parts, `Need`, own bytes, baseline RSS); loads and restores count the
   device-tier bytes against the `HostWatch`; learned floors are kept under
   `HOST_DEVICE_CLASS`.
+- **Baseline RSS vs. host room.** A forecast's host peaks include the
+  baseline RSS = the process RSS with EVERY large-pool holding taken out (this
+  handle's, its pair partner's, other models'; `_large_free_rss`), so a
+  reported host peak is what the backend would hold with only this run's
+  large model loaded. The host ROOM a plan is fitted against is probed
+  availability + own bytes - claims (+ reclaimable idle holdings) and never
+  depends on the baseline: other handles' bytes count as occupied unless the
+  arbiter could reclaim them.
 - **Host pin** (`LargeModelSpec.host_pin(options)`, e.g. "encoder on the
   CPU"): the planner places the pinned components by the RAM step alone
   (`planner` module notes); the pin is part of the residency key
@@ -1647,6 +1655,14 @@ class LargeModelManager:
     def _inputs(self, handle: _Handle | None, requester: Requester, *, own_reservation: Reservation | None, with_reclaim: bool, device: str | None = None) -> _Inputs:
         """Fresh planner inputs: probes, own bytes (+ own torch slack) credited, others' reservations claimed, reclaimable bytes.
 
+        `baseline_rss` is the process RSS with EVERY large-pool holding taken
+        out (`_large_free_rss`): this handle's live ledger bytes, its pair
+        partner's and any other large model's, so a forecast's host peak reads
+        "what the backend will hold with only this run's large model loaded".
+        The host ROOM does not depend on it (`Budgets.host_room` is probed
+        availability + own bytes - claims; the other handles' bytes are not
+        available unless `reclaimable`), and a plan's host growth is its peak
+        minus this same baseline, so admission is unaffected.
         A host run device reads no device budget: everything is on the host side (`Budgets.host_device`).
         """
         device_name = device or (handle.device if handle is not None else "")
@@ -1667,11 +1683,11 @@ class LargeModelManager:
             small = view.reclaimable(Pool.SMALL, device=device_name, requester=requester)
             large = view.reclaimable(Pool.LARGE, device=device_name, requester=requester)
             reclaimable = Reclaimable(small.device_bytes + large.device_bytes, small.host_bytes + large.host_bytes)
-        budgets = Budgets(host=host, device=budget, baseline_rss=max(0, host.rss_private - own.host_bytes), own_device_bytes=own.device_bytes + slack, own_host_bytes=own.host_bytes, claimed_device_bytes=max(0, claimed_device), claimed_host_bytes=max(0, claimed_host))
+        budgets = Budgets(host=host, device=budget, baseline_rss=self._large_free_rss(host.rss_private, requester.key, own.host_bytes), own_device_bytes=own.device_bytes + slack, own_host_bytes=own.host_bytes, claimed_device_bytes=max(0, claimed_device), claimed_host_bytes=max(0, claimed_host))
         return _Inputs(budgets=budgets, reclaimable=reclaimable)
 
     def _host_device_inputs(self, device_name: str, own: Holdings, requester: Requester, *, own_reservation: Reservation | None, with_reclaim: bool) -> _Inputs:
-        """`_inputs` of a host run device: a zero device budget (never probed), every own / claimed / reclaimable byte on the host side."""
+        """`_inputs` of a host run device: a zero device budget (never probed), every own / claimed / reclaimable byte on the host side (the baseline as in `_inputs`)."""
         host = self._probes.host()
         view = self._arbiter.view(None)
         own_host = own.device_bytes + own.host_bytes
@@ -1682,7 +1698,7 @@ class LargeModelManager:
             large = view.reclaimable(Pool.LARGE, device=None, requester=requester)
             reclaimable = Reclaimable(0, small.host_bytes + large.host_bytes)
         device = DeviceBudget(device=device_name, total=0, free=0, torch_allocated=0, torch_reserved=0, non_torch=0, reserve=0, cap=None)
-        budgets = Budgets(host=host, device=device, baseline_rss=max(0, host.rss_private - own_host), own_device_bytes=0, own_host_bytes=own_host, claimed_device_bytes=0, claimed_host_bytes=max(0, claimed_host), host_device=True)
+        budgets = Budgets(host=host, device=device, baseline_rss=self._large_free_rss(host.rss_private, requester.key, own_host), own_device_bytes=0, own_host_bytes=own_host, claimed_device_bytes=0, claimed_host_bytes=max(0, claimed_host), host_device=True)
         return _Inputs(budgets=budgets, reclaimable=reclaimable)
 
     def _run_need(self, handle: _Handle, peaks: tuple[int, int], *, extra_device: int = 0, extra_host: int = 0) -> Need:
@@ -1694,10 +1710,20 @@ class LargeModelManager:
             return Need(device=None, device_bytes=0, host_bytes=max(0, device_peak + host_growth - held) + max(0, extra_device) + max(0, extra_host))
         return Need(device=handle.device, device_bytes=max(0, device_peak - own.device_bytes) + max(0, extra_device), host_bytes=max(0, host_growth - own.host_bytes) + max(0, extra_host))
 
-    def _others_held(self, key: str, device: str | None) -> int:
-        """Ledger bytes every OTHER resident holding has on `device` (host bytes when `None`)."""
+    def _large_free_rss(self, rss_private: int, key: str, own_host_bytes: int) -> int:
+        """The process RSS without any large-pool holding (bytes, at least 0): `rss_private` less `key`'s own live host bytes and every other resident large holding's host bytes.
+
+        `own_host_bytes` comes from the handle's live ledger (all of it on a host
+        run device); the other handles' come from their published arbiter parts,
+        whose `host_bytes` already carry a host run device's bytes (`_publish`).
+        Small-pool models, the runtime and the allocator's cache stay in.
+        """
+        return max(0, rss_private - max(0, own_host_bytes) - self._others_held(key, None, pools=(Pool.LARGE,)))
+
+    def _others_held(self, key: str, device: str | None, *, pools: Collection[Pool] = tuple(Pool)) -> int:
+        """Ledger bytes every OTHER resident holding of `pools` (default: both) has on `device` (host bytes when `None`)."""
         total = 0
-        for pool in Pool:
+        for pool in pools:
             for holding in self._arbiter.holdings(pool).values():
                 if not holding.resident or (pool is Pool.LARGE and holding.key == key):
                     continue

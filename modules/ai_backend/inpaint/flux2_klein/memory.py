@@ -3,9 +3,10 @@ File: modules/ai_backend/inpaint/flux2_klein/memory.py
 
 Purpose:
 The FLUX.2 klein resource glue over the large-model manager, which owns every
-resource decision: the request's step pair, the step keys of an answer, the
-COMBINED VRAM-axis rule of the two handles (pipeline + text encoder), and the
-two-handle run forecast the calibration tool and the golden tests read.
+resource decision: the request's step pair, the step keys of an answer,
+FLUX.2's binding of the two-handle rule (pipeline + text encoder; the rule
+itself is `runtime.large_models.paired`), and the two-handle run forecast the
+calibration tool and the golden tests read.
 Nothing here forecasts on its own: the numbers come from `runtime.large_models`
 (the planner on `large_model.py`'s specs, the one `forecast` arithmetic).
 
@@ -14,9 +15,12 @@ Main responsibilities:
   `params.ram_step`, an absent axis «Авто»;
 - `steps_fields` / `STEP_FIELD_KEYS` - the four step keys of an answer
   (requested and effective);
-- the COMBINED VRAM-axis rule of the two handles (`combined_device_peak`,
-  `combined_ceilings`, `encoder_device_cap`; module notes), shared by
-  `forecast_memory`, the run's encoder admission and `large_model_profiles`;
+- `FLUX2_PAIR` - FLUX.2's `paired.PairPhases` (denoise + decode bound the
+  run, the encoder runs beside the denoise state), and the combined VRAM-axis
+  rule bound to it (`combined_device_peak`, `encoder_device_cap`; the chain
+  `combined_ceilings` re-exported from `paired`), shared by `forecast_memory`,
+  the run's encoder admission and `large_model_profiles` (both through
+  `paired`);
 - `forecast_memory` - the forecast of one run of both handles: the pipeline
   planned first, the text encoder second on what the pipeline left (exactly
   how a run is admitted), as `vram_bytes`, `ram_bytes`, per-phase figures,
@@ -35,21 +39,14 @@ Notes:
   device budget and no unbounded-VRAM rule, every byte on the host side, the
   RAM step alone picks the plan; the forecast's VRAM figures are `0` and `fits`
   is the host plan's.
-- Combined VRAM-axis monotonicity (the two handles together): the planner keeps
-  each handle monotone on its own, but the encoder is admitted on what the
-  pipeline's RESERVATION leaves, and its MAX / PHASE templates fill that room.
-  A lower step whose pipeline reserves less (PHASE parks the transformer for
-  the decode, MAX keeps it) would hand the encoder more room, and the encode
-  moment (the pipeline's denoise-state weights + the encoder) would forecast
-  more device memory than the higher step. So a run's encoder is admitted
-  with a device ceiling (`Budgets.device_cap_bytes`, `acquire(...,
-  device_cap_bytes=)`): the combined device peak of the nearest fitting HIGHER
-  VRAM step at the same RAM step (each planned under its own ceiling, the
-  chain `combined_ceilings`), minus this step's pipeline weights in the
-  denoise state (`encoder_device_cap`). Hence, for the same request and
-  budgets, a lower VRAM step never forecasts more device bytes than a higher
-  one for the two handles together. A host run device has no VRAM axis: no
-  ceiling.
+- Combined VRAM-axis monotonicity (the two handles together): the rule and
+  its reasoning are `runtime.large_models.paired`'s (module notes there); for
+  FLUX.2 the encoder runs while the pipeline sits in its denoise state, so a
+  lower VRAM step's encoder ceiling is the combined peak of the nearest fitting
+  higher step minus this step's denoise-state pipeline weights. Hence, for the
+  same request and budgets, a lower VRAM step never forecasts more device
+  bytes than a higher one for the two handles together. A host run device has
+  no VRAM axis: no ceiling.
 - The planner relaxes only device phases whose cost entry is unmeasured (e.g. a
   borrowed table of an unknown device class): it may admit on their weights alone. The
   displayed peaks are the plan's full forecast (`Planned.full_forecast`, every
@@ -67,7 +64,6 @@ from __future__ import annotations
 
 import functools
 import logging
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -77,7 +73,9 @@ from ...runtime.large_models.forecast import Forecast
 from ...runtime.large_models.inventory import ComponentInventory, build_inventory
 from ...runtime.large_models.planner import Budgets, Planned, PlanRefusal, plan
 from ...runtime.large_models.spec import LargeModelSpec
-from ...runtime.large_models.tiers import VRAM_ORDER, Limits, RamStep, Steps, VramStep
+from ...runtime.large_models import paired
+from ...runtime.large_models.paired import PairPhases, combined_ceilings
+from ...runtime.large_models.tiers import Limits, RamStep, Steps, VramStep
 from ...runtime.memory_budget import DeviceBudget, HostBudget
 from ...runtime.residency.footprint import is_device_accounted
 from . import attention, hardware, large_model
@@ -182,48 +180,26 @@ def _budgets(memory: dict[str, int] | None, *, host_device: bool = False, claime
     return Budgets(host=host, device=device, baseline_rss=0, claimed_device_bytes=claimed_device, claimed_host_bytes=claimed_host, device_cap_bytes=device_cap)
 
 
-def combined_device_peak(pipeline: Forecast, encoder: Forecast | None) -> int:
-    """The device peak of one run of both handles (bytes): the pipeline's denoise / decode peaks, and the encode moment.
+#: FLUX.2's phases in the two-handle rule (`runtime.large_models.paired`): the
+#: pipeline's denoise and decode bound the run, and the encoder runs while the
+#: pipeline sits in its denoise state.
+FLUX2_PAIR = PairPhases(pipeline=(large_model.PHASE_DENOISE, large_model.PHASE_DECODE), rest=large_model.PHASE_DENOISE, encode=large_model.PHASE_ENCODE)
 
-    The encode moment is the pipeline's denoise-state device weights (where a
-    cold run encodes) plus the encoder's `encode` phase peak; `encoder=None`
-    = nothing is encoded. Equal to `forecast_memory`'s `vram_bytes` for the
-    same two plans.
+
+def combined_device_peak(pipeline: Forecast, encoder: Forecast | None) -> int:
+    """The device peak of one FLUX.2 run of both handles (bytes): `paired.combined_device_peak` over `FLUX2_PAIR`.
+
+    The pipeline's denoise / decode peaks, and the encode moment (the
+    pipeline's denoise-state device weights plus the encoder's `encode` peak;
+    `encoder=None` = nothing is encoded). Equal to `forecast_memory`'s
+    `vram_bytes` for the same two plans.
     """
-    phases = pipeline.phases
-    peak = max(int(phases[large_model.PHASE_DENOISE].device_peak), int(phases[large_model.PHASE_DECODE].device_peak))
-    if encoder is not None and large_model.PHASE_ENCODE in encoder.phases:
-        peak = max(peak, int(phases[large_model.PHASE_DENOISE].device_weights) + int(encoder.phases[large_model.PHASE_ENCODE].device_peak))
-    return peak
+    return paired.combined_device_peak(pipeline, encoder, FLUX2_PAIR)
 
 
 def encoder_device_cap(ceiling: int | None, pipeline: Forecast) -> int | None:
-    """The encoder's device ceiling beside `pipeline`'s plan (bytes; `None` = none): `ceiling` minus the pipeline's denoise-state device weights (module notes)."""
-    if ceiling is None:
-        return None
-    return max(0, ceiling - int(pipeline.phases[large_model.PHASE_DENOISE].device_weights))
-
-
-def combined_ceilings(ram: RamStep, combined_at: Callable[[Steps, int | None], int | None], *, until: VramStep) -> dict[VramStep, int | None]:
-    """The combined ceiling of every concrete VRAM step from MAX down to `until` at the RAM step `ram` (module notes).
-
-    A step's ceiling is the combined device peak of the nearest FITTING higher
-    step (`None` for MAX, or when no higher step fits). `combined_at(cell,
-    ceiling)` plans `cell` with the encoder capped by `encoder_device_cap(ceiling,
-    <its pipeline plan>)` and returns `combined_device_peak` (`None` = the cell
-    does not fit); it is called only for the steps ABOVE `until`. The chain
-    is monotone by construction: every planned cell stays under its ceiling.
-    """
-    ceilings: dict[VramStep, int | None] = {}
-    ceiling: int | None = None
-    for vram in VRAM_ORDER:
-        ceilings[vram] = ceiling
-        if vram is until:
-            break
-        peak = combined_at(Steps(vram, ram), ceiling)
-        if peak is not None:
-            ceiling = peak
-    return ceilings
+    """The encoder's device ceiling beside `pipeline`'s plan (bytes; `None` = none): `paired.encoder_device_cap` over `FLUX2_PAIR` (module notes)."""
+    return paired.encoder_device_cap(ceiling, pipeline, FLUX2_PAIR)
 
 
 @dataclass(frozen=True)
@@ -334,8 +310,9 @@ def forecast_memory(
     resting_pipeline_host = pipe_full.phases[large_model.PHASE_DENOISE].host_weights if pipe_full is not None else 0
     encoder_idle_host = int(enc_full.phases["idle"].host_weights) if enc_full is not None else 0
     phases = {
-        # The encoder runs while the pipeline already sits in its denoise state.
-        "encode": {"vram_bytes": int(resting_pipeline + alone_vram) if enc_full else 0, "ram_bytes": int(resting_pipeline_host + alone_ram) if enc_full else 0},
+        # The encoder runs while the pipeline already sits in its denoise state
+        # (the paired encode moment: a CPU encoder adds only the device context).
+        "encode": {"vram_bytes": (paired.encode_moment_device(pipe_full, enc_full, FLUX2_PAIR) if pipe_full is not None else int(alone_vram)) if enc_full else 0, "ram_bytes": int(resting_pipeline_host + alone_ram) if enc_full else 0},
         "encode_standalone": {"vram_bytes": alone_vram, "ram_bytes": alone_ram},
         "denoise": {"vram_bytes": denoise_vram, "ram_bytes": denoise_ram + encoder_idle_host},
         "decode": {"vram_bytes": decode_vram, "ram_bytes": decode_ram + encoder_idle_host},

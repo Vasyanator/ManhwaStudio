@@ -139,7 +139,7 @@ pub(super) struct Flux2CatalogDownloadView<'a> {
     /// The last `.status` answer, for the presence marks beside the derived paths.
     pub(super) status: Option<&'a Flux2Status>,
     /// The gated repositories of the bundle's specs not known to be installed
-    /// ([`flux2_gated_repos_missing`]): the token row is drawn while this is non-empty.
+    /// ([`catalog_gated_repos_missing`]): the token row is drawn while this is non-empty.
     pub(super) gated_repos: &'a [&'static str],
     pub(super) token_state: ms_sysprobe::hf_token::HfTokenState,
     /// The masked field's buffer. Never persisted and never logged.
@@ -223,7 +223,7 @@ fn draw_encoder_source_toggle(ui: &mut egui::Ui, settings: &mut Flux2KleinSettin
         let mut uncensored = settings.encoder_source() == Flux2EncoderSource::Uncensored;
         let toggled = ui
             .checkbox(&mut uncensored, t!("cleaning.tools.flux2_klein.download.uncensored_label"))
-            .on_hover_text(t!("cleaning.tools.flux2_klein.download.uncensored_hint"))
+            .on_hover_text(t!("cleaning.tools.flux2_klein.download.uncensored_encoder_hint"))
             .changed();
         if toggled {
             let previous = settings.encoder_source();
@@ -351,7 +351,7 @@ mod tests {
     }
 
     /// The FLUX.2 keys of this block (the shared ones are pinned in
-    /// `../../shared/hf_download_ui.rs` and `stream_progress_ui.rs`) that every shipped locale
+    /// `../../shared/hf_download_ui.rs`, `stream_progress_ui.rs` and `catalog_download.rs`) that every shipped locale
     /// carries.
     #[test]
     fn every_catalog_carries_the_download_block_strings() {
@@ -359,9 +359,6 @@ mod tests {
             "cleaning.tools.flux2_klein.pipeline_busy_error",
             "cleaning.tools.flux2_klein.download.heading",
             "cleaning.tools.flux2_klein.download.uncensored_label",
-            "cleaning.tools.flux2_klein.download.uncensored_hint",
-            // The picker's disabled tooltips: a closed control that says nothing is a defect.
-            "cleaning.tools.flux2_klein.download.switch_blocked_download",
             "cleaning.tools.flux2_klein.variant_residency_hint",
             "cleaning.tools.flux2_klein.title",
             "cleaning.tools.flux2_klein.title_4b",
@@ -404,7 +401,7 @@ mod tests {
     /// source switch leaves, the readiness line of an incomplete bundle and the fp8 checkbox a
     /// GGUF encoder closes. The two catalogs maintained by hand (`en`, the reference, and
     /// `ru`) must carry them; `es` / `fr` / `pt` fall back to `en`. The retired backend-download
-    /// keys are gone from both.
+    /// keys and the two switch-block keys moved to the shared catalog block are gone from both.
     #[test]
     fn the_reference_catalogs_carry_the_weight_format_keys() {
         let plain = [
@@ -417,7 +414,9 @@ mod tests {
             "cleaning.tools.flux2_klein.format_gguf_encoder_hint",
             "cleaning.tools.flux2_klein.text_encoder_fp8_gguf_disabled_hint",
             "cleaning.tools.flux2_klein.bundle_missing_status",
-            "cleaning.tools.flux2_klein.download.switch_blocked_verify",
+            // Reworded under a new id (was `download.uncensored_hint`, retired below); es / fr
+            // / pt fall back to en.
+            "cleaning.tools.flux2_klein.download.uncensored_encoder_hint",
         ];
         // A format row is only a choice while it names the format and its size; the switch
         // line names both formats.
@@ -434,11 +433,16 @@ mod tests {
             "cleaning.tools.flux2_klein.download.token_unexpected_hint",
             "cleaning.tools.flux2_klein.download.variant_mismatch_error",
             "cleaning.tools.flux2_klein.download.switch_blocked_check",
+            // Moved to the shared `cleaning.tools.catalog_download.*` (pinned in
+            // `../../shared/catalog_download.rs`).
+            "cleaning.tools.flux2_klein.download.switch_blocked_download",
+            "cleaning.tools.flux2_klein.download.switch_blocked_verify",
             "cleaning.tools.flux2_klein.download.running_status",
             "cleaning.tools.flux2_klein.download.cancelled_status",
             "cleaning.tools.flux2_klein.download.done_status",
             "cleaning.tools.flux2_klein.download.error",
             "cleaning.tools.flux2_klein.download.download_tooltip",
+            "cleaning.tools.flux2_klein.download.uncensored_hint",
         ];
         for (tag, source) in ms_i18n::embedded_locales().iter().filter(|(tag, _)| matches!(*tag, "en" | "ru")) {
             let catalog = catalog(tag, source);

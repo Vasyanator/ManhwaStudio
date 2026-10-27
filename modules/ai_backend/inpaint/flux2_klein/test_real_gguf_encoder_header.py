@@ -35,7 +35,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from modules.ai_backend.inpaint.flux2_klein import components, encoder_gguf, large_model
+from modules.ai_backend.inpaint.flux2_klein import components, large_model
+from modules.ai_backend.runtime import qwen3_gguf
 from modules.ai_backend.runtime.paths import side_models_root
 
 #: Environment variable naming extra GGUF encoder files to check.
@@ -129,7 +130,7 @@ class RealGgufEncoderHeaderTests(unittest.TestCase):
                 expected = {key: tuple(value.shape) for key, value in model.state_dict().items()}
                 produced: dict[str, tuple[int, ...]] = {}
                 for span in layout.spans:
-                    key = encoder_gguf.encoder_state_key_of_gguf(span.name, keep)
+                    key = qwen3_gguf.encoder_state_key_of_gguf(span.name, keep)
                     if key is None:
                         continue
                     self.assertNotIn(key, produced, f"{span.name} writes {key} twice")
@@ -137,7 +138,7 @@ class RealGgufEncoderHeaderTests(unittest.TestCase):
                 self.assertEqual(set(produced), set(expected), "the file's kept tensors are exactly the model's state keys")
                 for key, shape in produced.items():
                     self.assertEqual(shape, expected[key], key)
-                quantized = encoder_gguf.gguf_encoder_quant_types(layout.spans, keep)
+                quantized = qwen3_gguf.gguf_encoder_quant_types(layout.spans, keep)
                 swapped = {f"{name}.weight" for name, module in model.named_modules() if isinstance(module, (GgufLinear, GgufEmbedding))}
                 self.assertEqual(swapped, set(quantized))
 
@@ -159,7 +160,7 @@ class RealGgufEncoderHeaderTests(unittest.TestCase):
                 spans = {span.name: span for span in reader.spans}
                 for name in ("blk.0.attn_q.weight", "blk.0.attn_k.weight"):
                     with self.subTest(file=path.name, tensor=name):
-                        hf_key = f"model.{encoder_gguf.encoder_state_key_of_gguf(name, components.ENCODER_KEEP_LAYERS)}"
+                        hf_key = f"model.{qwen3_gguf.encoder_state_key_of_gguf(name, components.ENCODER_KEEP_LAYERS)}"
                         with StreamingSafetensorsReader(weight_map[hf_key]) as reference_reader:
                             reference = reference_reader.read_tensor(next(span for span in reference_reader.spans if span.name == hf_key))[:_ROWS].float()
                         rows = reader.read_tensor(spans[name])[:_ROWS]

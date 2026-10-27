@@ -3,16 +3,26 @@ File: modules/ai_backend/inpaint/flux3_klein/test_service.py
 
 Purpose:
 Unit tests of `Flux3KleinService` over the real `LargeModelManager`
-(`_service_test_fixtures.ServiceRig`): the two resource steps decide where
+(`_service_test_fixtures.ServiceRig`): the two handles (pipeline, text
+encoder) admitted under the service lock in that order, the encoder under
+its combined VRAM-axis ceiling, a refused encoder that finishes the pipeline
+with nothing read, the lock order against a concurrent reclaim
+(`LockOrderTests`), the two resource steps decide where
 the encoder runs, the weight format and the steps are passed to the manager and
 never changed, a memory failure degrades the run instead of failing it, a refusal
 before / at the admission touches nothing, a failed load registers nothing, a
 failed run keeps the handle and releases what its frames held, the reference
 rules (VL images = AE images, the reference cap, the crop), `health()` while
 the lock is held and read from the manager's ledger (a reclaim park seen live),
-`unload`, a residency-key change, the key format; the step callback, «Энкодер
+`unload`, a residency-key change, the two key formats, a failed load that
+drops only the run's pipeline; the step callback, «Энкодер
 на CPU» (the encoder on the CPU at every VRAM step), a cancel that unloads
-nothing, the `large_models.profiles` adapter and `status`.
+nothing, the `large_models.profiles` adapter (the two-handle composition,
+FLUX.2's answer shape) and `status` (per offered DiT and
+encoder format; without `source_root` only the root is excused, every other
+malformed field is still refused); a GGUF DiT run end to end (compute path `gguf`, the key keyed
+by the file, the header check before the admission) and GGUF refusals before
+the admission (D6-D9).
 
 Notes:
 CPU only, no weights (stand-in modules in tiny real safetensors files); the
@@ -34,18 +44,40 @@ from ...runtime.large_models.manager import ComponentPlacement, LargeModelRefuse
 from ...runtime.large_models.spec import ExecDevice
 from ...runtime.large_models.tiers import RamStep, Steps, Tier, VramStep
 from ...runtime.residency.holdings import Action, Offer, OfferClass, Pool
-from . import packing, quant, service
+from . import loading, packing, quant, service, text_encoder
 from ._service_test_fixtures import Recorder, ServiceRig
-from .config import WeightFormat
+from .config import EncoderSource, GgufDit, WeightFormat
 from .params import AeDtype, EncoderMode, Flux3Options, Flux3Request, Fp8Compute
 from .phases import Phase
 
 
+def large_model_shape(caption: str) -> Any:
+    """The `RequestShape` a default run of `caption` (no references, the tiny package's 64x64 default size, 4 steps) admits."""
+    from .large_model import request_shape
+
+    return request_shape(64, 64, [], caption=caption, steps=4)
+
+
 class _Case(unittest.TestCase):
+    #: The native exports the rig's package holds.
+    VARIANTS: tuple[WeightFormat, ...] = (WeightFormat.FP8R, WeightFormat.NVFP4)
+
     def setUp(self) -> None:
-        self.rig = ServiceRig(self, variants=(WeightFormat.FP8R, WeightFormat.NVFP4))
+        self.rig = ServiceRig(self, variants=self.VARIANTS)
         self.service = self.rig.service
         self.recorder = Recorder()
+        # Every admission the service makes: (model, device_cap_bytes, session).
+        self.admissions: list[tuple[str, int | None, Any]] = []
+        real_acquire = self.rig.manager.acquire
+
+        def acquire(model: str, *args: Any, **kwargs: Any) -> Any:
+            session = real_acquire(model, *args, **kwargs)
+            self.admissions.append((model, kwargs.get("device_cap_bytes"), session))
+            return session
+
+        patcher = patch.object(self.rig.manager, "acquire", acquire)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _options(self, **overrides: Any) -> Flux3Options:
         return Flux3Options(model_root=self.rig.root, variant=overrides.pop("variant", WeightFormat.FP8R), **overrides)
@@ -55,9 +87,14 @@ class _Case(unittest.TestCase):
         return self.service.generate(request or Flux3Request(caption="a cat"), options or self._options(), observer=self.recorder)
 
     def _session(self) -> Any:
+        """The last run's pipeline session."""
         held = self.service._held
         assert held is not None
         return held.session
+
+    def _encoder_session(self) -> Any:
+        """The last encoder session the service admitted."""
+        return next(session for model, _cap, session in reversed(self.admissions) if model.startswith("flux3_klein_text_encoder."))
 
 
 class ManagerWiringTests(_Case):
@@ -71,7 +108,7 @@ class ManagerWiringTests(_Case):
         for steps, expected in cases:
             with self.subTest(steps=steps.label):
                 result = self._run(self._options(vram_step=steps.vram, ram_step=steps.ram))
-                plan = self._session().plan
+                plan = self._encoder_session().plan
                 self.assertEqual(plan.phase("encode").components["encoder"].exec_device, expected)
                 self.assertEqual((result.applied.steps_requested, result.applied.steps_effective), (steps, steps))
                 self.assertFalse(result.applied.degraded)
@@ -94,13 +131,29 @@ class ManagerWiringTests(_Case):
         self.assertEqual(self.recorder.begin(Phase.DENOISE)["compute_path"], "scaled_mm")
 
     def test_every_phase_carries_the_forecast_of_its_step(self) -> None:
+        from ...runtime.large_models import paired
+
+        from .large_model import FLUX3_PAIR
+
         self._run()
         forecast = self._session().forecast
+        encoder = self._encoder_session().forecast
         denoise = self.recorder.begin(Phase.DENOISE)
         self.assertEqual(denoise["forecast_device_peak"], forecast.phases["denoise"].device_peak)
         restore = self.recorder.begin(Phase.DIT_RESTORE)
         self.assertEqual(restore["forecast_device_peak"], forecast.transitions["ref_encode->denoise"].device_peak)
-        self.assertEqual(denoise["forecast_run_device_peak"], forecast.device_peak)
+        self.assertEqual(self.recorder.begin(Phase.DIT_LOAD)["forecast_device_peak"], forecast.transitions["idle->ref_encode"].device_peak)
+        # The encoder's steps read the encoder handle's forecast; ENCODER_RELEASE (its finish) has none.
+        self.assertEqual(self.recorder.begin(Phase.ENCODE)["forecast_device_peak"], encoder.phases["encode"].device_peak)
+        self.assertEqual(self.recorder.begin(Phase.ENCODER_LOAD)["forecast_host_peak"], encoder.transitions["idle->encode"].host_peak)
+        release = self.recorder.begin(Phase.ENCODER_RELEASE)
+        self.assertEqual((release["forecast_device_peak"], release["forecast_host_peak"]), (None, None))
+        # The run's peaks are the two-handle rule's, the same in every phase.
+        run_device = paired.combined_device_peak(forecast, encoder, FLUX3_PAIR)
+        run_host = forecast.host_peak + max(0, encoder.host_peak - paired.host_baseline(encoder))
+        for phase in Phase:
+            info = self.recorder.begin(phase)
+            self.assertEqual((info["forecast_run_device_peak"], info["forecast_run_host_peak"]), (run_device, run_host), phase)
 
     def test_the_dit_runs_every_step_through_the_manager(self) -> None:
         self._run(request=Flux3Request(caption="a cat", steps=3))
@@ -152,7 +205,8 @@ class ManagerWiringTests(_Case):
         with patch.object(service, "_clear_torch_cache", lambda: released.append("cache")), self.assertRaises(RuntimeError):
             self._run()
         self.assertEqual(released, ["cache"])
-        self.assertEqual(self.rig.large_holdings(), (1, 0, 0))
+        # Both handles stay resident (the pipeline and the encoder).
+        self.assertEqual(self.rig.large_holdings(), (2, 0, 0))
         self.assertTrue(self.service.health()["ready"])
         self.rig.dits[-1].fail = False
         self._run()
@@ -216,7 +270,8 @@ class ReferenceTests(_Case):
         info = self.recorder.begin(Phase.REF_ENCODE)
         self.assertEqual((info["n_refs"], info["ref_tokens"]), (2, 4 * 3 + 2 * 2))
         self.assertEqual((result.width, result.height), (64, 48))
-        self.assertEqual(self._session().model, "flux3_klein.vl_refs.ae_float32")
+        self.assertEqual(self._session().model, "flux3_klein.ae_float32")
+        self.assertEqual(self._encoder_session().model, "flux3_klein_text_encoder.vl_refs")
 
     def test_reference_max_pixels_caps_what_the_ae_and_the_vl_encoder_see(self) -> None:
         self._run(
@@ -289,11 +344,15 @@ class HealthTests(_Case):
         held.device = "gpu-label"
         self.assertEqual((self.service.health()["dit_device"], self.service.health()["encoder_resident"]), ("gpu-label", "gpu-label"))
         # The arbiter's reclaim path (`PoolPolicy.execute` -> the manager).
-        offer = Offer(pool=Pool.LARGE, key=held.key, part="dit", action=Action.PARK_TO_HOST, device="cpu", frees_device=0, frees_host=0, reload_cost_s=0.0, cls=OfferClass.A, last_used_at=0.0)
+        offer = Offer(pool=Pool.LARGE, key=held.pipeline_key, part="dit", action=Action.PARK_TO_HOST, device="cpu", frees_device=0, frees_host=0, reload_cost_s=0.0, cls=OfferClass.A, last_used_at=0.0)
         self.assertTrue(self.rig.manager._execute_offer(offer).ok)
-        self.assertIs(self.rig.manager.placements(held.key)["dit"].tier, Tier.HOST)
+        self.assertIs(self.rig.manager.placements(held.pipeline_key)["dit"].tier, Tier.HOST)
         health = self.service.health()
         self.assertEqual((health["dit_device"], health["encoder_resident"], health["ready"]), ("cpu", "gpu-label", True))
+        # The encoder is its own handle: dropping it leaves the pipeline ready.
+        self.assertTrue(self.rig.manager.unload_key(held.encoder_key))
+        health = self.service.health()
+        self.assertEqual((health["encoder_resident"], health["ready"], health["loaded"]), (None, True, True))
 
     def test_a_placement_is_read_as_device_ram_or_not_held(self) -> None:
         def placement(tier: Tier | None, blocks_device: int = 0, exec_device: ExecDevice | None = ExecDevice.RUN_DEVICE) -> ComponentPlacement:
@@ -320,14 +379,68 @@ class HealthTests(_Case):
         self._run(self._options(ae_dtype=AeDtype.BFLOAT16))
         self.assertNotEqual(self.service.health()["model_key"], first_key)
         self.assertEqual(len(self.rig.dits), 2)
-        # The first handle stays idle (the arbiter may reclaim it); unload drops both.
-        self.assertEqual(self.rig.large_holdings(), (2, 0, 0))
+        # The AE dtype keys the pipeline only: one encoder handle serves both
+        # pipelines. The first pipeline stays idle (the arbiter may reclaim it);
+        # unload drops all three handles.
+        self.assertEqual(len(self.rig.encoders), 1)
+        self.assertEqual(self.rig.large_holdings(), (3, 0, 0))
         self.assertTrue(self.service.unload())
         self.assertEqual(self.rig.large_holdings(), (0, 0, 0))
 
-    def test_the_model_key_is_computed_from_options_alone(self) -> None:
+    def test_the_keys_are_computed_from_options_alone(self) -> None:
         options = Flux3Options(model_root=Path("/nowhere/flux3"), variant=WeightFormat.NVFP4)
-        self.assertEqual(service._model_key(options, "cuda:0"), "flux3_klein:nvfp4|cuda:0|auto|float32|text|/nowhere/flux3")
+        self.assertEqual(service._model_key(options, "cuda:0"), "flux3_klein:nvfp4|cuda:0|auto|float32|/nowhere/flux3")
+        self.assertEqual(service._encoder_handle_key(options, "cuda:0"), "flux3_klein_text_encoder:bf16|cuda:0|text|/nowhere/flux3")
+        pinned = Flux3Options(model_root=Path("/nowhere/flux3"), variant=WeightFormat.NVFP4, encoder_on_cpu=True)
+        self.assertEqual(service._model_key(pinned, "cuda:0"), service._model_key(options, "cuda:0"))
+        self.assertEqual(service._encoder_handle_key(pinned, "cuda:0"), "flux3_klein_text_encoder:bf16|cuda:0|text|/nowhere/flux3|host_pin=encoder")
+
+    def test_a_failed_load_unloads_only_the_runs_pipeline(self) -> None:
+        # Another pipeline handle (AE bfloat16) and the shared encoder are held
+        # idle; a failed load of the float32 pipeline drops its own key only.
+        self._run(self._options(ae_dtype=AeDtype.BFLOAT16))
+        other = self.service._held
+        assert other is not None
+        self.rig.fail_ae_build = True
+        with self.assertRaises(ValueError):
+            self._run()
+
+        def held(key: str) -> bool:
+            return any(placement.tier is not None for placement in self.rig.manager.placements(key).values())
+
+        self.assertTrue(held(other.pipeline_key))
+        self.assertTrue(held(other.encoder_key))
+        self.assertFalse(held(service._model_key(self._options(), "cpu")))
+        self.assertEqual(self.rig.large_holdings(), (2, 0, 0))
+
+    def test_a_failed_encoder_read_leaves_the_encoder_handle_holding_nothing(self) -> None:
+        # A corrupt shard fails the encoder read part-way (a non-memory error
+        # after some tensors were read). The loader discards the partial module
+        # and leaves the ledger untouched (`runtime/large_models/loader.py`
+        # module notes), so the encoder handle holds nothing and is not
+        # forecast as resident; the warm pipeline keeps its between-runs state.
+        from . import large_model
+
+        options = self._options(vram_step=VramStep.MAX, ram_step=RamStep.KEEP, encoder_on_cpu=False)
+        armed = False
+        real = large_model._is_gguf_name
+
+        def observer(phase: Phase, event: str, info: Any) -> None:
+            nonlocal armed
+            if phase is Phase.ENCODER_LOAD and event == "begin":
+                armed = True
+
+        def corrupt(file_key: str) -> bool:
+            if armed and file_key.startswith("model.language_model.layers.1"):
+                raise OSError("corrupt shard")
+            return real(file_key)
+
+        with patch.object(large_model, "_is_gguf_name", corrupt), self.assertRaises(OSError):
+            self.service.generate(Flux3Request(caption="a cat"), options, observer=observer)
+        encoder = self.rig.manager.placements(service._encoder_handle_key(options, "cpu"))
+        self.assertTrue(all(placement.tier is None for placement in encoder.values()), encoder)
+        self.assertIsNone(self.service.health()["encoder_resident"])
+        self.assertEqual(self.rig.large_holdings(), (1, 0, 0), "the pipeline alone")
 
 
 class WireIntegrationTests(_Case):
@@ -345,8 +458,9 @@ class WireIntegrationTests(_Case):
         for vram in (VramStep.MAX, VramStep.PHASE, VramStep.HALF, VramStep.MIN):
             with self.subTest(vram=vram.value):
                 result = self._run(self._options(vram_step=vram, ram_step=RamStep.KEEP, encoder_on_cpu=True))
-                session = self._session()
+                session = self._encoder_session()
                 self.assertTrue(session.key.endswith("|host_pin=encoder"), session.key)
+                self.assertFalse(self._session().key.endswith("|host_pin=encoder"), "the pin is the encoder handle's")
                 for state in (*session.plan.phases, session.plan.idle):
                     self.assertIs(state.components["encoder"].exec_device, ExecDevice.CPU)
                     self.assertIsNot(state.components["encoder"].tier, Tier.DEVICE)
@@ -383,31 +497,92 @@ class WireIntegrationTests(_Case):
         self.assertIs(self.rig.dits[-1], warm, "the warm DiT survived every cancel")
         self.assertFalse(result.applied.degraded)
 
-    def test_the_profiles_adapter(self) -> None:
+    def _shape(self) -> Any:
+        from ...runtime.large_models.spec import RequestShape
+
+        return RequestShape(64, 64, references=((64, 64),))
+
+    def test_the_profiles_adapter_composes_both_handles(self) -> None:
+        from ...runtime.large_models.tiers import AUTO_STEPS
+
         for mode in ("text", "vl_refs"):
             for ae in ("float32", "bfloat16"):
                 with self.subTest(mode=mode, ae=ae):
-                    self.assertEqual(self.service.large_model_name(self._params(encoder_mode=mode, ae_dtype=ae)), f"flux3_klein.{mode}.ae_{ae}")
-        options, device = self.service.large_model_inputs(self._params(format="nvfp4"))
-        self.assertEqual((device, options.device, options.options.variant), ("cpu", "cpu", WeightFormat.NVFP4))
-        self.assertTrue(options.options.encoder_on_cpu, "absent = «Энкодер на CPU» on")
+                    answer = self.service.large_model_profiles(self._params(encoder_mode=mode, ae_dtype=ae), self._shape(), format=None, steps=AUTO_STEPS)
+                    self.assertEqual((answer["model"], answer["format"]), (f"flux3_klein.ae_{ae}", "fp8r"))
+                    self.assertTrue(answer["selected"]["fits"])
+                    self.assertIn("host_baseline", answer["selected"]["forecast"])
+                    self.assertEqual({line["component"] for line in answer["selected"]["plan_summary"]}, {"dit", "ae"})
+                    encoder = answer["encoder"]
+                    self.assertIsNotNone(encoder, "an uncached caption is encoded: the encoder is counted (served captions: test_prompt_cache)")
+                    self.assertEqual({line["component"] for line in encoder["plan_summary"]}, {"encoder"})
+                    self.assertIn("host_baseline", encoder["forecast"])
+                    self.assertEqual([row["id"] for row in answer["encoder_formats"]], ["bf16"])
+        on_cpu = self.service.large_model_profiles(self._params(), self._shape(), format=None, steps=AUTO_STEPS)
+        self.assertEqual(on_cpu["encoder"]["plan_summary"][0]["exec_device"], "cpu", "absent encoder_on_cpu = on")
+        on_card = self.service.large_model_profiles(self._params(encoder_on_cpu=False), self._shape(), format="nvfp4", steps=AUTO_STEPS)
+        self.assertEqual(on_card["encoder"]["plan_summary"][0]["exec_device"], "run_device")
+        self.assertEqual(on_card["format"], "nvfp4")
         with self.assertRaises(ValueError):
-            self.service.large_model_inputs(self._params(bogus=1))
-        report = self.manager_profiles(self._params())
-        self.assertEqual(report.format, "fp8r")
-        self.assertIsNotNone(report.selected)
+            self.service.large_model_profiles(self._params(bogus=1), self._shape(), format=None, steps=AUTO_STEPS)
 
-    def manager_profiles(self, params: dict[str, Any]) -> Any:
-        from ...runtime.large_models.spec import RequestShape
+    def test_the_profiles_report_matches_the_run(self) -> None:
+        # The run admits the plans the profiles adapter composes (same models,
+        # formats, steps and encoder ceiling chain). The observer reports the
+        # ADMITTED forecasts (`Session.forecast`, uncalibrated activations left
+        # out, `forecast_calibrated` says so), the report's `run_*_peak` the
+        # full ones: compared here over the admitted forecasts of the report.
+        from ...runtime.large_models import paired
 
-        options, device = self.service.large_model_inputs(params)
-        return self.rig.manager.profiles(self.service.large_model_name(params), options, RequestShape(64, 64, references=((64, 64),)), device=device)
+        from .large_model import FLUX3_PAIR
+
+        steps = Steps(VramStep.PHASE, RamStep.KEEP)
+        caption = "a cat"
+        shape = large_model_shape(caption)
+        report = self.service.plan_profiles(self._params(prompt=caption, encoder_on_cpu=False), shape, format=None, steps=steps)
+        self.assertEqual((report.alone.model, report.encoder.model), ("flux3_klein.ae_float32", "flux3_klein_text_encoder.text"))
+        self._run(self._options(vram_step=steps.vram, ram_step=steps.ram), Flux3Request(caption=caption, steps=4))
+        pipeline, encoder = report.alone.selected.forecast, report.encoder.selected.forecast
+        info = self.recorder.begin(Phase.DENOISE)
+        self.assertEqual(info["forecast_run_device_peak"], paired.combined_device_peak(pipeline, encoder, FLUX3_PAIR))
+        self.assertEqual(info["forecast_run_host_peak"], pipeline.host_peak + max(0, encoder.host_peak - paired.host_baseline(encoder)))
+        self.assertGreaterEqual(report.run_device_peak(FLUX3_PAIR), info["forecast_run_device_peak"])
+
+    def test_the_encoder_is_admitted_under_its_combined_ceiling(self) -> None:
+        # «Максимум скорости» has no higher step: no ceiling. A lower VRAM step
+        # gets the combined peak of the nearest fitting higher step minus its
+        # own pipeline's ref_encode weights (`paired` module notes).
+        for steps, capped in ((Steps(VramStep.MAX, RamStep.KEEP), False), (Steps(VramStep.PHASE, RamStep.KEEP), True), (Steps(VramStep.MIN, RamStep.KEEP), True)):
+            with self.subTest(steps=steps.label):
+                self.admissions.clear()
+                self._run(self._options(vram_step=steps.vram, ram_step=steps.ram))
+                models = [model for model, _cap, _session in self.admissions]
+                self.assertEqual(models, ["flux3_klein.ae_float32", "flux3_klein_text_encoder.text"], "pipeline before encoder")
+                self.assertIsNone(self.admissions[0][1], "the pipeline is never capped")
+                self.assertEqual(self.admissions[1][1] is not None, capped)
+
+    def test_a_refused_encoder_finishes_the_pipeline_with_nothing_read(self) -> None:
+        real_acquire = self.rig.manager.acquire
+
+        def refuse_encoder(model: str, *args: Any, **kwargs: Any) -> Any:
+            if model.startswith("flux3_klein_text_encoder."):
+                raise LargeModelRefused(model, kwargs["format"])
+            return real_acquire(model, *args, **kwargs)
+
+        with patch.object(self.rig.manager, "acquire", refuse_encoder), self.assertRaises(LargeModelRefused):
+            self._run()
+        self.assertEqual(self.recorder.events, [], "no phase: the refusal is part of the admission")
+        self.assertEqual(self.rig.dits, [], "nothing was built or read")
+        self.assertEqual(self.rig.large_holdings(), (0, 0, 0), "the pipeline session ended, its lease released")
+        self.assertIn("flux3_klein_text_encoder", self.service.health()["last_error"])
+        self._run()
+        self.assertIsNone(self.service.health()["last_error"])
 
     def test_status_and_an_explicit_dequant_never_probe(self) -> None:
         calls: list[Any] = []
         with patch.object(quant, "probe_scaled_mm", lambda device: calls.append(device) or quant.ScaledMmProbe(supported=False, reason="test", rel_error=None)):
             self.service.status(self._params(format="nvfp4"))
-            self.service.large_model_inputs(self._params(format="nvfp4", fp8_compute="dequant"))
+            self.service.plan_profiles(self._params(format="nvfp4", fp8_compute="dequant"), self._shape(), format=None, steps=Steps(VramStep.AUTO, RamStep.AUTO))
         self.assertEqual(calls, [])
 
     def test_status(self) -> None:
@@ -424,6 +599,266 @@ class WireIntegrationTests(_Case):
         empty = self.service.status({})
         self.assertFalse(empty["available"])
         self.assertTrue(empty["reason"])
+
+    def test_status_without_a_root_still_refuses_malformed_params(self) -> None:
+        # Only the missing root is the unavailable answer; anything else malformed is a request error naming its field.
+        for params in (None, {"source_root": ""}, {"format": "bf16"}):
+            with self.subTest(params=params):
+                self.assertFalse(self.service.status(params)["available"])
+        cases = {
+            "bogus": {"bogus": 1},
+            "format": {"format": 8},
+            "ae_dtype": {"ae_dtype": "fp16"},
+            "dit_formats": {"dit_formats": []},
+            "encoder_mode": {"text_encoder_formats": [{"id": "q8_0", "path": "/m/q8.gguf"}], "text_encoder_format": "q8_0", "encoder_mode": "vl_refs"},
+        }
+        for field, params in cases.items():
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError) as caught:
+                    self.service.status(params)
+                self.assertIn(field, str(caught.exception))
+
+
+class GgufRunTests(_Case):
+    """`status` per offered format, a GGUF DiT through the stubbed service (the header check patched: the stand-in is no FLUX.3 DiT) and the GGUF refusals."""
+
+    # A bf16 export too: a GGUF DiT reads the root `config.json`.
+    VARIANTS = (WeightFormat.FP8R, WeightFormat.NVFP4, WeightFormat.BF16)
+
+    def _params(self, **overrides: Any) -> dict[str, Any]:
+        return {"source_root": str(self.rig.root), "prompt": "a cat", **overrides}
+
+    def test_status_reports_every_offered_format(self) -> None:
+        dit = self.rig.root / "transformer_gguf" / "dit-Q8_0.gguf"
+        dit.parent.mkdir()
+        dit.write_bytes(b"x" * 11)
+        encoder = self.rig.root / "text_encoder_gguf" / "enc-Q8_0.gguf"
+        encoder.parent.mkdir()
+        encoder.write_bytes(b"x" * 7)
+        params = self._params(
+            dit_formats=[{"id": "bf16"}, {"id": "fp8r"}, {"id": "q8_0", "path": str(dit)}, {"id": "nvfp4"}, {"id": "q4_k_m", "path": str(self.rig.root / "transformer_gguf" / "absent.gguf")}],
+            format="q8_0",
+            text_encoder_formats=[{"id": "q8_0", "path": str(encoder)}, {"id": "q4_k_m", "path": str(self.rig.root / "text_encoder_gguf" / "absent.gguf")}],
+            text_encoder_format="q4_k_m",
+        )
+        answer = self.service.status(params)
+        self.assertEqual(list(answer["formats"]), ["bf16", "fp8r", "q8_0", "nvfp4", "q4_k_m"])
+        self.assertEqual((answer["available"], answer["formats"]["q8_0"]["dit_bytes"]), (True, 11))
+        self.assertFalse(answer["formats"]["q4_k_m"]["available"])
+        self.assertIn("absent.gguf", answer["formats"]["q4_k_m"]["reason"])
+        encoders = answer["text_encoder_formats"]
+        self.assertEqual(list(encoders), ["bf16", "q8_0", "q4_k_m"])
+        self.assertTrue(encoders["bf16"]["available"] and encoders["bf16"]["bytes"] > 0)
+        self.assertEqual((encoders["q8_0"]["available"], encoders["q8_0"]["bytes"], encoders["q8_0"]["reason"]), (True, 7, None))
+        self.assertFalse(encoders["q4_k_m"]["available"])
+        # `text_encoder_present` follows the SELECTED encoder format.
+        self.assertFalse(answer["text_encoder_present"])
+        self.assertTrue(self.service.status({**params, "text_encoder_format": "q8_0"})["text_encoder_present"])
+        self.assertTrue(self.service.status(self._params())["text_encoder_present"])
+        self.assertEqual(set(self.service.status({})["text_encoder_formats"]), {"bf16"})
+
+
+    def _gguf_dit(self) -> GgufDit:
+        from ...runtime._gguf_test_fixtures import Q, make_tensor, write_gguf
+
+        path = self.rig.root / "transformer_gguf" / "stub-Q8_0.gguf"
+        path.parent.mkdir(exist_ok=True)
+        # The stand-in's key layout (`StubDit`), F32 rows of 32 so a quantized one would be legal too.
+        tensors = [make_tensor(name, Q.F32, (4, 4), seed=index) for index, name in enumerate(("txt_in.weight", "single_blocks.0.weight", "single_blocks.1.weight"))]
+        write_gguf(path, tensors, architecture="flux")
+        return GgufDit("q8_0", path)
+
+    def test_a_gguf_dit_runs_with_the_gguf_compute_path(self) -> None:
+        dit = self._gguf_dit()
+        checked: list[str] = []
+
+        def require_gguf_dit(spans: Any, package: Any, *, source: Path, format_id: str) -> dict[str, int]:
+            checked.append(format_id)
+            return {}
+
+        with patch.object(loading, "require_gguf_dit", require_gguf_dit):
+            result = self._run(self._options(variant=dit))
+        self.assertEqual(checked, ["q8_0"])
+        self.assertEqual((result.applied.variant, result.applied.fp8_compute, result.applied.compute_path), (dit, None, "gguf"))
+        self.assertEqual(self.recorder.begin(Phase.DENOISE)["variant"], "q8_0")
+        self.assertEqual(self.recorder.begin(Phase.DENOISE)["text_encoder_format"], "bf16")
+        health = self.service.health()
+        self.assertEqual((health["variant"], health["compute_path"]), ("q8_0", "gguf"))
+        self.assertTrue(health["model_key"].endswith(f"|dit={dit.path}"), health["model_key"])
+
+    def test_a_broken_gguf_is_refused_before_the_admission_naming_the_field(self) -> None:
+        broken = self.rig.root / "transformer_gguf" / "broken.gguf"
+        broken.parent.mkdir(exist_ok=True)
+        broken.write_bytes(b"GGUF" + b"\0" * 12)
+        encoder_file = self.rig.root / "enc.gguf"
+        encoder_file.write_bytes(b"GGUF" + b"\0" * 12)
+        for options, field in (
+            (self._options(variant=GgufDit("q8_0", broken)), "«format»"),
+            (self._options(encoder=EncoderSource("q4_k_m", encoder_file)), "«text_encoder_format»"),
+            (self._options(encoder=EncoderSource("q4_k_m", self.rig.root / "absent.gguf")), "«text_encoder_format»"),
+        ):
+            with self.subTest(options=options.variant.value + "/" + options.encoder.id), self.assertRaises((ValueError, FileNotFoundError)) as caught:
+                self._run(options)
+            self.assertIn(field, str(caught.exception))
+        self.assertEqual(self.recorder.events, [])
+        self.assertEqual(self.rig.large_holdings(), (0, 0, 0))
+        self.assertEqual(self.rig.dits, [])
+
+    def test_the_header_refusals_name_the_wire_field(self) -> None:
+        def refuse_dit(*args: Any, **kwargs: Any) -> dict[str, int]:
+            raise ValueError("FLUX.3 klein DiT: формат «q8_0» (поле «format», x.gguf): нет весов")
+
+        def refuse_encoder(*args: Any, **kwargs: Any) -> None:
+            raise ValueError("FLUX.3 klein (текстовый энкодер): формат «q4_k_m» (поле «text_encoder_format», e.gguf): не Qwen3")
+
+        dit = self._gguf_dit()
+        encoder = self.rig.root / "enc.gguf"
+        encoder.write_bytes(b"x")
+        with patch.object(loading, "require_gguf_dit", refuse_dit), self.assertRaises(ValueError) as caught:
+            self._run(self._options(variant=dit))
+        self.assertIn("format", str(caught.exception))
+        with patch.object(text_encoder, "require_gguf_text_encoder", refuse_encoder), self.assertRaises(ValueError) as caught:
+            self._run(self._options(encoder=EncoderSource("q4_k_m", encoder)))
+        self.assertIn("text_encoder_format", str(caught.exception))
+        self.assertEqual(self.rig.large_holdings(), (0, 0, 0))
+        self.assertEqual(self.rig.dits, [])
+
+    def test_a_gguf_encoder_cannot_be_asked_for_vl_refs(self) -> None:
+        with self.assertRaises(ValueError):
+            self._options(encoder=EncoderSource("q4_k_m", self.rig.root / "enc.gguf"), encoder_mode=EncoderMode.VL_REFS)
+
+
+class _RecordingLock:
+    """`service._lock` stand-in: a real `RLock` that records which threads acquired it and whether inside a reclaim."""
+
+    def __init__(self, in_reclaim: threading.local) -> None:
+        self._inner = threading.RLock()
+        self._in_reclaim = in_reclaim
+        self.acquired_by: set[int] = set()
+        self.acquired_in_reclaim = 0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if getattr(self._in_reclaim, "active", False):
+            self.acquired_in_reclaim += 1
+        got = self._inner.acquire(blocking, timeout)
+        if got:
+            self.acquired_by.add(threading.get_ident())
+        return got
+
+    def release(self) -> None:
+        self._inner.release()
+
+    def __enter__(self) -> "_RecordingLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
+
+
+class LockOrderTests(_Case):
+    """The stated exception of the manager's "acquire before the service lock" rule (module notes of `service.py`).
+
+    A run takes this service's lock, then the pipeline's run lock, then the
+    encoder's. Three threads start together under a `Barrier`: such a run, a
+    `large_models.profiles` composition (read-only: it must never wait for the
+    service lock) and a small-pool admission whose hint is larger than the
+    host (the run device is `cpu` here, so the idle FLUX.3 components parked
+    in RAM are what a reclaim can free), so its reclaim is offered every idle
+    FLUX.3 handle (it may only TRY their run locks). None may deadlock (10 s join), and neither the reclaim
+    nor the profiles call may reach the service lock.
+    """
+
+    JOIN_S = 10.0
+    ROUNDS = 3
+
+    def setUp(self) -> None:
+        super().setUp()
+        from ...runtime.model_manager import SmallModelManager
+
+        self.small = SmallModelManager(arbiter=self.rig.arbiter)
+        self.in_reclaim = threading.local()
+        self.lock = _RecordingLock(self.in_reclaim)
+        self.service._lock = self.lock  # type: ignore[assignment]
+        self.reclaimed: list[tuple[int, str]] = []
+        real_execute = self.rig.manager._execute_offer
+        fixture = self
+
+        def execute(offer: Any) -> Any:
+            fixture.reclaimed.append((threading.get_ident(), offer.key))
+            fixture.in_reclaim.active = True
+            try:
+                return real_execute(offer)
+            finally:
+                fixture.in_reclaim.active = False
+
+        execute_patch = patch.object(self.rig.manager, "_execute_offer", execute)
+        execute_patch.start()
+        self.addCleanup(execute_patch.stop)
+
+    def _small_admission(self, key: str) -> None:
+        from ...runtime.residency.arbiter import ModelMemoryShortError
+        from ...runtime.residency.holdings import FootprintHint
+
+        try:
+            lease = self.small.begin_model_use(key, hint=FootprintHint("cpu", device_bytes=0, host_bytes=self.rig.probes.host_available * 4))
+        except ModelMemoryShortError:
+            return
+        lease.mark_load_failed()
+        lease.release()
+
+    def _prepare(self) -> None:
+        """Idle pipeline and encoder handles parked in RAM (kept between runs)."""
+        self._run(self._options(vram_step=VramStep.PHASE, ram_step=RamStep.KEEP))
+
+    def _profiles(self) -> None:
+        from ...runtime.large_models.spec import RequestShape
+        from ...runtime.large_models.tiers import AUTO_STEPS
+
+        params = {"source_root": str(self.rig.root), "prompt": "a cat", "encoder_on_cpu": False}
+        self.service.large_model_profiles(params, RequestShape(64, 64), format=None, steps=AUTO_STEPS)
+
+    def test_the_admission_alone_reclaims_idle_flux3_handles(self) -> None:
+        self._prepare()
+        self._small_admission("small-model")
+        keys = {key for _thread, key in self.reclaimed}
+        self.assertTrue(keys and all(key.startswith("flux3_klein") for key in keys), keys)
+        self.assertEqual(self.lock.acquired_in_reclaim, 0)
+
+    def test_run_profiles_and_reclaim_never_deadlock(self) -> None:
+        # No subTest: a deadlocked round holds the service lock, so the next
+        # round's preparation would block; the first failure must end the test.
+        for round_index in range(self.ROUNDS):
+            self._prepare()
+            barrier = threading.Barrier(3)
+            errors: list[BaseException] = []
+            idents: dict[str, int] = {}
+
+            def body(name: str, work: Any) -> None:
+                idents[name] = threading.get_ident()
+                barrier.wait(self.JOIN_S)
+                try:
+                    work()
+                except BaseException as exc:  # noqa: BLE001 - reported below
+                    errors.append(exc)
+
+            works = {
+                "run": lambda: self.service.generate(Flux3Request(caption=f"a dog {round_index}"), self._options(vram_step=VramStep.PHASE, ram_step=RamStep.KEEP)),
+                "profiles": self._profiles,
+                "reclaim": lambda: self._small_admission(f"small-model-{round_index}"),
+            }
+            threads = [threading.Thread(target=body, args=(name, work), name=f"lock-order-{name}", daemon=True) for name, work in works.items()]
+            # Daemon threads: a deadlock fails this test instead of hanging the suite at exit.
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(self.JOIN_S)
+            self.assertFalse(any(thread.is_alive() for thread in threads), "deadlock: a thread did not finish within 10 s")
+            self.assertEqual(errors, [])
+            self.assertNotIn(idents["reclaim"], self.lock.acquired_by, "the reclaim thread took the service lock")
+            self.assertNotIn(idents["profiles"], self.lock.acquired_by, "the profiles composition waited for the service lock")
+            self.assertEqual(self.lock.acquired_in_reclaim, 0, "a reclaim reached the service lock")
+            self.lock.acquired_by.clear()
 
 
 if __name__ == "__main__":

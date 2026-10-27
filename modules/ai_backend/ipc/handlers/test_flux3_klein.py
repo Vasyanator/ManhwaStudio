@@ -7,11 +7,15 @@ service and manager (`inpaint/flux3_klein/_service_test_fixtures.ServiceRig`:
 stand-in models on the CPU): the blob split with N references and strict
 lengths, the response header (`image_len`, `seed`, `applied` keys, the step
 keys) and the streamed frames with their `stage`, a mid-run cancel answered as
-`Interrupted` with a follow-up run that succeeds, `.status` / `.unload`, the
-download methods' format echo and cancel, `large_models.profiles` with
-`model: "flux3_klein"` (the adapter; `encoder_on_cpu` absent = on), the
-`MAX_REFERENCES` mirror and the
-registration of all five methods.
+`Interrupted` with a follow-up run that succeeds, `.status` / `.unload`,
+`large_models.profiles` with `model: "flux3_klein"` (the adapter: the
+pipeline handle's answer with the encoder line in `encoder`, `null` for a
+served caption; `encoder_on_cpu` absent = on), the four
+`.prompt_cache.*` methods (the build's `stage` frames, its cancel before the
+start and mid-build, list / export / import), the `MAX_REFERENCES` mirror, the
+registration of the seven methods and the absence of the retired
+`.download.*` pair (protocol 24: the application's model catalog downloads the
+package).
 
 Notes:
 CPU only; files go to temporary directories.
@@ -20,8 +24,10 @@ CPU only; files go to temporary directories.
 from __future__ import annotations
 
 import io
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -29,15 +35,18 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 
-from modules.ai_backend.inpaint.flux3_klein import wire
+from modules.ai_backend.inpaint.flux3_klein import prompt_cache, wire
 from modules.ai_backend.inpaint.flux3_klein._service_test_fixtures import ServiceRig
 from modules.ai_backend.inpaint.flux3_klein.config import WeightFormat
 from modules.ai_backend.ipc.dispatcher import ProgressEmitter
 from modules.ai_backend.ipc.handlers import flux3_klein as handlers
 from modules.ai_backend.ipc.protocol import (
+    ALL_METHODS,
     METHOD_INPAINT_FLUX3_KLEIN,
-    METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_CHECK,
-    METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_START,
+    METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_BUILD,
+    METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_EXPORT,
+    METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_IMPORT,
+    METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_LIST,
     METHOD_INPAINT_FLUX3_KLEIN_STATUS,
     METHOD_INPAINT_FLUX3_KLEIN_UNLOAD,
 )
@@ -144,14 +153,15 @@ class HandlerTests(unittest.TestCase):
         ctx = HandlerContext(state=SimpleNamespace(large_models=self.rig.manager, large_model_adapters={"flux3_klein": self.rig.service}), events=None, get_health_snapshot=lambda: {})
         header = {"model": "flux3_klein", "params": {"source_root": str(self.rig.root), "encoder_mode": "text", "ae_dtype": "float32"}, "shape": {"region_width": SIZE, "region_height": SIZE, "references": [{"w": SIZE, "h": SIZE}]}, "vram_step": "max", "ram_step": "keep"}
         answer, _ = get_handler(METHOD_LARGE_MODELS_PROFILES)(ctx, header, b"", threading.Event())
-        self.assertEqual((answer["model"], answer["format"]), ("flux3_klein.text.ae_float32", "fp8r"))
+        # The answer is the PIPELINE handle's (B3); the encoder handle is the additive `encoder`.
+        self.assertEqual((answer["model"], answer["format"]), ("flux3_klein.ae_float32", "fp8r"))
         self.assertTrue(answer["selected"]["fits"])
-        summary = {line["component"]: line for line in answer["selected"]["plan_summary"]}
-        self.assertEqual(summary["encoder"]["exec_device"], "cpu", "absent encoder_on_cpu = on")
+        self.assertNotIn("encoder", {line["component"] for line in answer["selected"]["plan_summary"]})
+        [encoder_line] = answer["encoder"]["plan_summary"]
+        self.assertEqual((encoder_line["component"], encoder_line["exec_device"]), ("encoder", "cpu"), "absent encoder_on_cpu = on")
         header["params"]["encoder_on_cpu"] = False
         answer, _ = get_handler(METHOD_LARGE_MODELS_PROFILES)(ctx, header, b"", threading.Event())
-        summary = {line["component"]: line for line in answer["selected"]["plan_summary"]}
-        self.assertEqual(summary["encoder"]["exec_device"], "run_device")
+        self.assertEqual(answer["encoder"]["plan_summary"][0]["exec_device"], "run_device")
 
     def test_status_and_unload(self) -> None:
         status, _ = get_handler(METHOD_INPAINT_FLUX3_KLEIN_STATUS)(self._ctx(), {"params": {"source_root": str(self.rig.root)}}, b"", threading.Event())
@@ -162,61 +172,116 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual(get_handler(METHOD_INPAINT_FLUX3_KLEIN_UNLOAD)(self._ctx(), {}, b"", threading.Event())[0], {"unloaded": True})
 
 
-class _FakeDownloads:
-    """Stand-in for `inpaint/flux3_download.py`."""
+class PromptCacheHandlerTests(unittest.TestCase):
+    """The four `.prompt_cache.*` methods over the real service (an identifiable stand-in encoder, a temporary library root)."""
 
-    class DownloadCanceled(Exception):
-        pass
-
-    def __init__(self) -> None:
-        self.checked: list[tuple[str, Any]] = []
-
-    def check_access(self, token: str, *, weight_format: Any = None) -> dict[str, Any]:
-        self.checked.append((token, weight_format))
-        return {"format": weight_format or "fp8r", "repos": {}, "plan": None, "plan_error": ""}
-
-    def download(self, token: str, *, weight_format: Any = None, progress_callback: Any = None, should_cancel: Any = None) -> dict[str, Any]:
-        progress_callback("download", 1, 2, "ae.safetensors", file_step=1, file_total=2, file_label="ae.safetensors")
-        if should_cancel():
-            raise self.DownloadCanceled("canceled")
-        return {"root": "/r", "downloaded_bytes": 2, "skipped_files": 0}
-
-
-class DownloadHandlerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.fake = _FakeDownloads()
-        patcher = patch.object(handlers, "_download_module", lambda: self.fake)
+        self.rig = ServiceRig(self, variants=(WeightFormat.FP8R,))
+        directory = self.rig.root / "text_encoder"
+        (directory / "config.json").write_text('{"model_type": "qwen3_vl"}', encoding="utf-8")
+        (directory / "chat_template.json").write_text('{"chat_template": "x"}', encoding="utf-8")
+        library_root = tempfile.TemporaryDirectory(prefix="flux3_handler_library_")
+        self.addCleanup(library_root.cleanup)
+        self.program_root = Path(library_root.name)
+        patcher = patch.object(prompt_cache, "program_root", lambda: self.program_root)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.dispatcher = _Dispatcher()
-        self.ctx = HandlerContext(state=SimpleNamespace(), events=None, get_health_snapshot=lambda: {})
-        self.ctx.progress_emitter = ProgressEmitter(self.dispatcher, REQUEST_ID)  # type: ignore[attr-defined]
 
-    def test_check_forwards_the_token_and_the_format(self) -> None:
-        answer, _ = get_handler(METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_CHECK)(self.ctx, {"hf_token": "t", "format": "nvfp4"}, b"", threading.Event())
-        self.assertEqual(answer["format"], "nvfp4")
-        self.assertEqual(self.fake.checked, [("t", "nvfp4")])
-        get_handler(METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_CHECK)(self.ctx, {}, b"", threading.Event())
-        self.assertEqual(self.fake.checked[-1], ("", None))
+    def _ctx(self) -> HandlerContext:
+        ctx = HandlerContext(state=SimpleNamespace(flux3_klein=self.rig.service), events=None, get_health_snapshot=lambda: {})
+        ctx.progress_emitter = ProgressEmitter(self.dispatcher, REQUEST_ID)  # type: ignore[attr-defined]
+        return ctx
 
-    def test_start_streams_and_a_cancel_is_interrupted(self) -> None:
-        answer, _ = get_handler(METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_START)(self.ctx, {"hf_token": "t"}, b"", threading.Event())
-        self.assertEqual(answer["root"], "/r")
-        self.assertEqual(self.dispatcher.frames[0]["file_label"], "ae.safetensors")
+    def _params(self, **overrides: Any) -> dict[str, Any]:
+        return {"source_root": str(self.rig.root), "prompt": "clean", "prompt_library": "flux3_klein", "prompt_cache_precision_order": ["bf16", "q8_0", "q4_k_m"], **overrides}
+
+    def _call(self, method: str, cancel: threading.Event | None = None, **header: Any) -> dict[str, Any]:
+        answer, blob = get_handler(method)(self._ctx(), {"params": self._params(), **header}, b"", cancel or threading.Event())
+        self.assertEqual(blob, b"")
+        return answer
+
+    def test_build_streams_the_encoder_stages_then_a_run_skips_the_encoder(self) -> None:
+        built = self._call(METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_BUILD, name="Чистка")
+        self.assertEqual((built["name"], built["encoded"], built["prompt_cached"]), ("Чистка", True, True))
+        self.assertEqual([frame["stage"] for frame in self.dispatcher.frames if "file_step" not in frame], ["prepare", "encoder_load", "encode", "encoder_release"])
+        reads = [frame for frame in self.dispatcher.frames if "file_step" in frame]
+        self.assertTrue(reads)
+        self.assertEqual({(frame["stage"], frame["file_component"]) for frame in reads}, {("encoder_load", "text_encoder")})
+        self.assertEqual({frame["phase"] for frame in self.dispatcher.frames}, {"load"})
+        status, _ = get_handler(METHOD_INPAINT_FLUX3_KLEIN_STATUS)(self._ctx(), {"params": self._params()}, b"", threading.Event())
+        self.assertTrue(status["prompt_cached"])
+        self.assertIsNotNone(status["prompt_cache_entry"])
+        self.dispatcher.frames.clear()
+        header = {"image_len": len(REGION), "mask_len": len(MASK), "params": {**self._params(), "steps": 2}}
+        get_handler(METHOD_INPAINT_FLUX3_KLEIN)(self._ctx(), header, REGION + MASK, threading.Event())
+        self.assertEqual(len(self.rig.encode_calls), 1, "the run's caption was served")
+
+    def test_a_build_cancel_is_interrupted(self) -> None:
         cancel = threading.Event()
-
-        def set_on_frame(header: dict[str, Any], blob: bytes = b"") -> None:
-            cancel.set()
-
-        self.ctx.progress_emitter = ProgressEmitter(SimpleNamespace(_write=set_on_frame), REQUEST_ID)  # type: ignore[attr-defined]
+        cancel.set()
         with self.assertRaises(Interrupted):
-            get_handler(METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_START)(self.ctx, {"hf_token": "t"}, b"", cancel)
+            self._call(METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_BUILD, cancel=cancel)
+        self.assertEqual(self.rig.encoders, [])
+        cancel = threading.Event()
+        original = self.dispatcher._write
+
+        def write(header: dict[str, Any], blob: bytes = b"") -> None:
+            original(header, blob)
+            if header.get("stage") == "prepare":
+                cancel.set()
+
+        self.dispatcher._write = write  # type: ignore[method-assign]
+        with self.assertRaises(Interrupted):
+            self._call(METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_BUILD, cancel=cancel)
+        self.assertEqual(self.rig.encode_calls, [])
+        self.assertEqual(self.rig.large_holdings()[1:], (0, 0))
+
+    def test_list_export_import(self) -> None:
+        self._call(METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_BUILD)
+        listing = self._call(METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_LIST)
+        self.assertEqual((listing["library"], listing["text_encoder_available"], listing["legacy"]), ("flux3_klein", True, None))
+        file = listing["texts"][0]["selected"]["file"]
+        out = self.program_root / "exported.msprompt"
+        exported = self._call(METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_EXPORT, file=file, path=str(out))
+        self.assertEqual(exported["path"], str(out))
+        imported = self._call(METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_IMPORT, path=str(out))
+        self.assertEqual((imported["library"], imported["library_matches"], imported["already_present"]), ("flux3_klein", True, True))
+        for method, header in ((METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_EXPORT, {"file": file}), (METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_IMPORT, {})):
+            with self.subTest(method=method), self.assertRaises(ValueError):
+                self._call(method, **header)
+
+    def test_profiles_drop_the_encoder_for_a_served_caption(self) -> None:
+        from modules.ai_backend.ipc.protocol import METHOD_LARGE_MODELS_PROFILES
+
+        self._call(METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_BUILD)
+        ctx = HandlerContext(state=SimpleNamespace(large_models=self.rig.manager, large_model_adapters={"flux3_klein": self.rig.service}), events=None, get_health_snapshot=lambda: {})
+        header = {"model": "flux3_klein", "params": self._params(), "shape": {"region_width": SIZE, "region_height": SIZE}, "vram_step": "phase", "ram_step": "run"}
+        answer, _ = get_handler(METHOD_LARGE_MODELS_PROFILES)(ctx, header, b"", threading.Event())
+        self.assertIsNone(answer["encoder"])
+        self.assertEqual(answer["encoder_formats"], [])
 
 
 class ContractTests(unittest.TestCase):
     def test_every_method_is_registered(self) -> None:
-        for method in (METHOD_INPAINT_FLUX3_KLEIN, METHOD_INPAINT_FLUX3_KLEIN_STATUS, METHOD_INPAINT_FLUX3_KLEIN_UNLOAD, METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_CHECK, METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_START):
+        for method in (
+            METHOD_INPAINT_FLUX3_KLEIN,
+            METHOD_INPAINT_FLUX3_KLEIN_STATUS,
+            METHOD_INPAINT_FLUX3_KLEIN_UNLOAD,
+            METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_BUILD,
+            METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_LIST,
+            METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_EXPORT,
+            METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_IMPORT,
+        ):
             self.assertIsNotNone(get_handler(method), method)
+            self.assertIn(method, ALL_METHODS)
+
+    def test_the_download_methods_are_gone(self) -> None:
+        # Protocol 24: the application's model catalog downloads the FLUX.3 klein
+        # package; the dispatcher answers the old names as unknown methods.
+        for method in ("inpaint.flux3_klein.download.check", "inpaint.flux3_klein.download.start"):
+            self.assertIsNone(get_handler(method), method)
+            self.assertNotIn(method, ALL_METHODS)
 
     def test_the_reference_cap_mirrors_the_service(self) -> None:
         self.assertEqual(handlers.MAX_REFERENCES, wire.MAX_EXTRA_REFERENCES)

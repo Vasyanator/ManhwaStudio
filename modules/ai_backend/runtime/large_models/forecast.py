@@ -35,7 +35,16 @@ Arithmetic (all bytes):
   transition of the same name (`idle-><first phase>` for the first one), so
   a plan that never reloads between runs still carries its cold-load
   transient; the device side of a transition stays the steady one;
-- overall peaks = max over phases, transitions and the idle state.
+- overall peaks = max over phases, transitions and the idle state;
+- a plan that puts NOTHING on the device in any state (no weights, no
+  activation, no staging, nothing in flight: a whole-handle host pin such as
+  the CPU text encoder) has every device peak `0`: no margin and no runtime
+  overhead, since the run needs no device memory of its own (the overhead is
+  counted by the handle that does use the device).
+
+The baseline RSS is the caller's (`Budgets.baseline_rss`: the process without
+any large-pool holding), so a host peak reads "the backend with only this
+plan's large model loaded"; a fit judges the growth above it.
 
 Host run device (`host_device=True`: `cpu` / `mps`, whose "device" memory is
 the host's): every device-side byte is host memory, so it is folded into the
@@ -129,7 +138,11 @@ class Forecast:
     """Everything `forecast()` computes; `peak_phase` names where `device_peak` occurs.
 
     `calibrated`: every phase calibrated; `device_calibrated`: every phase that
-    executes on the run device calibrated (module notes).
+    executes on the run device calibrated (module notes). `device_overhead`:
+    the runtime overhead (bytes) inside every device peak of a plan that uses
+    the device (`0` on a host run device and for a plan with nothing on the
+    device): what a two-handle rule adds to a moment the other handle spends
+    off the device (`paired.encode_moment_device`).
     """
 
     phases: Mapping[str, PhaseForecast]
@@ -141,6 +154,7 @@ class Forecast:
     plan_summary: tuple[PlanLine, ...]
     calibrated: bool
     device_calibrated: bool
+    device_overhead: int = 0
 
 
 def component_device_bytes(plan: ComponentPlan, inventory: ComponentInventory) -> int:
@@ -192,6 +206,9 @@ class _Calc:
         # device-executed ones only.
         self.measured = True
         self.device_measured = True
+        # Whether any state puts a byte on the device (module notes: a plan
+        # that never does has device peaks 0).
+        self.device_used = False
 
     def _margin(self, device_bytes: int) -> int:
         constants = self.tables.device
@@ -201,6 +218,8 @@ class _Calc:
         """`device_sum` + margin + runtime overhead; `0` on a host run device (nothing lives on a separate device)."""
         if self.host_device:
             return 0
+        if device_sum > 0:
+            self.device_used = True
         return device_sum + self._margin(device_sum) + self.tables.device.runtime_overhead_bytes
 
     def weights(self, state: PhasePlan) -> tuple[int, int]:
@@ -356,6 +375,11 @@ def forecast(spec: LargeModelSpec, plan: ResidencyPlan, inventories: Mapping[str
         if cold_entry.host_peak > steady_entry.host_peak:
             transitions[name] = replace(steady_entry, host_peak=cold_entry.host_peak)
 
+    if not host_device and not calc.device_used:
+        # Nothing of this plan ever reaches the device (module notes): the
+        # runtime overhead each state was given belongs to no allocation here.
+        phases = {name: replace(entry, device_peak=0) for name, entry in phases.items()}
+        transitions = {name: replace(entry, device_peak=0) for name, entry in transitions.items()}
     every = {**phases, **transitions}
     peak_phase = max(every, key=lambda key: every[key].device_peak)
     repeated = max(passes_by_phase, key=lambda key: passes_by_phase[key])
@@ -382,6 +406,7 @@ def forecast(spec: LargeModelSpec, plan: ResidencyPlan, inventories: Mapping[str
         plan_summary=tuple(lines),
         calibrated=tables.calibrated and calc.measured,
         device_calibrated=tables.calibrated and calc.device_measured,
+        device_overhead=tables.device.runtime_overhead_bytes if calc.device_used else 0,
     )
     log.debug("forecast %s/%s/%s: device %d B at %s, host %d B, total %.1f s, calibrated=%s (device %s)", spec.family, plan.steps.label, plan.format, result.device_peak, peak_phase, result.host_peak, result.time.total_s, result.calibrated, result.device_calibrated)
     return result

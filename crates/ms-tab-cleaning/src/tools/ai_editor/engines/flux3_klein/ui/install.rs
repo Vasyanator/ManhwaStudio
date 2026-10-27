@@ -2,20 +2,25 @@
 File: cleaning/tools/ai_editor/engines/flux3_klein/ui/install.rs
 
 Purpose:
-«Установка модели» of the FLUX.3 klein panel: the weight-format picker, the source-mode switch
-(«Скачать для меня» / «Своя папка»), the package folder row of manual mode, the Hugging Face
-download block of download mode (repository, licence page, token row with the access hint,
-check / plan / «Скачать» / «Отмена»), the residency line and «Выгрузить из памяти».
+«Установка модели» of the FLUX.3 klein panel: the two weight-format pickers («Формат весов» of
+the DiT, «Веса текстового энкодера»; each row names its catalog download size and carries ✓
+when `.status` found its file), the source-mode switch («Скачать для меня» / «Своя папка»), the
+package folder row of manual mode, the catalog download block of download mode (repository,
+licence page, destination, the parts present, the Hugging Face token row while a gated spec of
+the bundle is not installed, and ONE pinned bundle download over the shared
+`draw_ocr_model_download`), the residency line and «Выгрузить из памяти».
 
 Key functions:
-- `Flux3PanelCtx::draw_install_section()`, `draw_format_picker()`, `draw_source_mode_switch()`,
+- `Flux3PanelCtx::draw_install_section()`, `draw_format_pickers()`, `draw_source_mode_switch()`,
   `Flux3PanelCtx::draw_download_block()`
 
 Notes:
 The section starts folded and opens ITSELF once, on the first definite non-ready verdict, unless
 the user already moved the fold (FLUX.2 klein's seeding rule); «Установить» on the readiness
 line opens it on the frame it is pressed. Presence comes from the last `.status` answer, never a
-filesystem probe (this runs on the GUI thread). The token is never formatted or logged here.
+filesystem probe (this runs on the GUI thread). The pickers are drawn in BOTH modes: in manual
+mode a GGUF file is looked up at its catalog path under the chosen folder (plan D14). The token
+is never formatted or logged here.
 */
 
 use super::*;
@@ -33,7 +38,7 @@ impl Flux3PanelCtx<'_> {
             match self.readiness {
                 Flux3ModelReadiness::Unknown => {}
                 Flux3ModelReadiness::Ready => *self.install_section_seeded = true,
-                Flux3ModelReadiness::Missing(_) | Flux3ModelReadiness::NoRoot => {
+                Flux3ModelReadiness::Missing(_) | Flux3ModelReadiness::NoRoot | Flux3ModelReadiness::RootNotAbsolute => {
                     if !user_moved {
                         section.set_open(true);
                     }
@@ -53,7 +58,7 @@ impl Flux3PanelCtx<'_> {
                 ui.label(t!("cleaning.tools.flux3_klein.install_heading"));
             })
             .body(|ui| {
-                draw_format_picker(ui, self.settings, &mut self.intents.settings_changed);
+                draw_format_pickers(ui, self.settings, self.current_status, &mut self.intents.settings_changed);
                 draw_source_mode_switch(ui, self.settings, &mut self.intents.settings_changed);
                 match self.settings.source_mode() {
                     Flux3SourceMode::Manual => self.draw_model_root_row(ui),
@@ -67,7 +72,7 @@ impl Flux3PanelCtx<'_> {
     /// The package folder of manual mode: an editable path with a folder picker, and what the
     /// last answer says is inside it.
     fn draw_model_root_row(&mut self, ui: &mut egui::Ui) {
-        ui.label(t!("cleaning.tools.flux3_klein.model_root_label")).on_hover_text(t!("cleaning.tools.flux3_klein.model_root_hint"));
+        ui.label(t!("cleaning.tools.flux3_klein.model_root_label")).on_hover_text(t!("cleaning.tools.flux3_klein.package_folder_hint"));
         ui.horizontal(|ui| {
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut self.settings.model_root)
@@ -75,7 +80,7 @@ impl Flux3PanelCtx<'_> {
                     .hint_text(t!("cleaning.tools.flux3_klein.model_root_placeholder"))
                     .desired_width(ui.available_width() - 32.0),
             );
-            self.intents.settings_changed |= edit.on_hover_text(t!("cleaning.tools.flux3_klein.model_root_hint")).changed();
+            self.intents.settings_changed |= edit.on_hover_text(t!("cleaning.tools.flux3_klein.package_folder_hint")).changed();
             // A glyph is not prose; the meaning is on the hover.
             if ui.small_button("📁").on_hover_text(t!("cleaning.tools.flux3_klein.browse_folder_tooltip")).clicked() {
                 self.intents.picker = Some(Flux3PickerPurpose::ModelRoot);
@@ -84,18 +89,18 @@ impl Flux3PanelCtx<'_> {
         self.draw_package_parts(ui);
     }
 
-    /// The three parts the selected format needs, each with its presence from the last answer
+    /// The three parts the selected formats need, each with its presence from the last answer
     /// about the current root; nothing is claimed without one.
     fn draw_package_parts(&mut self, ui: &mut egui::Ui) {
-        let format = self.settings.format();
-        let Some(status) = self.status.filter(|_| !matches!(self.readiness, Flux3ModelReadiness::Unknown | Flux3ModelReadiness::NoRoot)) else {
+        let format = self.settings.dit_format();
+        let encoder = self.settings.encoder_format();
+        let Some(status) = self.current_status.filter(|_| !matches!(self.readiness, Flux3ModelReadiness::NoRoot | Flux3ModelReadiness::RootNotAbsolute)) else {
             return;
         };
-        let dit = status.format(format);
         for (part, present, reason) in [
-            (Flux3Part::Dit(format), dit.available, dit.reason.as_str()),
+            (Flux3Part::Dit(format), status.dit_available(format), status.dit(format).map_or("", |row| row.reason.as_str())),
             (Flux3Part::Autoencoder, status.ae_present, ""),
-            (Flux3Part::TextEncoder, status.text_encoder_present, ""),
+            (Flux3Part::TextEncoder(encoder), status.encoder_available(encoder), status.encoder_reason(encoder)),
         ] {
             ui.horizontal_wrapped(|ui| {
                 let (mark, color) = if present { ("✓", ms_theme::status::SUCCESS) } else { ("✗", ms_theme::status::WARNING) };
@@ -109,41 +114,44 @@ impl Flux3PanelCtx<'_> {
         }
     }
 
-    /// The download mode's body: the gated repository and its licence page, the token row,
-    /// where the files go, and the check / download controls — all for the selected format.
+    /// The download mode's body: the gated repository and its licence page, where the files go,
+    /// the parts present, the token row while a gated spec of the bundle is not installed, and
+    /// the catalog download block of the selection's bundle.
+    ///
+    /// The app fetches the pinned files itself (resumable, access preflight, adoption of an
+    /// existing tree by hash, verify); no backend method is involved. The block is skipped for
+    /// the one frame in which the pickers have just moved the bundle away from the snapshot, so
+    /// its click can only land on the bundle it shows.
     fn draw_download_block(&mut self, ui: &mut egui::Ui) {
-        ui.small(t!("cleaning.tools.flux3_klein.download_hint"));
+        ui.small(t!("cleaning.tools.flux3_klein.catalog_download_hint"));
         ui.horizontal_wrapped(|ui| {
             ui.small(tf!("cleaning.tools.flux3_klein.download_repo_status", repo = FLUX3_REPO));
             ui.hyperlink_to(t!("cleaning.tools.flux3_klein.licence_link"), ms_widgets::hf_access_hint::hf_repo_url(FLUX3_REPO));
         });
-        let hint = HfAccessHint::new("cleaning_flux3_klein_hf_access_hint", token_save_button_label()).repo(t!("cleaning.tools.flux3_klein.title"), FLUX3_REPO);
-        draw_hf_token_row(
-            ui,
-            HfTokenView { state: self.hf_token_state, input: &mut *self.hf_token_input, status: self.hf_token_status, busy: self.hf_token_busy },
-            "cleaning_flux3_klein_hf_token",
-            Some(hint),
-            &mut self.intents.hf_token_action,
-        );
         ui.label(t!("cleaning.tools.flux3_klein.download_destination_label"));
         // A path is data: selectable so it can be copied, never translated.
         ui.add(egui::Label::new(egui::RichText::new(self.settings.effective_root()).small()).selectable(true));
         self.draw_package_parts(ui);
-        let tooltip = tf!("cleaning.tools.flux3_klein.download_tooltip", format = self.settings.format().label());
-        draw_hf_download_controls(
-            ui,
-            &HfDownloadControlsView {
-                check: self.download_check,
-                check_error: self.download_check_error,
-                check_busy: self.download_check_busy,
-                download_busy: self.download_busy,
-                download_status: self.download_status,
-                ai_backend_available: self.ai_backend_available,
-                pipeline_busy: self.pipeline_busy,
-                download_tooltip: &tooltip,
-            },
-            &mut self.intents.download_action,
-        );
+        // The token is needed only to fetch from the gated BFL repository; once its specs of the
+        // bundle are installed the row would ask for nothing. The per-repository access lines and
+        // their links are the bundle block's own, below.
+        if !self.gated_repos.is_empty() {
+            let hint = HfAccessHint::new("cleaning_flux3_klein_hf_access_hint", token_save_button_label()).repo(t!("cleaning.tools.flux3_klein.title"), FLUX3_REPO);
+            draw_hf_token_row(
+                ui,
+                HfTokenView { state: self.hf_token_state, input: &mut *self.hf_token_input, status: self.hf_token_status, busy: self.hf_token_busy },
+                "cleaning_flux3_klein_hf_token",
+                Some(hint),
+                &mut self.intents.hf_token_action,
+            );
+        }
+        let current = bundle_key(&flux3_catalog_bundle(self.settings));
+        if let Some(snapshot) = self.catalog_snapshot.filter(|snapshot| snapshot.bundle_key == current) {
+            let clicked = draw_ocr_model_download(ui, snapshot);
+            if clicked != ModelDownloadAction::None {
+                self.intents.catalog_action = clicked;
+            }
+        }
     }
 
     /// Where the model sits in memory right now, and the button that frees it.
@@ -175,24 +183,47 @@ impl Flux3PanelCtx<'_> {
     }
 }
 
-/// The weight-format picker: what the run loads AND what the download fetches. The memory
-/// widget's format rows change the same setting from the forecast's side.
-fn draw_format_picker(ui: &mut egui::Ui, settings: &mut Flux3KleinSettings, changed: &mut bool) {
-    let mut format = settings.format();
+/// The two weight-format pickers: «Формат весов» (the DiT; the memory widget's format rows
+/// change the same setting from the forecast's side) and «Веса текстового энкодера». What the
+/// run loads AND what the catalog bundle fetches. Each row is captioned by
+/// `flux3_dit_format_row` / `flux3_encoder_format_row` (name, catalog size, ✓ from `status`, the
+/// answer about the CURRENT root) and hovered by its format hint.
+///
+/// `WheelComboBox` with a fixed `id_salt` each, never `egui::ComboBox` and never an id from the
+/// localized caption (`egui-docs/04-widgets.md` §0.2, `05-ids-and-i18n.md` §2).
+fn draw_format_pickers(ui: &mut egui::Ui, settings: &mut Flux3KleinSettings, status: Option<&Flux3Status>, changed: &mut bool) {
+    let mut format = settings.dit_format();
     ui.horizontal_wrapped(|ui| {
-        ui.label(t!("cleaning.tools.flux3_klein.format_label")).on_hover_text(t!("cleaning.tools.flux3_klein.format_hint"));
+        ui.label(t!("cleaning.tools.flux3_klein.format_label")).on_hover_text(t!("cleaning.tools.flux3_klein.dit_format_picker_hint"));
         WheelComboBox::from_id_salt("cleaning_flux3_klein_format")
-            .selected_text(format.label())
+            .selected_text(flux3_dit_format_row(format, status))
             .show_ui(ui, |ui| {
-                for candidate in Flux3Format::all() {
-                    ui.selectable_value(&mut format, candidate, candidate.label()).on_hover_text(candidate.hint());
+                for &candidate in Flux3DitFormat::all() {
+                    ui.selectable_value(&mut format, candidate, flux3_dit_format_row(candidate, status)).on_hover_text(flux3_dit_format_hint(candidate));
                 }
             })
             .response
-            .on_hover_text(format.hint());
+            .on_hover_text(flux3_dit_format_hint(format));
     });
     if format.wire() != settings.format {
         settings.format = format.wire().to_string();
+        *changed = true;
+    }
+    let mut encoder = settings.encoder_format();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(t!("cleaning.tools.flux3_klein.text_encoder_format_label")).on_hover_text(t!("cleaning.tools.flux3_klein.text_encoder_format_hint"));
+        WheelComboBox::from_id_salt("cleaning_flux3_klein_text_encoder_format")
+            .selected_text(flux3_encoder_format_row(encoder, status))
+            .show_ui(ui, |ui| {
+                for &candidate in Flux3EncoderFormat::all() {
+                    ui.selectable_value(&mut encoder, candidate, flux3_encoder_format_row(candidate, status)).on_hover_text(flux3_encoder_format_hint(candidate));
+                }
+            })
+            .response
+            .on_hover_text(flux3_encoder_format_hint(encoder));
+    });
+    if encoder.wire() != settings.text_encoder_format {
+        settings.text_encoder_format = encoder.wire().to_string();
         *changed = true;
     }
 }

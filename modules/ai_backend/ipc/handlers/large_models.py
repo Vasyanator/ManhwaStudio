@@ -30,9 +30,10 @@ that registered name instead of the wire `model`. An adapter whose operation
 opens SEVERAL handles (FLUX.2: pipeline + text encoder) implements
 `large_model_profiles(params: dict, shape: RequestShape, *, format: str | None,
 steps: Steps) -> dict` and composes the whole answer itself (one
-`ProfilesReport.to_dict()`-shaped dict, e.g. its pipeline planned with
-`LargeModelManager.profiles(..., claimed_device_bytes=, claimed_host_bytes=)`
-counting the encoder's admission); when present it is preferred, and
+`ProfilesReport.to_dict()`-shaped dict; a pipeline + text-encoder service
+builds it with `runtime.large_models.paired.plan_pair(...).to_wire()`: the
+pipeline planned with the encoder's admission claimed, plus the additive
+`encoder` / `encoder_formats` keys); when present it is preferred, and
 `large_model_inputs` / `large_model_name` are not called.
 
 Torch-free at import: `runtime/large_models/{spec,tiers}.py` are stdlib-only.

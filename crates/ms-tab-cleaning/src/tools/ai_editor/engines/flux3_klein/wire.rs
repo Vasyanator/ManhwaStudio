@@ -2,8 +2,9 @@
 File: cleaning/tools/ai_editor/engines/flux3_klein/wire.rs
 
 Purpose:
-The FLUX.3 klein backend calls that are not the download: the region-edit run itself with
-its request packing and answer validation, the `.status` query and `.unload`.
+The FLUX.3 klein backend calls: the region-edit run itself with
+its request packing and answer validation, the `.status` query, `.unload`, and the engine's
+bindings of the shared prompt-cache jobs (its `.prompt_cache.*` method family and header).
 
 Main responsibilities:
 - pack one run (`flux3_run_request`): header `{image_len, mask_len, reference_lens, params}`
@@ -13,18 +14,23 @@ Main responsibilities:
 - validate the answer (`parse_flux3_run_answer`): the declared `image_len` with STRICT
   equality, a PNG of exactly the region size, the echoed `seed`, the degraded steps. The PNG is
   the RAW model output (protocol 17); the host post-processes it with the run's mask;
-- ask `.status` (`fetch_flux3_status`) and `.unload` (`unload_flux3_klein`).
+- ask `.status` (`fetch_flux3_status`, recording the prompt the question carried) and
+  `.unload` (`unload_flux3_klein`);
+- name the `.prompt_cache.*` methods and timeouts (`FLUX3_PROMPT_CACHE_METHODS`) and build
+  their header (`flux3_prompt_cache_header`); the calls themselves are the shared
+  `PromptCacheController`'s.
 
 Key structures:
 - `Flux3RunInput`, `Flux3RunAnswer`, `Flux3RunOutcome`, `Flux3Applied`
 
 Key functions:
 - `flux3_run_request()`, `run_flux3_klein()`, `parse_flux3_run_answer()`,
-  `fetch_flux3_status()`, `unload_flux3_klein()`
+  `fetch_flux3_status()`, `unload_flux3_klein()`, `flux3_prompt_cache_header()`
+- `FLUX3_PROMPT_CACHE_METHODS`
 
 Notes:
 Every function that calls the backend runs on a WORKER thread. The wire contract is
-`modules/ai_backend/ipc/PROTOCOL.md` §5.4 «FLUX.3 klein region editing» (v15); the Python
+`modules/ai_backend/ipc/PROTOCOL.md` §5.4 «FLUX.3 klein region editing» (v15; GGUF formats v24); the Python
 split is `_split_request_blob` in `modules/ai_backend/ipc/handlers/flux3_klein.py`, so a change
 of the blob layout is a protocol change.
 */
@@ -177,8 +183,9 @@ fn run_flux3_klein_pass(
 /// `image_len` must equal the blob length exactly and the PNG must be exactly `size` (the
 /// backend never resizes). Every other field the reply is required to carry is checked for
 /// presence and type: `seed`, `steps` (1..=64), `width` / `height` (= `size`), `text_tokens`,
-/// `applied` (`format`, `fp8_compute` — a concrete path for fp8r, `null` otherwise —
-/// `compute_path`, `encoder_mode`, `ae_dtype`, each a known value), the four step ids,
+/// `applied` (`format` — a DiT id this build offers, a GGUF one since protocol 24 —,
+/// `fp8_compute` — a concrete path for fp8r, `null` otherwise —, `compute_path` — `gguf` exactly
+/// for a GGUF format —, `encoder_mode`, `ae_dtype`, each a known value), the four step ids,
 /// `degraded` and `degrade_reason` (string or `null`). A reply that misses one is a backend
 /// out of step with this build, reported as such rather than as a successful run with an
 /// unknown seed.
@@ -245,8 +252,14 @@ fn parse_flux3_answer_fields(header: &Value, size: [usize; 2]) -> Result<Flux3An
     let text = |name: &'static str, allowed: &[&str]| {
         applied.get(name).and_then(Value::as_str).filter(|value| allowed.contains(value)).map(str::to_string).ok_or(name)
     };
-    let format = text("format", &["bf16", "fp8r", "nvfp4"])?;
-    let compute_path = text("compute_path", &["native", "scaled_mm", "dequant"])?;
+    // `format` is the DiT id that ran: one this build offers (`Flux3DitFormat::all`, natives and
+    // GGUF ids since protocol 24); a GGUF DiT computes through `gguf`, a native one never does.
+    let format = applied.get("format").and_then(Value::as_str).and_then(Flux3DitFormat::from_wire).ok_or("format")?;
+    let compute_path = text("compute_path", &["native", "scaled_mm", "dequant", "gguf"])?;
+    if (compute_path == "gguf") != format.is_gguf() {
+        return Err("compute_path");
+    }
+    let format = format.wire().to_string();
     let encoder_mode = text("encoder_mode", &["text", "vl_refs"])?;
     let ae_dtype = text("ae_dtype", &["float32", "bfloat16"])?;
     // fp8r reports its concrete path, every other format `null`.
@@ -278,14 +291,40 @@ fn parse_flux3_answer_fields(header: &Value, size: [usize; 2]) -> Result<Flux3An
 /// Asks `.status` about `params` (normalized; their `source_root` is the package root the
 /// answer describes). Worker threads only.
 ///
+/// The answer's `prompt_cached` is about the prompt that travelled (`params.prompt`, already
+/// trimmed), so that prompt is recorded with it (`Flux3Status::prompt_cache_asked_about`).
+///
 /// # Errors
 /// The user-facing message of a refused or unreachable call.
 pub(super) fn fetch_flux3_status(params: Value) -> Result<Flux3Status, String> {
+    let asked_about = params.get("prompt").and_then(Value::as_str).map(str::to_string);
     let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
     let (header, _blob) = client
         .call(backend_ipc::protocol::METHOD_INPAINT_FLUX3_KLEIN_STATUS, json!({ "params": params }), &[], FLUX3_QUERY_TIMEOUT)
         .map_err(map_call_error)?;
-    Ok(parse_flux3_status(&header))
+    Ok(Flux3Status { prompt_cache_asked_about: asked_about, ..parse_flux3_status(&header) })
+}
+
+/// The FLUX.3 klein `.prompt_cache.*` method family. A build streams under the run timeout (it
+/// reads the Qwen3-VL encoder); the other three are one-shot queries.
+pub(super) const FLUX3_PROMPT_CACHE_METHODS: PromptCacheMethods = PromptCacheMethods {
+    build: backend_ipc::protocol::METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_BUILD,
+    list: backend_ipc::protocol::METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_LIST,
+    export: backend_ipc::protocol::METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_EXPORT,
+    import: backend_ipc::protocol::METHOD_INPAINT_FLUX3_KLEIN_PROMPT_CACHE_IMPORT,
+    build_timeout: FLUX3_RUN_TIMEOUT,
+    query_timeout: FLUX3_QUERY_TIMEOUT,
+    log_label: FLUX3_LOG_LABEL,
+};
+
+/// Builds the request header of a prompt-cache call from `settings` (which must already be
+/// `normalized()`): their `params` (root, encoder format and candidates, encoder mode, prompt,
+/// library id, precision order) plus the operation's own fields BESIDE them
+/// (`prompt_cache_header`: `name`, `file`, `path`), the FLUX.2 klein shape.
+#[must_use]
+pub(super) fn flux3_prompt_cache_header(settings: &Flux3KleinSettings, extra: &[(&str, Value)]) -> Value {
+    // `whole_region = false` as on every other query path: a prompt-cache call carries no mask.
+    prompt_cache_header(settings.to_params(false), extra)
 }
 
 /// Releases the resident FLUX.3 klein weights. Returns whether anything was unloaded. Worker
@@ -304,6 +343,27 @@ pub(super) fn unload_flux3_klein() -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A prompt-cache header carries the normalized params (library id, precision order,
+    /// encoder, prompt) and the operation's fields beside them, where the backend reads them.
+    #[test]
+    fn prompt_cache_headers_carry_the_params_and_the_operation_fields() {
+        let settings = Flux3KleinSettings { prompt: "  remove the sfx ".to_string(), text_encoder_format: "q8_0".to_string(), ..Flux3KleinSettings::default() }.normalized();
+        let plain = flux3_prompt_cache_header(&settings, &[]);
+        assert_eq!(plain["params"]["prompt"], json!("remove the sfx"));
+        assert_eq!(plain["params"]["prompt_library"], json!("flux3_klein"));
+        assert_eq!(plain["params"]["text_encoder_format"], json!("q8_0"));
+        assert_eq!(plain["params"]["encoder_mode"], json!("text"));
+        let named = flux3_prompt_cache_header(&settings, &[("name", json!("sfx"))]);
+        assert_eq!(named["name"], json!("sfx"));
+        assert!(named["params"].get("name").is_none());
+        let exported = flux3_prompt_cache_header(&settings, &[("file", json!("a.msprompt")), ("path", json!("/tmp/a.msprompt"))]);
+        assert_eq!((exported["file"].clone(), exported["path"].clone()), (json!("a.msprompt"), json!("/tmp/a.msprompt")));
+        assert_eq!(FLUX3_PROMPT_CACHE_METHODS.build, "inpaint.flux3_klein.prompt_cache.build");
+        assert_eq!(FLUX3_PROMPT_CACHE_METHODS.list, "inpaint.flux3_klein.prompt_cache.list");
+        assert_eq!(FLUX3_PROMPT_CACHE_METHODS.export, "inpaint.flux3_klein.prompt_cache.export");
+        assert_eq!(FLUX3_PROMPT_CACHE_METHODS.import, "inpaint.flux3_klein.prompt_cache.import");
+    }
 
     /// The declared lengths cover the blob exactly and in order — the backend splits it with
     /// strict equality.
@@ -365,6 +425,14 @@ mod tests {
         bf16["degrade_reason"] = Value::Null;
         let outcome = parse_flux3_run_answer(&bf16, &blob, [128, 256]).expect("a valid bf16 answer");
         assert!(outcome.degraded.is_none());
+        // Protocol 24: a GGUF DiT reports its id and the `gguf` path (`large_model.compute_path`).
+        let mut gguf = full_answer(&blob, 128, 256);
+        gguf["applied"]["format"] = json!("q8_0");
+        gguf["applied"]["fp8_compute"] = Value::Null;
+        gguf["applied"]["compute_path"] = json!("gguf");
+        let outcome = parse_flux3_run_answer(&gguf, &blob, [128, 256]).expect("a valid GGUF answer");
+        assert_eq!(outcome.applied.format, "q8_0");
+        assert_eq!(outcome.applied.compute_path, "gguf");
     }
 
     /// The length, the blob and the size are refused as before.
@@ -430,6 +498,7 @@ mod tests {
             ("format", Some(json!("int8")), "format"),
             ("compute_path", Some(json!(1)), "compute_path"),
             ("compute_path", Some(json!("magic")), "compute_path"),
+            ("compute_path", Some(json!("gguf")), "compute_path"),
             ("encoder_mode", None, "encoder_mode"),
             ("ae_dtype", Some(json!("float16")), "ae_dtype"),
             ("fp8_compute", None, "applied.fp8_compute"),
@@ -452,6 +521,11 @@ mod tests {
         let mut nvfp4 = full_answer(&blob, 128, 128);
         nvfp4["applied"]["format"] = json!("nvfp4");
         assert_eq!(parse_flux3_answer_fields(&nvfp4, [128, 128]).err(), Some("applied.fp8_compute"));
+        // A GGUF format must compute through `gguf`.
+        let mut gguf = full_answer(&blob, 128, 128);
+        gguf["applied"]["format"] = json!("q4_k_m");
+        gguf["applied"]["fp8_compute"] = Value::Null;
+        assert_eq!(parse_flux3_answer_fields(&gguf, [128, 128]).err(), Some("compute_path"));
     }
 
     /// The worker refuses what the backend would, before encoding anything — no backend needed.

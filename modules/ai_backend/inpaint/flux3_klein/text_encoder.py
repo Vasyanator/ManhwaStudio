@@ -11,6 +11,10 @@ Main responsibilities:
 - building (`build_text_encoder_meta`, `encoder_key_map`): config truncation to
   `ENCODER_KEEP_LAYERS` and the model on `meta` — what the large-model spec
   (`large_model.py`) loads through the manager;
+- the GGUF encoder (TEXT mode only, Qwen's llama.cpp export of the text half):
+  `require_gguf_text_encoder` (the header against `<dir>/config.json`, before
+  the admission) and `build_gguf_text_encoder_meta` (`Qwen3VLTextModel` on
+  `meta` with `runtime.gguf_layers` modules for every block-quantized weight);
 - the standalone loader (`load_text_encoder`, `load_text_encoder_model`,
   `load_text_processor`): the same model filled from the shards of
   `model.safetensors.index.json` (the parity script, tests);
@@ -58,23 +62,31 @@ Notes:
   `config.py` (the spec sizes the encoder from them without torch).
 - torch is imported at module level; transformers, accelerate and PIL are
   imported inside the functions that need them.
+- GGUF encoder: the tensor names are bridged by `runtime.qwen3_gguf` (the
+  `Qwen3VLTextModel` key set equals `Qwen3Model`'s; no Q/K permutation for
+  `qwen3vl`); the config, tokenizer and processor stay those of
+  `<root>/text_encoder` (the GGUF metadata is only checked against them). The
+  file holds no vision tower, so VL_REFS is refused upstream (`params`).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, assert_never
 
 import torch
 
+from ...runtime import qwen3_gguf
 from ...runtime.encoder_truncation import keep_layers_for_hidden_states
 from ...runtime.rocm_mmap_transfer import move_module_to
-from ...runtime.safetensors_stream import FillReport, fill_module_from_safetensors
+from ...runtime.safetensors_stream import FillReport, TensorSpan, fill_module_from_safetensors
+from ...runtime.tensor_container import read_container_layout
 from .config import TEXT_MAX_TOKENS, TEXT_OUTPUT_LAYERS, TEXT_PAD_MULTIPLE, text_encoder_shards, text_mode_key_map, vl_mode_key_map
 from .params import EncoderMode
 
@@ -103,6 +115,14 @@ VL_WRAPPER_TOKENS_PER_REFERENCE = 2
 #: Owner prefix of the loader's log records and refusal texts.
 _OWNER = "FLUX.3 klein (текстовый энкодер)"
 
+#: The service name the shared Qwen3 GGUF refusals (`runtime.qwen3_gguf`) print.
+_SERVICE = "FLUX.3 klein"
+
+#: `general.architecture` of Qwen's llama.cpp export of the Qwen3-VL text half.
+GGUF_ENCODER_ARCHITECTURE = "qwen3vl"
+
+#: The wire field a GGUF encoder refusal names.
+_GGUF_FIELD = "text_encoder_format"
 
 
 @dataclass(frozen=True)
@@ -306,6 +326,148 @@ def load_text_encoder(
         device=torch.device(device),
         keep_layers=ENCODER_KEEP_LAYERS,
     )
+
+
+# =====================================================================
+#  GGUF encoder (TEXT mode)
+# =====================================================================
+def _metadata_int(metadata: Mapping[str, Any], key: str) -> int | None:
+    """A positive integer GGUF metadata value, or `None` when absent / not a positive int."""
+    value = metadata.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def gguf_encoder_mismatches(metadata: Mapping[str, Any], spans: Sequence[TensorSpan], text_config: Mapping[str, Any], *, keep_layers: int) -> list[str]:
+    """Why a `qwen3vl` GGUF header does not fit the Qwen3-VL `text_config` (the `text_config` object of `text_encoder/config.json`); empty = it fits.
+
+    Compared (a GGUF value that is absent is a mismatch for the REQUIRED
+    ones): `block_count` >= `keep_layers` (the DiT reads hidden state 32);
+    `embedding_length` = `hidden_size`, `attention.head_count` /
+    `head_count_kv` = the head counts (required); `feed_forward_length` =
+    `intermediate_size`, `attention.key_length` = `head_dim`, the embedding
+    rows = `vocab_size` (when the file states them). The architecture itself is
+    `qwen3_gguf.require_architecture`'s.
+    """
+    arch = GGUF_ENCODER_ARCHITECTURE
+
+    def gguf(key: str) -> int | None:
+        return _metadata_int(metadata, f"{arch}.{key}")
+
+    def config(key: str) -> int | None:
+        value = text_config.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    found: list[str] = []
+    blocks = gguf("block_count")
+    if blocks is None or blocks < keep_layers:
+        found.append(f"слоёв {blocks}, а нужно не меньше {keep_layers}")
+    embedding = next((span for span in spans if span.name == "token_embd.weight"), None)
+    pairs = (
+        ("ширина", gguf("embedding_length"), config("hidden_size"), True),
+        ("голов внимания", gguf("attention.head_count"), config("num_attention_heads"), True),
+        ("голов ключей", gguf("attention.head_count_kv"), config("num_key_value_heads"), True),
+        ("ширина MLP", gguf("feed_forward_length"), config("intermediate_size"), False),
+        ("размер головы", gguf("attention.key_length"), config("head_dim"), False),
+        ("размер словаря", embedding.shape[0] if embedding is not None else None, config("vocab_size"), False),
+    )
+    for label, declared, expected, required in pairs:
+        if declared is None and not required:
+            continue
+        if declared != expected:
+            found.append(f"{label}: в файле {declared}, в config.json {expected}")
+    return found
+
+
+def _text_config_json(directory: Path) -> Mapping[str, Any]:
+    """The `text_config` object of `<directory>/config.json`.
+
+    # Raises
+    `FileNotFoundError` when the file is missing; `ValueError` when it is not
+    JSON or has no `text_config` object.
+    """
+    path = directory / "config.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        # Kept as is (not folded into the OSError branch): a missing config is a missing file.
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{_OWNER}: не удалось прочитать {path}: {exc}") from exc
+    text_config = data.get("text_config") if isinstance(data, dict) else None
+    if not isinstance(text_config, dict):
+        raise ValueError(f"{_OWNER}: в {path} нет объекта text_config (нужен config.json Qwen3-VL)")
+    return text_config
+
+
+def require_gguf_text_encoder(gguf_file: Path, directory: Path, *, format_id: str, keep_layers: int = ENCODER_KEEP_LAYERS) -> None:
+    """Refuse a GGUF encoder file the FLUX.3 encoder cannot be built from (header + config reads only).
+
+    `directory` is the package's `text_encoder/` (its `config.json`
+    describes the model the GGUF must be). Checks: a GGUF container;
+    `general.architecture` `qwen3vl` (`qwen3_gguf.require_architecture`);
+    `gguf_encoder_mismatches`; every block-quantized type dequantizable by
+    `runtime.gguf_layers`; every tensor name a Qwen3 weight and every kept
+    weight present (`qwen3_gguf.require_known_encoder_names`). Each refusal
+    names the format id and the wire field `text_encoder_format`, and is
+    logged.
+
+    # Raises
+    `ValueError` as above; `FileNotFoundError` for a missing file or config.
+    """
+    from ...runtime.gguf_layers import dequantizable_types, quant_type_name
+
+    def refuse(reason: str, *, logged: bool = False) -> ValueError:
+        # `logged`: the shared check already wrote the error record (`qwen3_gguf`).
+        if not logged:
+            log.error("%s: GGUF %s (формат «%s») отклонён: %s", _OWNER, gguf_file, format_id, reason)
+        return ValueError(f"{_OWNER}: формат «{format_id}» (поле «{_GGUF_FIELD}», {gguf_file.name}): {reason}")
+
+    if not gguf_file.is_file():
+        raise FileNotFoundError(f"{_OWNER}: формат «{format_id}» (поле «{_GGUF_FIELD}»): не найден файл {gguf_file}")
+    try:
+        layout = read_container_layout(gguf_file)
+    except (ValueError, RuntimeError) as exc:
+        raise refuse(f"заголовок не прочитан: {exc}") from exc
+    if layout.kind != "gguf" or layout.gguf is None:
+        raise refuse("это не файл GGUF")
+    metadata = layout.gguf.metadata
+    try:
+        qwen3_gguf.require_architecture(metadata, frozenset({GGUF_ENCODER_ARCHITECTURE}), source=gguf_file, owner=_SERVICE)
+    except ValueError as exc:
+        raise refuse(str(exc)) from exc
+    mismatches = gguf_encoder_mismatches(metadata, layout.spans, _text_config_json(directory), keep_layers=keep_layers)
+    if mismatches:
+        raise refuse(f"файл не совпадает с text_encoder/config.json пакета: {'; '.join(mismatches)}")
+    unsupported = sorted({quant_type_name(int(span.quant_type)) for span in layout.spans if span.quant_type is not None and int(span.quant_type) not in dequantizable_types()})
+    if unsupported:
+        raise refuse(f"типы квантования GGUF {', '.join(unsupported)} не поддерживаются")
+    try:
+        qwen3_gguf.require_known_encoder_names([span.name for span in layout.spans], keep_layers, source=gguf_file, owner=_SERVICE, logger=log)
+    except ValueError as exc:
+        raise refuse(str(exc), logged=True) from exc
+
+
+def build_gguf_text_encoder_meta(directory: Path, gguf_file: Path, *, format_id: str, keep_layers: int = ENCODER_KEEP_LAYERS) -> Any:
+    """The TEXT-mode encoder (`Qwen3VLTextModel` of `directory`'s config, truncated to `keep_layers`) on `meta`,
+    with a `runtime.gguf_layers` module (compute bf16) for every weight `gguf_file` stores block-quantized
+    (the linears and `embed_tokens`); the F32 norms stay ordinary parameters (bf16 after the spec's cast).
+    `format_id` is the client's id of the file (refusal texts only).
+
+    # Raises
+    `ValueError` / `FileNotFoundError` from `require_gguf_text_encoder` and
+    `_truncated_config`; `ValueError` when a quantized tensor names no linear
+    / embedding (`gguf_layers.swap_gguf_modules`).
+    """
+    from ...runtime.gguf_layers import swap_gguf_modules
+
+    require_gguf_text_encoder(gguf_file, directory, format_id=format_id, keep_layers=keep_layers)
+    model = build_text_encoder_meta(directory, mode=EncoderMode.TEXT, keep_layers=keep_layers)
+    quant_types = qwen3_gguf.gguf_encoder_quant_types(read_container_layout(gguf_file).spans, keep_layers)
+    swapped = swap_gguf_modules(model, quant_types, compute_dtype=torch.bfloat16)
+    log.info("%s: GGUF %s — %d слоёв GGUF, распаковка в bfloat16 при каждом проходе", _OWNER, gguf_file.name, swapped)
+    return model
 
 
 # =====================================================================

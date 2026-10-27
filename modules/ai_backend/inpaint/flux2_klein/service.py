@@ -17,22 +17,26 @@ Main responsibilities:
   text encoder handle encodes whatever the prompt cache misses (on the GPU
   when the step pair and the device allow it beside the pipeline, else on the
   CPU from RAM; always under the combined VRAM-axis ceiling planned before
-  the pipeline's admission, `_combined_ceilings` / `memory` module notes), then the denoise and the VAE decode run as manager phases (a
+  the pipeline's admission, `_combined_ceilings`, `runtime.large_models.paired` module notes), then the denoise and the VAE decode run as manager phases (a
   memory failure re-plans along the degrade ladder: tiled decode, lowered tile,
   a lower «Видеопамять» step);
 - `component_action` - one per-component residency action, each a manager
   session (load / unload / park in RAM / back to the GPU / warm-up);
 - `_prompt_plan` - THE answer to "which embedding serves each text this run
-  needs, and which must be encoded": memory and the model's library
-  (`runtime.prompt_library`) ranked by `select_entry`; the run, `.status`
-  (`prompt_cached`, `prompt_cache_entry`) and the encoder forecast all derive
-  from it;
+  needs, and which must be encoded", delegated to the shared orchestration
+  (`runtime.prompt_cache_service.PromptCacheOrchestrator.plan` over FLUX.2's
+  `prompt_cache.Flux2PromptCacheAdapter`): memory and the model's library
+  ranked by `select_entry`; the run, `.status` (`prompt_cached`,
+  `prompt_cache_entry`) and the encoder forecast all derive from it;
 - the `prompt_cache_*` methods (`build` / `list` / `export` / `import`) - the
-  library surface (protocol 23: named presets, one library per model);
+  library surface (protocol 23: named presets, one library per model) over
+  the same orchestrator; this service adds the encoder session, the progress
+  steps, the answers' extra keys and its own refusals;
 - `large_model_profiles` - the adapter `large_models.profiles` calls: the
   pipeline's step pickers planned with the encoder's admission claimed (the
-  encoder counted unless it is neither needed nor resident: `_encoder_need`,
-  the one owner of that rule), plus
+  two-handle composition is `runtime.large_models.paired.plan_pair` over
+  `memory.FLUX2_PAIR`; the encoder counted unless it is neither needed nor
+  resident: `_encoder_need` decides the request's `paired.EncoderNeed`), plus
   the encoder's own format rows (`encoder_formats`); both handles are planned
   in the request's selected formats (`large_model.weight_format_of`)
   (`large_model_name` / `large_model_inputs` stay the single-handle fallback);
@@ -55,9 +59,10 @@ Notes:
 - Symbols the test suite monkeypatches are reached through their defining
   module (`hardware._clear_torch_cache`, `prompt_library.serialize_tensor`,
   `attention.build_text_attention_mask`, ...).
-- The memory cache is an `OrderedDict` touched only under the service lock;
-  its provenance index (`_memory_index`) is a copy-on-write `dict` that the
-  lock-free `_prompt_plan` (status, forecast) reads.
+- The memory cache (`runtime.prompt_cache_service.EmbeddingMemory`, count-capped
+  by `PROMPT_EMBED_CACHE_ENTRIES`) is mutated only under the service lock; its
+  provenance index is a copy-on-write `dict` that the lock-free `_prompt_plan`
+  (status, forecast) reads.
 - torch / diffusers / transformers are imported lazily.
 """
 
@@ -67,24 +72,34 @@ import logging
 import os
 import threading
 import time
-from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import numpy as np
 
 from ...runtime import prompt_library as pl
 from ...runtime.health_snapshot import HealthSnapshot
+from ...runtime.large_models import paired
 from ...runtime.large_models.manager import LargeModelManager, MemoryLimitsStore, ProfilesReport, Session, SessionObserver
-from ...runtime.large_models.forecast import Forecast
-from ...runtime.large_models.planner import Planned, PlanResult
+from ...runtime.large_models.paired import EncoderNeed, HandleRequest
 from ...runtime.large_models.spec import ExecDevice
 from ...runtime.large_models.spec import RequestShape
-from ...runtime.large_models.tiers import IDLE_PHASE, RamStep, Steps, VramStep
+from ...runtime.large_models.tiers import RamStep, Steps, VramStep
 from ...runtime.model_manager import SmallModelManager
+from ...runtime.prompt_cache_service import (
+    EmbeddingMemory,
+    MemoryEmbedding,
+    PromptCacheOrchestrator,
+    PromptPlan,
+    entry_info as _entry_info,
+    require_prompt_to_cache,
+)
+from ...runtime.prompt_cache_service import (  # noqa: F401  - test seams reached through this module (`_test_fixtures.seed_memory`)
+    memory_key as _memory_key,
+    tensor_width as _tensor_width,
+)
 from ...runtime.residency.footprint import normalize_device
 from ...runtime.residency.holdings import Pool
 from ..region_imaging import decode_image_rgb, decode_mask, encode_png_rgb, require_solid_mask
@@ -148,19 +163,9 @@ from .progress import (
     ProgressCb,
 )
 from .prompt_cache import (
-    FLUX2_LIBRARY_IDS,
     PROMPT_EMBED_CACHE_ENTRIES,
-    V1_FORMAT,
-    classify_v1_entry,
-    convert_v1_metadata,
+    Flux2PromptCacheAdapter,
     encoder_provenance,
-    ensure_legacy_migrated,
-    is_current_encoder,
-    known_local_encoders,
-    library_of,
-    migration_report,
-    parse_v1_header,
-    transformer_text_width,
 )
 
 log = logging.getLogger(__name__)
@@ -181,118 +186,6 @@ def _encoder_load_steps(requested: Steps) -> Steps:
     if requested.vram is VramStep.MAX or requested.ram in (RamStep.KEEP, RamStep.AUTO):
         return requested
     return _TO_RAM_STEPS
-
-
-#: The `origin` of an embedding encoded in this process and not (yet) in a library file.
-MEMORY_ORIGIN = "memory"
-
-
-@dataclass(frozen=True)
-class MemoryEmbedding:
-    """Provenance of one in-memory embedding (the tensor itself lives in `_prompt_cache` under `key`).
-
-    `library`: the library id of the request that produced it (`""` = none);
-    `entry`: the library entry it was read from (`None` = encoded here);
-    `width`: the tensor's last dimension.
-    """
-
-    key: tuple[Any, ...]
-    library: str
-    text: str
-    max_sequence_length: int
-    encoder: pl.EncoderProvenance
-    width: int | None
-    entry: pl.LibraryEntry | None
-    created_at: str
-
-
-@dataclass(frozen=True)
-class PromptChoice:
-    """The embedding that serves one text: from memory or from a file of the library `library` (`""` = none)."""
-
-    text: str
-    source: Literal["memory", "library"]
-    entry: pl.LibraryEntry | MemoryEmbedding
-    library: str
-
-    @property
-    def encoder(self) -> pl.EncoderProvenance:
-        return self.entry.encoder
-
-
-@dataclass(frozen=True)
-class PromptPlan:
-    """`_prompt_plan`'s answer: the choice per served text and the texts left to encode (in the order the run needs them)."""
-
-    served: Mapping[str, PromptChoice]
-    to_encode: tuple[str, ...]
-
-
-def _memory_key(library: str, text: str, max_sequence_length: int, encoder: pl.EncoderProvenance, origin_file: str) -> tuple[Any, ...]:
-    """The in-memory cache key: library, text, length, encoder identity, precision, and the file it came from (`"encoded"` when encoded here)."""
-    return (library, text, int(max_sequence_length), encoder.encoder_id, encoder.precision_id(), origin_file or "encoded")
-
-
-def _tensor_width(tensor: Any) -> int | None:
-    shape = tuple(getattr(tensor, "shape", ()) or ())
-    return int(shape[-1]) if shape else None
-
-
-def _entry_info(entry: pl.LibraryEntry | MemoryEmbedding, current: pl.EncoderProvenance | None) -> dict[str, Any]:
-    """The wire `EntryInfo` of a library entry or a memory embedding (protocol 23, PROTOCOL.md §5.4).
-
-    A memory embedding read from a file reports that file's entry; one
-    encoded here reports `origin: "memory"` with an empty `file` and `name`.
-    `current_encoder`: made by the request's current encoder (same
-    fingerprint and fp8 flag; false without one).
-    """
-    if isinstance(entry, MemoryEmbedding):
-        if entry.entry is not None:
-            return _entry_info(entry.entry, current)
-        return {
-            "file": "",
-            "name": "",
-            "encoder_source": entry.encoder.source,
-            "encoder_format": entry.encoder.format,
-            "encoder_fp8": entry.encoder.fp8,
-            "encoder_label": entry.encoder.label,
-            "current_encoder": is_current_encoder(entry.encoder, current),
-            "created_at": entry.created_at,
-            "size_bytes": 0,
-            "origin": MEMORY_ORIGIN,
-        }
-    return {
-        "file": entry.file,
-        "name": entry.name,
-        "encoder_source": entry.encoder.source,
-        "encoder_format": entry.encoder.format,
-        "encoder_fp8": entry.encoder.fp8,
-        "encoder_label": entry.encoder.label,
-        "current_encoder": is_current_encoder(entry.encoder, current),
-        "created_at": entry.created_at,
-        "size_bytes": int(entry.size_bytes),
-        "origin": entry.origin,
-    }
-
-
-@dataclass(frozen=True)
-class EncoderNeed:
-    """What a request asks of the text encoder handle (`Flux2KleinInpaintService._encoder_need`).
-
-    `encodes`: an encoder is installed and some prompt the run needs (the
-    prompt, plus `""` under classifier-free guidance) is missing from the
-    prompt cache — the run will load the encoder and encode. `resident`: the
-    encoder handle this request would use holds bytes in RAM or VRAM right
-    now.
-    """
-
-    encodes: bool
-    resident: bool
-
-    @property
-    def counted(self) -> bool:
-        """Whether the forecast counts the encoder: left out ONLY when it is not resident AND the cache covers every prompt."""
-        return self.encodes or self.resident
 
 
 def _load_frames(callback: ProgressCb | None, normalized: Mapping[str, Any]) -> LoadFrames | None:
@@ -319,30 +212,9 @@ def _encoder_file_label(normalized: Mapping[str, Any]) -> str:
     return component_dir_for_path(source).name
 
 
-def _host_baseline(forecast: Forecast) -> int:
-    """The backend's baseline RSS a forecast's host peaks include, read back from its idle state (`host_peak` = baseline + host weights there)."""
-    idle = forecast.phases[IDLE_PHASE]
-    return max(0, int(idle.host_peak) - int(idle.host_weights))
-
-
-def _reservation_of(admitted: Forecast) -> tuple[int, int]:
-    """`(device bytes, host growth)` a plan's admission reserves: its device peak, and its host peak above the baseline RSS (`_host_baseline`, the figure the manager subtracts)."""
-    return int(admitted.device_peak), max(0, int(admitted.host_peak) - _host_baseline(admitted))
-
-
-def _with_host_baseline(selected: dict[str, Any], result: PlanResult) -> dict[str, Any]:
-    """`selected` (a report's wire `selected`) with `forecast.host_baseline` added: the baseline RSS inside its `host_peak`.
-
-    Additive (v21): the client sums the pipeline's and the encoder's host
-    peaks, and each one already includes the backend process once; it
-    subtracts one baseline. `result` is the `PlanResult` `selected` was
-    serialized from (its shown forecast: a plan's full one, a refusal's
-    closest attempt). A `selected` without a forecast is returned unchanged.
-    """
-    forecast = result.full_forecast if isinstance(result, Planned) else result.forecast
-    if forecast is None or selected.get("forecast") is None:
-        return selected
-    return {**selected, "forecast": {**selected["forecast"], "host_baseline": _host_baseline(forecast)}}
+def _encoder_request(encoder_options: large_model.EncoderOptions) -> HandleRequest:
+    """The text-encoder handle of a request for `paired`: its registration (by precision), `encoder_options` and their weight format."""
+    return HandleRequest(large_model.encoder_model_name(encoder_options.fp8), encoder_options, large_model.weight_format_of(encoder_options))
 
 
 def _private_manager(model_manager: SmallModelManager) -> LargeModelManager:
@@ -388,11 +260,13 @@ class Flux2KleinInpaintService:
         self._scheduler_dir: str | None = None
         self._last_paths: dict[str, str] = {}
         # Prompt embeddings in memory (`_memory_key` -> host tensor). Always
-        # on, LRU, touched only under `_lock`; `_memory_index` is its
-        # provenance, replaced wholesale on every change (copy-on-write) so the
-        # lock-free `_prompt_plan` can iterate it.
-        self._prompt_cache: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
-        self._memory_index: dict[tuple[Any, ...], MemoryEmbedding] = {}
+        # on, LRU, mutated only under `_lock`; its provenance index is replaced
+        # wholesale on every change (copy-on-write) so the lock-free
+        # `_prompt_plan` can iterate it. The orchestrator owns the plan and the
+        # library surface over it.
+        self._embeddings = EmbeddingMemory(PROMPT_EMBED_CACHE_ENTRIES)
+        self._prompt_adapter = Flux2PromptCacheAdapter(self._effective_guidance_scale)
+        self._prompts = PromptCacheOrchestrator(self._prompt_adapter, self._embeddings)
         self._guidance_ignored_note: tuple[Any, ...] | None = None
         self._phase_observer: SessionObserver | None = None
 
@@ -499,7 +373,7 @@ class Flux2KleinInpaintService:
         a DISK-tier component brought back inside a phase, a degrade retry's
         reload) streams its bytes on the current step (`LoadFrames`).
         `device_cap_bytes`: the per-handle device ceiling (`None` = none; the
-        encoder's under the combined VRAM-axis rule, `memory` module notes).
+        encoder's under the combined VRAM-axis rule, `paired` module notes).
         """
         session = self._large.acquire(model, options, shape, device=device, format=large_model.weight_format_of(options), steps=steps, observer=self._observer(model), device_cap_bytes=device_cap_bytes)
         if frames is not None:
@@ -507,47 +381,22 @@ class Flux2KleinInpaintService:
         return session
 
     def _combined_ceilings(self, alone: ProfilesReport, encoder_options: large_model.EncoderOptions, shape: RequestShape, device: str, *, until: VramStep) -> tuple[RamStep, dict[VramStep, int | None]] | None:
-        """`(RAM step, memory.combined_ceilings)` of the pipeline report `alone`'s VRAM column, with the manager's live budgets; `None` when there is no VRAM axis to keep monotone.
+        """`(RAM step, combined ceilings)` of the pipeline report `alone`'s VRAM column for the encoder `encoder_options` (`paired.live_ceilings` over `memory.FLUX2_PAIR`).
 
-        Each higher cell is the pipeline's grid row (`alone.vram_rows`) and the
-        encoder `encoder_options` admitted beside its reservation under that
-        cell's own ceiling, exactly as a run of that cell would admit it. Call
-        it BEFORE this run's pipeline holds a reservation (the manager would
-        claim it a second time). Read-only.
+        `None` when there is no VRAM axis to keep monotone. Call it BEFORE this
+        run's pipeline holds a reservation (the manager would claim it a second
+        time). Read-only.
         """
-        if not alone.vram_applicable or not isinstance(alone.selected, Planned):
-            return None
-        ram = alone.selected.plan.steps.ram
-        encoder_model = large_model.encoder_model_name(encoder_options.fp8)
-
-        def combined_at(cell: Steps, ceiling: int | None) -> int | None:
-            row = alone.vram_rows.get(cell.vram)
-            if not isinstance(row, Planned):
-                return None
-            claim = _reservation_of(row.forecast)
-            beside = self._large.profiles(encoder_model, encoder_options, shape, device=device, format=large_model.weight_format_of(encoder_options), steps=cell, claimed_device_bytes=claim[0], claimed_host_bytes=claim[1], device_cap_bytes=memory.encoder_device_cap(ceiling, row.full_forecast))
-            if not isinstance(beside.selected, Planned):
-                return None
-            return memory.combined_device_peak(row.full_forecast, beside.selected.full_forecast)
-
-        return ram, memory.combined_ceilings(ram, combined_at, until=until)
+        return paired.live_ceilings(self._large, alone, _encoder_request(encoder_options), shape, device, memory.FLUX2_PAIR, until=until)
 
     @staticmethod
     def _encoder_cap(ceilings: tuple[RamStep, dict[VramStep, int | None]] | None, pipeline: Session) -> int | None:
-        """The encoder's device ceiling beside the admitted `pipeline` session (`memory.encoder_device_cap`); `None` without ceilings.
+        """The encoder's device ceiling beside the admitted `pipeline` session (`paired.encoder_cap_beside` over `memory.FLUX2_PAIR`); `None` without ceilings.
 
-        The ceilings were computed for the RAM step the pre-admission plan
-        chose; a session admitted at another RAM step (the budgets moved in
-        between) gets no ceiling, logged.
+        A session admitted at another RAM step than the ceilings were planned
+        for gets no ceiling, logged.
         """
-        if ceilings is None:
-            return None
-        ram, table = ceilings
-        effective = pipeline.steps_effective
-        if effective.ram is not ram:
-            log.info("FLUX.2 klein: пайплайн принят на шаге ОЗУ «%s», а потолок энкодера считался для «%s»; энкодер принимается без потолка.", effective.ram.value, ram.value)
-            return None
-        return memory.encoder_device_cap(table.get(effective.vram), pipeline.forecast)
+        return paired.encoder_cap_beside(ceilings, pipeline, memory.FLUX2_PAIR, owner="FLUX.2 klein")
 
     def large_model_name(self, params: dict[str, Any]) -> str:
         """The registered PIPELINE model `large_models.profiles` must plan for `params` (`flux2_klein` or `flux2_klein.float16`, by `dtype`).
@@ -576,17 +425,19 @@ class Flux2KleinInpaintService:
         """`large_models.profiles` for a FLUX.2 run: the PIPELINE's pickers with the text encoder's admission claimed.
 
         A run admits the pipeline first and the encoder on what the pipeline's
-        reservation left. So: (1) the pipeline is planned alone; (2) the
-        encoder is planned with that plan's reservation claimed, under the
-        same requested `steps`, with the combined VRAM-axis ceiling a run would give it
-        (`_combined_ceilings`, `memory` module notes); (3) the pipeline is planned again with the encoder's
-        reservation claimed, and that report is the answer
-        (`ProfilesReport.to_dict()`; `model` is the dtype's registration):
+        reservation left. So (`paired.plan_pair` over `memory.FLUX2_PAIR`, its
+        wire form `PairedReport.to_wire`): (1) the pipeline is planned alone;
+        (2) the encoder is planned with that plan's reservation claimed, under
+        the same requested `steps`, with the combined VRAM-axis ceiling a run
+        would give it (`paired.live_ceilings`, `paired` module notes); (3) the
+        pipeline is planned again with the encoder's reservation claimed, and
+        that report is the answer (`ProfilesReport.to_dict()`; `model` is the
+        dtype's registration):
         `selected` stays the PIPELINE's plan (the encoder enters it only as a
         claim), so the run's total is `selected` + `encoder`, summed by the
         client; each of the two `forecast` objects carries the additive
         `host_baseline` (the baseline RSS inside its `host_peak`,
-        `_with_host_baseline`) so that sum counts the process once. The additive key `encoder` is the encoder's `selected`, or
+        `paired.with_host_baseline`) so that sum counts the process once. The additive key `encoder` is the encoder's `selected`, or
         `null` when the encoder is not needed AND not resident
         (`EncoderNeed.counted`: every prompt the run needs is cached and the
         encoder handle holds no byte, or no encoder is installed); a resident
@@ -608,32 +459,10 @@ class Flux2KleinInpaintService:
         normalized = normalize_flux2_klein_params(params)
         device = self._device_name()
         guidance = self._effective_guidance_scale(normalized) > 1.0
-        model = large_model.pipeline_model_name(normalized["dtype"])
         options = large_model.pipeline_options(normalized, guidance=guidance)
-        format = format or large_model.weight_format_of(options)
-        alone = self._large.profiles(model, options, shape, device=device, format=format, steps=steps)
-        if not self._encoder_need(normalized, device).counted:
-            answer = alone.to_dict()
-            return {**answer, "selected": _with_host_baseline(answer["selected"], alone.selected), "encoder": None, "encoder_formats": []}
-        pipeline_claim = _reservation_of(alone.selected.forecast) if isinstance(alone.selected, Planned) else (0, 0)
-        encoder_options = large_model.encoder_options(normalized)
-        cap = None
-        if isinstance(alone.selected, Planned):
-            selected_vram = alone.selected.plan.steps.vram
-            ceilings = self._combined_ceilings(alone, encoder_options, shape, device, until=selected_vram)
-            cap = memory.encoder_device_cap(ceilings[1][selected_vram], alone.selected.full_forecast) if ceilings is not None else None
-        encoder = self._large.profiles(large_model.encoder_model_name(encoder_options.fp8), encoder_options, shape, device=device, format=large_model.weight_format_of(encoder_options), steps=steps, claimed_device_bytes=pipeline_claim[0], claimed_host_bytes=pipeline_claim[1], device_cap_bytes=cap)
-        encoder_report = encoder.to_dict()
-        encoder_selected = _with_host_baseline(encoder_report["selected"], encoder.selected)
-        encoder_formats = encoder_report["formats"]
-        if not isinstance(encoder.selected, Planned):
-            answer = alone.to_dict()
-            answer["selected"] = {**_with_host_baseline(answer["selected"], alone.selected), "fits": False, "vram": None, "ram": None, "needs_reclaim": None, "reason": encoder_selected["reason"], "shortest_resource": encoder_selected["shortest_resource"]}
-            return {**answer, "encoder": encoder_selected, "encoder_formats": encoder_formats}
-        encoder_claim = _reservation_of(encoder.selected.forecast)
-        combined: ProfilesReport = self._large.profiles(model, options, shape, device=device, format=format, steps=steps, claimed_device_bytes=encoder_claim[0], claimed_host_bytes=encoder_claim[1])
-        answer = combined.to_dict()
-        return {**answer, "selected": _with_host_baseline(answer["selected"], combined.selected), "encoder": encoder_selected, "encoder_formats": encoder_formats}
+        pipeline_request = HandleRequest(large_model.pipeline_model_name(normalized["dtype"]), options, format or large_model.weight_format_of(options))
+        encoder_request = _encoder_request(large_model.encoder_options(normalized)) if self._encoder_need(normalized, device).counted else None
+        return paired.plan_pair(self._large, pipeline_request, encoder_request, shape, device, steps, memory.FLUX2_PAIR).to_wire()
 
     # ---- status / health ----
     def status(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -844,7 +673,7 @@ class Flux2KleinInpaintService:
                 # headers and configs, which on a cold page cache take long
                 # enough that the user would see nothing happen.
                 report(LOAD_STEP_PREPARE, "Подготовка запуска FLUX.2 klein")
-                self._migrate_legacy(normalized)
+                self._prompt_adapter.migrate(normalized)
                 # The plan is made ONCE, under the lock, and the run follows it
                 # (`_prompt_embeds_locked` re-plans only when a chosen file vanished).
                 plan = self._prompt_plan(normalized, blocking_load=True)
@@ -1121,7 +950,8 @@ class Flux2KleinInpaintService:
         """`({"prompt", "negative"} host embeddings, encoder retries)` following `plan`.
 
         Served texts are taken from memory or read from their library file
-        (which then stays in memory); `plan.to_encode` is encoded. On a full
+        (which then stays in memory; `PromptCacheOrchestrator.serve_locked`);
+        `plan.to_encode` is encoded. On a full
         hit no encoder is touched («Промпт взят из кэша»). A library file that
         vanished or changed since the plan (`LibraryEntryGone`) re-plans once;
         a text still unserved then is encoded when an encoder is available,
@@ -1136,7 +966,7 @@ class Flux2KleinInpaintService:
         tensors: dict[str, Any] = {}
         lost: dict[str, str] = {}
         for text, choice in plan.served.items():
-            tensor = self._serve_locked(choice)
+            tensor = self._prompts.serve_locked(choice)
             if tensor is None:
                 lost[text] = choice.entry.file if isinstance(choice.entry, pl.LibraryEntry) else ""
             else:
@@ -1146,7 +976,7 @@ class Flux2KleinInpaintService:
             replan = self._prompt_plan(normalized, blocking_load=True)
             for text in lost:
                 choice = replan.served.get(text)
-                tensor = self._serve_locked(choice) if choice is not None else None
+                tensor = self._prompts.serve_locked(choice) if choice is not None else None
                 if tensor is None:
                     missing.append(text)
                 else:
@@ -1168,38 +998,6 @@ class Flux2KleinInpaintService:
         if self._effective_guidance_scale(normalized) > 1.0:
             embeds["negative"] = tensors[""]
         return embeds, retries
-
-    def _serve_locked(self, choice: PromptChoice) -> Any | None:
-        """The tensor of `choice` (caller holds `self._lock`); `None` when it is gone (a memory entry evicted, a library file vanished or changed).
-
-        A library read is remembered in memory under its file's key, so the
-        next run does not read the file again.
-        """
-        if isinstance(choice.entry, MemoryEmbedding):
-            tensor = self._prompt_cache.get(choice.entry.key)
-            if tensor is not None:
-                self._prompt_cache.move_to_end(choice.entry.key)
-            return tensor
-        entry = choice.entry
-        library = library_of(choice.library)
-        try:
-            tensor = library.read_tensor(entry)
-        except pl.LibraryEntryGone as exc:
-            log.warning("FLUX.2 klein: кэш промпта %s больше не годится (%s); запуск подберёт другой или закодирует промпт.", entry.file, exc)
-            return None
-        remembered = MemoryEmbedding(
-            key=_memory_key(library.spec.library_id, entry.prompt, entry.max_sequence_length, entry.encoder, entry.file),
-            library=library.spec.library_id,
-            text=entry.prompt,
-            max_sequence_length=entry.max_sequence_length,
-            encoder=entry.encoder,
-            width=_tensor_width(tensor),
-            entry=entry,
-            created_at=entry.created_at,
-        )
-        self._store_embeds(remembered, tensor)
-        log.info("FLUX.2 klein: промпт взят из библиотеки %s: %s (энкодер %s, %s).", library.spec.library_id, entry.file, entry.encoder.label, entry.encoder.precision_id())
-        return tensor
 
     def _encode_prompts_locked(
         self,
@@ -1259,17 +1057,7 @@ class Flux2KleinInpaintService:
         created_at = pl.utc_now()
         encoded: dict[str, Any] = {}
         for text, embeds in zip(texts, results):
-            remembered = MemoryEmbedding(
-                key=_memory_key(library, text, msl, provenance, ""),
-                library=library,
-                text=text,
-                max_sequence_length=msl,
-                encoder=provenance,
-                width=_tensor_width(embeds),
-                entry=None,
-                created_at=created_at,
-            )
-            self._store_embeds(remembered, embeds)
+            self._prompts.remember_locked(library, text, msl, provenance, embeds, created_at)
             encoded[text] = embeds
         if release:
             self._unload_models_locked((model,))
@@ -1309,45 +1097,34 @@ class Flux2KleinInpaintService:
         load raises.
         """
         normalized = normalize_flux2_klein_params(params)
-        text = normalized["prompt"]
-        if not text:
-            raise ValueError("Кэшировать нечего: промпт пуст. Введите текст промпта и повторите.")
-        library = self._require_library(normalized["prompt_library"])
+        require_prompt_to_cache(normalized["prompt"])
+        library = self._prompts.require_library(normalized)
         self._last_paths = {key: normalized[key] for key in _PATH_KEYS}
         frames = _load_frames(progress_callback, normalized)
         report = _progress_reporter(frames, "load", LOAD_PHASE_STEPS)
+
+        def encode_missing(need: list[str]) -> dict[str, Any]:
+            # Only reached when something must really be encoded: a build served
+            # from memory needs no loadable encoder.
+            large_model.require_loadable_encoder(normalized)
+            report(LOAD_STEP_PREPARE, "Подготовка кэширования промпта")
+            device = self._device_name()
+            resident = self._holds(self._handle_key(lambda: self._encoder_key(normalized, normalized["text_encoder_fp8"], device, on_cpu=normalized["encoder_on_cpu"]), "text_encoder"))
+            shape = large_model.request_shape(MIN_REGION_SIDE, MIN_REGION_SIDE, with_reference=False, max_sequence_length=int(normalized["max_sequence_length"]), steps=1)
+            _retries, fresh = self._encode_prompts_locked(normalized, need, report, frames, steps=memory.requested_steps(normalized), device=device, shape=shape, release=not resident)
+            return fresh
+
+        def nothing_to_encode(any_to_write: bool) -> None:
+            report(LOAD_STEP_ENCODER_DONE, "Промпт уже в кэше" if any_to_write else "Промпт уже в библиотеке")
+
         with self._lock:
             try:
-                self._migrate_legacy(normalized)
+                self._prompt_adapter.migrate(normalized)
                 require_text_encoder(normalized, what="кэширование промпта")
                 current = encoder_provenance(normalized)
                 if current is None:
                     raise ValueError(f"Текстовый энкодер пропал: {normalized['text_encoder_path']}")
-                msl = int(normalized["max_sequence_length"])
-                snap = library.reconcile()
-                requested = pl.normalize_preset_name(name or "")
-                preset_name = requested or snap.preset_name(text) or pl.default_preset_name(text)
-                to_write = [needed for needed in self._texts_needed(normalized) if not any(is_current_encoder(entry.encoder, current) for entry in library.entries_for(needed, msl))]
-                tensors = {needed: tensor for needed in to_write if (tensor := self._memory_tensor_of(library.spec.library_id, needed, msl, current)) is not None}
-                need = [needed for needed in to_write if needed not in tensors]
-                encoded = bool(need)
-                if need:
-                    large_model.require_loadable_encoder(normalized)
-                    report(LOAD_STEP_PREPARE, "Подготовка кэширования промпта")
-                    device = self._device_name()
-                    resident = self._holds(self._handle_key(lambda: self._encoder_key(normalized, normalized["text_encoder_fp8"], device, on_cpu=normalized["encoder_on_cpu"]), "text_encoder"))
-                    shape = large_model.request_shape(MIN_REGION_SIDE, MIN_REGION_SIDE, with_reference=False, max_sequence_length=msl, steps=1)
-                    _retries, fresh = self._encode_prompts_locked(normalized, need, report, frames, steps=memory.requested_steps(normalized), device=device, shape=shape, release=not resident)
-                    tensors.update(fresh)
-                else:
-                    report(LOAD_STEP_ENCODER_DONE, "Промпт уже в кэше" if to_write else "Промпт уже в библиотеке")
-                written: list[pl.LibraryEntry] = []
-                extra = {"text_encoder_path": str(normalized["text_encoder_path"])}
-                for needed in to_write:
-                    entry, new = library.write_entry(needed, tensors[needed], current, max_sequence_length=msl, name=preset_name if needed == text else "", origin=pl.ORIGIN_BUILT, extra=extra)
-                    if new:
-                        written.append(entry)
-                renamed = bool(library.rename_text(text, preset_name)) if requested else False
+                built = self._prompts.build_locked(normalized, name, encode_missing, current=current, extra={"text_encoder_path": str(normalized["text_encoder_path"])}, on_nothing_to_encode=nothing_to_encode)
                 self._last_error = None
                 self._publish_health_locked()
             except Exception as exc:
@@ -1356,30 +1133,21 @@ class Flux2KleinInpaintService:
                 raise
         log.info(
             "FLUX.2 klein: промпт «%s» в библиотеке %s: записано %d, %s, %s.",
-            preset_name,
+            built.name,
             library.spec.library_id,
-            len(written),
-            "закодирован" if encoded else "без кодирования",
-            "переименован" if renamed else "имя прежнее",
+            len(built.written),
+            "закодирован" if built.encoded else "без кодирования",
+            "переименован" if built.renamed else "имя прежнее",
         )
         return {
-            "prompt": text,
-            "name": preset_name,
-            "encoded": encoded,
-            "written": [_entry_info(entry, current) for entry in written],
-            "renamed": renamed,
+            "prompt": built.prompt,
+            "name": built.name,
+            "encoded": built.encoded,
+            "written": [_entry_info(entry, built.current) for entry in built.written],
+            "renamed": built.renamed,
             "prompt_cached": True,
             "device": self._device_label(),
         }
-
-    def _memory_tensor_of(self, library_id: str, text: str, max_sequence_length: int, current: pl.EncoderProvenance) -> Any | None:
-        """An in-memory embedding of `text` made by the encoder `current` (caller holds `self._lock`); `None` when there is none."""
-        for key, remembered in self._memory_index.items():
-            if remembered.library == library_id and remembered.text == text and remembered.max_sequence_length == max_sequence_length and is_current_encoder(remembered.encoder, current):
-                tensor = self._prompt_cache.get(key)
-                if tensor is not None:
-                    return tensor
-        return None
 
     # ---- per-component actions ----
     def component_action(
@@ -1536,29 +1304,6 @@ class Flux2KleinInpaintService:
 
     # ---- prompt library ----
     @staticmethod
-    def _require_library(library_id: str | None) -> pl.PromptLibrary:
-        """The library a library operation works on; the request must name one (`params.prompt_library`).
-
-        # Raises
-        `ValueError` when it names none (or an invalid id).
-        """
-        if not library_id:
-            raise ValueError("FLUX.2 klein: в запросе нет «prompt_library» — неизвестно, библиотеку какой модели открыть.")
-        return library_of(library_id)
-
-    @staticmethod
-    def _migrate_legacy(params: Mapping[str, Any]) -> None:
-        """Run the one-time v1 migration (`prompt_cache.ensure_legacy_migrated`) when the request names a library.
-
-        A request without one (the calibration tool, tests) never touches the
-        library root. The request's encoder joins the known encoders with its
-        source.
-        """
-        if not params.get("prompt_library"):
-            return
-        ensure_legacy_migrated([(str(params.get("text_encoder_path") or ""), str(params.get("text_encoder_source") or ""))])
-
-    @staticmethod
     def _lenient_library_request(params: dict[str, Any] | None) -> dict[str, Any]:
         """What the browse-only library methods read from `params`, without requiring a transformer or a VAE.
 
@@ -1588,15 +1333,6 @@ class Flux2KleinInpaintService:
             "max_sequence_length": length,
         }
 
-    @staticmethod
-    def _current_or_none(request: Mapping[str, Any]) -> pl.EncoderProvenance | None:
-        """`encoder_provenance` of `request`, `None` (logged) when the encoder exists but cannot be identified: browsing never fails over it."""
-        try:
-            return encoder_provenance(request)
-        except ValueError as exc:
-            log.info("FLUX.2 klein: текущий текстовый энкодер не опознан, записи библиотеки не сверяются с ним: %s", exc)
-            return None
-
     def prompt_cache_list(self, params: dict[str, Any] | None) -> dict[str, Any]:
         """The presets of the request's library (`params.prompt_library`).
 
@@ -1619,32 +1355,7 @@ class Flux2KleinInpaintService:
         `ValueError` for a request without `prompt_library` or a malformed
         library field.
         """
-        request = self._lenient_library_request(params)
-        library = self._require_library(request["prompt_library"])
-        self._migrate_legacy(request)
-        snap = library.reconcile()
-        current = self._current_or_none(request)
-        pref = pl.Preference(request["text_encoder_source"], request["prompt_cache_precision_order"])
-        width = transformer_text_width(request["transformer_path"])
-        msl = request["max_sequence_length"]
-        texts: list[dict[str, Any]] = []
-        for text in snap.texts():
-            if text == "":
-                continue
-            usable = [entry for entry in snap.by_text.get((text, msl), ()) if width is None or entry.width == width]
-            if not usable:
-                continue
-            ranked = sorted(usable, key=lambda entry: pl.rank_key(entry.encoder, entry.created_at, False, entry.file, pref))
-            texts.append({"prompt": text, "name": snap.preset_name(text), "selected": _entry_info(ranked[0], current), "entries": [_entry_info(entry, current) for entry in ranked]})
-        legacy = migration_report()
-        return {
-            "library": library.spec.library_id,
-            "directory": str(library.directory),
-            "texts": texts,
-            "skipped": [{"file": file, "reason": reason} for file, reason in sorted(snap.skipped.items())],
-            "text_encoder_available": text_encoder_available(request),
-            "legacy": legacy.to_wire() if legacy is not None and legacy.found_anything else None,
-        }
+        return self._prompts.listing(self._lenient_library_request(params))
 
     def prompt_cache_export(self, params: dict[str, Any] | None, file: str, path: str) -> dict[str, Any]:
         """Copy the entry `file` of the request's library to the `.msprompt` path `path` (a byte copy, atomic).
@@ -1660,20 +1371,7 @@ class Flux2KleinInpaintService:
         regular file inside the library (`pl.UnsafeLibraryPath`), or a rejected
         destination (`require_entry_destination`).
         """
-        request = self._lenient_library_request(params)
-        library = self._require_library(request["prompt_library"])
-        if file not in library.reconcile().entries:
-            raise ValueError(f"Кэша промпта «{file}» нет в библиотеке {library.directory}.")
-        # The bytes copied out must be the library's own file, never a link's target.
-        source = library.confined_entry_path(file)
-        dest = pl.require_entry_destination(path)
-        try:
-            payload = source.read_bytes()
-            size = pl.publish_bytes_atomically(dest, payload)
-        except OSError as exc:
-            raise ValueError(f"Не удалось скопировать кэш промпта {source} в {dest}: {exc}") from exc
-        log.info("FLUX.2 klein: кэш промпта %s выгружен в %s (%d байт).", file, dest, size)
-        return {"library": library.spec.library_id, "file": file, "path": str(dest), "size_bytes": int(size)}
+        return self._prompts.export(self._lenient_library_request(params), file, path)
 
     def prompt_cache_import(self, params: dict[str, Any] | None, path: str) -> dict[str, Any]:
         """Copy an outside `.msprompt` file into the library it belongs to.
@@ -1694,116 +1392,20 @@ class Flux2KleinInpaintService:
         `ValueError` for a rejected path, a file that is not a prompt cache, a
         library that is not FLUX.2's, a refused v1 file, or a failed write.
         """
-        request = self._lenient_library_request(params)
-        source = pl.require_entry_source(path)
-        self._migrate_legacy(request)
-        try:
-            payload = source.read_bytes()
-        except OSError as exc:
-            raise ValueError(f"Не удалось прочитать файл кэша промпта {source}: {exc}") from exc
-        try:
-            header, _start = pl.parse_payload_header(payload)
-        except ValueError as exc:
-            raise ValueError(f"Файл {source} не является кэшем промпта ManhwaStudio: {exc}.") from exc
-        raw_meta = header.get("__metadata__")
-        marker = raw_meta.get("format") if isinstance(raw_meta, dict) else None
-        if marker == pl.CONTAINER_FORMAT:
-            library_id = str(raw_meta.get("library", ""))
-            if library_id not in FLUX2_LIBRARY_IDS:
-                raise ValueError(f"Файл кэша промпта {source} относится к библиотеке «{library_id}», а не к FLUX.2 klein.")
-            metadata = {str(key): str(value) for key, value in raw_meta.items()}
-            metadata["origin"] = pl.ORIGIN_IMPORTED
-        elif marker == V1_FORMAT:
-            v1_meta, tensor = parse_v1_header(header, source)
-            family = str(v1_meta.get("text_encoder_family", ""))
-            known = known_local_encoders([(request["text_encoder_path"], request["text_encoder_source"]), (v1_meta.get("text_encoder_path", ""), "")])
-            verdict = classify_v1_entry(v1_meta, tensor, known, family=family)
-            if verdict.action != "migrate" or verdict.library_id is None:
-                raise ValueError(f"Файл кэша промпта {source} не импортирован: {verdict.reason}.")
-            library_id = verdict.library_id
-            metadata = convert_v1_metadata(v1_meta, verdict, name=source.stem, migrated_from=f"{family}/{source.name}")
-        else:
-            raise ValueError(f"Файл {source} не является кэшем промпта ManhwaStudio: нет известной метки формата.")
-        library = library_of(library_id)
-        entry, written = library.add_payload(payload, metadata)
-        library_matches = library_id == request["prompt_library"]
-        log.info(
-            "FLUX.2 klein: кэш промпта %s импортирован в библиотеку %s как %s (%s).",
-            source,
-            library_id,
-            entry.file,
-            "новая запись" if written else "уже была",
-        )
-        return {
-            "library": library_id,
-            "file": entry.file,
-            "prompt": entry.prompt,
-            "name": entry.name,
-            "library_matches": library_matches,
-            "already_present": not written,
-            "origin": entry.origin,
-        }
+        return self._prompts.import_file(self._lenient_library_request(params), path)
 
     # ---- the prompt plan ----
-    def _texts_needed(self, normalized: dict[str, Any]) -> list[str]:
-        """The texts a run of `normalized` embeds: the prompt, plus `""` under effective classifier-free guidance.
-
-        A distilled checkpoint never asks for `""`: `_effective_guidance_scale`
-        has already pinned its scale to 1.0, so the encoder is never read for
-        an embedding the denoise would ignore.
-        """
-        wanted = [normalized["prompt"]]
-        if self._effective_guidance_scale(normalized) > 1.0 and normalized["prompt"] != "":
-            wanted.append("")
-        return wanted
-
     def _prompt_plan(self, normalized: dict[str, Any], *, blocking_load: bool) -> PromptPlan:
-        """THE owner of "which embedding serves each text this run needs, and what must be encoded".
+        """THE owner of "which embedding serves each text this run needs, and what must be encoded" (`PromptCacheOrchestrator.plan`).
 
-        Candidates of a text are the memory embeddings of the request's library
-        (`""` = none) with the exact text and `max_sequence_length`, plus that
-        library's entries with the same keys, minus every candidate whose
-        width the transformer does not accept (`transformer_text_width`);
-        `pl.select_entry` picks one under the request's preference (selected
-        encoder source, precision order). Lock-free: it reads the
-        copy-on-write memory index and the library snapshot (`load`, blocking
-        or not per `blocking_load`). Never migrates.
+        The texts are the prompt plus `""` under effective classifier-free
+        guidance (`Flux2PromptCacheAdapter.texts_needed`); candidates are the
+        memory embeddings and the library entries of the request's library at
+        its `max_sequence_length` that the transformer's width accepts
+        (`transformer_text_width`), ranked by `prompt_library.select_entry`.
+        Lock-free; never migrates.
         """
-        library_id = normalized.get("prompt_library") or ""
-        library = library_of(library_id) if library_id else None
-        if library is not None:
-            library.load(blocking=blocking_load)
-        pref = pl.Preference(str(normalized.get("text_encoder_source") or ""), tuple(normalized.get("prompt_cache_precision_order") or ()))
-        width = transformer_text_width(str(normalized.get("transformer_path") or ""))
-        msl = int(normalized["max_sequence_length"])
-        remembered = self._memory_index
-        served: dict[str, PromptChoice] = {}
-        to_encode: list[str] = []
-        for text in self._texts_needed(normalized):
-            candidates: list[PromptChoice] = [
-                PromptChoice(text, "memory", item, library_id)
-                for item in remembered.values()
-                if item.library == library_id and item.text == text and item.max_sequence_length == msl and (width is None or item.width is None or item.width == width)
-            ]
-            if library is not None:
-                for entry in library.entries_for(text, msl):
-                    if width is not None and entry.width != width:
-                        log.debug("FLUX.2 klein: запись %s шириной %s не подходит трансформеру (%d).", entry.file, entry.width, width)
-                        continue
-                    candidates.append(PromptChoice(text, "library", entry, library_id))
-            choice = pl.select_entry(
-                candidates,
-                pref,
-                provenance=lambda candidate: candidate.encoder,
-                created=lambda candidate: candidate.entry.created_at,
-                in_memory=lambda candidate: candidate.source == "memory",
-                name=lambda candidate: candidate.entry.file if isinstance(candidate.entry, pl.LibraryEntry) else (candidate.entry.entry.file if candidate.entry.entry is not None else ""),
-            )
-            if choice is None:
-                to_encode.append(text)
-            else:
-                served[text] = choice
-        return PromptPlan(served=served, to_encode=tuple(to_encode))
+        return self._prompts.plan(normalized, blocking_load=blocking_load)
 
     def _status_prompt_cache(self, params: dict[str, Any] | None) -> tuple[bool, dict[str, Any] | None]:
         """`(prompt_cached, prompt_cache_entry)` of `.status`, read leniently.
@@ -1823,10 +1425,7 @@ class Flux2KleinInpaintService:
             normalized = normalize_flux2_klein_params(probe)
         except ValueError:
             return False, None
-        plan = self._prompt_plan(normalized, blocking_load=True)
-        choice = plan.served.get(normalized["prompt"])
-        entry = None if choice is None else _entry_info(choice.entry, self._current_or_none(normalized))
-        return not plan.to_encode, entry
+        return self._prompts.status(normalized)
 
     def _prompt_cached(self, params: dict[str, Any] | None) -> bool:
         """Whether every text a run of `params` needs is served by memory or the library (`_status_prompt_cache`, lenient)."""
@@ -1867,13 +1466,13 @@ class Flux2KleinInpaintService:
         return 1.0
 
     def _store_embeds(self, remembered: MemoryEmbedding, value: Any) -> None:
-        """Insert into the LRU memory cache (caller holds `self._lock`), evicting the oldest entry when full; republishes `_memory_index`."""
-        self._prompt_cache[remembered.key] = value
-        self._prompt_cache.move_to_end(remembered.key)
-        while len(self._prompt_cache) > PROMPT_EMBED_CACHE_ENTRIES:
-            self._prompt_cache.popitem(last=False)
-        index = {**self._memory_index, remembered.key: remembered}
-        self._memory_index = {key: item for key, item in index.items() if key in self._prompt_cache}
+        """Insert into the LRU memory cache (caller holds `self._lock`), evicting the oldest entry when full (`EmbeddingMemory.store`; the test fixtures' seam)."""
+        self._embeddings.store(remembered, value)
+
+    @property
+    def _memory_index(self) -> Mapping[tuple[Any, ...], MemoryEmbedding]:
+        """The memory cache's provenance index (copy-on-write; read by the prompt-cache golden test)."""
+        return self._embeddings.index
 
     def _ensure_tokenizer_locked(self, tokenizer_dir: Path) -> Any:
         """Return the Qwen tokenizer for `tokenizer_dir`, reading it once per directory.

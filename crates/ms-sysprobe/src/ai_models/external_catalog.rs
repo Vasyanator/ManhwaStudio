@@ -4,8 +4,9 @@ File: crates/ms-sysprobe/src/ai_models/external_catalog.rs
 Purpose:
 The pinned catalog of EXTERNAL (third-party) models the application downloads itself:
 Baberu OCR, the three PaddleOCR-VL variants, the Surya detection and recognition
-checkpoints, the SDXL diffusers configs, the curated SDXL inpainting model and the FLUX.2
-klein 4B and 9B packages (in the submodule `flux2_klein`, re-exported here) (the EasyOCR
+checkpoints, the SDXL diffusers configs, the curated SDXL inpainting model, the FLUX.2
+klein 4B and 9B packages (in the submodule `flux2_klein`, re-exported here) and the FLUX.3
+klein package (in the submodule `flux3_klein`, re-exported here) (the EasyOCR
 specs live with their language rule in `easyocr.rs`). This file is the single owner of each
 model's source (Hugging Face repository + pinned commit + gated flag, or HTTPS base URL), file
 allowlist (exact size + sha256) and target directory under the caller's `side_models` root.
@@ -22,6 +23,11 @@ Key items:
   `flux2_klein_weights_path`, `flux2_klein_legacy_transformer_spec`,
   `flux2_klein_transformer_layout` + `Flux2TransformerLayout`, `flux2_klein_spec_role` +
   `Flux2SpecRole`).
+- Re-exported from `flux3_klein`: the `FLUX3_KLEIN_*` statics, the gated repository id
+  `FLUX3_KLEIN_BFL_REPO` and the FLUX.3 klein lookups
+  (`flux3_klein_dit_spec`, `flux3_klein_encoder_spec`, `flux3_klein_package_specs`,
+  `flux3_klein_dit_reads_root_config`, `flux3_klein_dit_relative_path`, `flux3_klein_encoder_relative_path`,
+  `flux3_klein_spec_role` + `Flux3SpecRole`).
 - `all_specs()`: every spec of the application (catalog + EasyOCR), for whole-catalog
   checks.
 - `BaberuFiles` + `baberu_files()`: the one owner of the Baberu on-disk layout names; uses
@@ -41,6 +47,7 @@ use std::path::{Path, PathBuf};
 use super::external::{DirLayout, ExternalFile, ExternalModelSpec, ExternalSource};
 
 mod flux2_klein;
+mod flux3_klein;
 
 pub use flux2_klein::{
     FLUX2_KLEIN_4B_BASE, FLUX2_KLEIN_4B_TEXT_ENCODER_BF16, FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q4_K_M, FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q5_K_M,
@@ -52,6 +59,12 @@ pub use flux2_klein::{
     FLUX2_KLEIN_9B_TRANSFORMER_BF16_DIFFUSERS, FLUX2_KLEIN_9B_TRANSFORMER_GGUF_Q4_K_M, FLUX2_KLEIN_9B_TRANSFORMER_GGUF_Q5_K_M, FLUX2_KLEIN_9B_TRANSFORMER_GGUF_Q6_K,
     FLUX2_KLEIN_9B_TRANSFORMER_GGUF_Q8_0, Flux2SpecRole, Flux2TransformerLayout, flux2_klein_legacy_transformer_spec, flux2_klein_package_specs,
     flux2_klein_spec, flux2_klein_spec_role, flux2_klein_transformer_layout, flux2_klein_weights_path,
+};
+pub use flux3_klein::{
+    FLUX3_KLEIN_BASE, FLUX3_KLEIN_BFL_REPO, FLUX3_KLEIN_DIT_BF16, FLUX3_KLEIN_DIT_CONFIG, FLUX3_KLEIN_DIT_FP8R, FLUX3_KLEIN_DIT_GGUF_Q4_K_M, FLUX3_KLEIN_DIT_GGUF_Q5_K_M, FLUX3_KLEIN_DIT_GGUF_Q6_K,
+    FLUX3_KLEIN_DIT_GGUF_Q8_0, FLUX3_KLEIN_DIT_NVFP4, FLUX3_KLEIN_TEXT_ENCODER_BF16, FLUX3_KLEIN_TEXT_ENCODER_GGUF_Q4_K_M, FLUX3_KLEIN_TEXT_ENCODER_GGUF_Q8_0,
+    Flux3SpecRole, flux3_klein_dit_reads_root_config, flux3_klein_dit_relative_path, flux3_klein_dit_spec, flux3_klein_encoder_relative_path, flux3_klein_encoder_spec, flux3_klein_package_specs,
+    flux3_klein_spec_role,
 };
 
 /// Baberu vision encoder (fp16 ONNX), relative to the model directory.
@@ -396,6 +409,7 @@ pub fn all_specs() -> Vec<&'static ExternalModelSpec> {
         &SDXL_INPAINT_FP16,
     ];
     specs.extend(flux2_klein::FLUX2_KLEIN_SPECS);
+    specs.extend(flux3_klein::FLUX3_KLEIN_SPECS);
     specs.extend(super::easyocr::EasyOcrScript::ALL.into_iter().map(super::easyocr::easyocr_spec));
     specs
 }

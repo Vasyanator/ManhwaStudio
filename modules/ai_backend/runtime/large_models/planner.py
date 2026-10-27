@@ -188,8 +188,14 @@ class PlanFit:
 class Budgets:
     """Budget inputs of one planning call (bytes).
 
-    `baseline_rss` is the backend's anonymous RSS without any large model (host
-    peaks include it). `own_*_bytes` are what THIS model already holds (a warm
+    `baseline_rss` is the backend's anonymous RSS without any large-pool
+    holding — every handle's host bytes taken out, this model's own and its
+    pair partner's included (the manager's `_large_free_rss`); host peaks
+    include it, so a reported host peak is what the process would hold with
+    only this plan's large model loaded. It never enters the host ROOM
+    (`host_room`: probed availability + own bytes - claims, + `reclaimable`),
+    and a plan's host growth is its peak minus this same baseline: holdings of
+    other large handles count as occupied unless reclaimable. `own_*_bytes` are what THIS model already holds (a warm
     model): the plan may reuse them, so they are credited back. `claimed_*_bytes`
     are bytes other memory pools have claimed (outstanding reservations) but
     that the readings do not show yet; they are taken out of the room.
@@ -233,7 +239,7 @@ class Budgets:
         return max(0, size - max(0, self.device.reserve))
 
     def host_room(self) -> int:
-        """Host bytes a plan may add above `baseline_rss`."""
+        """Host bytes a plan's host growth (its peak above `baseline_rss`) may reach: probed headroom + own bytes - claims; independent of `baseline_rss`."""
         return max(0, self.host.headroom() + max(0, self.own_host_bytes) - max(0, self.claimed_host_bytes))
 
 

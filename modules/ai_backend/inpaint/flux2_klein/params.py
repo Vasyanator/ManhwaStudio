@@ -25,7 +25,8 @@ Main responsibilities:
 - `prompt_library_fields` - the prompt-library fields of the wire (protocol
   23): the library id, the selected encoder source and the precision order,
   validated without touching any path (`.list` / `.export` / `.import` read
-  them before a transformer is configured).
+  them before a transformer is configured); the shared reader
+  `runtime.prompt_cache_service.read_library_fields` with FLUX.2's message prefix.
 
 Key functions:
 - normalize_flux2_klein_params()
@@ -56,6 +57,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from ...runtime.large_models.tiers import RamStep, VramStep
+from ...runtime.prompt_cache_service import read_library_fields
 from ...runtime.tensor_container import container_kind
 
 log = logging.getLogger(__name__)
@@ -125,11 +127,6 @@ GGUF_FORMAT = "gguf"
 #: The shape every weight-format id on the wire must have; the ids themselves
 #: are opaque to the backend (module notes).
 WEIGHT_FORMAT_ID_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
-
-#: Shape of `prompt_library` (a library id: a directory name, Rust
-#: `Flux2Variant::prompt_library_id`) and of `text_encoder_source` (protocol 23).
-PROMPT_LIBRARY_ID_PATTERN = re.compile(r"^[a-z0-9_]{1,40}$")
-ENCODER_SOURCE_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
 
 
 # =====================================================================
@@ -519,39 +516,31 @@ def _weight_formats(
 def prompt_library_fields(params: Mapping[str, Any] | None) -> tuple[str | None, str, tuple[str, ...]]:
     """`(prompt_library, text_encoder_source, prompt_cache_precision_order)` of a raw params object (protocol 23).
 
-    - `prompt_library`: the model's library id (`PROMPT_LIBRARY_ID_PATTERN`);
-      absent or `null` = no library (memory only: the calibration tool, tests);
-    - `text_encoder_source`: the selected encoder source id
-      (`ENCODER_SOURCE_PATTERN`); absent, `null` or `""` = unknown (manual mode);
-    - `prompt_cache_precision_order`: a list of distinct precision ids
-      (`WEIGHT_FORMAT_ID_PATTERN`), most precise first; absent or `null` = `()`.
-    All three are opaque to the backend beyond their shape (Rust owns them).
+    - `prompt_library`: the model's library id (Rust
+      `Flux2Variant::prompt_library_id`, a directory name), one of
+      `prompt_cache.FLUX2_LIBRARY_IDS`; absent or `null` = no library (memory
+      only: the calibration tool, tests). Another model's id (FLUX.3's
+      `flux3_klein`) is refused: opening its directory with FLUX.2's library
+      spec would block that model's library for the life of the process
+      (`prompt_library.library_for` keeps one spec per directory);
+    - `text_encoder_source`: the selected encoder source id; absent, `null` or
+      `""` = unknown (manual mode);
+    - `prompt_cache_precision_order`: a list of distinct precision ids, most
+      precise first; absent or `null` = `()`.
+    The shapes are `runtime.prompt_cache_service.read_library_fields`'s, the
+    one owner shared with FLUX.3; every message starts with `FLUX.2 klein`.
     Reads no path, so it is valid before any component is configured.
 
     # Raises
     `ValueError` naming the field that breaks its contract.
     """
-    merged = params or {}
-    raw_library = merged.get("prompt_library")
-    library: str | None = None
-    if raw_library is not None:
-        if not isinstance(raw_library, str) or PROMPT_LIBRARY_ID_PATTERN.fullmatch(raw_library) is None:
-            raise ValueError(f"FLUX.2 klein: поле «prompt_library» должно быть идентификатором библиотеки (1–40 символов a-z, 0-9, «_»), получено {raw_library!r}")
-        library = raw_library
-    raw_source = merged.get("text_encoder_source")
-    source = ""
-    if raw_source is not None and raw_source != "":
-        if not isinstance(raw_source, str) or ENCODER_SOURCE_PATTERN.fullmatch(raw_source) is None:
-            raise ValueError(f"FLUX.2 klein: поле «text_encoder_source» должно быть идентификатором источника (1–32 символа a-z, 0-9, «_»), получено {raw_source!r}")
-        source = raw_source
-    raw_order = merged.get("prompt_cache_precision_order")
-    order: tuple[str, ...] = ()
-    if raw_order is not None:
-        if not isinstance(raw_order, list):
-            raise ValueError(f"FLUX.2 klein: поле «prompt_cache_precision_order» должно быть списком идентификаторов, получено {raw_order!r}")
-        order = tuple(_format_id(item, f"prompt_cache_precision_order[{index}]") for index, item in enumerate(raw_order))
-        if len(set(order)) != len(order):
-            raise ValueError(f"FLUX.2 klein: в «prompt_cache_precision_order» есть повторы: {list(order)!r}")
+    # Imported here: `prompt_cache` imports this module (the id table lives
+    # there because a Rust test reads it from that file).
+    from .prompt_cache import FLUX2_LIBRARY_IDS
+
+    library, source, order = read_library_fields(params, owner="FLUX.2 klein")
+    if library is not None and library not in FLUX2_LIBRARY_IDS:
+        raise ValueError(f"FLUX.2 klein: поле «prompt_library» должно быть одной из библиотек FLUX.2 klein {sorted(FLUX2_LIBRARY_IDS)}, получено {library!r}")
     return library, source, order
 
 

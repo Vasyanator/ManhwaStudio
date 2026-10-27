@@ -1,0 +1,576 @@
+{
+  "_note": "GOLDEN snapshot of FLUX.2 klein's prompt-library answers (test_prompt_cache_golden.py). A refactor must keep it byte-identical; regenerate only for a deliberate behaviour change with `python -m modules.ai_backend.inpaint.flux2_klein.test_prompt_cache_golden --write-golden` and review the diff.",
+  "steps": {
+    "status_empty": {
+      "prompt_cached": false,
+      "prompt_cache_entry": null,
+      "text_encoder_available": true
+    },
+    "legacy_after_status": true,
+    "status_memory": {
+      "prompt_cached": true,
+      "prompt_cache_entry": {
+        "file": "",
+        "name": "",
+        "encoder_source": "",
+        "encoder_format": "bf16",
+        "encoder_fp8": false,
+        "encoder_label": "<root-name>/text_encoder",
+        "current_encoder": true,
+        "created_at": "2026-10-27T00:00:00Z",
+        "size_bytes": 0,
+        "origin": "memory"
+      },
+      "text_encoder_available": true
+    },
+    "build_new_from_memory": {
+      "prompt": "a cat",
+      "name": "Кот",
+      "encoded": false,
+      "written": [
+        {
+          "file": "a_cat-5dbe772336-2687cc43.msprompt",
+          "name": "Кот",
+          "encoder_source": "",
+          "encoder_format": "bf16",
+          "encoder_fp8": false,
+          "encoder_label": "<root-name>/text_encoder",
+          "current_encoder": true,
+          "created_at": "2026-10-27T00:00:00Z",
+          "size_bytes": "<size>",
+          "origin": "built"
+        }
+      ],
+      "renamed": false,
+      "prompt_cached": true,
+      "device": "cpu"
+    },
+    "legacy_after_build": false,
+    "build_already": {
+      "prompt": "a cat",
+      "name": "Кот",
+      "encoded": false,
+      "written": [],
+      "renamed": false,
+      "prompt_cached": true,
+      "device": "cpu"
+    },
+    "build_rename": {
+      "prompt": "a cat",
+      "name": "Котик",
+      "encoded": false,
+      "written": [],
+      "renamed": true,
+      "prompt_cached": true,
+      "device": "cpu"
+    },
+    "status_library_or_memory": {
+      "prompt_cached": true,
+      "prompt_cache_entry": {
+        "file": "",
+        "name": "",
+        "encoder_source": "",
+        "encoder_format": "bf16",
+        "encoder_fp8": false,
+        "encoder_label": "<root-name>/text_encoder",
+        "current_encoder": true,
+        "created_at": "2026-10-27T00:00:00Z",
+        "size_bytes": 0,
+        "origin": "memory"
+      },
+      "text_encoder_available": true
+    },
+    "status_other_source": {
+      "prompt_cached": true,
+      "prompt_cache_entry": {
+        "file": "a_dog-c1ff5d6189-01906d1a.msprompt",
+        "name": "Пёс",
+        "encoder_source": "uncensored",
+        "encoder_format": "q8_0",
+        "encoder_fp8": false,
+        "encoder_label": "uncensored-q8_0",
+        "current_encoder": false,
+        "created_at": "2026-09-01T00:00:00Z",
+        "size_bytes": "<size>",
+        "origin": "built"
+      },
+      "text_encoder_available": true
+    },
+    "status_preferred_stock": {
+      "prompt_cached": true,
+      "prompt_cache_entry": {
+        "file": "a_dog-c1ff5d6189-6223a62d.msprompt",
+        "name": "",
+        "encoder_source": "stock",
+        "encoder_format": "q4_k_m",
+        "encoder_fp8": false,
+        "encoder_label": "stock-q4_k_m",
+        "current_encoder": false,
+        "created_at": "2026-08-01T00:00:00Z",
+        "size_bytes": "<size>",
+        "origin": "built"
+      },
+      "text_encoder_available": true
+    },
+    "status_without_encoder": {
+      "prompt_cached": true,
+      "prompt_cache_entry": {
+        "file": "a_dog-c1ff5d6189-01906d1a.msprompt",
+        "name": "Пёс",
+        "encoder_source": "uncensored",
+        "encoder_format": "q8_0",
+        "encoder_fp8": false,
+        "encoder_label": "uncensored-q8_0",
+        "current_encoder": false,
+        "created_at": "2026-09-01T00:00:00Z",
+        "size_bytes": "<size>",
+        "origin": "built"
+      },
+      "text_encoder_available": false
+    },
+    "status_guidance_needs_empty": {
+      "prompt_cached": true,
+      "prompt_cache_entry": {
+        "file": "a_dog-c1ff5d6189-01906d1a.msprompt",
+        "name": "Пёс",
+        "encoder_source": "uncensored",
+        "encoder_format": "q8_0",
+        "encoder_fp8": false,
+        "encoder_label": "uncensored-q8_0",
+        "current_encoder": false,
+        "created_at": "2026-09-01T00:00:00Z",
+        "size_bytes": "<size>",
+        "origin": "built"
+      },
+      "text_encoder_available": true
+    },
+    "list_stock": {
+      "library": "flux2_klein_9b",
+      "directory": "<root>/_program/prompt_cache/flux2_klein_9b",
+      "texts": [
+        {
+          "prompt": "a cat",
+          "name": "Котик",
+          "selected": {
+            "file": "a_cat-5dbe772336-2687cc43.msprompt",
+            "name": "Котик",
+            "encoder_source": "",
+            "encoder_format": "bf16",
+            "encoder_fp8": false,
+            "encoder_label": "<root-name>/text_encoder",
+            "current_encoder": true,
+            "created_at": "2026-10-27T00:00:00Z",
+            "size_bytes": "<size>",
+            "origin": "built"
+          },
+          "entries": [
+            {
+              "file": "a_cat-5dbe772336-2687cc43.msprompt",
+              "name": "Котик",
+              "encoder_source": "",
+              "encoder_format": "bf16",
+              "encoder_fp8": false,
+              "encoder_label": "<root-name>/text_encoder",
+              "current_encoder": true,
+              "created_at": "2026-10-27T00:00:00Z",
+              "size_bytes": "<size>",
+              "origin": "built"
+            }
+          ]
+        },
+        {
+          "prompt": "legacy text",
+          "name": "legacy preset",
+          "selected": {
+            "file": "legacy_text-be7a3099c2-ffffffff.msprompt",
+            "name": "legacy preset",
+            "encoder_source": "",
+            "encoder_format": "bf16",
+            "encoder_fp8": false,
+            "encoder_label": "qwen-te",
+            "current_encoder": false,
+            "created_at": "2026-09-02T17:28:47Z",
+            "size_bytes": "<size>",
+            "origin": "migrated_v1_unverified"
+          },
+          "entries": [
+            {
+              "file": "legacy_text-be7a3099c2-ffffffff.msprompt",
+              "name": "legacy preset",
+              "encoder_source": "",
+              "encoder_format": "bf16",
+              "encoder_fp8": false,
+              "encoder_label": "qwen-te",
+              "current_encoder": false,
+              "created_at": "2026-09-02T17:28:47Z",
+              "size_bytes": "<size>",
+              "origin": "migrated_v1_unverified"
+            }
+          ]
+        },
+        {
+          "prompt": "a dog",
+          "name": "Пёс",
+          "selected": {
+            "file": "a_dog-c1ff5d6189-6223a62d.msprompt",
+            "name": "",
+            "encoder_source": "stock",
+            "encoder_format": "q4_k_m",
+            "encoder_fp8": false,
+            "encoder_label": "stock-q4_k_m",
+            "current_encoder": false,
+            "created_at": "2026-08-01T00:00:00Z",
+            "size_bytes": "<size>",
+            "origin": "built"
+          },
+          "entries": [
+            {
+              "file": "a_dog-c1ff5d6189-6223a62d.msprompt",
+              "name": "",
+              "encoder_source": "stock",
+              "encoder_format": "q4_k_m",
+              "encoder_fp8": false,
+              "encoder_label": "stock-q4_k_m",
+              "current_encoder": false,
+              "created_at": "2026-08-01T00:00:00Z",
+              "size_bytes": "<size>",
+              "origin": "built"
+            },
+            {
+              "file": "a_dog-c1ff5d6189-01906d1a.msprompt",
+              "name": "Пёс",
+              "encoder_source": "uncensored",
+              "encoder_format": "q8_0",
+              "encoder_fp8": false,
+              "encoder_label": "uncensored-q8_0",
+              "current_encoder": false,
+              "created_at": "2026-09-01T00:00:00Z",
+              "size_bytes": "<size>",
+              "origin": "built"
+            }
+          ]
+        }
+      ],
+      "skipped": [
+        {
+          "file": "junk.msprompt",
+          "reason": "Файл слишком мал для safetensors: <root>/_program/prompt_cache/flux2_klein_9b/junk.msprompt"
+        }
+      ],
+      "text_encoder_available": true,
+      "legacy": {
+        "migrated": 1,
+        "deleted": 0,
+        "not_migrated": 0,
+        "directory": "<root>/_program/prompt_cache"
+      }
+    },
+    "list_256": {
+      "library": "flux2_klein_9b",
+      "directory": "<root>/_program/prompt_cache/flux2_klein_9b",
+      "texts": [
+        {
+          "prompt": "short",
+          "name": "",
+          "selected": {
+            "file": "short-ec94c555aa-f8cb27f2.msprompt",
+            "name": "",
+            "encoder_source": "stock",
+            "encoder_format": "bf16",
+            "encoder_fp8": false,
+            "encoder_label": "stock-bf16",
+            "current_encoder": false,
+            "created_at": "2026-07-01T00:00:00Z",
+            "size_bytes": "<size>",
+            "origin": "built"
+          },
+          "entries": [
+            {
+              "file": "short-ec94c555aa-f8cb27f2.msprompt",
+              "name": "",
+              "encoder_source": "stock",
+              "encoder_format": "bf16",
+              "encoder_fp8": false,
+              "encoder_label": "stock-bf16",
+              "current_encoder": false,
+              "created_at": "2026-07-01T00:00:00Z",
+              "size_bytes": "<size>",
+              "origin": "built"
+            }
+          ]
+        }
+      ],
+      "skipped": [
+        {
+          "file": "junk.msprompt",
+          "reason": "Файл слишком мал для safetensors: <root>/_program/prompt_cache/flux2_klein_9b/junk.msprompt"
+        }
+      ],
+      "text_encoder_available": true,
+      "legacy": {
+        "migrated": 1,
+        "deleted": 0,
+        "not_migrated": 0,
+        "directory": "<root>/_program/prompt_cache"
+      }
+    },
+    "list_lenient_4b": {
+      "library": "flux2_klein_4b",
+      "directory": "<root>/_program/prompt_cache/flux2_klein_4b",
+      "texts": [],
+      "skipped": [],
+      "text_encoder_available": false,
+      "legacy": {
+        "migrated": 1,
+        "deleted": 0,
+        "not_migrated": 0,
+        "directory": "<root>/_program/prompt_cache"
+      }
+    },
+    "export": {
+      "library": "flux2_klein_9b",
+      "file": "a_dog-c1ff5d6189-01906d1a.msprompt",
+      "path": "<root>/out/copy.msprompt",
+      "size_bytes": "<size>"
+    },
+    "export_size_matches_file": true,
+    "import_v2_other_library": {
+      "library": "flux2_klein_4b",
+      "file": "imported-bc4ebfece6-eeeeeeee.msprompt",
+      "prompt": "imported",
+      "name": "Imp",
+      "library_matches": false,
+      "already_present": false,
+      "origin": "imported"
+    },
+    "import_v2_again_matching": {
+      "library": "flux2_klein_4b",
+      "file": "imported-bc4ebfece6-eeeeeeee.msprompt",
+      "prompt": "imported",
+      "name": "Imp",
+      "library_matches": true,
+      "already_present": true,
+      "origin": "imported"
+    },
+    "import_v2_foreign": {
+      "type": "ValueError",
+      "message": "Файл кэша промпта <root>/outside/foreign.msprompt относится к библиотеке «other_model», а не к FLUX.2 klein."
+    },
+    "import_v1_migrated": {
+      "library": "flux2_klein_9b",
+      "file": "remove_the_text-4b870c01dc-ffffffff.msprompt",
+      "prompt": "remove the text",
+      "name": "my preset",
+      "library_matches": true,
+      "already_present": false,
+      "origin": "migrated_v1_unverified"
+    },
+    "import_v1_refused": {
+      "type": "ValueError",
+      "message": "Файл кэша промпта <root>/outside/old.msprompt не импортирован: создан до исправления RoPE энкодера: эмбеддинги неверны."
+    },
+    "import_junk": {
+      "type": "ValueError",
+      "message": "Файл <root>/junk.msprompt не является кэшем промпта ManhwaStudio: файл слишком мал для safetensors."
+    },
+    "import_unmarked": {
+      "type": "ValueError",
+      "message": "Файл <root>/unmarked.msprompt не является кэшем промпта ManhwaStudio: нет известной метки формата."
+    },
+    "import_relative": {
+      "type": "ValueError",
+      "message": "Путь к кэшу промпта должен быть абсолютным: relative.msprompt"
+    },
+    "build_without_library": {
+      "type": "ValueError",
+      "message": "FLUX.2 klein: в запросе нет «prompt_library» — неизвестно, библиотеку какой модели открыть."
+    },
+    "build_empty_prompt": {
+      "type": "ValueError",
+      "message": "Кэшировать нечего: промпт пуст. Введите текст промпта и повторите."
+    },
+    "build_without_encoder": {
+      "type": "ValueError",
+      "message": "Текстовый энкодер недоступен, а кэширование промпта требует кодирования промпта. Либо укажите текстовый энкодер в настройках, либо выберите в библиотеке промптов закэшированный пресет с этим текстом (или импортируйте файл .msprompt) — с ним генерация энкодер не читает."
+    },
+    "build_bad_library_id": {
+      "type": "ValueError",
+      "message": "FLUX.2 klein: поле «prompt_library» должно быть идентификатором библиотеки (1–40 символов a-z, 0-9, «_»), получено 'Bad-Id'"
+    },
+    "list_without_library": {
+      "type": "ValueError",
+      "message": "FLUX.2 klein: в запросе нет «prompt_library» — неизвестно, библиотеку какой модели открыть."
+    },
+    "list_bad_order": {
+      "type": "ValueError",
+      "message": "FLUX.2 klein: в «prompt_cache_precision_order» есть повторы: ['bf16', 'bf16']"
+    },
+    "export_missing_file": {
+      "type": "ValueError",
+      "message": "Кэша промпта «missing.msprompt» нет в библиотеке <root>/_program/prompt_cache/flux2_klein_9b."
+    },
+    "export_without_library": {
+      "type": "ValueError",
+      "message": "FLUX.2 klein: в запросе нет «prompt_library» — неизвестно, библиотеку какой модели открыть."
+    },
+    "list_final": {
+      "library": "flux2_klein_9b",
+      "directory": "<root>/_program/prompt_cache/flux2_klein_9b",
+      "texts": [
+        {
+          "prompt": "a cat",
+          "name": "Котик",
+          "selected": {
+            "file": "a_cat-5dbe772336-2687cc43.msprompt",
+            "name": "Котик",
+            "encoder_source": "",
+            "encoder_format": "bf16",
+            "encoder_fp8": false,
+            "encoder_label": "<root-name>/text_encoder",
+            "current_encoder": false,
+            "created_at": "2026-10-27T00:00:00Z",
+            "size_bytes": "<size>",
+            "origin": "built"
+          },
+          "entries": [
+            {
+              "file": "a_cat-5dbe772336-2687cc43.msprompt",
+              "name": "Котик",
+              "encoder_source": "",
+              "encoder_format": "bf16",
+              "encoder_fp8": false,
+              "encoder_label": "<root-name>/text_encoder",
+              "current_encoder": false,
+              "created_at": "2026-10-27T00:00:00Z",
+              "size_bytes": "<size>",
+              "origin": "built"
+            }
+          ]
+        },
+        {
+          "prompt": "legacy text",
+          "name": "legacy preset",
+          "selected": {
+            "file": "legacy_text-be7a3099c2-ffffffff.msprompt",
+            "name": "legacy preset",
+            "encoder_source": "",
+            "encoder_format": "bf16",
+            "encoder_fp8": false,
+            "encoder_label": "qwen-te",
+            "current_encoder": false,
+            "created_at": "2026-09-02T17:28:47Z",
+            "size_bytes": "<size>",
+            "origin": "migrated_v1_unverified"
+          },
+          "entries": [
+            {
+              "file": "legacy_text-be7a3099c2-ffffffff.msprompt",
+              "name": "legacy preset",
+              "encoder_source": "",
+              "encoder_format": "bf16",
+              "encoder_fp8": false,
+              "encoder_label": "qwen-te",
+              "current_encoder": false,
+              "created_at": "2026-09-02T17:28:47Z",
+              "size_bytes": "<size>",
+              "origin": "migrated_v1_unverified"
+            }
+          ]
+        },
+        {
+          "prompt": "remove the text",
+          "name": "my preset",
+          "selected": {
+            "file": "remove_the_text-4b870c01dc-ffffffff.msprompt",
+            "name": "my preset",
+            "encoder_source": "",
+            "encoder_format": "bf16",
+            "encoder_fp8": false,
+            "encoder_label": "qwen-te",
+            "current_encoder": false,
+            "created_at": "2026-09-02T17:28:47Z",
+            "size_bytes": "<size>",
+            "origin": "migrated_v1_unverified"
+          },
+          "entries": [
+            {
+              "file": "remove_the_text-4b870c01dc-ffffffff.msprompt",
+              "name": "my preset",
+              "encoder_source": "",
+              "encoder_format": "bf16",
+              "encoder_fp8": false,
+              "encoder_label": "qwen-te",
+              "current_encoder": false,
+              "created_at": "2026-09-02T17:28:47Z",
+              "size_bytes": "<size>",
+              "origin": "migrated_v1_unverified"
+            }
+          ]
+        },
+        {
+          "prompt": "a dog",
+          "name": "Пёс",
+          "selected": {
+            "file": "a_dog-c1ff5d6189-6223a62d.msprompt",
+            "name": "",
+            "encoder_source": "stock",
+            "encoder_format": "q4_k_m",
+            "encoder_fp8": false,
+            "encoder_label": "stock-q4_k_m",
+            "current_encoder": false,
+            "created_at": "2026-08-01T00:00:00Z",
+            "size_bytes": "<size>",
+            "origin": "built"
+          },
+          "entries": [
+            {
+              "file": "a_dog-c1ff5d6189-6223a62d.msprompt",
+              "name": "",
+              "encoder_source": "stock",
+              "encoder_format": "q4_k_m",
+              "encoder_fp8": false,
+              "encoder_label": "stock-q4_k_m",
+              "current_encoder": false,
+              "created_at": "2026-08-01T00:00:00Z",
+              "size_bytes": "<size>",
+              "origin": "built"
+            },
+            {
+              "file": "a_dog-c1ff5d6189-01906d1a.msprompt",
+              "name": "Пёс",
+              "encoder_source": "uncensored",
+              "encoder_format": "q8_0",
+              "encoder_fp8": false,
+              "encoder_label": "uncensored-q8_0",
+              "current_encoder": false,
+              "created_at": "2026-09-01T00:00:00Z",
+              "size_bytes": "<size>",
+              "origin": "built"
+            }
+          ]
+        }
+      ],
+      "skipped": [
+        {
+          "file": "junk.msprompt",
+          "reason": "Файл слишком мал для safetensors: <root>/_program/prompt_cache/flux2_klein_9b/junk.msprompt"
+        }
+      ],
+      "text_encoder_available": true,
+      "legacy": {
+        "migrated": 1,
+        "deleted": 0,
+        "not_migrated": 0,
+        "directory": "<root>/_program/prompt_cache"
+      }
+    },
+    "memory_texts": [
+      [
+        "flux2_klein_9b",
+        "a cat",
+        512,
+        ""
+      ]
+    ]
+  }
+}

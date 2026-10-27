@@ -70,8 +70,8 @@ ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules o
   in `detection/textdetector/`. See `detection/MODULE_README.md`.
 - `inpaint/`: inpainting backends (`inpaint.lama_v2` / `.lama_mpe` / `.aot` / `.sdxl` /
   `.flux_fill` / `.flux2_klein` / `.flux3_klein`), the standalone LaMa V2 runtime module, the
-  vendored `lama_runtime_bundle/`, the shared region-editor helpers (`region_imaging.py`) and
-  the gated Hugging Face download machinery (`hf_gated_download.py`). See `inpaint/MODULE_README.md`.
+  vendored `lama_runtime_bundle/` and the shared region-editor helpers (`region_imaging.py`).
+  See `inpaint/MODULE_README.md`.
 - `watermark/`: visible-watermark removal (`watermark.detect` / `.remove` / `.status` / `.unload`).
   A domain of its own, not an inpainter: it PREDICTS a mask instead of consuming one, and its
   weights plus the network code are fetched on demand into `side_models/WatermarkRemoval/`
@@ -113,8 +113,9 @@ the convention `browser/` already used.
   never a silent fallback to a different model, device, or channel mode.
 - Torch and ONNX model roots are separate: `ManhwaStudio_AI_Models/Torch` vs `.../ONNX`. Do not write
   ONNX weights under `Torch/` or Torch checkpoints under `ONNX/`. PaddleOCR-VL, Baberu OCR,
-  EasyOCR, Surya and the SDXL config / curated inpaint repos are downloaded by RUST (pinned
-  external catalog, sha256 per file; locations are the catalog's); the backend receives their
+  EasyOCR, Surya, the SDXL config / curated inpaint repos and the FLUX.2 / FLUX.3 klein packages
+  are downloaded by RUST (pinned external catalog, sha256 per file; locations are the catalog's,
+  or a root the user picked for the klein models); the backend receives their
   absolute paths per request, loads them offline, never downloads them, never reads a library or
   Hugging Face cache for them, and never runs `trust_remote_code`.
 - `General.ai_device`, `General.ai_onnx_provider` and `General.ai_onnx_device_id` use `not-selected`

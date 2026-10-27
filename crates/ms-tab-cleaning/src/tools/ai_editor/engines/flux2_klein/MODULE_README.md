@@ -90,7 +90,7 @@ Queries the panel arms are one-shot and independent of the run: `.status`
 (`status.rs` + `wire.rs`), the memory forecast `large_models.profiles`
 (the engine's `ResourcesController` from `../../large_model_resources/`: one request in
 flight, latest wins, plus the debounced cap writer and the floor reset), `.prompt_cache.list`
-(`prompt_cache.rs`). The catalog download is the engine's `OcrModelDownloadController`
+(the shared `PromptCacheController`, driven with FLUX.2's methods from `prompt_cache.rs`). The catalog download is the engine's `OcrModelDownloadController`
 (status probes, the download / verify job with its gated-repository access check, the
 automatic adoption of files already on disk), polled from `AiEngine::poll`.
 The forecast is drawn by the shared widget `../../large_model_resources/` (steps, per-step
@@ -98,8 +98,12 @@ rows, floor, «Пределы»).
 
 MODEL-AGNOSTIC PARTS LIVE IN `../shared/` (`use super::shared::*` in `mod.rs`): the progress
 state of all three long operations and its streaming call, the Hugging Face token controls
-and their drawing, the settings-file quarantine and save backoff, `mask_for_run`, and the
-prompt library's listing shapes, preset rules and picker (`prompt_library*`). What
+and their drawing, the settings-file quarantine and save backoff, `mask_for_run`, the
+prompt library's listing shapes, preset rules and picker (`prompt_library*`), the prompt-cache
+controller — the «Кэшировать» / export / import gates, the cache line, the `.prompt_cache.*`
+jobs, the cache row and the library fold (`prompt_cache*`) — and the
+model-catalog download decisions (`catalog_download.rs`: gated repositories still missing, bundle
+state, running job, the engine-picker block and its texts). What
 stays here is what is FLUX.2's own: its headers, its settings document and migration, its
 sentences.
 
@@ -115,13 +119,13 @@ sentences.
   `components.rs`, `advanced.rs` and `mask_hint.rs` draw the blocks it calls into. See
   `ui/MODULE_README.md`.
 - `decisions.rs`: the PURE decisions the panel renders — `flux2_readiness_line`,
-  `flux2_prompt_cache_line` (with `flux2_encoder_caption`, the localized name of the encoder
-  an entry was made by), `flux2_guidance_supported`, `flux2_run_block_reason`,
-  `region_block_reason`, the catalog bundle of the selection and its state
-  (`flux2_catalog_bundle`, `flux2_catalog_bundle_missing`, `flux2_catalog_job_running`), the
-  gated repositories still missing (`flux2_gated_repos_missing`: what draws the token row), the
-  engine-picker block of a running catalog job (`flux2_catalog_switch_block_reason`) and the
-  weight-format row captions (`flux2_weight_format_label` / `_hint`, `flux2_encoder_format_token`)
+  `flux2_encoder_caption` (the localized name of the encoder an entry was made by, which the
+  shared cache line and picker show), `flux2_guidance_supported`, `flux2_run_block_reason`,
+  `region_block_reason`, the catalog bundle of the selection (`flux2_catalog_bundle`; its
+  state, the gated repositories still missing and the engine-picker block of a running catalog
+  job are the shared `catalog_bundle_missing` / `catalog_job_running` /
+  `catalog_gated_repos_missing` / `catalog_switch_block_reason` of `../shared/catalog_download.rs`)
+  and the weight-format row captions (`flux2_weight_format_label` / `_hint`, `flux2_encoder_format_token`)
   — with the line/tone types
   they answer in. Edit it to change what a
   line or a refusal SAYS, or which control the backend's answer closes.
@@ -152,12 +156,14 @@ sentences.
   `flux2_status_for_paths`, the merged `flux2_component_rows`, `flux2_install_seed`,
   `flux2_pipeline_busy`. Edit it to change what a catalog MEANS; the parsers that build
   one live in `wire.rs`.
-- `prompt_cache.rs`: the FLUX.2 side of the shared prompt library — `flux2_cache_button`
-  («Кэшировать» / «Переименовать» / closed with a reason: an entry of the current encoder, or a
-  strictly more precise one of the same source, already serves the text), the export / import
-  gates (`flux2_prompt_cache_gates`), `prompt_cache_state_for`, and the four `.prompt_cache.*`
-  calls (`build` streaming, `list`, `export`, `import`) with their parsers. The listing shapes,
-  the exact-text preset match, the «Нет» stash and the picker are `../shared/prompt_library*`.
+- `prompt_cache.rs`: the FLUX.2 BINDINGS of the shared prompt-cache controller — the method
+  family and timeouts (`FLUX2_PROMPT_CACHE_METHODS`), the encoder context «Кэшировать» is
+  decided on (`flux2_cache_context`: the effective encoder path, the download-mode provenance,
+  the FLUX.2 precision ranking; an entry of the current encoder, or a strictly more precise one
+  of the same source, closes it) and the request header (`flux2_prompt_cache_header`). The gates,
+  the cache line, the four `.prompt_cache.*` calls, the controller state and the drawing are
+  `../shared/prompt_cache*.rs`; the listing shapes, the exact-text preset match, the «Нет» stash
+  and the picker are `../shared/prompt_library*`.
 - `run_outcome.rs`: what one run answers with (`Flux2RunOutcome`: the raw decode and the latent
   mask; `Flux2JobResult`: plus the run's mask and `whole_region`) and the one
   memory flag it writes back (`parse_applied_flags`: `vae_tiling` only, tolerant of the v13 and
@@ -167,8 +173,9 @@ sentences.
   finished run is the host's `RawRegionResult`),
   `apply_backend_flags` (writes `vae_tiling` only), `flux2_run_done_status`
   (a degraded run names its effective steps) and `flux2_picker_request` (the dialog request per
-  picker purpose; the engine opens it through `ms_platform::file_dialog::request` and commits
-  the prompt-cache export's save target after the backend wrote it; the weight-file filters are
+  picker purpose — the two prompt-cache dialogs are the shared `prompt_cache_export_dialog` /
+  `prompt_cache_import_dialog`; the engine opens it through `ms_platform::file_dialog::request`
+  and the shared controller commits the export's save target after the backend wrote it; the weight-file filters are
   per component — transformer safetensors or GGUF, VAE safetensors only, encoder FILE
   (`TextEncoderFile`) GGUF only).
 - `wire.rs`: `Flux2RunInput` (the pixels of one run), `run_flux2_klein` (which builds the
@@ -184,8 +191,8 @@ sentences.
 
 ## Contracts and invariants
 - **The GUI thread never blocks.** Every function in `wire.rs`,
-  `prompt_cache.rs`, `engine/actions.rs` and the IO in `settings.rs` and `session.rs`
-  runs on an `ms_thread::spawn` worker; `AiEngine::poll` only drains channels.
+  `engine/actions.rs` (and the shared prompt-cache jobs it starts) and the IO in `settings.rs`
+  and `session.rs` runs on an `ms_thread::spawn` worker; `AiEngine::poll` only drains channels.
 - **`normalized()` is the only value that reaches the wire** (`settings.rs`), and
   `effective_paths` is the ONE answer to which three model paths a call uses. Both are
   variant-aware: the derived paths sit under the variant's own model directory, and a
@@ -220,7 +227,7 @@ sentences.
   included); the panel draws that bundle through the shared `draw_ocr_model_download` (which
   also draws the per-repository access lines of its gated sources) only while its snapshot
   still describes the current selection. The token row is drawn while a gated spec of the bundle
-  is not seen installed (`flux2_gated_repos_missing`); the controller notices a changed token
+  is not seen installed (`catalog_gated_repos_missing`); the controller notices a changed token
   itself. The end of a controller job (download / verify / adoption) re-runs the
   installed-formats probe and re-asks `.status`, the forecast and the prompt-cache listing. A
   changed selection (format or source) saves the setting and re-arms the status, the forecast,
@@ -328,8 +335,8 @@ sentences.
 - To change what the readiness line, the prompt-cache line or a run refusal SAYS, see
   `decisions.rs`; to change what a `.status` answer MEANS, see `status.rs`; to change how
   either LOOKS, see `ui/`.
-- To change a request or response shape, see `wire.rs` or `prompt_cache.rs` — the file that
-  owns that method family. A change to the run blob
+- To change a request or response shape, see `wire.rs`, or `../shared/prompt_cache.rs` for the
+  `.prompt_cache.*` family (its FLUX.2 method names and header are `prompt_cache.rs`). A change to the run blob
   (`flux2_run_request`) is a protocol change: the Python split is `_split_request_blob` in
   `modules/ai_backend/ipc/handlers/flux2_klein.py`, and `PROTOCOL_VERSION` is bumped on
   both sides.

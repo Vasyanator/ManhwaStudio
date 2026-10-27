@@ -13,11 +13,14 @@ Key declarations:
   what one run produced (incl. the steps it ended on, the manager's full
   forecast of the requested cell before the run)
 - `forecast_combo()` - the manager's answer for the combo's requested steps
-  (`LargeModelManager.profiles` `selected`: the FULL forecast, every
-  activation counted, or the refusal), read before the admission
+  over FLUX.3's two handles (`Flux3KleinService.plan_pair` -> the
+  `PairedReport`: the pipeline's resolved steps, the run's FULL device / host
+  peaks of both handles, every activation counted, or the refusal of either
+  handle), read before the admission
 - `WorkCapture` - per model phase the spec's own `PhaseWork` (the `x` of
   every cost-table fit) plus the cost-table key, captured from the manager
-  calls the service makes
+  calls the service makes (a FLUX.3 run admits two models: the pipeline and
+  the text encoder; a step record is matched to the one that has its phase)
 - `run_combo()`, `reset_device()`
 
 Notes:
@@ -308,36 +311,89 @@ class WorkCapture:
         return works
 
     def annotate(self, records: list[StepRecord]) -> None:
-        """Set `work` of every model-phase record: by `(record.model, step)`, or by step alone when
-        the observer names no model and one model was admitted (FLUX.3)."""
+        """Set `work` of every model-phase record: by `(record.model, step)`, or — when the observer
+        names no model (FLUX.3) — by the UNIQUE admitted model that has that phase (the pipeline's
+        `ref_encode` / `denoise` / `decode`, the text encoder's `encode`); `None` when none or
+        several have it."""
         works = self.works()
-        models = {model for model, _phase in works}
+        owners: dict[str, set[str]] = {}
+        for model, phase in works:
+            owners.setdefault(phase, set()).add(model)
         for record in records:
-            model = record.model or (next(iter(models)) if len(models) == 1 else "")
+            model = record.model
+            if not model:
+                candidates = owners.get(record.step, set())
+                model = next(iter(candidates)) if len(candidates) == 1 else ""
             record.work = works.get((model, record.step))
 
 
-def forecast_combo(service: Flux3KleinService, large_models: Any, request: Flux3Request, options: Flux3Options, rss_before: int | None) -> dict[str, Any]:
+def forecast_combo(service: Flux3KleinService, request: Flux3Request, options: Flux3Options, rss_before: int | None) -> dict[str, Any]:
     """The manager's answer for `request` / `options` before the admission (read-only: plans, never loads).
 
     Resolves the request through the service's own pre-admission shaping
-    (`Flux3KleinService._plan`: the same model, model options, request shape
-    and device the admission uses), then `LargeModelManager.profiles` with the
-    requested steps; `selected` is what the admission would plan (floor and
-    Q-P1 applied). Keys: `fits`, `vram` / `ram` (resolved steps), `same_as_vram`
-    / `same_as_ram`, `reason` / `shortest_resource` (refusal),
-    `full_device_peak`, `full_host_peak` (absolute RSS), `host_growth`
-    (`full_host_peak` - `rss_before`), `device_calibrated`. A failure here
-    (the request itself is invalid) is recorded as `error`; `generate` then
-    fails the same way.
+    (`Flux3KleinService._plan`: the same model options, request shape and
+    device the admissions use), then the service's two-handle composition
+    (`Flux3KleinService.plan_pair`: the pipeline, the text encoder beside it
+    under the combined ceiling) with the requested steps; the answer is
+    `paired_answer`'s. A failure here (the request itself is invalid) is
+    recorded as `error`; `generate` then fails the same way.
     """
     try:
         plan = service._plan(request, options)
-        report = large_models.profiles(plan.model, plan.model_options, plan.shape, device=plan.device, format=options.variant.value, steps=options.steps)
+        report = service.plan_pair(plan.model_options, plan.shape, format=None, steps=options.steps)
     except Exception as exc:  # noqa: BLE001 - recorded beside the combo; the generation reports the same failure
         log.warning("forecast of %s failed: %s", options.steps.label, exc)
         return {"error": f"{type(exc).__name__}: {exc}"}
-    return selected_answer(report.selected, rss_before, options.steps.label)
+    return paired_answer(report, rss_before, options.steps.label)
+
+
+def paired_answer(report: Any, rss_before: int | None, label: str) -> dict[str, Any]:
+    """The JSON answer of a two-handle `PairedReport` (FLUX.3), keys as `selected_answer`.
+
+    `fits` / `vram` / `ram` / `same_as_*` are the PIPELINE's resolved steps
+    (the encoder is planned with the same request beside it); a refused
+    pipeline or encoder answers that refusal (`reason`, `shortest_resource`,
+    its closest attempt's peaks). Planned, `full_device_peak` is the run's
+    device peak under the two-handle rule (`PairedReport.run_device_peak`
+    over `FLUX3_PAIR`), `full_host_peak` the run's host peak (absolute RSS,
+    the baseline counted once: `run_host_peak`), `device_calibrated` both
+    handles' flag.
+    """
+    from modules.ai_backend.inpaint.flux3_klein.large_model import FLUX3_PAIR
+    from modules.ai_backend.runtime.large_models.planner import Planned
+
+    alone = report.alone.selected
+    encoder = report.encoder.selected if report.encoder is not None else None
+    if not isinstance(alone, Planned):
+        return selected_answer(alone, rss_before, label)
+    if encoder is not None and not isinstance(encoder, Planned):
+        return selected_answer(encoder, rss_before, f"{label} (text encoder)")
+    device_peak = report.run_device_peak(FLUX3_PAIR)
+    host_peak = report.run_host_peak()
+    calibrated = alone.full_forecast.device_calibrated and (encoder is None or encoder.full_forecast.device_calibrated)
+    answer: dict[str, Any] = {
+        "fits": True,
+        "vram": alone.plan.steps.vram.value,
+        "ram": alone.plan.steps.ram.value,
+        "same_as_vram": alone.same_as_vram.value if alone.same_as_vram is not None else None,
+        "same_as_ram": alone.same_as_ram.value if alone.same_as_ram is not None else None,
+        "reason": None,
+        "shortest_resource": None,
+        "full_device_peak": device_peak,
+        "full_host_peak": host_peak,
+        "host_growth": host_peak - rss_before if host_peak is not None and rss_before is not None else None,
+        "device_calibrated": calibrated,
+    }
+    log.info(
+        "forecast %s -> %s/%s (text encoder %s): device %s GiB, host +%s GiB",
+        label,
+        answer["vram"],
+        answer["ram"],
+        "not counted" if encoder is None else f"{encoder.plan.steps.vram.value}/{encoder.plan.steps.ram.value}",
+        "n/a" if device_peak is None else f"{device_peak / GIB:.2f}",
+        "n/a" if answer["host_growth"] is None else f"{answer['host_growth'] / GIB:.2f}",
+    )
+    return answer
 
 
 def selected_answer(selected: Any, rss_before: int | None, label: str) -> dict[str, Any]:
@@ -416,7 +472,7 @@ def run_combo(
     request = Flux3Request(caption=caption, references=references, width=width, height=height, seed=seed, steps=steps)
     recorder = StepRecorder(measure_device, baseline_used=baseline_used, status=large_models.status)
     rss_before = rss_private()
-    planned = forecast_combo(service, large_models, request, options, rss_before)
+    planned = forecast_combo(service, request, options, rss_before)
     capture.clear()
     started = time.monotonic()
     outcome: ComboOutcome

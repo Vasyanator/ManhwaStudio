@@ -1,9 +1,9 @@
 # Module: crates/ms-sysprobe/src/ai_models/external_catalog
 
 ## Purpose
-Submodules of `external_catalog.rs` (the pinned external-model catalog). Today one: the FLUX.2
-klein 4B / 9B part, split out because it is the largest family. The parent re-exports every
-public item, so callers name `ms_sysprobe::ai_models::external_catalog::<item>`.
+Submodules of `external_catalog.rs` (the pinned external-model catalog), one per large model
+family: FLUX.2 klein 4B / 9B and FLUX.3 klein. The parent re-exports every public item, so
+callers name `ms_sysprobe::ai_models::external_catalog::<item>`.
 
 ## Files and submodules
 - `flux2_klein.rs`: the FLUX.2 klein statics (11 specs for 4B, 17 for 9B), the lookups from a
@@ -11,6 +11,11 @@ public item, so callers name `ms_sysprobe::ai_models::external_catalog::<item>`.
   `Flux2WeightFormat`) to specs and backend paths, the bf16 transformer layout rule, the spec
   role reverse lookup, and their tests (validation, totals, path tables, a sparse-file temp
   root for the layout rule). `FLUX2_KLEIN_SPECS` is appended by the parent's `all_specs()`.
+- `flux3_klein.rs`: the FLUX.3 klein statics (12 specs), the lookups from a typed selection
+  (`ms_config::Flux3DitFormat` + `Flux3EncoderFormat`) to specs and package-relative paths,
+  the spec role reverse lookup, and their tests (validation, totals, gated flags, path
+  agreement with `ms_config::flux3_klein_dir`, a sparse-file temp root for the adoption
+  contract). `FLUX3_KLEIN_SPECS` is appended by the parent's `all_specs()`.
 
 ## Contracts and invariants
 - Layout: every spec is `DirLayout::Shared` under `<side_models>/<Flux2Variant::dir_name()>`:
@@ -47,6 +52,27 @@ public item, so callers name `ms_sysprobe::ai_models::external_catalog::<item>`.
 - `flux2_klein_spec_role` searches the typed lookups (never a second table), so it cannot
   disagree with them; a transformer role always carries `source: Stock`.
 
+- FLUX.3 layout: every spec is `DirLayout::Shared` under `<side_models>/FLUX.3-image-klein`
+  (= `ms_config::flux3_klein_dir`), at exactly the repository paths the backend's former
+  download wrote, so an existing install is adopted by hash. `flux3_klein_base` holds
+  `ae.safetensors` and the `text_encoder/` licence, configs, tokenizer and preprocessor files (no
+  README): exactly what the released downloader fetched for EVERY format. The root
+  `config.json` is its own spec, `flux3_klein_dit_config` (read by the bf16 AND the GGUF DiT;
+  one owner per file, test), because that downloader fetched it only for bf16 — in the base it
+  would keep an old fp8r / nvfp4 install from adopting (regression test). DiT: `flux3_klein_dit_bf16` (root `model.safetensors` + `manifest.json`),
+  `flux3_klein_dit_{fp8r,nvfp4}` (`variants/<format>/`), `flux3_klein_dit_gguf_<quant>` in
+  `transformer_gguf/` (unsloth). Encoder: `flux3_klein_text_encoder_bf16` (shards + index in
+  `text_encoder/`), `flux3_klein_text_encoder_gguf_{q8_0,q4_k_m}` in `text_encoder_gguf/`
+  (official `Qwen/Qwen3-VL-4B-Instruct-GGUF`, text-only).
+- FLUX.3 bundles (`flux3_klein_package_specs`): base, the root DiT config when the DiT reads
+  it (`flux3_klein_dit_reads_root_config`: bf16 and GGUF), DiT, encoder. Paths
+  (`flux3_klein_dit_relative_path`, `flux3_klein_encoder_relative_path`) are relative to the
+  PACKAGE ROOT, so manual mode joins them onto the user's root; a test pins
+  `flux3_klein_dir().join(rel)` to the spec's file (or, for the bf16 encoder, the folder
+  holding every file of the spec).
+- FLUX.3 gated: only the BFL repository (base, native DiTs, bf16 encoder); both GGUF
+  repositories are public.
+
 ## Editing map
 - New weight format / encoder source / variant: `ms_config::flux2_weight_format` first, then
   the statics and the exhaustive `flux2_klein_4b_weights_spec` / `flux2_klein_9b_weights_spec`
@@ -54,3 +80,7 @@ public item, so callers name `ms_sysprobe::ai_models::external_catalog::<item>`.
 - Where a component is sent to the backend: `flux2_klein_weights_path` +
   `unquantized_component_path`.
 - Which bf16 transformer layout an install uses: `flux2_klein_transformer_layout`.
+- New FLUX.3 klein DiT or encoder format: `ms_config::flux3_weight_format` first, then the
+  static, the exhaustive `flux3_klein_dit_spec` / `flux3_klein_encoder_spec` and
+  `*_relative_path` / `flux3_klein_dit_reads_root_config` matches, `FLUX3_KLEIN_SPECS`, the totals test and
+  `tools/model_pins/sources.json`.

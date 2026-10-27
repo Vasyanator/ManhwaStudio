@@ -2,7 +2,7 @@
 
 ## Purpose
 The model-agnostic building blocks the LARGE-model engines of the «ИИ-редактор области» share
-(FLUX.2 klein and FLUX.3 klein; the prompt library is used by FLUX.2 klein only so far). Each lives here so every large-model engine composes it
+(FLUX.2 klein and FLUX.3 klein; both use the prompt library). Each lives here so every large-model engine composes it
 instead of copying it. An engine adds only what is its own: its
 request headers, its settings document and migrations, its staleness rules, its sentences.
 
@@ -13,10 +13,8 @@ engine (flux2_klein/, flux3_klein/)
                          stream_call (id-exposing streaming call), spawn_backend_cancel
   -> stream_progress_ui  draw_stream_progress[_staged] (one bar, a second while a download names
                          a file; the staged variant names a frame by the engine's stage label)
-  -> hf_download         HfDownloadCheck<Q> + verdict vocabulary, hf_download_readiness,
-                         call_hf_download_check / run_hf_download, HfTokenControl
-  -> hf_download_ui      draw_hf_token_row, draw_hf_repo_row, draw_hf_download_controls,
-                         gated_button
+  -> hf_download         HfTokenControl + HfTokenAction (the token field's secret-store worker)
+  -> hf_download_ui      draw_hf_token_row, token_save_button_label, gated_button
   -> (re-export)         read_settings_file, write_settings_json, SettingsSaver — owned by
                          region_edit_v2::engine_settings_file
   -> region_mask         mask_for_run
@@ -24,6 +22,14 @@ engine (flux2_klein/, flux3_klein/)
   -> prompt_library      PromptLibraryListing / Text / Entry + parsers (protocol 23 EntryInfo),
                          find / derived_pick / track_uncached / apply_pick / sync_preset_name
   -> prompt_library_ui   draw_prompt_library_picker (SearchableComboBox, row «Нет» + presets)
+  -> prompt_cache        PromptCacheController (operation in flight, .list arming, name field,
+                         export capture) + PromptCacheEffects, cache_button / prompt_cache_gates
+                         over the engine's CacheContext, prompt_cache_line, the .prompt_cache.*
+                         header / parsers / jobs, the two file-dialog requests
+  -> prompt_cache_ui     draw_cache_row, draw_prompt_cache_line, draw_prompt_library_toggle,
+                         draw_prompt_cache_library (picker + Export / Import + outcome lines)
+  -> catalog_download    catalog_gated_repos_missing, catalog_bundle_missing, catalog_job_running,
+                         catalog_switch_block_reason (an engine fed by the app's model catalog)
 ```
 `mod.rs` re-exports every submodule flat, so an engine writes `use super::shared::*;`. The
 forecast / caps / learned-floor half of «Память и скорость» is NOT here: it is
@@ -44,16 +50,12 @@ forecast / caps / learned-floor half of «Память и скорость» is 
   fields — download, load, encode or a denoise re-read) and
   `draw_stream_progress_staged` (a load / generate frame named by the engine's localization of
   its stable `stage` id, the `label` as fallback for an unknown id).
-- `hf_download.rs`: the per-repository verdicts (`HfDownloadState`, `HfDownloadLink`,
-  `HfDownloadRepo::link`), the check generic over the engine's QUESTION (`HfDownloadCheck<Q>`,
-  `parse_hf_download_check(header, question)`), the nullable plan and `hf_download_readiness`,
-  the two calls, the token field's worker (`HfTokenControl`; FLUX.2 klein uses only this part,
-  its download being the app's model catalog).
+- `hf_download.rs`: the token field's worker (`HfTokenControl`: the entry buffer, the store /
+  delete worker, the line about the last operation) and `HfTokenAction`. Both engines download
+  through the app's model catalog, which reads the stored token itself.
 - `hf_download_ui.rs`: the token row (`HfTokenView`, caller-given field id, an optional
-  `ms_widgets::HfAccessHint` beside the badge whose last step names `token_save_button_label`),
-  one repository row,
-  the check / plan / «Скачать» / «Отмена» block (`HfDownloadControlsView`; the download hover is
-  the engine's), and `gated_button`.
+  `ms_widgets::HfAccessHint` beside the badge whose last step names `token_save_button_label`)
+  and `gated_button`.
 - the settings-file rules (`read_settings_file`, `write_settings_json`, `SettingsSaver` +
   `SaveGate`) are re-exported by `mod.rs` from their owner
   `../../../region_edit_v2/engine_settings_file.rs` (shared with the engines outside
@@ -75,13 +77,41 @@ forecast / caps / learned-floor half of «Память и скорость» is 
 - `prompt_library_ui.rs`: `draw_prompt_library_picker` — the labelled `SearchableComboBox` of
   presets (row 0 «Нет»; primary = preset name, secondary = the encoder of the entry in use and its
   date, hover = the prompt and every entry's encoder); the encoder caption is the engine's closure.
+  Not re-exported: an engine draws it through `prompt_cache_ui.rs`'s library fold.
+- `prompt_cache.rs`: the model-agnostic CONTROLLER of the library (GUI-free). The engine hands
+  in `PromptCacheMethods` (its four method names, the build / query timeouts, its log label)
+  and a `CacheContext` (the typed text, whether an encoder is configured, the current encoder's
+  provenance when known, its precision ranking and fp8 id, an optional engine-specific block
+  reason). It decides «Кэшировать» / «Переименовать» / closed (`cache_button`; an entry of the
+  current encoder, or a strictly more precise one of the same source, closes it unless `.status`
+  says the prompt is not served) and the export / import gates, picks the one cache line
+  (`prompt_cache_line`), reads the cache half of `.status` (`parse_prompt_cache_status`) and
+  owns the jobs: `PromptCacheController` keeps the one operation in flight (build streams on the
+  engine's progress bar), the `.list` query and its one-shot arming, the name field, the export
+  file captured when its dialog opened, the fold flag and the outcome lines; `poll` /
+  `poll_list` return `PromptCacheEffects` (re-ask `.status`, invalidate the forecast), which the
+  engine folds into its own queries.
+- `prompt_cache_ui.rs`: the drawing half — the name field with «Кэшировать» /
+  «Переименовать» (`draw_cache_row`, returns the press), the cache line, the
+  «Библиотека промптов» toggle and the fold (`draw_prompt_cache_library`: picker, «Экспорт» /
+  «Импорт», listing error, outcome, warning, the engine's `PromptCacheNote`s, skipped files)
+  over a one-frame `PromptCacheBlockView` (the caller's two id salts and encoder caption).
+
+- `catalog_download.rs`: the pure decisions of an engine whose weights come from the app's model
+  catalog through the shared `ms_tab_translation::ocr_model_download` controller (GUI-free): the
+  gated repositories of a bundle not seen installed (`catalog_gated_repos_missing`: what draws
+  the token row), whether a bundle state says files are absent (`catalog_bundle_missing`),
+  whether any controller job runs (`catalog_job_running`: its falling edge re-arms the engine's
+  probes) and why a running job closes the engine picker (`catalog_switch_block_reason`, texts
+  `cleaning.tools.catalog_download.*`). The engine keeps its own bundle (which specs a selection
+  needs).
 
 ## Contracts and invariants
 - **Nothing names a model.** Log lines take a `log_label`; user texts are
-  `cleaning.tools.engine_progress.*` / `cleaning.tools.hf_download.*`; a sentence that names the
-  model (its settings-file notices, its download heading and hover, its switch-block reasons)
-  stays in the engine and reaches shared code only as an already-localized string or a
-  `describe` closure.
+  `cleaning.tools.engine_progress.*` / `cleaning.tools.hf_download.*` /
+  `cleaning.tools.prompt_library.*` / `cleaning.tools.catalog_download.*`; a sentence that names the
+  model (its settings-file notices, its download heading and hover) stays in the engine and
+  reaches shared code only as an already-localized string or a `describe` closure.
 - **Nothing blocks the GUI thread.** Every call, keyring access and file write runs on an
   `ms_thread` worker; the GUI side only drains channels. The progress lock is held for a field
   copy and nothing more (`draw_stream_progress` copies out, then draws).
@@ -99,10 +129,6 @@ forecast / caps / learned-floor half of «Память и скорость» is 
   backend requests.
 - **One progress bar per engine, claimed by generation.** A write from a retired generation —
   including its terminal "the bar is done" — is dropped (`update_progress`).
-- **An absent plan forbids a size and a completion state**, whatever the verdicts say
-  (`hf_download_readiness`); `SizeUnknown` keeps «Скачать» open (`startable`).
-- **An unknown verdict literal is "not known"**, keeps the literal for the hover and offers no
-  link — never folded onto one of the six.
 - **The HF token is never persisted, logged or formatted here.** It reaches the wire only through
   the header the ENGINE builds; `HfTokenControl::input` is the entry buffer, cleared when the
   store worker takes it.
@@ -129,15 +155,19 @@ forecast / caps / learned-floor half of «Память и скорость» is 
   `modules/ai_backend/runtime/prompt_library.py`; both sides' tests read
   `modules/ai_backend/runtime/fixtures/preset_name_normalization.json`, so change the rule only
   together with that file and the Python side.
+- **One prompt-cache operation at a time, and the controller never re-asks the engine's
+  queries itself.** `PromptCacheController` refuses a second build / export / import while one is
+  in flight (the engine additionally gates on its whole-pipeline busy flag); a finished build
+  re-arms `.list`, and `.status` / the forecast are the ENGINE's — the controller only returns
+  `PromptCacheEffects`. A listing that differs from the one held (the first one included: the
+  first `.list` of a process migrates old caches) is such an effect.
 - Visibility ceiling: `pub(in crate::tools::ai_editor::engines)`.
 
 ## Editing map
 - To change how the bar looks or what its lines say: `stream_progress_ui.rs` and the
   `cleaning.tools.engine_progress.*` keys; its arithmetic: `stream_progress.rs`.
-- To change the verdict vocabulary, a verdict's link, or the readiness rule:
-  `hf_download.rs` (the wire literals are pinned by the `state` table of `modules/ai_backend/ipc/PROTOCOL.md` and matched by the
-  backend's download module).
-- To change the token row or the download controls for every engine: `hf_download_ui.rs`.
+- To change the token row for every engine: `hf_download_ui.rs`; the token field's worker:
+  `hf_download.rs`.
 - To change the quarantine naming, the temp naming, the save debounce or backoff, or the
   teardown flush: `../../../region_edit_v2/engine_settings_file.rs`.
 - To change where the «Постобработка» section sits or its chrome: `postprocess_section.rs`; its
@@ -145,5 +175,13 @@ forecast / caps / learned-floor half of «Память и скорость» is 
 - To change how a library listing is read, what the typed text matches or what «Нет» keeps:
   `prompt_library.rs`; how the picker looks: `prompt_library_ui.rs` and the
   `cleaning.tools.prompt_library.*` keys.
+- To change when «Кэшировать» / «Экспорт» / «Импорт» open, which line the prompt block shows,
+  what a finished operation re-asks or how a `.prompt_cache.*` call is made: `prompt_cache.rs`;
+  how the cache row and the library fold look: `prompt_cache_ui.rs`. An engine adds only its
+  `PromptCacheMethods`, its `CacheContext` builder and its request `params`.
+- To change which catalog states count as "missing" or "running", or the engine-picker block of
+  a catalog job: `catalog_download.rs` and the `cleaning.tools.catalog_download.*` keys.
 - Tests sit at the end of each file; the catalog tests (every key in every shipped locale, with
-  its placeholders) are in `hf_download_ui.rs` and `stream_progress_ui.rs`.
+  its placeholders; the retired download-block keys absent) are in `hf_download_ui.rs`,
+  `stream_progress_ui.rs`, `catalog_download.rs` and `prompt_cache.rs` (the moved prompt-library
+  keys present, their former `cleaning.tools.flux2_klein.*` ids gone).

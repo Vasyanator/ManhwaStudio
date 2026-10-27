@@ -3,8 +3,8 @@ File: modules/ai_backend/engines/model_download.py
 
 Purpose:
 Shared on-demand download primitive for the service domains that fetch their
-own files: `inpaint/flux_fill.py` and `inpaint/hf_gated_download.py` (Hugging Face,
-bearer token), `watermark/service.py` (Google Drive, confirm interstitial),
+own files: `inpaint/flux_fill.py` (Hugging Face, bearer token),
+`watermark/service.py` (Google Drive, confirm interstitial),
 `watermark/code_fetch.py` (pinned upstream source files) and `reline/service.py`
 (user-chosen catalog models).
 

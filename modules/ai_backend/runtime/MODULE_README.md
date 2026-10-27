@@ -20,7 +20,9 @@ once at backend startup, the second is applied per weight transfer by the Torch 
 `gguf_stream.py` builds on `safetensors_stream.py` (stdlib, `gguf.constants` lazily) and
 `tensor_container.py` on both; `memory_probe.py` depends only on `torch_support.py`. They are the
 shared, model-agnostic checkpoint/memory utilities model packages build on (first consumer:
-`inpaint/flux2_klein/`).
+`inpaint/flux2_klein/`). `qwen3_gguf.py` (stdlib; gguf, transformers and accelerate lazily) is the
+one family-specific piece: the Qwen3 GGUF name bridge shared by the services whose text encoder is
+a Qwen3 decoder stack.
 
 The only outbound dependency of this package is `rocm_runtime._resolve_cache_root()`, which lazily
 imports `..engines.paddle_onnx` to reuse the ONNX model-root resolution and falls back to
@@ -124,7 +126,23 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   policy of `ms_atomic_file::sync_directory`, a no-op on Windows). Stdlib + `safetensors_stream`; `safetensors.torch` lazily
   (`serialize_tensor` / `load_tensor`, the tests' patch points). `test_prompt_library.py`: its tests.
   Model specifics (library ids, encoder identity, width checks, v1 migration) stay in the model
-  package (`inpaint/flux2_klein/prompt_cache.py`).
+  package (`inpaint/flux2_klein/prompt_cache.py`). `ROOT_DIRNAME` is the libraries' directory in the
+  program root; `same_encoder` is THE "made by the current encoder" rule (fingerprint + fp8).
+- `prompt_cache_service.py`: the model-agnostic ORCHESTRATION of a prompt cache over that library
+  (stdlib + `prompt_library` only): the in-memory embeddings (`EmbeddingMemory`: LRU by count and an
+  optional byte cap, the newest entry always kept, a copy-on-write `index` for lock-free readers;
+  `MemoryEmbedding`, `memory_key`, `tensor_width`, `tensor_bytes`), THE selection of what serves each
+  needed text (`PromptCacheOrchestrator.plan` -> `PromptPlan` of `PromptChoice`s), `.status`'s
+  `(prompt_cached, EntryInfo)` (`status`, `entry_info`), serving and remembering under the owning
+  service's lock (`serve_locked`, `remember_locked`), the build (`build_locked` -> `BuildResult`:
+  skip what the current encoder already saved, reuse memory, call back to encode the rest, name /
+  rename the preset), and `listing` / `export` / `import_file`; plus the wire-field reader
+  (`read_library_fields`) and the shared refusals (`require_prompt_to_cache`,
+  `refuse_unknown_marker`). A model plugs in a `PromptCacheAdapter` (its library ids, texts,
+  preference, width, encoder identity, legacy migration / import; `owner` prefixes every log line and
+  model-naming refusal) and keeps its encoder session, progress frames and answer keys. Consumer:
+  FLUX.2 klein (`inpaint/flux2_klein/prompt_cache.Flux2PromptCacheAdapter`).
+  `test_prompt_cache_service.py`: its tests over a fake adapter.
 - `gguf_stream.py`: model-agnostic GGUF header parsing — `read_gguf_header` -> `GgufHeader`
   (version 2/3, alignment, data start, spans in file order, scalar/string metadata, names of
   zero-element tensors), `is_gguf_file`, `ggml_type_name`, ceiling `MAX_GGUF_HEADER_BYTES`; every
@@ -155,6 +173,15 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   forward parity, survival of slot moves, refusals.
 - `memory_probe.py`: `memory_snapshot` — the tolerant `{vram,ram}_{total,free}` snapshot, `0` =
   unknown, never raises — and `cuda_device_index`.
+- `qwen3_gguf.py`: the llama.cpp GGUF <-> HF Qwen3 name bridge of a Qwen3 text encoder
+  (`encoder_state_key_of_gguf`, `is_gguf_encoder_name`, `require_known_encoder_names`,
+  `gguf_encoder_quant_types`, `require_architecture`): the `gguf` package's QWEN3 map inverted
+  over the real `Qwen3Model` key set (built once on `meta`, cached), no hand-written table, no Q/K
+  row permutation. Serves GGUF architecture `qwen3` (FLUX.2 klein's Qwen3 4B / 8B) and `qwen3vl`
+  (the text half of Qwen3-VL, FLUX.3 klein): `Qwen3VLTextModel` has the `Qwen3Model` key set.
+  `test_qwen3_gguf.py`: the name map, the refusals, the architecture check, the Qwen3-VL key-set
+  equality, and an opt-in header-only check of the real files under `<side_models>` (or
+  `MS_QWEN3_GGUF_FILES`).
 - `encoder_truncation.py`: `keep_layers_for_hidden_states` — how many decoder layers a text
   encoder keeps when a pipeline reads only some hidden states (`max(indices) + 1`, and why the
   `+ 1` is exact).
@@ -398,6 +425,10 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   `memory_snapshot`), so each service's records keep its prefix and land in its own logger tree;
   a service whose tests patch its own `is_torch_available` passes that binding as
   `torch_available`.
+- **`qwen3_gguf` is family-specific but service-agnostic.** It knows Qwen3 tensor names and
+  nothing of any service: which `general.architecture` ids a service accepts (`accepted`), the
+  service name its refusals print (`owner`) and the logger its error records go to (`logger`)
+  are the caller's. It has no patch point: callers and tests call its functions directly.
 
 ## Editing map
 - To change how the installation root is found, edit `paths.py` — and only `paths.py`.
@@ -444,5 +475,9 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   never a branch inside the filler.
 - To change the memory snapshot, edit `memory_probe.py`; to change the truncation rule, edit
   `encoder_truncation.py`.
+- To change how llama.cpp Qwen3 GGUF names map onto HF Qwen3 state keys, or the refusal of a
+  foreign / incomplete encoder file or architecture, edit `qwen3_gguf.py` and
+  `test_qwen3_gguf.py`, then re-run `inpaint/flux2_klein/` (its characterization tests pin the
+  FLUX.2 wording) and `inpaint/flux3_klein/`.
 - To wire a new Torch service onto the GPU, do not edit this package: pick the
   `move_module_to` / `patched_module_to` form described above from the service side.

@@ -50,7 +50,7 @@ client of `large_models.*`); the cap editor is `ms_widgets::ByteCapEdit`.
   (raises `EncoderOnCpuChanged`; the engine persists the flag and sends it as `encoder_on_cpu` in
   its run AND forecast `params`, honouring it is the backend's). With the flag on, the encoder's
   forecast line names RAM only (`encoder_line`). A model whose text encoder has several weight
-  formats (`LargeModelProfiles::encoder_formats`, FLUX.2 klein 4B) draws them with
+  formats (`LargeModelProfiles::encoder_formats`: FLUX.2 klein 4B, FLUX.3 klein) draws them with
   `draw_encoder_formats`, a separate call returning the picked id, so the widget's signature
   and `ResourcesAction` stay the same for every engine; it draws only with two rows or more and
   shares the row labels and visuals of the model's format rows (`draw_format_rows`). No model
@@ -73,7 +73,13 @@ client of `large_models.*`); the cap editor is `ms_widgets::ByteCapEdit`.
   Combined as the backend's admission combines them — the pipeline is planned with the
   encoder's reservation claimed beside it: device peaks add, host peaks add with the shared
   baseline RSS taken out once (`Forecast::host_baseline`; absent = counted twice, an
-  over-estimate), times add (encode, then denoise). The encoder line stays as the breakdown.
+  over-estimate), times add (encode, then denoise). Since protocol 24 that baseline holds no
+  large-model bytes, so the RAM figure reads "the backend with only this run's models loaded"
+  (another resident large model and a resident encoder are not added in); a CPU-pinned
+  encoder reports device peak `0`. The encoder line stays as the breakdown.
+  The device sum is what admission reserves for the two handles together; the backend's
+  `paired.combined_device_peak` (the maximum over the run's moments, which its combined VRAM
+  ceilings use) can be lower. The two figures differ by design; the widget shows the sum.
 
 ## Editing map
 - To change what a picker row or the forecast line SAYS: `step_row_label` / `forecast_line`
