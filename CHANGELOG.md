@@ -127,7 +127,7 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - The launcher's export page warns that chapter export uses the program's own format.
 - Updates and fresh installs verify every downloaded file against the release's SHA-256 checksums before using it.
 
-## Unreleased
+## 367 — 2026-10-28
 
 ### New features
 - **FLUX klein on Stable-Diffusion.cpp** — FLUX.2 klein and FLUX.3 klein region editing can now run without PyTorch, on the Stable-Diffusion.cpp library through Vulkan or the CPU: for graphics cards PyTorch does not support (for example AMD RX 580) and machines without the AI environment. A «PyTorch | Stable-Diffusion.cpp» switch at the top of each engine panel picks the runtime; on Stable-Diffusion.cpp the engines use GGUF or single-file bf16 weights and offer text encoder on CPU, a video memory limit, VAE tiling and flash attention, while the prompt library, memory forecast and PyTorch-only formats stay with PyTorch. The library (Linux and Windows, x86-64) is downloaded only when you install it in Settings › AI backend › Stable-Diffusion.cpp, runs in a separate process so its crash never closes the editor, and a model / text encoder pair that does not fit together is refused before the run. The AI region editor opens when either PyTorch or an installed Stable-Diffusion.cpp is available; its model buttons show which runtime each model needs (LaMa and SDXL: PyTorch; FLUX: PyTorch or Stable-Diffusion.cpp), and choosing FLUX while PyTorch is unavailable switches it to Stable-Diffusion.cpp.
@@ -193,6 +193,8 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **Python environment repair** — environments set up by older versions no longer end up with two conflicting OpenCV packages: the duplicate is removed and the right one reinstalled; the readiness message now says packages are «missing or outdated».
 - **Image bubbles** — pasting an image from the clipboard or choosing an image file for a bubble no longer freezes the window while it is saved, and an interrupted save can no longer leave a damaged file.
 - **New Project window** — its dropdowns and the download-threads slider react to the mouse wheel like the rest of the app, without scrolling the panel.
+
+## Unreleased
 
 ---
 
@@ -326,7 +328,7 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - Страница экспорта в лаунчере предупреждает, что экспорт главы идёт в собственном формате программы.
 - Обновление и установка проверяют каждый скачанный файл по контрольным суммам SHA-256 релиза перед использованием.
 
-## Не выпущено
+## 367 — 2026-10-28
 
 ### Новые возможности
 - **FLUX klein на Stable-Diffusion.cpp** — редактирование области FLUX.2 klein и FLUX.3 klein теперь работает и без PyTorch, на библиотеке Stable-Diffusion.cpp через Vulkan или процессор: для видеокарт, которые PyTorch не поддерживает (например, AMD RX 580), и для машин без ИИ-окружения. Переключатель «PyTorch | Stable-Diffusion.cpp» в верхней части панели каждого движка выбирает среду; на Stable-Diffusion.cpp движки используют веса GGUF или однофайловые bf16 и предлагают энкодер на процессоре, ограничение видеопамяти, тайлинг VAE и flash attention, а библиотека промптов, прогноз памяти и форматы только для PyTorch остаются у PyTorch. Библиотека (Linux и Windows, x86-64) скачивается только по кнопке установки в Настройки › ИИ бэкенд › Stable-Diffusion.cpp, работает в отдельном процессе, поэтому её сбой никогда не закрывает редактор, а неподходящая пара модели и текстового энкодера отклоняется ещё до запуска. ИИ-редактор области доступен, если есть PyTorch или установленный Stable-Diffusion.cpp; кнопки моделей показывают, какая среда нужна каждой (LaMa и SDXL — PyTorch, FLUX — PyTorch или Stable-Diffusion.cpp), а выбор FLUX без доступного PyTorch сам переключает его на Stable-Diffusion.cpp.
@@ -393,3 +395,5 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - **Бабблы-картинки** — вставка картинки из буфера обмена или выбор файла картинки для баббла больше не подвешивает окно на время сохранения, а прерванное сохранение не оставляет повреждённый файл.
 - **Окно «Новый проект»** — выпадающие списки и ползунок потоков загрузки реагируют на колесо мыши, как во всём приложении, не прокручивая панель.
 - **Расцензуренный текстовый энкодер FLUX.2 klein 9B** — теперь кодирует промпты с правильными настройками позиций (раньше они неверно читались из его конфигурации); закэшированные с ним промпты один раз кодируются заново.
+
+## Не выпущено

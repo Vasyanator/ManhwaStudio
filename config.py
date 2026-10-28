@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import docstore
 
 _log = logging.getLogger(__name__)
-VERSION = "325"
+VERSION = "367"
 
 
 def _default_documents_dir() -> Optional[Path]:
