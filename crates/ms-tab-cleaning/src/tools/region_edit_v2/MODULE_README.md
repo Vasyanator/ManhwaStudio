@@ -499,7 +499,22 @@ Host contracts:
   whose worker cannot be interrupted mid-call keeps the abandoned worker until it ends (drained
   in `poll`, its answer never reported) and refuses a new start meanwhile through
   `run_block_reason`, so cancel-and-restart never stacks blocked workers (the cloud engine does).
-- **`pytorch_required()` follows the SELECTED engine**: the tab gates the tool button on it.
+- **Runtime gating has three levels: tool, engine, run.** Each engine declares the local
+  runtimes it can run on, `AiEngine::ai_requirement()` (trait default: `Torch` when
+  `requires_torch()`, else `None`; FLUX answers `TorchOrSdcpp` whichever runtime is selected). The
+  tool button's requirement (`CleaningTool::ai_requirement`, the tab's `AiButton` and
+  `ensure_active_tool_available`) is their UNION (`catalog_requirement`: met as soon as one engine
+  is; `None` for an empty catalog, a runtime-free engine, or a mix no single `AiRequirement`
+  expresses). In the picker each engine is an `AiButton` with its own requirement (strict
+  `AiCaps`); a selected engine whose runtime goes away stays selected. The need of the SELECTED
+  configuration is enforced at «Обработать» by the host's `run_block_reason()` — the engine's
+  own `run_block_reason` first, then `requires_torch()` against the pushed Torch flag
+  (`cleaning.region_edit.torch_required_error`, naming the engine) — read by the button AND
+  `start_run`.
+- **`AiEngine::on_selected` fires on user events only**: a picker switch (`select_engine`) and the
+  tool's activation (`CleaningTool::activate`), with the strict `AiCaps` of that moment; never per
+  frame. FLUX uses it to leave an out-of-reach PyTorch for sd.cpp (`shared::sdcpp_auto_switch`);
+  an engine whose settings are still loading defers the decision until they land.
 - **Mask generation belongs to the host; what the mask MEANS belongs to the engine.** The block is
   drawn for every engine and says nothing about meaning; `../mask_generation.rs` owns the
   sources, rules, worker and validation. A generated mask enters through

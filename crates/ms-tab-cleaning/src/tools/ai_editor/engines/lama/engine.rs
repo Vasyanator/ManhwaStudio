@@ -455,7 +455,7 @@ impl AiEngine for LamaEngine {
     ///
     /// Only what no frame state describes: a run already in flight. The rectangle is
     /// validated against `constraints()` by the frame, the non-empty-mask rule is
-    /// `allows_empty_mask`, and the PyTorch requirement is the host's `AiButton`.
+    /// `allows_empty_mask`, and the PyTorch requirement is the host's run gate.
     fn run_block_reason(&self) -> Option<String> {
         if self.run_rx.is_some() {
             return Some(t!("cleaning.mask_editor.processing_already_running_status").to_string());
@@ -576,8 +576,8 @@ impl AiEngine for LamaEngine {
     /// answer than a control greyed out by a second copy of that fact.
     fn set_backend_available(&mut self, _available: bool) {}
 
-    /// Deliberately empty: the run button is the host's `AiButton` with
-    /// `AiRequirement::Torch`, which resolves the runtime's presence itself.
+    /// Deliberately empty: the host's run gate (`RegionEditHost::run_block_reason`)
+    /// applies the PyTorch requirement itself.
     fn set_torch_available(&mut self, _available: bool) {}
 
     /// Deliberately empty: nothing in this engine's panel depends on the rectangle before a

@@ -18,6 +18,9 @@ Key items:
   selection needs.
 - `flux3_klein_dit_relative_path` / `flux3_klein_encoder_relative_path`: where a component
   lives relative to the PACKAGE ROOT (so manual mode joins them onto its own root).
+- `flux3_klein_package_specs_for` / `flux3_klein_sdcpp_paths`: the bundle per
+  `ms_config::ImageEditRuntime` and the three files Stable-Diffusion.cpp loads (diffusion
+  model, VAE, LLM text encoder), joined onto a package root.
 - `Flux3SpecRole` + `flux3_klein_spec_role`: reverse lookup spec id -> typed role (display
   names in the UI).
 
@@ -37,10 +40,18 @@ Notes:
   them to pins. The exhaustive matches force a spec for every new format.
 - Pins: the Hugging Face tree API at each commit (the gated BFL repository read with a token);
   small files hashed after download (git blob sha1 equal to the tree's).
+- sd.cpp file rule (measured against release `master-1017-be48649`): the root
+  `model.safetensors` or a GGUF DiT, `ae.safetensors`, and the encoder's
+  `text_encoder/model.safetensors.index.json` or a GGUF load there; fp8r / nvfp4 are not offered
+  on sd.cpp (`Flux3DitFormat::offered_on`). sd.cpp reads no JSON config, so its bundle carries no
+  root `config.json`.
 */
 
-use ms_config::{Flux3DitFormat, Flux3EncoderFormat};
+use std::path::Path;
 
+use ms_config::{Flux3DitFormat, Flux3EncoderFormat, ImageEditRuntime};
+
+use super::{SdCppComponentPaths, join_relative};
 use crate::ai_models::external::{DirLayout, ExternalFile, ExternalModelSpec, ExternalSource};
 
 /// The FLUX.3 klein package root, relative to `side_models` (`ms_config::flux3_klein_dir`; a
@@ -50,6 +61,11 @@ const FLUX3_KLEIN_DIR: &str = "FLUX.3-image-klein";
 const FLUX3_KLEIN_DIT_GGUF_DIR: &str = "FLUX.3-image-klein/transformer_gguf";
 /// Folder of the GGUF text-encoder files, relative to `side_models`.
 const FLUX3_KLEIN_TEXT_ENCODER_GGUF_DIR: &str = "FLUX.3-image-klein/text_encoder_gguf";
+/// The autoencoder inside the package root (pinned by the base; the VAE file sd.cpp loads).
+const FLUX3_KLEIN_AE: &str = "ae.safetensors";
+/// The bf16 encoder's shard index inside the package root: the file sd.cpp is given (it reads
+/// the shards the index names).
+const FLUX3_KLEIN_TEXT_ENCODER_INDEX: &str = "text_encoder/model.safetensors.index.json";
 /// The gated BFL repository (`owner/name`) every native FLUX.3 klein file comes from: the one
 /// spelling of the id (the panel names it with its licence page).
 pub const FLUX3_KLEIN_BFL_REPO: &str = "black-forest-labs/flux-3-image-klein";
@@ -328,6 +344,53 @@ pub fn flux3_klein_encoder_relative_path(format: Flux3EncoderFormat) -> &'static
     }
 }
 
+/// The bundle of specs a FLUX.3 klein selection needs installed on `runtime`.
+///
+/// - `PyTorch`: exactly [`flux3_klein_package_specs`].
+/// - `SdCpp`: the base part (it holds `ae.safetensors`), the DiT spec of `dit` when
+///   `Flux3DitFormat::offered_on(SdCpp)` lists it (fp8r / nvfp4 contribute no spec), the encoder
+///   spec of `encoder`. No root DiT config: sd.cpp reads tensors only.
+#[must_use]
+pub fn flux3_klein_package_specs_for(runtime: ImageEditRuntime, dit: Flux3DitFormat, encoder: Flux3EncoderFormat) -> Vec<&'static ExternalModelSpec> {
+    match runtime {
+        ImageEditRuntime::PyTorch => flux3_klein_package_specs(dit, encoder),
+        ImageEditRuntime::SdCpp => {
+            let mut specs = vec![&FLUX3_KLEIN_BASE];
+            if Flux3DitFormat::offered_on(ImageEditRuntime::SdCpp).contains(&dit) {
+                specs.push(flux3_klein_dit_spec(dit));
+            }
+            specs.push(flux3_klein_encoder_spec(encoder));
+            specs
+        }
+    }
+}
+
+/// The three files Stable-Diffusion.cpp is given for a FLUX.3 klein selection, joined onto
+/// `package_root` (`ms_config::flux3_klein_dir()` in download mode, the user's root in manual
+/// mode). Pure path joining: checks nothing on disk.
+///
+/// | component | path |
+/// |---|---|
+/// | diffusion | [`flux3_klein_dit_relative_path`] (`model.safetensors` or the `.gguf` file) |
+/// | vae | `ae.safetensors` |
+/// | llm, bf16 | `text_encoder/model.safetensors.index.json` |
+/// | llm, GGUF | [`flux3_klein_encoder_relative_path`] (the `.gguf` file) |
+///
+/// `None` when `dit` is not offered on sd.cpp (`Flux3DitFormat::offered_on(SdCpp)`: fp8r,
+/// nvfp4).
+#[must_use]
+pub fn flux3_klein_sdcpp_paths(package_root: &Path, dit: Flux3DitFormat, encoder: Flux3EncoderFormat) -> Option<SdCppComponentPaths> {
+    if !Flux3DitFormat::offered_on(ImageEditRuntime::SdCpp).contains(&dit) {
+        return None;
+    }
+    let llm = if encoder.is_gguf() { flux3_klein_encoder_relative_path(encoder) } else { FLUX3_KLEIN_TEXT_ENCODER_INDEX };
+    Some(SdCppComponentPaths {
+        diffusion: join_relative(package_root, flux3_klein_dit_relative_path(dit)),
+        vae: join_relative(package_root, FLUX3_KLEIN_AE),
+        llm: join_relative(package_root, llm),
+    })
+}
+
 /// What a FLUX.3 klein catalog spec is, for display: the reverse of the lookups above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flux3SpecRole {
@@ -362,11 +425,9 @@ pub fn flux3_klein_spec_role(id: &str) -> Option<Flux3SpecRole> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
     use crate::ai_models::external::{unmarked_files_present, validate_spec};
-    use crate::ai_models::external_catalog::{all_specs, join_relative};
+    use crate::ai_models::external_catalog::all_specs;
 
     fn ids(specs: &[&'static ExternalModelSpec]) -> Vec<&'static str> {
         specs.iter().map(|spec| spec.id).collect()
@@ -635,5 +696,53 @@ mod tests {
             }
             assert!(!unmarked_files_present(root, &FLUX3_KLEIN_DIT_CONFIG), "{format:?}");
         }
+    }
+
+    /// Every DiT format offered on sd.cpp resolves, with every encoder, to a bundle of base +
+    /// DiT + encoder and to three paths, each a pinned file of that bundle (joined onto the
+    /// download-mode package root); the formats not offered there resolve to nothing.
+    #[test]
+    fn every_sdcpp_format_resolves_to_a_bundle_and_paths() {
+        let side = Path::new("side");
+        let package = join_relative(side, FLUX3_KLEIN_DIR);
+        for &dit in Flux3DitFormat::all() {
+            let offered = Flux3DitFormat::offered_on(ImageEditRuntime::SdCpp).contains(&dit);
+            for &encoder in Flux3EncoderFormat::all() {
+                let paths = flux3_klein_sdcpp_paths(&package, dit, encoder);
+                assert_eq!(paths.is_some(), offered, "{dit:?} {encoder:?}");
+                let bundle = flux3_klein_package_specs_for(ImageEditRuntime::SdCpp, dit, encoder);
+                assert!(bundle.iter().all(|spec| spec.id != FLUX3_KLEIN_DIT_CONFIG.id), "{dit:?}");
+                let Some(paths) = paths else {
+                    assert_eq!(ids(&bundle), [FLUX3_KLEIN_BASE.id, flux3_klein_encoder_spec(encoder).id]);
+                    continue;
+                };
+                assert_eq!(ids(&bundle), [FLUX3_KLEIN_BASE.id, flux3_klein_dit_spec(dit).id, flux3_klein_encoder_spec(encoder).id]);
+                for path in [&paths.diffusion, &paths.vae, &paths.llm] {
+                    let is_file = bundle.iter().any(|spec| spec.files.iter().any(|file| join_relative(&spec.local_dir(side), file.path) == *path));
+                    assert!(is_file, "{dit:?} {encoder:?}: {} is not a file of the bundle", path.display());
+                }
+            }
+        }
+        // PyTorch keeps the existing bundle for every selection.
+        for &dit in Flux3DitFormat::all() {
+            for &encoder in Flux3EncoderFormat::all() {
+                assert_eq!(ids(&flux3_klein_package_specs_for(ImageEditRuntime::PyTorch, dit, encoder)), ids(&flux3_klein_package_specs(dit, encoder)));
+            }
+        }
+    }
+
+    #[test]
+    fn flux3_klein_sdcpp_path_table() {
+        let root = Path::new("root");
+        let expect = |diffusion: &str, llm: &str| Some(SdCppComponentPaths { diffusion: join_relative(root, diffusion), vae: root.join("ae.safetensors"), llm: join_relative(root, llm) });
+        assert_eq!(flux3_klein_sdcpp_paths(root, Flux3DitFormat::Bf16, Flux3EncoderFormat::Bf16), expect("model.safetensors", "text_encoder/model.safetensors.index.json"));
+        assert_eq!(
+            flux3_klein_sdcpp_paths(root, Flux3DitFormat::Q4KM, Flux3EncoderFormat::Q80),
+            expect("transformer_gguf/flux-3-image-klein-Q4_K_M.gguf", "text_encoder_gguf/Qwen3VL-4B-Instruct-Q8_0.gguf")
+        );
+        assert_eq!(flux3_klein_sdcpp_paths(root, Flux3DitFormat::Fp8r, Flux3EncoderFormat::Bf16), None);
+        assert_eq!(flux3_klein_sdcpp_paths(root, Flux3DitFormat::Nvfp4, Flux3EncoderFormat::Q4KM), None);
+        assert!(FLUX3_KLEIN_BASE.files.iter().any(|file| file.path == FLUX3_KLEIN_AE));
+        assert!(FLUX3_KLEIN_TEXT_ENCODER_BF16.files.iter().any(|file| file.path == FLUX3_KLEIN_TEXT_ENCODER_INDEX));
     }
 }

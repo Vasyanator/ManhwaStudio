@@ -80,7 +80,7 @@ impl WatermarkMode {
     ///
     /// The chapter mode is deliberately AI-free. This gates the two NETWORK entries of the
     /// mode picker and the run button INSIDE the tool; it deliberately does NOT reach
-    /// `CleaningTool::pytorch_required`, which is a constant `false` so the picker button —
+    /// `CleaningTool::ai_requirement`, which is a constant `None` so the picker button —
     /// and `ensure_active_tool_available` behind it — can never make the chapter mode
     /// unreachable on a machine without Torch.
     pub(super) fn requires_torch(self) -> bool {

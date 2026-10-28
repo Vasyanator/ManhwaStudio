@@ -31,7 +31,7 @@ use super::frame::PaintTarget;
 use super::geometry::{FrameConstraints, check_size};
 use super::host::RegionEditHost;
 use crate::tools::mask_generation;
-use ms_widgets::WheelSlider;
+use ms_widgets::{AiButton, AiCaps, AiRequirement, WheelSlider};
 use eframe::egui;
 
 /// Smallest and largest brush radius, in region pixels, the compact panel offers.
@@ -65,6 +65,11 @@ impl RegionEditHost {
     /// The frame lock is tested FIRST and keeps its own wording: it is the older and more
     /// specific rule, and an engine that is merely busy must not restate it.
     ///
+    /// Each engine's button is ALSO gated on the local runtimes it can run on
+    /// ([`AiEngine::ai_requirement`], strict `AiCaps`): an `AiButton` that explains the missing
+    /// runtime on hover (LaMa / SDXL need Torch, FLUX Torch or Stable-Diffusion.cpp). A selected
+    /// engine whose runtime goes away stays selected; its run is refused by the run gate.
+    ///
     /// Not drawn at all for a one-engine catalog ([`engine_picker_shown`]): a row with a single
     /// button that cannot switch to anything is noise. Returns whether anything was drawn, so
     /// the caller separates it from what follows only when it is there.
@@ -87,16 +92,19 @@ impl RegionEditHost {
             None => t!("cleaning.tools.area_editor.engine_locked_hint"),
         };
         let enabled = !locked && switch_blocked.is_none();
+        // One snapshot for every row: whether a disabled button owes the lock's reason or the
+        // `AiButton`'s own runtime reason.
+        let caps = AiCaps::current();
         let mut requested: Option<usize> = None;
         for section in ENGINE_SECTIONS {
             // Captions are resolved here, before the row closure, so the closure borrows only
             // this local list and not `self.engines`.
-            let entries: Vec<(usize, String)> = self
+            let entries: Vec<(usize, String, Option<AiRequirement>)> = self
                 .engines
                 .iter()
                 .enumerate()
                 .filter(|(_, engine)| engine.section() == section)
-                .map(|(idx, engine)| (idx, engine.title()))
+                .map(|(idx, engine)| (idx, engine.title(), engine.ai_requirement()))
                 .collect();
             if entries.is_empty() {
                 continue;
@@ -110,9 +118,18 @@ impl RegionEditHost {
                 // break a long engine name over two LINES instead of moving its button to the
                 // next ROW — the same fix `tab.rs::draw_tool_button_rows` makes.
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                for (idx, title) in entries {
-                    let response = ui.add_enabled(enabled, egui::Button::new(title).selected(idx == self.selected));
-                    if response.on_disabled_hover_text(disabled_hint).clicked() {
+                for (idx, title, requirement) in entries {
+                    let selected = idx == self.selected;
+                    let response = match requirement {
+                        Some(requirement) => {
+                            let drawn = AiButton::new(title, requirement).selected(selected).and_enabled(enabled).draw(ui);
+                            // The `AiButton` names an unmet runtime itself; the lock's reason is
+                            // added only when the runtime is there and the lock alone closes it.
+                            if requirement.satisfied(&caps) { drawn.response.on_disabled_hover_text(disabled_hint) } else { drawn.response }
+                        }
+                        None => ui.add_enabled(enabled, egui::Button::new(title).selected(selected)).on_disabled_hover_text(disabled_hint),
+                    };
+                    if response.clicked() {
                         requested = Some(idx);
                     }
                 }
@@ -378,7 +395,7 @@ impl RegionEditHost {
     /// its chrome row is then unreachable and this panel is the only way to resolve the result.
     pub(super) fn draw_host_actions(&mut self, ui: &mut egui::Ui) {
         let enabled = self.frame.buttons();
-        let block_reason = self.engine().and_then(AiEngine::run_block_reason);
+        let block_reason = self.run_block_reason();
         ui.horizontal_wrapped(|ui| {
             // `interact_size.y` is what actually sets a button's height — a `Button` takes the
             // larger of it and its padded text — so the emphasis is applied there, and the
@@ -399,8 +416,9 @@ impl RegionEditHost {
                     )
                 })
                 .inner;
-            // The engine's own reason is more specific than the generic hint, so it wins when
-            // there is one: "no model selected" beats "paint a mask first".
+            // A refusal (the engine's own reason, else the host's PyTorch rule) is more specific
+            // than the generic hint, so it wins when there is one: "no model selected" beats
+            // "paint a mask first".
             let process = match block_reason.as_ref() {
                 Some(reason) => process.on_disabled_hover_text(reason),
                 None => process.on_hover_text(t!("cleaning.tools.area_editor.process_hint")),

@@ -22,7 +22,12 @@ Main responsibilities:
   still missing, bundle state, running job, engine-picker block) are `../shared/catalog_download.rs`;
 - caption each weight-format row with its size and installed mark, and say what it costs
   (`flux2_weight_format_label`, `flux2_weight_format_hint`);
-- name the first reason a run cannot start (`flux2_run_block_reason`);
+- name the first reason a run cannot start (`flux2_run_block_reason` for PyTorch,
+  `flux2_sdcpp_run_block_reason` for Stable-Diffusion.cpp, `flux2_runtime_run_block_reason`
+  choosing by runtime) and why the runtime switch is closed
+  (`flux2_runtime_switch_block_reason`);
+- say when the sd.cpp bundle needs the separate 4B bf16 single file
+  (`flux2_sdcpp_single_file_hint`);
 - validate a region SIZE against the model's hard limits (`region_block_reason`), the
   check the run gate and the worker share so the two cannot disagree.
 
@@ -33,7 +38,10 @@ Key functions:
 - `flux2_encoder_caption()`, `flux2_guidance_supported()`,
   `flux2_readiness_line()`
 - `flux2_text_attention_block_reason()`
-- `flux2_catalog_bundle()`
+- `flux2_catalog_bundle()` (runtime-aware: the sd.cpp bundle on Stable-Diffusion.cpp),
+  `flux2_sdcpp_single_file_hint()`
+- `flux2_runtime_run_block_reason()`, `flux2_sdcpp_run_block_reason()`,
+  `flux2_runtime_switch_block_reason()`
 - `flux2_weight_format_label()`, `flux2_weight_format_hint()`, `flux2_encoder_format_token()`
 - `flux2_run_block_reason()`, `region_block_reason()`
 
@@ -219,9 +227,12 @@ pub(super) fn flux2_readiness_line(
     }
 }
 
-/// The catalog package (`flux2_klein_package_specs`) the CURRENT selection needs: the base
+/// The catalog package (`flux2_klein_package_specs_for` of the selected runtime) the CURRENT
+/// selection needs. On PyTorch: the base
 /// files, then the transformer spec (the adopt-only legacy one when the probe found that bf16
-/// layout), then the text-encoder spec of the selected source and formats.
+/// layout), then the text-encoder spec of the selected source and formats. On
+/// Stable-Diffusion.cpp: the base files (the VAE), the transformer FILE sd.cpp loads (the BFL
+/// single file for bf16, else the GGUF) and the text-encoder spec.
 ///
 /// Empty unless the weight formats are in effect
 /// ([`Flux2KleinSettings::weight_formats_in_effect`]: download mode, either variant), so
@@ -231,13 +242,79 @@ pub(super) fn flux2_catalog_bundle(settings: &Flux2KleinSettings) -> Vec<&'stati
     if !settings.weight_formats_in_effect() {
         return Vec::new();
     }
-    flux2_klein_package_specs(
+    flux2_klein_package_specs_for(
+        settings.runtime(),
         settings.variant(),
         settings.weight_format(Flux2WeightAxis::Transformer),
         settings.installed_formats.transformer_layout,
         settings.encoder_source(),
         settings.weight_format(Flux2WeightAxis::TextEncoder),
     )
+}
+
+/// Whether «Установка модели» must say that the sd.cpp bundle needs the SEPARATE bf16
+/// single-file checkpoint: sd.cpp, download mode, 4B, bf16 transformer — the PyTorch package of
+/// 4B is a diffusers folder sd.cpp cannot load (9B's bf16 transformer already is the single
+/// file).
+#[must_use]
+pub(super) fn flux2_sdcpp_single_file_hint(settings: &Flux2KleinSettings) -> bool {
+    settings.runtime() == ImageEditRuntime::SdCpp
+        && settings.weight_formats_in_effect()
+        && settings.variant() == Flux2Variant::Klein4B
+        && settings.weight_format(Flux2WeightAxis::Transformer) == Flux2WeightFormat::Bf16
+}
+
+/// The run gate by runtime. PyTorch without Torch: when sd.cpp can run here
+/// (`sdcpp_available` = the shared `sdcpp_route_available`) the refusal is the hint to switch to
+/// it; when it cannot, the engine says nothing and the host's plain «PyTorch required» line
+/// applies (never a hint at a runtime this process cannot use). Otherwise the runtime's own
+/// reason (`pytorch` / `sdcpp`, evaluated only for the selected runtime) decides.
+#[must_use]
+pub(super) fn flux2_runtime_run_block_reason(
+    runtime: ImageEditRuntime,
+    torch_available: bool,
+    sdcpp_available: bool,
+    pytorch: impl FnOnce() -> Option<String>,
+    sdcpp: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    match runtime {
+        ImageEditRuntime::PyTorch if !torch_available => sdcpp_available.then(|| t!("cleaning.tools.sdcpp.torch_missing_hint").to_string()),
+        ImageEditRuntime::PyTorch => pytorch(),
+        ImageEditRuntime::SdCpp => sdcpp(),
+    }
+}
+
+/// Why an sd.cpp run cannot start: a run of this engine still in flight or ending (`busy`), the
+/// runtime's readiness (`SdCppReadiness::run_block_reason`: disabled, not installed, host
+/// requirement, missing device, not checked yet), the model files (`None` = not resolved yet,
+/// else the resolver's refusal), an empty prompt.
+#[must_use]
+pub(super) fn flux2_sdcpp_run_block_reason(busy: bool, readiness: &SdCppReadiness, files: Option<&Result<ms_sdcpp::ModelFiles, Flux2SdcppFilesError>>, prompt: &str) -> Option<String> {
+    if busy {
+        return Some(t!("cleaning.tools.flux2_klein.sdcpp_busy_error").to_string());
+    }
+    if let Some(reason) = readiness.run_block_reason() {
+        return Some(reason);
+    }
+    match files {
+        None => return Some(t!("cleaning.tools.flux2_klein.sdcpp_files_checking_status").to_string()),
+        Some(Err(err)) => return Some(err.message()),
+        Some(Ok(_)) => {}
+    }
+    if prompt.trim().is_empty() {
+        return Some(t!("cleaning.tools.flux2_klein.prompt_required_error").to_string());
+    }
+    None
+}
+
+/// Why the PyTorch / Stable-Diffusion.cpp switch is closed: a catalog job in flight
+/// (`catalog`, the shared `catalog_switch_block_reason`: the bundle follows the runtime, and the
+/// other runtime's block would only show the running job as "another download" with no cancel),
+/// or any operation of either runtime (a run, a prompt-cache build, a component action, a
+/// cancelled run still ending).
+#[must_use]
+pub(super) fn flux2_runtime_switch_block_reason(catalog: Option<String>, pytorch_busy: bool, sdcpp_busy: bool) -> Option<String> {
+    catalog.or_else(|| (pytorch_busy || sdcpp_busy).then(|| t!("cleaning.tools.flux2_klein.runtime_switch_busy_reason").to_string()))
 }
 
 /// The row (and closed-combo) caption of one weight format in «Веса трансформера» /
@@ -419,6 +496,75 @@ pub(super) fn region_block_reason(region: [usize; 2]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::tools::region_edit_v2::geometry::check_size;
+
+    /// The run gate by runtime: PyTorch without Torch names sd.cpp; otherwise each runtime's
+    /// own reason, and only the selected runtime's reason is evaluated.
+    #[test]
+    fn the_run_gate_follows_the_runtime() {
+        let pytorch_reason = || Some("pytorch".to_string());
+        let sdcpp_reason = || Some("sdcpp".to_string());
+        let torch_missing = flux2_runtime_run_block_reason(ImageEditRuntime::PyTorch, false, true, pytorch_reason, || panic!("sd.cpp is not asked on PyTorch"));
+        assert!(torch_missing.is_some_and(|reason| reason != "pytorch"), "Torch missing wins, with the sd.cpp hint");
+        assert_eq!(
+            flux2_runtime_run_block_reason(ImageEditRuntime::PyTorch, false, false, pytorch_reason, || panic!("not asked")),
+            None,
+            "without sd.cpp here no hint: the host's plain Torch line applies"
+        );
+        assert_eq!(flux2_runtime_run_block_reason(ImageEditRuntime::PyTorch, true, true, pytorch_reason, || panic!("not asked")), Some("pytorch".to_string()));
+        assert_eq!(flux2_runtime_run_block_reason(ImageEditRuntime::PyTorch, true, false, || None, || panic!("not asked")), None);
+        assert_eq!(flux2_runtime_run_block_reason(ImageEditRuntime::SdCpp, false, true, || panic!("PyTorch is not asked on sd.cpp"), sdcpp_reason), Some("sdcpp".to_string()), "Torch is irrelevant on sd.cpp");
+        assert_eq!(flux2_runtime_run_block_reason(ImageEditRuntime::SdCpp, false, false, || panic!("not asked"), || None), None);
+    }
+
+    /// The sd.cpp gate: busy, then the readiness, then the files (unresolved or refused), then
+    /// the prompt; ready + files + prompt passes.
+    #[test]
+    fn the_sdcpp_gate_table() {
+        let files = Ok(ms_sdcpp::ModelFiles { family: ms_sdcpp::ModelFamily::Flux2Klein, components: std::collections::BTreeMap::new() });
+        let refused: Result<ms_sdcpp::ModelFiles, Flux2SdcppFilesError> = Err(Flux2SdcppFilesError::DiffusersTransformer);
+        let ready = SdCppReadiness::Ready(None);
+        assert!(flux2_sdcpp_run_block_reason(true, &ready, Some(&files), "p").is_some(), "a cancelled run still ending");
+        assert!(flux2_sdcpp_run_block_reason(false, &SdCppReadiness::NotInstalled, Some(&files), "p").is_some());
+        assert!(flux2_sdcpp_run_block_reason(false, &ready, None, "p").is_some(), "files not resolved yet");
+        assert_eq!(flux2_sdcpp_run_block_reason(false, &ready, Some(&refused), "p"), Some(Flux2SdcppFilesError::DiffusersTransformer.message()));
+        assert!(flux2_sdcpp_run_block_reason(false, &ready, Some(&files), "  ").is_some(), "an empty prompt");
+        assert_eq!(flux2_sdcpp_run_block_reason(false, &ready, Some(&files), "p"), None);
+        assert_eq!(flux2_sdcpp_run_block_reason(false, &SdCppReadiness::ProbeFailed("x".to_string()), Some(&files), "p"), None, "a failed probe does not block");
+    }
+
+    /// The switch is closed while a catalog job runs or either runtime has an operation.
+    #[test]
+    fn the_runtime_switch_closes_while_anything_runs() {
+        assert!(flux2_runtime_switch_block_reason(None, false, false).is_none());
+        assert!(flux2_runtime_switch_block_reason(None, true, false).is_some());
+        assert!(flux2_runtime_switch_block_reason(None, false, true).is_some());
+        assert_eq!(flux2_runtime_switch_block_reason(Some("download".to_string()), false, false), Some("download".to_string()), "a catalog job closes it");
+    }
+
+    /// The bundle follows the runtime (sd.cpp: base + the transformer FILE + the encoder), and
+    /// the 4B bf16 single-file hint shows exactly on sd.cpp, download mode, 4B, bf16.
+    #[test]
+    fn the_bundle_and_the_single_file_hint_follow_the_runtime() {
+        let download_4b = Flux2KleinSettings {
+            variant: Flux2Variant::Klein4B.wire().to_string(),
+            source_mode: Flux2SourceMode::Download.wire().to_string(),
+            ..Flux2KleinSettings::default()
+        };
+        let mut sdcpp = download_4b.clone();
+        sdcpp.set_runtime(ImageEditRuntime::SdCpp);
+        let ids = |settings: &Flux2KleinSettings| flux2_catalog_bundle(settings).iter().map(|spec| spec.id).collect::<Vec<_>>();
+        let expected_sdcpp = flux2_klein_package_specs_for(ImageEditRuntime::SdCpp, Flux2Variant::Klein4B, Flux2WeightFormat::Bf16, Flux2TransformerLayout::default(), Flux2EncoderSource::Stock, Flux2WeightFormat::Bf16).iter().map(|spec| spec.id).collect::<Vec<_>>();
+        assert_eq!(ids(&sdcpp), expected_sdcpp);
+        assert_ne!(ids(&sdcpp), ids(&download_4b), "4B bf16 needs another transformer file on sd.cpp");
+        assert!(flux2_sdcpp_single_file_hint(&sdcpp));
+        assert!(!flux2_sdcpp_single_file_hint(&download_4b), "not on PyTorch");
+        let mut gguf = sdcpp.clone();
+        gguf.transformer_format = Flux2WeightFormat::Q4KM.wire().to_string();
+        assert!(!flux2_sdcpp_single_file_hint(&gguf));
+        let mut nine = sdcpp.clone();
+        nine.variant = Flux2Variant::Klein9B.wire().to_string();
+        assert!(!flux2_sdcpp_single_file_hint(&nine), "9B's bf16 transformer is already the single file");
+    }
 
     /// The run option is open exactly while a mask is painted, and a closed one always
     /// says why.

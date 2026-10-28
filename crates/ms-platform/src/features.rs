@@ -32,6 +32,8 @@ const ANDROID: bool = cfg!(target_os = "android");
 const WINDOWS: bool = cfg!(target_os = "windows");
 /// `true` on macOS.
 const MACOS: bool = cfg!(target_os = "macos");
+/// The target CPU is `x86_64` (the only architecture the pinned sd.cpp packages exist for).
+const X86_64: bool = cfg!(target_arch = "x86_64");
 
 /// A capability that differs between platforms. [`PlatformFeature::is_available`] is the single
 /// owner of the per-platform answer; callers never re-derive it from `cfg` themselves.
@@ -52,6 +54,10 @@ pub enum PlatformFeature {
     /// a pinned release package and loads at runtime. Packages exist for Linux and Windows
     /// only; macOS has none, so it is unavailable there as well as on Android and wasm.
     Waifu2xUpscaler,
+    /// The Stable-Diffusion.cpp runtime: official prebuilt Vulkan / CPU packages the app
+    /// downloads and runs in a separate worker process. Packages are used for Linux and Windows
+    /// only, so it is unavailable on macOS as well as on Android and wasm.
+    SdCppRuntime,
     /// The OS credential store for AI API keys and the Hugging Face token (desktop keyring;
     /// on Android the Keystore-backed `credentials` store).
     CredentialStore,
@@ -88,13 +94,14 @@ pub enum PlatformFeature {
 
 impl PlatformFeature {
     /// Every feature, in declaration order (tests and diagnostics iterate it).
-    pub const ALL: [PlatformFeature; 18] = [
+    pub const ALL: [PlatformFeature; 19] = [
         PlatformFeature::PythonBackend,
         PlatformFeature::InstalledCopyManagement,
         PlatformFeature::NativeOnnxRuntime,
         PlatformFeature::ScreenCapture,
         PlatformFeature::ExternalArchiveTools,
         PlatformFeature::Waifu2xUpscaler,
+        PlatformFeature::SdCppRuntime,
         PlatformFeature::CredentialStore,
         PlatformFeature::FilePicker,
         PlatformFeature::PersistentDirectoryPicker,
@@ -129,6 +136,9 @@ impl PlatformFeature {
             PlatformFeature::CanvasTouchGestures => (DESKTOP && !WINDOWS) || ANDROID,
             // The pinned waifu2x release ships `Lin.zip` and `Win.zip` only (no macOS build).
             PlatformFeature::Waifu2xUpscaler => DESKTOP && !MACOS,
+            // The app pins only the x86_64 Linux and Windows Vulkan / CPU sd.cpp packages
+            // (`ms_sdcpp::catalog`); another architecture has nothing to install.
+            PlatformFeature::SdCppRuntime => DESKTOP && !MACOS && X86_64,
             PlatformFeature::PythonBackend
             | PlatformFeature::InstalledCopyManagement
             | PlatformFeature::ScreenCapture
@@ -167,6 +177,7 @@ impl PlatformFeature {
             | PlatformFeature::ScreenCapture
             | PlatformFeature::ExternalArchiveTools
             | PlatformFeature::Waifu2xUpscaler
+            | PlatformFeature::SdCppRuntime
             | PlatformFeature::CredentialStore
             | PlatformFeature::FilePicker
             | PlatformFeature::PersistentDirectoryPicker
@@ -191,6 +202,7 @@ impl PlatformFeature {
             PlatformFeature::ScreenCapture => "platform.unavailable.screen_capture_error",
             PlatformFeature::ExternalArchiveTools => "platform.unavailable.external_archive_tools_error",
             PlatformFeature::Waifu2xUpscaler => "platform.unavailable.waifu2x_upscaler_error",
+            PlatformFeature::SdCppRuntime => "platform.unavailable.sdcpp_runtime_error",
             PlatformFeature::CredentialStore => "platform.unavailable.credential_store_error",
             PlatformFeature::FilePicker => "platform.unavailable.file_picker_error",
             PlatformFeature::PersistentDirectoryPicker => "platform.unavailable.persistent_directory_picker_error",
@@ -321,15 +333,14 @@ mod tests {
     }
 
     #[test]
-    fn waifu2x_upscaler_table() {
-        // Pinned packages exist for Linux and Windows only.
-        let expected = cfg!(any(target_os = "linux", target_os = "windows"));
-        assert_eq!(PlatformFeature::Waifu2xUpscaler.is_available(), expected);
-        if !expected {
-            assert_eq!(
-                PlatformFeature::Waifu2xUpscaler.require(),
-                Err(Unavailable::new(PlatformFeature::Waifu2xUpscaler, UnavailableReason::NotOnThisPlatform))
-            );
+    fn waifu2x_upscaler_and_sdcpp_runtime_tables() {
+        // Pinned / used packages exist for Linux and Windows only; sd.cpp's only for x86_64.
+        let linux_or_windows = cfg!(any(target_os = "linux", target_os = "windows"));
+        for (feature, expected) in [(PlatformFeature::Waifu2xUpscaler, linux_or_windows), (PlatformFeature::SdCppRuntime, linux_or_windows && cfg!(target_arch = "x86_64"))] {
+            assert_eq!(feature.is_available(), expected, "{feature:?}");
+            if !expected {
+                assert_eq!(feature.require(), Err(Unavailable::new(feature, UnavailableReason::NotOnThisPlatform)));
+            }
         }
     }
 

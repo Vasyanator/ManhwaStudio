@@ -32,7 +32,7 @@ impl CleaningTool for WatermarkRemovalTool {
         t!("cleaning.tools.watermark.title")
     }
 
-    /// Always `false`: the Torch requirement of this tool lives INSIDE it.
+    /// Always `None`: the Torch requirement of this tool lives INSIDE it.
     ///
     /// Only the two network modes need Torch, and «По главе (точное вычитание)» needs neither
     /// backend nor Torch nor weights — so the picker BUTTON must never be AI-gated. Following
@@ -42,8 +42,8 @@ impl CleaningTool for WatermarkRemovalTool {
     /// force-deselected the tool. The gate is therefore drawn where it belongs: the two
     /// network entries of the mode picker and the run button (`draw_mode_picker`,
     /// `draw_actions`), both explaining themselves on hover.
-    fn pytorch_required(&self) -> bool {
-        false
+    fn ai_requirement(&self) -> Option<ms_widgets::AiRequirement> {
+        None
     }
 
     fn deactivate(&mut self, _canvas: &mut CanvasView) {

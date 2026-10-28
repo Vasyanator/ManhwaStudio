@@ -91,6 +91,12 @@ ms-window-geometry = { path = "../ms-window-geometry" }
 # The OS-record probe behind the System registration warnings (`settings_warnings`
 # checks): `CopyIdentity`, `report::probe`, `badge_worthy`. No OS records exist on the web.
 ms-os-integration = { path = "../ms-os-integration" }
+# The Stable-Diffusion.cpp runtime behind the AI pane's «Stable-Diffusion.cpp» tab: its build
+# catalog, install / remove, requirement problems and the process-global status. Native-only
+# like the crate itself (its `lib.rs` is empty on wasm).
+ms-sdcpp = { path = "../ms-sdcpp" }
+# `PackageProgress` / `PackageStage`: the progress the sd.cpp install reports to the tab.
+ms-native-package = { path = "../ms-native-package" }
 
 [dev-dependencies]
 # Isolated user-config files for the persistence tests (tutorial progress).

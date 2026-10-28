@@ -11,7 +11,9 @@ Main responsibilities:
 - close the `guidance_scale` control, with the reason stated in the open, on a checkpoint
   the backend reports as distilled;
 - close the fp8-encoder switch, showing its effective value (off) and the reason, while a
-  GGUF text encoder format is in effect (D8; the stored choice is kept).
+  GGUF text encoder format is in effect (D8; the stored choice is kept);
+- on Stable-Diffusion.cpp draw only the steps, the seed and the mask growth (guidance is fixed
+  at 1.0 there; precision, tiling and fp8 are the Python backend's).
 
 Key functions:
 - `draw_advanced_section()`
@@ -56,6 +58,10 @@ pub(super) fn draw_advanced_section(
         t!("cleaning.tools.flux2_klein.advanced_heading"),
         false,
         |ui| {
+            // On Stable-Diffusion.cpp only the steps, the seed and the mask growth exist: the
+            // guidance is fixed at 1.0 there and the precision / tiling / fp8 switches are the
+            // Python backend's (sd.cpp's own are in its section).
+            let pytorch = settings.runtime() == ImageEditRuntime::PyTorch;
             *changed |= ui
                 .add(
                     WheelSlider::new(&mut settings.steps, FLUX2_STEPS_MIN..=FLUX2_STEPS_MAX)
@@ -75,22 +81,24 @@ pub(super) fn draw_advanced_section(
             //   `WheelSlider` ignores the wheel and reports no change
             //   (`ms_widgets::wheel_slider`, `apply_hovered_wheel_delta`;
             //   `egui-docs/04-widgets.md`).
-            let guidance = ui
-                .add_enabled(
-                    guidance_supported,
-                    WheelSlider::new(&mut settings.guidance_scale, FLUX2_GUIDANCE_MIN..=FLUX2_GUIDANCE_MAX)
-                        .text(t!("cleaning.tools.flux2_klein.guidance_label")),
-                )
-                .on_hover_text(t!("cleaning.tools.flux2_klein.guidance_hint"))
-                .on_disabled_hover_text(t!(
-                    "cleaning.tools.flux2_klein.guidance_unsupported_disabled_tooltip"
-                ));
-            *changed |= guidance.changed();
-            // The tooltip alone is not enough: a control that is grey for a reason nobody
-            // can read off it reaches the developer as a bug report, so the reason is also
-            // stated in the open, under the control it disables.
-            if !guidance_supported {
-                ui.small(t!("cleaning.tools.flux2_klein.guidance_unsupported_note"));
+            if pytorch {
+                let guidance = ui
+                    .add_enabled(
+                        guidance_supported,
+                        WheelSlider::new(&mut settings.guidance_scale, FLUX2_GUIDANCE_MIN..=FLUX2_GUIDANCE_MAX)
+                            .text(t!("cleaning.tools.flux2_klein.guidance_label")),
+                    )
+                    .on_hover_text(t!("cleaning.tools.flux2_klein.guidance_hint"))
+                    .on_disabled_hover_text(t!(
+                        "cleaning.tools.flux2_klein.guidance_unsupported_disabled_tooltip"
+                    ));
+                *changed |= guidance.changed();
+                // The tooltip alone is not enough: a control that is grey for a reason nobody
+                // can read off it reaches the developer as a bug report, so the reason is also
+                // stated in the open, under the control it disables.
+                if !guidance_supported {
+                    ui.small(t!("cleaning.tools.flux2_klein.guidance_unsupported_note"));
+                }
             }
             ui.horizontal(|ui| {
                 *changed |= ui
@@ -119,6 +127,9 @@ pub(super) fn draw_advanced_section(
                 )
                 .on_hover_text(t!("cleaning.tools.flux2_klein.mask_expand_hint"))
                 .changed();
+            if !pytorch {
+                return;
+            }
 
             ui.separator();
             ui.horizontal(|ui| {

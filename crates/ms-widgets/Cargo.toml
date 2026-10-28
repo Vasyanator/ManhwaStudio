@@ -39,7 +39,7 @@ ms-atomic-file = { path = "../ms-atomic-file" }
 # (`ms_text_util::language`); `hangul_keyboard.rs` uses `ms_text_util::hangul`.
 ms-text-util = { path = "../ms-text-util" }
 # `AiButton` gates itself on the process-global capability signals
-# (`ms_sysprobe::ai_backend_capabilities`: backend / torch / onnxruntime).
+# (`ms_sysprobe::ai_backend_capabilities`: backend / torch / onnxruntime / the sd.cpp route).
 ms-sysprobe = { path = "../ms-sysprobe" }
 # `HelpHint` streams its animated WebP hints from the bundled asset crate.
 ms-gifs = { path = "../ms-gifs" }
@@ -73,6 +73,12 @@ ttf-parser = { workspace = true, default-features = true }
 # capped backoff, `Range` resume, timeouts, size cap). Native-only: there is no synchronous
 # HTTP client on wasm, where the download path returns an error.
 ms-download = { path = "../ms-download" }
+
+# `AiButton`'s sd.cpp capability (`AiRequirement::Sdcpp` / `TorchOrSdcpp`): the process-global
+# "is sd.cpp installed and ready" answer (`ms_sdcpp::ready`). The SAME gate the binary links
+# the runtime under: on wasm and Android the capability is a fixed `Some(false)`.
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
+ms-sdcpp = { path = "../ms-sdcpp" }
 
 [dev-dependencies]
 # Same crate as in `[dependencies]`, re-declared only to switch on `test-support`

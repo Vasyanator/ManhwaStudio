@@ -8,8 +8,9 @@ sequence below in this exact order. Every `eframe::NativeOptions` built under th
 
 Main flow (`run_native`): parse -> `mode::decide` (the ONE run-mode decision, pure and
 table-tested) -> match on the `RunMode`:
-- Usage error (`service_flags.rs`) and the elevated system-registration helper exit before any
-  other side effect; a self-update refused for lack of `InstalledCopyManagement` only reports and
+- Usage error (`service_flags.rs`), the elevated system-registration helper and the
+  Stable-Diffusion.cpp worker process (`--sdcpp-worker`, `ms_sdcpp::worker`; no session log)
+  exit before any other side effect; a self-update refused for lack of `InstalledCopyManagement` only reports and
   returns. Their localized report runs the storage-mode probe first (the process's first document
   access, `services::init_full` rule (a)), then reads `user_config` for the UI language.
 - Every other mode first runs `init_minimal` (startup workers from `os_integration.rs`: the stale
@@ -103,7 +104,9 @@ pub(crate) fn run_native() -> anyhow::Result<()> {
     // before the log init; a clap usage error exits there without touching the logs. The skip
     // is keyed on the flag itself, so a usage error that includes the helper flag also runs
     // without the file log.
-    if cli.system_registration_apply.is_none() {
+    // The sd.cpp worker (`--sdcpp-worker`) skips it for the same reason: it runs next to the
+    // app that started it, and its diagnostics reach the app's log through its stderr.
+    if cli.system_registration_apply.is_none() && !cli.sdcpp_worker {
         init_startup_logging_best_effort();
     }
     match decide(&cli, PlatformFacts::current()) {
@@ -116,6 +119,15 @@ pub(crate) fn run_native() -> anyhow::Result<()> {
         // effect (scratch sweep, desktop entry, backend socket): an elevated process must do
         // nothing else.
         RunMode::Service(ServiceMode::RegistrationHelper) => std::process::exit(run_system_registration_helper(&cli)),
+        // The Stable-Diffusion.cpp worker: a child process of the app that loads the sd.cpp
+        // library (so a library abort never takes the editor down) and serves frames on its
+        // stdin / stdout. Like the helper it runs before every other startup side effect.
+        #[cfg(not(target_os = "android"))]
+        RunMode::Service(ServiceMode::SdCppWorker) => std::process::exit(ms_sdcpp::worker::run_worker_main()),
+        // Android builds do not link `ms-sdcpp` (no sd.cpp runtime there); nothing starts a
+        // worker on Android, so the flag is a broken contract, reported instead of panicking.
+        #[cfg(target_os = "android")]
+        RunMode::Service(ServiceMode::SdCppWorker) => anyhow::bail!("the Stable-Diffusion.cpp worker is not available on Android"),
         #[cfg(target_os = "windows")]
         RunMode::Service(ServiceMode::WindowsStartMenuShortcut { install_dir, continuation }) => {
             init_minimal(&cli);

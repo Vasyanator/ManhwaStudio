@@ -32,6 +32,9 @@ Main items:
   FLUX.3 klein weight formats (native bf16 / fp8r / nvfp4 + GGUF DiT quants; bf16 + GGUF
   encoder quants), the prompt-library id `FLUX3_PROMPT_LIBRARY_ID` and the prompt cache's
   precision order (`flux3_prompt_cache_precision_order` / `_rank`).
+- `sdcpp_choice` (module): the Stable-Diffusion.cpp runtime choice (`General.sdcpp_build` /
+  `sdcpp_device` / `sdcpp_threads`: `SdCppChoice`, its logging reader and one saver per key) and
+  `ImageEditRuntime` (PyTorch / sd.cpp, frozen wire ids) that keys `Flux3DitFormat::offered_on`.
 - `Flux2Variant`: which FLUX.2 klein checkpoint an «ИИ-редактор области» engine works with
   (9B / 4B). It keys the package directory (`flux2_klein_dir`, `flux2_klein_vae_dir`; every
   weight path inside it is the model catalog's `flux2_klein_weights_path`), the engine's
@@ -184,6 +187,16 @@ pub use flux2_weight_format::{Flux2EncoderSource, Flux2WeightAxis, Flux2WeightFo
 // FLUX.2 list: the engine settings and the pinned catalog in `ms-sysprobe` need the one list.
 pub mod flux3_weight_format;
 pub use flux3_weight_format::{FLUX3_PROMPT_LIBRARY_ID, Flux3DitFormat, Flux3EncoderFormat, flux3_prompt_cache_precision_order, flux3_prompt_cache_precision_rank};
+
+// The Stable-Diffusion.cpp runtime choice (`General.sdcpp_build` / `sdcpp_device` /
+// `sdcpp_threads`) and the image-edit runtime vocabulary (`ImageEditRuntime`). Here because the
+// keys are `user_config` values with a place in the default tree, and the runtime vocabulary keys
+// the weight-format offer above (`Flux3DitFormat::offered_on`).
+pub mod sdcpp_choice;
+pub use sdcpp_choice::{
+    GENERAL_SDCPP_BUILD_KEY, GENERAL_SDCPP_DEVICE_KEY, GENERAL_SDCPP_THREADS_KEY, ImageEditRuntime, SdCppChoice, SdCppDeviceChoice, save_sdcpp_build, save_sdcpp_device, save_sdcpp_threads,
+    sdcpp_choice_from_user_settings,
+};
 
 use crate::bubble_status::default_bubble_status_rules_value;
 use anyhow::{Context, Result};
@@ -1526,6 +1539,10 @@ pub fn user_config_defaults() -> Value {
             "ai_onnx_device_id": "not-selected",
             "ai_onnx_build": "not-selected",
             "ai_max_loaded_models": 3,
+            // `sdcpp_build` is NOT here: absent = the sd.cpp catalog's default build
+            // (`sdcpp_choice`).
+            "sdcpp_device": "auto",
+            "sdcpp_threads": 0,
             // The large-model caps are NOT here: see `GENERAL_LARGE_MODELS_VRAM_CAP_BYTES_KEY`.
             "large_models_oom_score_adj": true,
             "ai_install_type": AiInstallType::None.as_str(),

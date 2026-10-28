@@ -29,7 +29,9 @@ Main responsibilities:
   worker probe `probe_flux2_installed_formats`);
 - read the settings file, moving a damaged one aside instead of ever overwriting it
   (`load_flux2_settings_from`, over the shared `read_settings_file`), and write it back
-  (`save_flux2_settings`, over the shared `write_settings_json`).
+  (`save_flux2_settings`, over the shared `write_settings_json`);
+- persist the runtime switch (`runtime`: PyTorch / Stable-Diffusion.cpp, absent = PyTorch) and
+  the engine's sd.cpp options (`sdcpp`: the shared `SdCppRunOptions`, never sent to the backend).
 
 There is ONE FILE PER VARIANT and the document records which one it is: 9B keeps
 `flux2_klein_settings.json` byte-for-byte, 4B gets its own name, `load_flux2_settings`
@@ -45,7 +47,7 @@ Key functions:
 - `load_flux2_settings()`, `load_flux2_settings_from()`, `save_flux2_settings()`,
   `settings_from_json()`, `legacy_memory_steps()`
 - `Flux2KleinSettings::{encoder_source, set_encoder_source, weight_format, format_candidates,
-  effective_paths, normalized}`,
+  effective_paths, normalized, runtime, set_runtime}`,
   `probe_flux2_installed_formats()` (worker only)
 - `normalize_source_lang()`, `source_lang_title()`
 
@@ -299,7 +301,7 @@ fn flux2_component_spec(
         .into_iter()
         .find(|spec| match flux2_klein_spec_role(spec.id) {
             Some(Flux2SpecRole::Weights { axis: role_axis, format: role_format, .. }) => role_axis == axis && role_format == format,
-            Some(Flux2SpecRole::LegacyTransformer { .. }) => axis == Flux2WeightAxis::Transformer,
+            Some(Flux2SpecRole::LegacyTransformer { .. } | Flux2SpecRole::SingleFileTransformer { .. }) => axis == Flux2WeightAxis::Transformer,
             Some(Flux2SpecRole::Base { .. } | Flux2SpecRole::TextEncoderConfig { .. }) | None => false,
         })
 }
@@ -469,6 +471,15 @@ pub(super) struct Flux2KleinSettings {
     /// `true`, also for a file written before the field existed (the struct-level
     /// `#[serde(default)]`).
     pub(super) text_attention_in_mask: bool,
+    /// The local runtime a run uses: `ImageEditRuntime::wire()` (`pytorch` / `sdcpp`), the
+    /// switch at the top of the panel. A file without the field (every file written before
+    /// Stable-Diffusion.cpp existed) and an unknown id read as PyTorch ([`Self::runtime`]).
+    /// An unknown id (a newer build's runtime) is rewritten as `pytorch` by the next save
+    /// (`normalized`): the file stays loadable, the other build's choice is not kept.
+    pub(super) runtime: String,
+    /// The Stable-Diffusion.cpp options of this engine («Stable-Diffusion.cpp» section): the
+    /// shared `SdCppRunOptions`, nested under its own key; absent reads as its defaults.
+    pub(super) sdcpp: SdCppRunOptions,
 }
 
 impl Default for Flux2KleinSettings {
@@ -524,6 +535,10 @@ impl Default for Flux2KleinSettings {
             // On: a prompt that may also act outside the mask can edit a matching object
             // the user never selected, and painting a mask says "only here".
             text_attention_in_mask: true,
+            // PyTorch: the only runtime that existed before, so nothing changes for a user who
+            // never touches the switch.
+            runtime: ImageEditRuntime::PyTorch.wire().to_string(),
+            sdcpp: SdCppRunOptions::default(),
         }
     }
 }
@@ -596,7 +611,22 @@ impl Flux2KleinSettings {
             mask_dilate_px: self.mask_dilate_px.min(FLUX2_DILATE_MAX),
             postprocess: self.postprocess.normalized(),
             text_attention_in_mask: self.text_attention_in_mask,
+            runtime: self.runtime().wire().to_string(),
+            sdcpp: self.sdcpp.normalized(),
         }
+    }
+
+    /// The runtime a run uses; an absent or unknown persisted id reads as PyTorch.
+    #[must_use]
+    pub(super) fn runtime(&self) -> ImageEditRuntime {
+        ImageEditRuntime::from_wire(&self.runtime).unwrap_or_default()
+    }
+
+    /// Stores `runtime`; returns `true` when it changed (a save is owed).
+    pub(super) fn set_runtime(&mut self, runtime: ImageEditRuntime) -> bool {
+        let changed = self.runtime() != runtime || self.runtime != runtime.wire();
+        self.runtime = runtime.wire().to_string();
+        changed
     }
 
     /// The memory step pair, an unknown persisted id reading as «Авто».
@@ -1067,6 +1097,27 @@ mod tests {
         assert_eq!(partial.steps, 4);
         assert_eq!(partial.vram_step, "auto");
         assert_eq!(partial.ram_step, "auto");
+    }
+
+    /// The runtime switch: a file without the field (every file older than sd.cpp) and an
+    /// unknown id read as PyTorch; the sd.cpp options nest under `sdcpp` and default sensibly;
+    /// neither ever reaches the backend's `params`.
+    #[test]
+    fn the_runtime_defaults_to_pytorch_and_never_travels() {
+        assert_eq!(loaded_settings(&json!({})).runtime(), ImageEditRuntime::PyTorch);
+        assert_eq!(loaded_settings(&json!({ "runtime": "quantum" })).runtime(), ImageEditRuntime::PyTorch);
+        let sdcpp = loaded_settings(&json!({ "runtime": "sdcpp", "sdcpp": { "vae_tiling": true } }));
+        assert_eq!(sdcpp.runtime(), ImageEditRuntime::SdCpp);
+        assert!(sdcpp.sdcpp.vae_tiling);
+        assert!(sdcpp.sdcpp.text_encoder_on_cpu, "an absent sd.cpp field keeps its default");
+        assert_eq!(sdcpp.normalized().runtime, "sdcpp");
+        let mut settings = Flux2KleinSettings::default();
+        assert!(settings.set_runtime(ImageEditRuntime::SdCpp));
+        assert!(!settings.set_runtime(ImageEditRuntime::SdCpp), "an unchanged runtime owes no save");
+        let params = settings.normalized().to_params(false);
+        assert!(params.get("runtime").is_none() && params.get("sdcpp").is_none(), "{params}");
+        let saved = serde_json::to_value(&settings).expect("serializable");
+        assert_eq!(saved["runtime"], json!("sdcpp"));
     }
 
     #[test]
@@ -1700,13 +1751,13 @@ mod tests {
         // the encoder placement, the two local colour-match values with the local match, the
         // two weight formats with the GGUF quants (the encoder source stays the historic
         // `uncensored_text_encoder` bool, no new key), the «Нет» stash with the shared prompt
-        // library; a
+        // library, the runtime switch and the sd.cpp options with Stable-Diffusion.cpp; a
         // document without any of them still loads (`#[serde(default)]`). The runtime
         // `installed_formats` is never written (`serde(skip)`).
         assert_eq!(
             added,
-            ["color_match_local_pct", "color_match_scale_px", "encoder_on_cpu", "ram_step", "text_attention_in_mask", "text_encoder_format", "transformer_format", "uncached_prompt", "variant", "vram_step"],
-            "only the variant, the run option, the two step axes, the encoder placement, the local colour match, the two weight formats and the «Нет» stash were added"
+            ["color_match_local_pct", "color_match_scale_px", "encoder_on_cpu", "ram_step", "runtime", "sdcpp", "text_attention_in_mask", "text_encoder_format", "transformer_format", "uncached_prompt", "variant", "vram_step"],
+            "only the variant, the run option, the two step axes, the encoder placement, the local colour match, the two weight formats, the «Нет» stash, the runtime and the sd.cpp options were added"
         );
         for retired in ["placement", "low_cpu_mem_usage", "vae_slicing", "unload_transformer_before_vae", "unload_text_encoder_after_encode"] {
             assert!(!object.contains_key(retired), "the retired `{retired}` must not be written back");

@@ -9,8 +9,8 @@ client of the backend's large-model pool (`large_models`).
 ## Architecture
 Consumers: the Translation tab (OCR / text-detector routing, health gating), the Cleaning tab
 (offline message, health snapshot), `ms-settings-ui` (AI backend pane, supervisor, settings
-warnings), the launcher's reline flow and the root (`LocalAiAvailability::for_process` in
-`src/startup/services.rs`, the device prompt). None of them needs a tab crate for these facts.
+warnings), the launcher's reline flow and the root (`LocalAiAvailability::for_process` +
+`install_process` in `src/startup/services.rs`, the device prompt). None of them needs a tab crate for these facts.
 
 Consumers of `large_models`: the Cleaning tab's large-model engines (FLUX.2 klein) and the AI
 backend settings pane's «Большие модели» section.
@@ -42,12 +42,14 @@ ms-native-runtime` line (`ARCHITECTURE.md` §2).
   when absent or `null`, and are parsed strictly when present. A forecast's optional
   `host_baseline` (the baseline RSS its `host_peak` includes) reads as `None` when absent; it
   lets a consumer add two forecasts' host peaks without counting the process twice.
-- `local_ai.rs`: `LocalAiAvailability` (may this process use the Python backend / native ONNX:
-  `--no-ai` switches both off, the platform capability table decides independently, a platform
-  reason wins; built once at startup), `LocalAiOff` / `LocalRuntime` / `LocalAiOffReason` (typed
-  reason + localized `user_message`), `AiRouteKind` and its `availability` (the ONE
-  route-availability rule: cloud always, native needs native ONNX allowed, backend needs the
-  backend allowed), and `effective_ai_runtime` (the router's runtime: a stored `Backend` reads as
+- `local_ai.rs`: `LocalAiAvailability` (may this process use the Python backend / native ONNX /
+  the Stable-Diffusion.cpp worker: `--no-ai` switches all three off, the platform capability
+  table decides independently, a platform reason wins; built once at startup), the process-global
+  copy of it (`install_process`, set once by the root's `init_full`, a second install is logged
+  and ignored; `process()` reads it, `for_process(false)` before or without an install),
+  `LocalAiOff` / `LocalRuntime` / `LocalAiOffReason` (typed reason + localized `user_message`),
+  `AiRouteKind` and its `availability` (the ONE route-availability rule: cloud always, native
+  needs native ONNX allowed, backend needs the backend allowed, sd.cpp needs sd.cpp allowed), and `effective_ai_runtime` (the router's runtime: a stored `Backend` reads as
   `Native` without `PlatformFeature::PythonBackend`).
 - `backend_health.rs`: push-driven backend health via `TOPIC_HEALTH` v2 events (with a one-shot
   `health` pull as the startup/liveness fallback, `check_ai_backend_health`), plus `device`
@@ -74,7 +76,7 @@ ms-native-runtime` line (`ARCHITECTURE.md` §2).
   `runtime/large_models/tiers.py`'s and are never re-derived here. The pool caps have one
   writer, the backend (`limits.set` -> `runtime/device_service.py`); no Rust code writes
   `General.large_models_*_cap_bytes`.
-- `--no-ai` switches off every LOCAL runtime (backend AND native ONNX); cloud AI API and plain
+- `--no-ai` switches off every LOCAL runtime (backend, native ONNX AND sd.cpp); cloud AI API and plain
   machine translators are never gated by it. A platform reason wins over the flag.
 - Every route-availability decision goes through `AiRouteKind::availability`; routers read the
   runtime through `effective_ai_runtime`, never `AiRuntime::from_user_settings` directly.

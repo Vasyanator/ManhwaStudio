@@ -16,7 +16,7 @@ Key functions:
 
 Notes:
 Pure functions over in-memory data (no I/O, no egui); cheap enough for every frame. Colours and
-layout stay with the caller (`ai_backend_panel::draw_torch_build_lines`).
+layout stay with the caller (`ai_backend_panel::backend_process::draw_torch_build_lines`).
 */
 
 use ms_config::torch_choice::TorchFlavour;

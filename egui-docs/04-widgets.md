@@ -84,7 +84,7 @@ Public surface is `crates/ms-widgets/src/lib.rs:43-72`; the module contract is
 | `ArmedDeleteButton` (+ `ArmedDeleteStep`, `armed_delete_step`) | `crates/ms-widgets/src/armed_delete_button.rs:57` | The two-click delete button: the first plain click arms it (confirm caption, `ms_theme::status::DESTRUCTIVE_ARMED_FILL`), the next plain click confirms, a double click never confirms, an armed button the pointer leaves disarms; `idle_fill` optional, `enabled(false)` is never armed. Stateless: `show(ui, armed)` returns the response and the step; the caller owns what is armed. Use it for every inline destructive confirm. Call sites: `PresetPicker`'s «Delete», Settings › Тайп font groups (`src/tabs/settings/typesetting/font_groups.rs`) and custom fonts (`hybrid_fonts.rs`). |
 | `EditableComboBox` | `crates/ms-widgets/src/editable_combo_box.rs:38` | Combo box whose value can also be typed freely. Stateful; takes an explicit id source in `new`. |
 | `HfAccessHint` (+ `hf_repo_url`, `HF_JOIN_URL`, `HF_TOKEN_SETTINGS_URL`) | `crates/ms-widgets/src/hf_access_hint.rs:59` | Small underlined "How do I get access?" caption whose hover tooltip walks the user into a GATED Hugging Face model in four steps (account, licence on each `repo(name, id)` page, a Read token, paste it and press the caller-named save button), each page a clickable link. The links make the tooltip interactable, so it stays open while the pointer moves into it (`egui-0.36.2/src/containers/tooltip.rs:135`, `:274-291`). Owns the Hugging Face page URLs. Call site: the large-model engines' token row (`ms-tab-cleaning` `engines/shared/hf_download_ui.rs`). |
-| `AiButton` | `crates/ms-widgets/src/ai_button.rs:31-96` | Button for an AI tool that gates itself on runtime capabilities (§3). |
+| `AiButton` | `crates/ms-widgets/src/ai_button.rs:175-186` | Button for an AI tool that gates itself on runtime capabilities (§3). |
 | `ViewportColorSelector` | `crates/ms-widgets/src/viewport_color_selector.rs:28` | Color swatch + eyedropper that samples a viewport pixel through egui screenshot events. Stateful, owns a screenshot token. |
 | `paint_marquee_galley` | `crates/ms-widgets/src/marquee.rs` | Paint-only label helper: a single-line galley clipped to a rect; when it overflows it scrolls like a web marquee (rest, scroll, rest, jump back) and repaints only while overflowing and visible. Use for a fixed-width custom-painted button whose label may not fit (launcher settings sidebar). |
 | `MarkedScrollArea` | `crates/ms-widgets/src/marked_scroll/` | Vertical scroll area with marks painted on the bar and a gutter of items left of it (§4). |
@@ -116,13 +116,18 @@ exists**; the unsmoothed per-notch delta is recovered by summing `Event::MouseWh
 
 ## 3. `ai_button.rs` — self-gating AI button
 
-Three process-global capability signals live in `src/ai_backend_capabilities.rs:55-58`
-(`AtomicU8`, tri-state unknown/yes/no): backend, torch, onnxruntime.
+The process-global capability signals live in `crates/ms-sysprobe/src/ai_backend_capabilities.rs:66-71`
+(`AtomicU8`, tri-state unknown/yes/no): backend, torch, onnxruntime (two slots), and the
+sd.cpp ROUTE (`--no-ai` + platform), plus the "backend starting" flag (`AtomicBool`). sd.cpp
+readiness itself is `ms_sdcpp::ready()`.
 
-- `AiRequirement` (`crates/ms-widgets/src/ai_button.rs:31`): `Backend | Torch | Onnx | TorchOrOnnx`.
-- `AiCaps::current()` (`:96-100`) snapshots the three globals.
-- `AiRequirement::is_met(caps, unknown_ok)` (`:52`) is the pure, unit-testable gate;
-  `satisfied` (`:43`) is the strict alias (`unknown_ok = false`).
+- `AiRequirement` (`crates/ms-widgets/src/ai_button.rs:35`): `Backend | Torch | Onnx | TorchOrOnnx
+  | Sdcpp | TorchOrSdcpp`.
+- `AiCaps::current()` (`:115`) snapshots the signals; its `sdcpp` is the route slot combined
+  with `ms_sdcpp::ready()` (`combine_sdcpp`), a fixed `Some(false)` on wasm / Android;
+  `backend_starting` is the supervisor's "a start is underway" flag (no requirement reads it).
+- `AiRequirement::is_met(caps, unknown_ok)` (`:60`) is the pure, unit-testable gate;
+  `satisfied` (`:51`) is the strict alias (`unknown_ok = false`).
 
 **Rule:** do not hand-thread `ui.add_enabled(torch_available, egui::Button::new(...))` and
 re-derive the tooltip text at each call site. Use `AiButton`: it disables itself, explains
@@ -274,7 +279,7 @@ Shared panes today:
 | Pane | Renderer |
 |---|---|
 | General | `draw_general_settings_panel(ui, &mut GeneralSettingsPanelState, Option<&WarningSet>) -> GeneralSettingsOutcome` — `crates/ms-settings-ui/src/general_settings_panel.rs:257` |
-| AI backend | `draw_ai_backend_panel(ui, &AiBackendHandle, &mut AiBackendPanelState, Option<&WarningSet>) -> AiBackendPanelOutcome` — `crates/ms-settings-ui/src/ai_backend_panel.rs:272` |
+| AI backend | `draw_ai_backend_panel(ui, &AiBackendHandle, &mut AiBackendPanelState, Option<&WarningSet>) -> AiBackendPanelOutcome` — `crates/ms-settings-ui/src/ai_backend_panel/mod.rs:401` — its body is three sub-tabs drawn with the house strip (`ui.horizontal` + `selectable_label`, `draw_tab_strip` in the same file), each listed only where its platform feature exists |
 | Tutorials | `draw_tutorials_pane(ui, &TutorialProgressHandle)` — `crates/ms-settings-ui/src/tutorial/settings_pane.rs:31` (behind the `tutorial` feature) |
 
 Glue (`crates/ms-settings-ui/src/settings_shared.rs`): `SettingsSurface { Launcher, Studio }`,

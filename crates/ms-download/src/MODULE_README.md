@@ -4,8 +4,8 @@
 The native-only HTTP download engine of the application: one file streamed into a `.part`
 staging file with `Range` resume, automatic retry of transient failures with capped
 exponential backoff, connect/read timeouts and cancel; verified publishing of that file;
-small in-memory bodies; atomic extraction of one zip member; plus a process-wide "one
-download per id" busy guard. It is the mechanism the project's network-download rule (`PROJECT_RULES.md`,
+small in-memory bodies; atomic extraction of one zip member; all-or-nothing staging of several
+zip / tar.gz / tar.zst members; plus a process-wide "one download per id" busy guard. It is the mechanism the project's network-download rule (`PROJECT_RULES.md`,
 "Network downloads") is implemented with. Foundation layer: GUI-free, no i18n, no config.
 
 ## Architecture
@@ -31,9 +31,14 @@ download per id" busy guard. It is the mechanism the project's network-download 
   without an announced size is accepted at a clean end of stream (metadata use).
 - `unpack.rs`: `zip_member_atomic(archive, member, dest, expected)` — one member into
   `<dest>.unpack`, size-capped, hashed, fsynced, replace-renamed; a matching `dest` is a
-  no-op, a concurrent extraction of the same `dest` is `Busy`.
-- `error.rs`: `DownloadError` (thiserror, English `Display`) for `file`, `small`, `unpack`
-  and the busy wait; `From<StreamError>`.
+  no-op, a concurrent extraction of the same `dest` is `Busy`. `stage_members(archive,
+  ArchiveKind, &[WantedMember])` — every wanted member of a zip / tar.gz / tar.zst written,
+  hashed and fsynced to `staging_path(dest)` (`<dest>.tmp`), returned as `StagedMember`s in
+  wanted order; all or nothing (any failure removes every temporary), publishes nothing;
+  typed `UnpackError` per operation. Its one consumer is `ms-native-package`.
+- `error.rs`: `DownloadError` (thiserror, English `Display`) for `file`, `small`,
+  `zip_member_atomic` and the busy wait; `From<StreamError>`. (`stage_members` has its own
+  `unpack::UnpackError`.)
 - `busy.rs`: `BusyGuard::try_acquire(id)` -> RAII guard or `Busy`;
   `BusyGuard::acquire_waiting(key, cancel, retry, on_wait)` polls per `wait_slice` until the
   key is free (cancellable); `dest_key(dest)` names a destination file.
@@ -44,7 +49,8 @@ download per id" busy guard. It is the mechanism the project's network-download 
   markers and user-facing text. They verify and publish through `fetch_verified` /
   `zip_member_atomic` (e.g. `ms_sysprobe::ai_models::external` with size + sha256 pins and
   its own multi-file markers, `ms_sysprobe::ai_models` with `Expected::Announced`), or
-  themselves around `fetch_part`.
+  themselves around `fetch_part`. A pinned multi-member archive package with a completion
+  marker is `ms-native-package` (built on `fetch_verified` + `stage_members`).
 
 ## Files and submodules
 - `lib.rs`: crate root; `#![cfg(not(target_arch = "wasm32"))]` — the crate is empty on wasm.
@@ -55,7 +61,9 @@ download per id" busy guard. It is the mechanism the project's network-download 
 - `file.rs` + `file/tests.rs`: verified single-file download and the shared publish /
   hash helpers.
 - `small.rs` + `small/tests.rs`: capped in-memory fetch.
-- `unpack.rs` + `unpack/tests.rs`: atomic zip-member extraction.
+- `unpack.rs` + `unpack/tests.rs`: atomic zip-member extraction and multi-member staging
+  (zip / tar.gz / tar.zst; tar keys normalized: `\` -> `/`, a leading `./` stripped;
+  directory and symlink entries skipped).
 - `error.rs`: `DownloadError`.
 - `busy.rs`: the process-wide busy guard, its cancellable wait and `dest_key`.
 - `test_support.rs`: the scripted fetcher shared with dependents' tests.
@@ -119,7 +127,8 @@ download per id" busy guard. It is the mechanism the project's network-download 
 - Resume / size / deletion rules: `ResumableFetch::{attempt, range_not_satisfiable}`.
 - New scripted server behaviour for tests: `test_support.rs` (`Step`).
 - A new downloader of one file: `fetch_verified` (plus `zip_member_atomic` for an archive
-  member); of a small body: `fetch_small`; only a multi-file transaction with its own
+  member); of a small body: `fetch_small`; of a pinned archive package (several members,
+  completion marker): `ms-native-package`; only a multi-file transaction with its own
   markers builds on `fetch_part` directly. Keep the URL, pins and UI text in the consumer.
 - Verified publish, shared-destination rule: `file.rs` (`fetch_verified`, `publish_replace`).
-- Archive members: `unpack.rs`.
+- Archive members, archive formats, tar-key normalization: `unpack.rs`.

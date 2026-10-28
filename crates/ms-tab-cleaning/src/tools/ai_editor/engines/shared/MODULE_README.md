@@ -2,7 +2,8 @@
 
 ## Purpose
 The model-agnostic building blocks the LARGE-model engines of the «ИИ-редактор области» share
-(FLUX.2 klein and FLUX.3 klein; both use the prompt library). Each lives here so every large-model engine composes it
+(FLUX.2 klein and FLUX.3 klein; both use the prompt library and can run on PyTorch or on
+Stable-Diffusion.cpp). Each lives here so every large-model engine composes it
 instead of copying it. An engine adds only what is its own: its
 request headers, its settings document and migrations, its staleness rules, its sentences.
 
@@ -30,6 +31,11 @@ engine (flux2_klein/, flux3_klein/)
                          draw_prompt_cache_library (picker + Export / Import + outcome lines)
   -> catalog_download    catalog_gated_repos_missing, catalog_bundle_missing, catalog_job_running,
                          catalog_switch_block_reason (an engine fed by the app's model catalog)
+  -> sdcpp_options       SdCppRunOptions + FlashAttentionChoice (persisted per engine), to_context
+  -> sdcpp_run           SdCppRunJob (start / poll / cancel) over EngineProgress + AbandonedJobs,
+                         SdCppGenerate seam, read_sdcpp_choice, spawn_sdcpp_unload   (native only)
+  -> sdcpp_ui            draw_runtime_switch, draw_sdcpp_options, draw_sdcpp_unload_button,
+                         SdCppReadiness + draw_sdcpp_readiness (native only)
 ```
 `mod.rs` re-exports every submodule flat, so an engine writes `use super::shared::*;`. The
 forecast / caps / learned-floor half of «Память и скорость» is NOT here: it is
@@ -106,6 +112,46 @@ forecast / caps / learned-floor half of «Память и скорость» is 
   `cleaning.tools.catalog_download.*`). The engine keeps its own bundle (which specs a selection
   needs).
 
+- `sdcpp_options.rs`: `SdCppRunOptions` — what ONE engine persists for its Stable-Diffusion.cpp
+  runs (text encoder on the CPU, default on; weights in RAM; VRAM budget `None` = «Авто», else
+  1..=128 GiB; VAE tiling; `FlashAttentionChoice` with frozen ids `auto` / `on` / `off`, an unknown
+  value reading as auto). `#[serde(default)]`, unknown fields ignored. `to_context(&SdCppChoice)`
+  joins them with the APP-WIDE device and thread count (Settings › ИИ бэкенд ›
+  Stable-Diffusion.cpp). The types compile everywhere; `to_context` only natively.
+- `sdcpp_run.rs` (native only; `ms-sdcpp` is empty on wasm): `SdCppRunJob::start(input, &progress,
+  log_label)` claims the engine's progress generation on the GUI thread and runs on a worker:
+  `AiRouteKind::SdCpp.availability(local_ai::process())` (the `--no-ai` / platform gate), the
+  `user_config` `SdCppChoice` (`read_sdcpp_choice`, worker-only), the catalog build, the
+  `GenerateJob` (request `vae_tiling` from the options), `ms_sdcpp::service().generate`. Stages
+  become counter-less bar labels (`cleaning.tools.sdcpp.stage_*`), steps the step counter.
+  `poll()` answers `Option<Result<egui::ColorImage, String>>` (converted on the job's worker by
+  `rgb_to_color_image`, never on the GUI thread; localized error); `cancel(self,
+  &mut AbandonedJobs, log_label)` raises the flag, parks the receiver and retires the generation;
+  dropping a job raises the flag too. `SdCppGenerate` is the service seam (implemented for
+  `SdCppService`, faked in the tests). `spawn_sdcpp_unload` stops the worker process off the GUI
+  thread. `sdcpp_route_available()` is THE "can this process run sd.cpp at all" answer every
+  engine uses (whether a Torch hint may suggest sd.cpp, whether the switch is offered, whether
+  the automatic switch may move there): `AiRouteKind::SdCpp.availability(local_ai::process())`
+  plus a catalog build offered here (`ms_sdcpp::offers_a_build_here`). It says nothing about the
+  install; the picker's `AiButton` gate reads `AiCaps` (route + `ms_sdcpp::ready`).
+- `sdcpp_ui.rs`: `draw_runtime_switch(ui, &mut ImageEditRuntime, blocked, pytorch_unavailable,
+  id_salt)` — the PyTorch / Stable-Diffusion.cpp toggle pair at the TOP of an engine's panel,
+  disabled with a hover reason while `blocked`; the PyTorch side alone also while
+  `pytorch_unavailable_reason(&AiCaps)` says so (strict, the `AiButton` signal; the sd.cpp side
+  stays open, its readiness line offers the install); `sdcpp_auto_switch` (pure) +
+  `log_sdcpp_auto_switch` — the ONE rule both FLUX engines apply in `AiEngine::on_selected`:
+  on PyTorch, PyTorch OUT OF REACH (Torch known absent, or the backend down —
+  `AiCaps.backend == Some(false)` — while no start is underway, `AiCaps.backend_starting`),
+  sd.cpp offered and the switch open -> move to sd.cpp through the click's own path. Never per
+  frame, never on unknown, and never on settings that have not been loaded yet (an engine defers
+  the decision until its settings file landed: a change before it would discard the file); `draw_sdcpp_options(ui, &mut SdCppRunOptions, id_salt)` (no heading: the caller's section
+  is titled `cleaning.tools.sdcpp.options_heading`);
+  `draw_sdcpp_unload_button(ui, enabled)` (the caller passes `worker_running` and no run of its
+  own in flight); natively `SdCppReadiness::of(status, local, device)` (disabled, checking, no
+  build for this machine, not installed, requirement, probe failed, device missing, ready;
+  `run_block_reason` closes the run on all but the last two) and `draw_sdcpp_readiness`, which also
+  asks for the first status refresh when none ever ran.
+
 ## Contracts and invariants
 - **Nothing names a model.** Log lines take a `log_label`; user texts are
   `cleaning.tools.engine_progress.*` / `cleaning.tools.hf_download.*` /
@@ -161,6 +207,17 @@ forecast / caps / learned-floor half of «Память и скорость» is 
   re-arms `.list`, and `.status` / the forecast are the ENGINE's — the controller only returns
   `PromptCacheEffects`. A listing that differs from the one held (the first one included: the
   first `.list` of a process migrates old caches) is such an effect.
+- **sd.cpp runs never touch the Python backend.** A run's progress claim never publishes a
+  backend request id, so retiring it sends no backend cancel; cancellation is the run's own flag
+  (the service sends `Cancel` to its worker process and kills it after the grace period). The
+  run is still parked in `AbandonedJobs` until its worker ends: `ms_sdcpp` runs one generation at
+  a time and answers a second one `Busy`.
+- **No sd.cpp I/O on the GUI thread.** The `user_config` choice is read on the run worker (and,
+  for the readiness device, on the engine's status worker through `read_sdcpp_choice`); the
+  readiness reads the status snapshot the caller took; unload goes through `spawn_sdcpp_unload`.
+  The studio teardown stops a running sd.cpp worker (`../../../../studio_tab.rs`).
+- **The runtime choice is per engine and persisted by `ImageEditRuntime::wire`**; the device and
+  thread count are app-wide and never copied into an engine's file.
 - Visibility ceiling: `pub(in crate::tools::ai_editor::engines)`.
 
 ## Editing map
@@ -181,6 +238,9 @@ forecast / caps / learned-floor half of «Память и скорость» is 
   `PromptCacheMethods`, its `CacheContext` builder and its request `params`.
 - To change which catalog states count as "missing" or "running", or the engine-picker block of
   a catalog job: `catalog_download.rs` and the `cleaning.tools.catalog_download.*` keys.
+- To change what an sd.cpp run sends or how it reports: `sdcpp_run.rs`; the persisted sd.cpp
+  options: `sdcpp_options.rs`; the switch, readiness line and options widgets: `sdcpp_ui.rs` and
+  the `cleaning.tools.sdcpp.*` keys (catalog test in `sdcpp_ui.rs`).
 - Tests sit at the end of each file; the catalog tests (every key in every shipped locale, with
   its placeholders; the retired download-block keys absent) are in `hf_download_ui.rs`,
   `stream_progress_ui.rs`, `catalog_download.rs` and `prompt_cache.rs` (the moved prompt-library

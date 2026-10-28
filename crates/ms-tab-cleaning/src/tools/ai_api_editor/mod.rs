@@ -94,7 +94,7 @@ mod tests {
         assert_eq!(AI_API_EDITOR_SPEC.tool_id, "ai_api_editor");
         let tool = tool();
         assert!(!tool.title().is_empty());
-        assert!(!tool.pytorch_required(), "the tool button must not be gated on Torch");
+        assert_eq!(tool.ai_requirement(), None, "the tool button must not be gated on a local runtime");
         assert!(!tool.input_contexts().contains(&crate::input::EDITOR_WINDOW), "D5: the frame never takes the clean-overlay undo or the canvas zoom");
     }
 

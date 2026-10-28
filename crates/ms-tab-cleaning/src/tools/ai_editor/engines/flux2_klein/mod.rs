@@ -66,7 +66,9 @@ Selection contract (checked twice, on purpose):
   gets an explanation instead of a request the backend would reject.
 
 Panel layout (`Flux2PanelCtx::draw`, and its ORDER is the design):
-progress bar -> run status -> the PROMPT block (the English field, the preset name with
+progress bar -> run status -> the PyTorch / Stable-Diffusion.cpp switch (where sd.cpp is
+offered; on sd.cpp the PyTorch-only blocks below are hidden and «Stable-Diffusion.cpp» replaces
+«Память и скорость», see `ui/MODULE_README.md`) -> the PROMPT block (the English field, the preset name with
 «Кэшировать» / «Переименовать», the one compact line about its cache state, and two toggles
 that unfold the translator and the prompt library: the shared preset picker, «Экспорт»,
 «Импорт») -> «Сила изменения» -> the READINESS line -> three sibling collapsible sections,
@@ -110,8 +112,13 @@ Submodules (each re-exported into this root with `use <name>::*;`):
 - `run_outcome.rs`: what one run answers with — the raw region, the run's mask and latent
   mask, the `applied.vae_tiling` flag, a degraded run's effective steps.
 - `session.rs`: the run channel and the pickers.
-- `wire.rs`: the generation run (including the latent-mask dilation), the `.status` and
-  `.component_action` calls and the image/mask blob encoding.
+- `wire.rs`: the generation run (including the latent-mask dilation, `flux2_latent_mask`,
+  shared with the sd.cpp request), the `.status` and `.component_action` calls and the
+  image/mask blob encoding.
+- `sdcpp_files.rs`: the three files Stable-Diffusion.cpp loads (catalog map or manual rows,
+  checked on a worker).
+- `sdcpp_request.rs`: the sd.cpp request of a run (same validation and latent mask as the
+  PyTorch pass) and the answer's conversion.
 - The MODEL-AGNOSTIC parts are not files here: the progress state of all three long
   operations with its generation guard, rate window, frame parser and streaming call, the
   Hugging Face token controls and their drawing, the settings-file
@@ -296,17 +303,18 @@ use ms_region_postprocess::{PostprocessSettings, dilate_ellipse};
 use ms_backend_ipc as backend_ipc;
 use ms_canvas::OverlayRectPx;
 use ms_config as config;
-use ms_config::{Flux2EncoderSource, Flux2Variant, Flux2WeightAxis, Flux2WeightFormat};
+use ms_config::{Flux2EncoderSource, Flux2Variant, Flux2WeightAxis, Flux2WeightFormat, ImageEditRuntime};
 // The catalog package of both variants: its pinned specs per weight format and encoder source,
 // and the explicit-download controller and panel block shared with the Translation tab (the
 // SDXL engine is the other cleaning consumer).
 use ms_sysprobe::ai_models::external::ExternalModelSpec;
-use ms_sysprobe::ai_models::external_catalog::{Flux2TransformerLayout, flux2_klein_package_specs, flux2_klein_spec};
+use ms_sysprobe::ai_models::external_catalog::{Flux2TransformerLayout, flux2_klein_package_specs, flux2_klein_package_specs_for, flux2_klein_sdcpp_paths, flux2_klein_spec};
 use ms_tab_translation::ocr_model_download::{OcrModelDownloadController, OcrModelDownloadState, OcrModelPanelSnapshot, bundle_key};
 use ms_tab_translation::panels::ocr_model_download::{ModelDownloadAction, draw_ocr_model_download};
 use crate::tools::base::RegionEditToolBase;
 use crate::tools::region_edit_v2::geometry::{AspectLimit, FrameConstraints};
 use ms_local_ai::backend_health::ai_backend_offline_error;
+use ms_local_ai::local_ai::{AiRouteKind, LocalAiOff};
 // The one client of `large_models.*`: the step vocabulary, the forecast query and the caps.
 use ms_local_ai::large_models::{LIMITS_EDIT_DEBOUNCE, LargeModelStep, ProfilesRequest, RamStep, StepChoice, VramStep, format_gib};
 // The axes widget the large-model cleaning engines share (FLUX.2 and FLUX.3 klein).
@@ -316,7 +324,7 @@ use crate::tools::ai_editor::large_model_resources::{ResourcesAction, ResourcesC
 use super::shared::*;
 use ms_tab_translation::machine_translation::{MtService, translate_texts_via_translator};
 use ms_tab_translation::panels::machine_translation::{MT_SOURCE_LANGUAGES, MtLanguage};
-use ms_widgets::{SeedSpinBox, WheelComboBox, WheelSlider};
+use ms_widgets::{AiCaps, AiRequirement, SeedSpinBox, WheelComboBox, WheelSlider};
 use eframe::egui;
 use egui::Color32;
 // The wire PNG encoders, shared by `wire.rs` (through its `use super::*`) and the tests.
@@ -351,6 +359,10 @@ use session::*;
 // The run, status and component-action calls, and the blob encoding a run carries.
 mod wire;
 use wire::*;
+mod sdcpp_files;
+use sdcpp_files::*;
+mod sdcpp_request;
+use sdcpp_request::*;
 // The engine itself: its state, its `AiEngine` contract and its long operations.
 mod engine;
 // The one item this module exports; the module path is unchanged by the split.

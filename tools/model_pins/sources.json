@@ -95,6 +95,38 @@
       "note": "crates/ms-onnx-runtime/src/ort_manifest.json row"
     },
     {
+      "id": "sdcpp/linux-x86_64-vulkan",
+      "kind": "url",
+      "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-1017-be48649/sd-master-be48649-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip",
+      "expected_sha256": "794c913d077aaf72025e772b2acfb6a30f49156e92d072461ae15ce958d95c14",
+      "zip_members": "*",
+      "note": "crates/ms-sdcpp/src/catalog.rs PackageRow (url, size, sha256, members)"
+    },
+    {
+      "id": "sdcpp/linux-x86_64-cpu",
+      "kind": "url",
+      "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-1017-be48649/sd-master-be48649-bin-Linux-Ubuntu-24.04-x86_64.zip",
+      "expected_sha256": "1016ea927e00b0176ca23aa9f5dc5de68290ea7e115eb3fe6c2399acca41701f",
+      "zip_members": "*",
+      "note": "crates/ms-sdcpp/src/catalog.rs PackageRow (url, size, sha256, members)"
+    },
+    {
+      "id": "sdcpp/windows-x86_64-vulkan",
+      "kind": "url",
+      "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-1017-be48649/sd-master-be48649-bin-win-vulkan-x64.zip",
+      "expected_sha256": "833414dfe255d9709c6184e699017028ee8d5522058ad53b201d9602805c6b41",
+      "zip_members": "*",
+      "note": "crates/ms-sdcpp/src/catalog.rs PackageRow (url, size, sha256, members)"
+    },
+    {
+      "id": "sdcpp/windows-x86_64-cpu",
+      "kind": "url",
+      "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-1017-be48649/sd-master-be48649-bin-win-cpu-x64.zip",
+      "expected_sha256": "f0f76c8176a90cafc431ca7d5049cbe8c5cea61ca7cb92b78e07361d41d8fb21",
+      "zip_members": "*",
+      "note": "crates/ms-sdcpp/src/catalog.rs PackageRow (url, size, sha256, members)"
+    },
+    {
       "id": "watermark/slbr",
       "kind": "gdrive",
       "file_id": "1uTCzubnWZtu3HIXaK8xsXX-7x302ss13",
@@ -397,9 +429,10 @@
         "transformer/diffusion_pytorch_model.safetensors",
         "text_encoder/model-00001-of-00002.safetensors",
         "text_encoder/model-00002-of-00002.safetensors",
-        "text_encoder/model.safetensors.index.json"
+        "text_encoder/model.safetensors.index.json",
+        "flux-2-klein-4b.safetensors"
       ],
-      "note": "ms_sysprobe external_catalog FLUX2_KLEIN_4B_BASE + _TRANSFORMER_BF16 + _TEXT_ENCODER_BF16 (the diffusers folders the FLUX.2 klein engine loads)"
+      "note": "ms_sysprobe external_catalog FLUX2_KLEIN_4B_BASE + _TRANSFORMER_BF16 + _TEXT_ENCODER_BF16 (the diffusers folders the PyTorch FLUX.2 klein engine loads) + _TRANSFORMER_BF16_SINGLE (the BFL single file the sd.cpp runtime loads)"
     },
     {
       "id": "flux2-klein-4b/unsloth/FLUX.2-klein-4B-GGUF",

@@ -8,8 +8,9 @@ and performs each mode's side effects in their documented order.
 Key items:
 - `RunMode` = `Service(ServiceMode)` (ends the process or returns without the main window) or
   `Main(MainRun)` (optional update-window preludes, then the test launcher or the main window).
-- `ServiceMode`: usage error (`UsageConflicts`), elevated system-registration helper, Windows
-  Start Menu shortcut, Windows uninstall, `--check-venv`, refused self-update.
+- `ServiceMode`: usage error (`UsageConflicts`), elevated system-registration helper, the
+  Stable-Diffusion.cpp worker process, Windows Start Menu shortcut, Windows uninstall,
+  `--check-venv`, refused self-update.
 - `PlatformFacts`: the platform inputs of the decision (`current()` reads them for this build).
 
 Notes:
@@ -47,6 +48,9 @@ pub(super) enum ServiceMode {
     /// `--system-registration-apply` (+ result file): the elevated helper; off Windows it
     /// reports "unsupported" itself (`service_flags::run_system_registration_helper`).
     RegistrationHelper,
+    /// `--sdcpp-worker`: the Stable-Diffusion.cpp worker process the app starts for itself
+    /// (`ms_sdcpp::worker::run_worker_main`); it serves stdin / stdout frames and exits.
+    SdCppWorker,
     /// `--create-start-menu-shortcut-install-dir` (Windows only).
     WindowsStartMenuShortcut {
         /// The installed copy's directory.
@@ -127,7 +131,8 @@ impl PlatformFacts {
 /// 1. contradictory flags -> `UsageError`: installed-copy flags with `--ignore-installed`, an
 ///    image or `--project` with a terminal mode (an image also with installed-copy flags), and
 ///    any Windows-only service flag on a build without `windows_service_flags`;
-/// 2. `--system-registration-apply` -> `RegistrationHelper` (on every OS);
+/// 2. `--system-registration-apply` -> `RegistrationHelper` (on every OS), then
+///    `--sdcpp-worker` -> `SdCppWorker` (on every OS; a build without sd.cpp reports it);
 /// 3. (Windows only, step 1 rejected them elsewhere) `--create-start-menu-shortcut-install-dir`
 ///    -> `WindowsStartMenuShortcut`, then `--uninstall` -> `WindowsUninstall`;
 /// 4. `--check-venv` -> `CheckVenv`;
@@ -145,6 +150,9 @@ pub(super) fn decide(cli: &Cli, platform: PlatformFacts) -> RunMode {
     }
     if cli.system_registration_apply.is_some() {
         return RunMode::Service(ServiceMode::RegistrationHelper);
+    }
+    if cli.sdcpp_worker {
+        return RunMode::Service(ServiceMode::SdCppWorker);
     }
     if platform.windows_service_flags {
         if let Some(install_dir) = &cli.create_start_menu_shortcut_install_dir {
@@ -208,6 +216,10 @@ mod tests {
             ("registration_helper_windows", vec!["--system-registration-apply", "x", "--system-registration-result", "/home/u/r.json"], WINDOWS, RunMode::Service(ServiceMode::RegistrationHelper)),
             ("registration_helper_other_os", vec!["--system-registration-apply", "x", "--system-registration-result", "/home/u/r.json"], DESKTOP_OTHER, RunMode::Service(ServiceMode::RegistrationHelper)),
             ("registration_helper_beats_windows_flags", vec!["--system-registration-apply", "x", "--system-registration-result", "/home/u/r.json", "--uninstall"], WINDOWS, RunMode::Service(ServiceMode::RegistrationHelper)),
+            ("sdcpp_worker", vec!["--sdcpp-worker"], DESKTOP_OTHER, RunMode::Service(ServiceMode::SdCppWorker)),
+            ("sdcpp_worker_windows", vec!["--sdcpp-worker"], WINDOWS, RunMode::Service(ServiceMode::SdCppWorker)),
+            ("registration_helper_beats_sdcpp_worker", vec!["--system-registration-apply", "x", "--system-registration-result", "/home/u/r.json", "--sdcpp-worker"], DESKTOP_OTHER, RunMode::Service(ServiceMode::RegistrationHelper)),
+            ("usage_error_project_with_sdcpp_worker", vec!["--sdcpp-worker", "--project", "/home/u/ch1"], DESKTOP_OTHER, usage_all(&[], &[], &["--sdcpp-worker"], &[])),
             ("windows_start_menu_shortcut", vec!["--create-start-menu-shortcut-install-dir", "/home/u/MS", "--continue-create-start-menu-shortcut"], WINDOWS, shortcut.clone()),
             ("windows_shortcut_beats_uninstall", vec!["--create-start-menu-shortcut-install-dir", "/home/u/MS", "--continue-create-start-menu-shortcut", "--uninstall"], WINDOWS, shortcut),
             ("windows_uninstall", vec!["--uninstall", "--continue-uninstall", "--uninstall-signal-file", "/home/u/sig"], WINDOWS, RunMode::Service(ServiceMode::WindowsUninstall { continuation: true, signal_file: Some(PathBuf::from("/home/u/sig")) })),

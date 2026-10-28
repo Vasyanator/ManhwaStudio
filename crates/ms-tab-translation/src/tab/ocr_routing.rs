@@ -281,7 +281,8 @@ impl TranslationTabState {
             Ok(AiRouteKind::Backend) if self.ai_backend_unavailable() => {
                 Some(t!("translation.tab.backend_unavailable_status").to_string())
             }
-            Ok(AiRouteKind::Backend | AiRouteKind::Native | AiRouteKind::Cloud) => None,
+            // No OCR route runs on sd.cpp (`ocr_route_kind`); the arm only keeps the match total.
+            Ok(AiRouteKind::Backend | AiRouteKind::Native | AiRouteKind::Cloud | AiRouteKind::SdCpp) => None,
         }
     }
 

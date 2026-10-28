@@ -284,6 +284,8 @@ mod tests {
                         no_ai,
                         platform(backend_platform, PlatformFeature::PythonBackend),
                         platform(native_platform, PlatformFeature::NativeOnnxRuntime),
+                        // OCR never runs on sd.cpp, so its platform answer is irrelevant here.
+                        Ok(()),
                     );
                     for engine in ENGINES {
                         for model in ["base_onnx", "base_torch"] {

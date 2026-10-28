@@ -20,6 +20,10 @@ Main responsibilities:
   (`uncached_prompt`) are persisted here but never sent;
 - answer which encoder mode a call actually sends (`text_mode_in_effect`: the prompt cache
   serves TEXT mode only);
+- answer which local runtime runs the edit (`runtime`: PyTorch or Stable-Diffusion.cpp) and which
+  DiT format that runtime loads (`run_dit_format`: on sd.cpp a stored fp8r / nvfp4 falls back to
+  the closest offered format, `flux3_closest_offered`, while the stored choice is kept); the
+  per-engine sd.cpp options (`sdcpp`) are persisted here and never sent to the backend;
 - load and save the settings file on worker threads (`load_flux3_settings`,
   `save_flux3_settings`).
 
@@ -28,7 +32,8 @@ Key structures:
 
 Key functions:
 - `Flux3KleinSettings::{normalized, effective_root, dit_format, encoder_format,
-  text_mode_in_effect, to_params, step_choice, set_step_choice}`, `package_path()`
+  text_mode_in_effect, to_params, step_choice, set_step_choice, runtime, run_dit_format}`,
+  `package_path()`, `flux3_closest_offered()`
 - `settings_from_json()`, `load_flux3_settings()`, `load_flux3_settings_from()`, `save_flux3_settings()`
 
 Notes:
@@ -199,6 +204,14 @@ pub(super) struct Flux3KleinSettings {
     /// «Энкодер на CPU»: the text encoder runs on the CPU from RAM at every VRAM step. Default
     /// `true`, also for a document without the field. Sent in every `params`.
     pub(super) encoder_on_cpu: bool,
+    /// `ImageEditRuntime::wire()`: the local runtime that runs the edit. Absent in a document of
+    /// an earlier build (or unknown): reads as `pytorch`, the only runtime there was. Never sent
+    /// to the backend.
+    pub(super) runtime: String,
+    /// The Stable-Diffusion.cpp options (encoder on the CPU, weights in RAM, VRAM budget, VAE
+    /// tiling, flash attention), read only on that runtime; an absent object reads as the shared
+    /// defaults. Never sent to the backend.
+    pub(super) sdcpp: SdCppRunOptions,
 }
 
 impl Default for Flux3KleinSettings {
@@ -222,6 +235,8 @@ impl Default for Flux3KleinSettings {
             vram_step: VramStep::Auto.wire().to_string(),
             ram_step: RamStep::Auto.wire().to_string(),
             encoder_on_cpu: true,
+            runtime: ImageEditRuntime::default().wire().to_string(),
+            sdcpp: SdCppRunOptions::default(),
         }
     }
 }
@@ -253,7 +268,21 @@ impl Flux3KleinSettings {
             vram_step: choice.vram.wire().to_string(),
             ram_step: choice.ram.wire().to_string(),
             encoder_on_cpu: self.encoder_on_cpu,
+            runtime: self.runtime().wire().to_string(),
+            sdcpp: self.sdcpp.normalized(),
         }
+    }
+
+    /// The local runtime the edit runs on; an unknown or absent id reads as PyTorch.
+    pub(super) fn runtime(&self) -> ImageEditRuntime {
+        ImageEditRuntime::from_wire(&self.runtime).unwrap_or_default()
+    }
+
+    /// The DiT format a run on the SELECTED runtime loads: the stored one on PyTorch; on
+    /// Stable-Diffusion.cpp the closest format it offers (`flux3_closest_offered`), so a stored
+    /// fp8r / nvfp4 is kept for PyTorch while sd.cpp runs a format it has kernels for.
+    pub(super) fn run_dit_format(&self) -> Flux3DitFormat {
+        flux3_closest_offered(self.dit_format(), self.runtime())
     }
 
     /// The active source mode.
@@ -391,6 +420,19 @@ impl Flux3KleinSettings {
             "prompt_cache_precision_order": flux3_prompt_cache_precision_order(),
         })
     }
+}
+
+/// The format of `Flux3DitFormat::offered_on(runtime)` that best keeps `stored`: `stored` when
+/// it is offered, else the first offered format after it in `Flux3DitFormat::all` (quality)
+/// order (fp8r -> GGUF Q8_0, nvfp4 -> GGUF Q4_K_M), else bf16. The rule of
+/// `ms_config::Flux2WeightFormat::closest_offered`, for the FLUX.3 vocabulary.
+#[must_use]
+pub(super) fn flux3_closest_offered(stored: Flux3DitFormat, runtime: ImageEditRuntime) -> Flux3DitFormat {
+    let offered = Flux3DitFormat::offered_on(runtime);
+    if offered.contains(&stored) {
+        return stored;
+    }
+    Flux3DitFormat::all().iter().copied().skip_while(|format| *format != stored).find(|format| offered.contains(format)).unwrap_or(Flux3DitFormat::Bf16)
 }
 
 /// `relative` (a catalog path, `/`-separated) joined onto the package `root` component by
@@ -686,6 +728,10 @@ mod tests {
         assert_eq!(added, Some(json!("bf16")));
         let stash = saved.as_object_mut().expect("an object").remove("uncached_prompt");
         assert_eq!(stash, Some(json!("")), "an earlier document has no «Нет» stash");
+        let runtime = saved.as_object_mut().expect("an object").remove("runtime");
+        assert_eq!(runtime, Some(json!("pytorch")), "an earlier document runs on PyTorch");
+        let sdcpp = saved.as_object_mut().expect("an object").remove("sdcpp");
+        assert_eq!(sdcpp, Some(serde_json::to_value(SdCppRunOptions::default()).expect("serializes")), "an earlier document has the default sd.cpp options");
         let mut saved_keys: Vec<&str> = saved.as_object().expect("an object").keys().map(String::as_str).collect();
         saved_keys.sort_unstable();
         let mut old_keys: Vec<&str> = old.as_object().expect("an object").keys().map(String::as_str).collect();
@@ -742,6 +788,46 @@ mod tests {
         assert!(gguf.vl_refs, "the stored choice is untouched");
         let bf16 = Flux3KleinSettings { text_encoder_format: "bf16".to_string(), ..gguf };
         assert_eq!(bf16.normalized().to_params(false)["encoder_mode"], json!("vl_refs"));
+    }
+
+    /// The runtime: an earlier document (no field) and an unknown id read as PyTorch, `sdcpp`
+    /// round-trips; the sd.cpp options persist with their own defaults; neither travels to the
+    /// backend.
+    #[test]
+    fn the_runtime_and_the_sdcpp_options_persist_and_never_travel() {
+        let old = settings_from_json(&json!({ "prompt": "edit" })).expect("loads");
+        assert_eq!(old.runtime(), ImageEditRuntime::PyTorch);
+        assert_eq!(old.sdcpp, SdCppRunOptions::default());
+        let unknown = settings_from_json(&json!({ "runtime": "onnx" })).expect("loads");
+        assert_eq!(unknown.runtime(), ImageEditRuntime::PyTorch);
+        assert_eq!(unknown.normalized().runtime, "pytorch");
+        let sdcpp = Flux3KleinSettings { runtime: "sdcpp".to_string(), sdcpp: SdCppRunOptions { vae_tiling: true, vram_budget_gib: Some(500.0), ..SdCppRunOptions::default() }, ..Flux3KleinSettings::default() };
+        let text = serde_json::to_string(&sdcpp).expect("serializes");
+        let back = settings_from_json(&serde_json::from_str(&text).expect("json")).expect("loads");
+        assert_eq!(back, sdcpp);
+        assert_eq!(back.runtime(), ImageEditRuntime::SdCpp);
+        assert_eq!(back.normalized().sdcpp.vram_budget_gib, Some(128.0), "the options normalize with the settings");
+        let params = sdcpp.normalized().to_params(false);
+        assert!(params.get("runtime").is_none() && params.get("sdcpp").is_none(), "the backend refuses unknown keys");
+    }
+
+    /// On sd.cpp a stored fp8r / nvfp4 falls back to the closest offered format (stepping down in
+    /// quality order) while the stored choice is kept; on PyTorch every format runs as stored.
+    #[test]
+    fn a_format_sd_cpp_lacks_falls_back_to_the_closest_offered() {
+        assert_eq!(flux3_closest_offered(Flux3DitFormat::Fp8r, ImageEditRuntime::SdCpp), Flux3DitFormat::Q80);
+        assert_eq!(flux3_closest_offered(Flux3DitFormat::Nvfp4, ImageEditRuntime::SdCpp), Flux3DitFormat::Q4KM);
+        for &format in Flux3DitFormat::offered_on(ImageEditRuntime::SdCpp) {
+            assert_eq!(flux3_closest_offered(format, ImageEditRuntime::SdCpp), format);
+        }
+        for &format in Flux3DitFormat::all() {
+            assert_eq!(flux3_closest_offered(format, ImageEditRuntime::PyTorch), format);
+        }
+        let stored = Flux3KleinSettings { runtime: "sdcpp".to_string(), ..Flux3KleinSettings::default() };
+        assert_eq!(stored.dit_format(), Flux3DitFormat::Fp8r, "the stored choice is kept");
+        assert_eq!(stored.run_dit_format(), Flux3DitFormat::Q80);
+        assert_eq!(stored.normalized().format, "fp8r", "normalizing never rewrites the stored format");
+        assert_eq!(Flux3KleinSettings::default().run_dit_format(), Flux3DitFormat::Fp8r);
     }
 
     /// A damaged settings file is moved aside and the defaults load; the copy keeps its bytes.

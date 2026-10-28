@@ -38,6 +38,9 @@ Main items:
 - `Cli.system_registration_apply` / `Cli.system_registration_result`: hidden pair that runs this
   process as the elevated system-registration helper (Windows only; protocol owned by
   `ms_os_integration::actions`). Each requires the other.
+- `Cli.sdcpp_worker`: hidden flag that runs this process as the Stable-Diffusion.cpp worker
+  (`ms_sdcpp::worker::run_worker_main`); started only by the app's own sd.cpp client
+  (`ms_sdcpp::client`), never by a user. Desktop only.
 - `Cli.trace`: enables detailed execution tracing to `trace-last.log` (see `crates/ms-log/src/trace.rs`).
 
 Notes:
@@ -142,6 +145,12 @@ pub struct Cli {
     #[arg(long, value_name = "PATH", hide = true, requires = "system_registration_apply")]
     pub system_registration_result: Option<PathBuf>,
 
+    /// Runs this process as the Stable-Diffusion.cpp worker: it loads an installed sd.cpp
+    /// package and serves the app over stdin / stdout frames (`ms_sdcpp::protocol`). Started
+    /// only by the app itself (`ms_sdcpp::client::spawn::WORKER_FLAG`, same spelling).
+    #[arg(long, default_value_t = false, hide = true)]
+    pub sdcpp_worker: bool,
+
     #[arg(long, default_value_t = false)]
     pub trace: bool,
 }
@@ -208,14 +217,14 @@ fn installed_copy_flags_present(cli: &Cli) -> [bool; INSTALLED_COPY_FLAGS.len()]
 }
 
 /// Startup modes that an open target (an image set or `--project`) cannot be combined with: each
-/// one is its own terminal flow (environment check, launcher test window) and would silently drop
-/// the target otherwise.
-const OPEN_TARGET_EXCLUSIVE_MODE_FLAGS: &[&str] = &["--check-venv", "--test-launcher"];
+/// one is its own terminal flow (environment check, launcher test window, the sd.cpp worker
+/// process) and would silently drop the target otherwise.
+const OPEN_TARGET_EXCLUSIVE_MODE_FLAGS: &[&str] = &["--check-venv", "--test-launcher", "--sdcpp-worker"];
 
 /// Presence of every [`OPEN_TARGET_EXCLUSIVE_MODE_FLAGS`] entry in `cli`, index-aligned with that
 /// table (the array length is the table length, so the two cannot drift apart).
 fn open_target_exclusive_modes_present(cli: &Cli) -> [bool; OPEN_TARGET_EXCLUSIVE_MODE_FLAGS.len()] {
-    [cli.check_venv, cli.test_launcher]
+    [cli.check_venv, cli.test_launcher, cli.sdcpp_worker]
 }
 
 /// Service flags that act only on Windows (the Start Menu shortcut and the uninstall of an

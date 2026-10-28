@@ -6,14 +6,17 @@ host, and every long operation it starts on a worker. The only place in `flux3_k
 mutable state; the panel (`../ui/`) borrows it for one frame.
 
 ## Architecture
-Two files, one type. `mod.rs` declares the struct, `impl AiEngine`, and the per-frame
+Three files, one type. `mod.rs` declares the struct, `impl AiEngine`, and the per-frame
 housekeeping that must run whether the panel is drawn or not (settings load once, save when
 dirty, `.status` re-asked when the package root or the cache question changes, the forecast
 re-armed on a settled region SIZE, the run and the prompt-library jobs drained). `actions.rs` is
 a second inherent `impl` block: the fold of the panel's intents (`apply_intents`) and the
 `start_*` / `poll_*` pair of every long operation (token, file dialogs, reference reads, unload,
 the prompt library through the shared `PromptCacheController`) and the fold of the catalog
-block's click.
+block's click. `sdcpp.rs` is a third: the Stable-Diffusion.cpp files worker
+(`poll_and_maybe_resolve_sdcpp_files`) and run (`start_sdcpp` -> prep worker builds the
+`GenerateRequest` -> `poll_sdcpp_run` starts the shared `SdCppRunJob` on the GUI thread -> its
+image becomes `EnginePoll::DoneRaw`; `cancel_sdcpp_run`).
 
 ```
 start_x()  -> validate, claim the progress generation if it streams, ms_thread::spawn
@@ -30,6 +33,10 @@ poll_x()   -> try_recv, apply the outcome, clear the receiver
 - `actions.rs`: `apply_intents` and the long operations, including the prompt library
   (`start_prompt_cache_build`, the export / import picker purposes, `poll_prompt_cache`,
   `poll_and_maybe_query_prompt_cache_list`, `apply_prompt_cache_effects`).
+- `sdcpp.rs`: `Flux3SdcppRun` / `Flux3SdcppPrepared`, the files state and runtime readiness
+  accessors (`sdcpp_files_state`, `sdcpp_readiness`), the request builder
+  (`flux3_sdcpp_generate_request`, `flux3_sdcpp_capped_size`), the result pairing
+  (`flux3_sdcpp_raw_result`) and the seed draw.
 
 ## Contracts and invariants
 - **Nothing blocks the GUI thread**; `poll` only drains channels and is never conditional on
@@ -68,6 +75,28 @@ poll_x()   -> try_recv, apply the outcome, clear the receiver
 - **A run answers raw pixels**: `poll` returns `EnginePoll::DoneRaw` (raw region + the mask and
   mode `run_input` derived, moved back from the worker); `postprocess_settings` answers the
   persisted «Постобработка» values, normalized, every frame and for the engine's whole life.
+- **Two runtimes, one engine** (`settings.runtime()`): `requires_torch` is "runtime is
+  PyTorch", `ai_requirement` is `TorchOrSdcpp` (the picker's gate, either runtime), and
+  `on_selected` moves an out-of-reach PyTorch to sd.cpp (the shared `sdcpp_auto_switch`, through
+  `switch_runtime`, which folds the change like a click) — never on unloaded settings: a
+  selection during the load is kept (`selection_pending`) and decided right after it lands
+  (`poll_settings_load_with`; dropped if the loader died). The gate
+  splits by runtime: PyTorch without Torch answers `cleaning.tools.sdcpp.torch_missing_hint`
+  where that route is available (else the host's generic refusal), then the `.status` verdict;
+  sd.cpp answers the shared `SdCppReadiness`, then the files state (checking blocks: a run
+  needs the validated paths), the prompt and the seed (≤ `i64::MAX`). On sd.cpp the backend is
+  asked NOTHING (`.status`, forecast and listing are gated on PyTorch); the files worker
+  follows the selection's key `(root, sd.cpp DiT format, encoder)`, one query at a time, and
+  re-checks on «Обновить» and a catalog job's end. The runtime switch is closed while a job of
+  either runtime is in flight or a catalog job runs (`runtime_switch_block_reason`:
+  `pipeline_busy`, `.unload`, the catalog job), and an sd.cpp run or a cancelled run still
+  ending (`abandoned`) also closes the engine picker. The files worker also re-asks when the
+  `ms_sdcpp` status revision moves, re-reading the saved device (a device picked in Settings
+  clears a stale «device not found»).
+- **An sd.cpp run** builds its request off the GUI thread (decode, flatten over white, Lanczos3
+  to «Ограничить референсы» by AREA) and answers `DoneRaw` with the same mask and mode the run
+  sent (no `sample_mask`); a blank seed is drawn in Rust so the run line names it. A cancelled
+  job is parked in `abandoned` (its worker process is told to stop); a cancelled prep is dropped.
 - **A moved frame cancels the run** (the answer would describe another place); a settled resize
   arms the forecast once, a pure move arms nothing.
 
@@ -77,4 +106,6 @@ poll_x()   -> try_recv, apply the outcome, clear the receiver
   what a request becomes: `run_input`.
 - A new button that starts something long: a `start_*` / `poll_*` pair in `actions.rs`, drained
   from `AiEngine::poll`, its receiver in `pipeline_busy` if it holds the backend.
+- What an sd.cpp run sends or how its answer is paired: `sdcpp.rs`; which files it loads:
+  `../sdcpp_files.rs`; what its gate says: `../decisions.rs`.
 - Tests sit at the end of each file and use `../test_support.rs`.

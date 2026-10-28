@@ -3306,6 +3306,7 @@ dependencies = [
  "ms-page-ops",
  "ms-platform",
  "ms-project",
+ "ms-sdcpp",
  "ms-settings-ui",
  "ms-storage",
  "ms-studio-tab",
@@ -3626,12 +3627,15 @@ dependencies = [
 name = "ms-download"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "ms-log",
  "sha2",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "ureq",
  "zip",
+ "zstd",
 ]
 
 [[package]]
@@ -3815,6 +3819,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-native-package"
+version = "0.1.0"
+dependencies = [
+ "ms-atomic-file",
+ "ms-download",
+ "ms-log",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "zip",
+]
+
+[[package]]
 name = "ms-native-runtime"
 version = "0.1.0"
 dependencies = [
@@ -3849,21 +3866,19 @@ dependencies = [
 name = "ms-onnx-runtime"
 version = "0.1.0"
 dependencies = [
- "flate2",
  "ms-atomic-file",
  "ms-config",
  "ms-download",
  "ms-i18n",
  "ms-log",
+ "ms-native-package",
  "ms-onnx",
  "ms-platform",
  "serde",
  "serde_json",
  "sha2",
- "tar",
  "tempfile",
  "zip",
- "zstd",
 ]
 
 [[package]]
@@ -3955,6 +3970,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-sdcpp"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libloading 0.8.9",
+ "ms-backend-ipc",
+ "ms-config",
+ "ms-download",
+ "ms-i18n",
+ "ms-log",
+ "ms-native-package",
+ "ms-platform",
+ "ms-thread",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "windows-sys 0.59.0",
+ "zip",
+]
+
+[[package]]
 name = "ms-settings-ui"
 version = "0.1.0"
 dependencies = [
@@ -3968,12 +4006,14 @@ dependencies = [
  "ms-local-ai",
  "ms-log",
  "ms-memory",
+ "ms-native-package",
  "ms-native-runtime",
  "ms-onnx",
  "ms-onnx-runtime",
  "ms-os-integration",
  "ms-platform",
  "ms-project",
+ "ms-sdcpp",
  "ms-sysprobe",
  "ms-text-util",
  "ms-theme",
@@ -4052,6 +4092,7 @@ dependencies = [
  "ms-project",
  "ms-raster",
  "ms-region-postprocess",
+ "ms-sdcpp",
  "ms-studio-tab",
  "ms-sysprobe",
  "ms-tab-translation",
@@ -4324,6 +4365,7 @@ dependencies = [
  "ms-gifs",
  "ms-i18n",
  "ms-log",
+ "ms-sdcpp",
  "ms-sysprobe",
  "ms-text-util",
  "ms-theme",

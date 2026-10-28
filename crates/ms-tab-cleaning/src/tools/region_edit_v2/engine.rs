@@ -47,6 +47,7 @@ use super::geometry::{FrameConstraints, SizeViolation, check_size};
 use ms_canvas::OverlayRectPx;
 use ms_region_postprocess::PostprocessSettings;
 use eframe::egui;
+use ms_widgets::{AiCaps, AiRequirement};
 
 /// Which picker section an engine appears in.
 ///
@@ -318,8 +319,31 @@ pub trait AiEngine: Send {
     /// Which picker section the engine appears in.
     fn section(&self) -> EngineSection;
 
-    /// Whether the engine needs the PyTorch runtime, which gates its run button.
+    /// Whether a run of the engine AS CURRENTLY CONFIGURED needs the PyTorch runtime. The host
+    /// refuses «Обработать» while it does and Torch is unavailable (after the engine's own
+    /// [`AiEngine::run_block_reason`], which wins). Must stay cheap: re-read every frame.
     fn requires_torch(&self) -> bool;
+
+    /// The local runtimes this engine can run on, as the requirement its picker button is
+    /// gated on (`None`: it needs no local runtime, e.g. a cloud engine). Over every runtime
+    /// the engine OFFERS, not the one currently selected: FLUX on PyTorch or
+    /// Stable-Diffusion.cpp answers `TorchOrSdcpp`, whichever its switch shows. Static for the
+    /// process and cheap. Default: `Torch` when [`AiEngine::requires_torch`], else `None` —
+    /// right for an engine with one runtime.
+    ///
+    /// The host merges the catalog's answers into the tool button's requirement
+    /// (`CleaningTool::ai_requirement`, `catalog_requirement`).
+    fn ai_requirement(&self) -> Option<AiRequirement> {
+        self.requires_torch().then_some(AiRequirement::Torch)
+    }
+
+    /// Called when the engine becomes the one the user works with: picked in the engine
+    /// picker, or the hosting tool activated while it is selected — user events only, never
+    /// once per frame. `caps` is the frame's strict capability snapshot. An engine with a
+    /// runtime switch may move itself to a runtime that is available (FLUX: to sd.cpp when
+    /// PyTorch is not, `shared::sdcpp_auto_switch`), through the same path a click on its
+    /// switch takes. Default: nothing.
+    fn on_selected(&mut self, _caps: &AiCaps) {}
 
     /// Size requirements the engine imposes on the frame rectangle, in source page pixels.
     ///
@@ -371,7 +395,9 @@ pub trait AiEngine: Send {
     /// Why a run is refused right now, localized; `None` when it may start.
     ///
     /// Only the engine's OWN half of the gate: the rectangle is already validated against
-    /// `constraints()` by the frame, and the non-empty-mask rule is `allows_empty_mask()`.
+    /// `constraints()` by the frame, the non-empty-mask rule is `allows_empty_mask()`, and the
+    /// PyTorch requirement is the host's (`requires_torch()` against the pushed Torch flag),
+    /// checked only when this answers `None`.
     fn run_block_reason(&self) -> Option<String>;
 
     /// Why switching AWAY from this engine is unsafe right now, localized; `None` when the

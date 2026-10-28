@@ -10,6 +10,13 @@ licence page, destination, the parts present, the Hugging Face token row while a
 the bundle is not installed, and ONE pinned bundle download over the shared
 `draw_ocr_model_download`), the residency line and «Выгрузить из памяти».
 
+On Stable-Diffusion.cpp: the DiT picker lists only the formats sd.cpp runs
+(`Flux3DitFormat::offered_on`) and shows the one a run uses, with one line when the stored
+fp8r / nvfp4 falls back; the catalog block fetches the sd.cpp bundle
+(`flux3_klein_package_specs_for(SdCpp, …)`, via `flux3_catalog_bundle`); the backend's parts
+list, residency and «Выгрузить из памяти» give way to the shared «Выгрузить модель» of the sd.cpp
+worker process.
+
 Key functions:
 - `Flux3PanelCtx::draw_install_section()`, `draw_format_pickers()`, `draw_source_mode_switch()`,
   `Flux3PanelCtx::draw_download_block()`
@@ -35,10 +42,10 @@ impl Flux3PanelCtx<'_> {
         // retires the one-shot seeding for good.
         let user_moved = self.install_section_open_prev.is_some_and(|prev| prev != section.is_open());
         if !*self.install_section_seeded {
-            match self.readiness {
-                Flux3ModelReadiness::Unknown => {}
-                Flux3ModelReadiness::Ready => *self.install_section_seeded = true,
-                Flux3ModelReadiness::Missing(_) | Flux3ModelReadiness::NoRoot | Flux3ModelReadiness::RootNotAbsolute => {
+            match self.install_verdict() {
+                None => {}
+                Some(true) => *self.install_section_seeded = true,
+                Some(false) => {
                     if !user_moved {
                         section.set_open(true);
                     }
@@ -65,7 +72,14 @@ impl Flux3PanelCtx<'_> {
                     Flux3SourceMode::Download => self.draw_download_block(ui),
                 }
                 ui.separator();
-                self.draw_residency(ui);
+                match self.settings.runtime() {
+                    ImageEditRuntime::PyTorch => self.draw_residency(ui),
+                    ImageEditRuntime::SdCpp => {
+                        if draw_sdcpp_unload_button(ui, self.sdcpp_status.worker_running) {
+                            self.intents.sdcpp_unload = true;
+                        }
+                    }
+                }
             });
     }
 
@@ -90,8 +104,12 @@ impl Flux3PanelCtx<'_> {
     }
 
     /// The three parts the selected formats need, each with its presence from the last answer
-    /// about the current root; nothing is claimed without one.
+    /// about the current root; nothing is claimed without one. PyTorch only: on sd.cpp the files
+    /// line of the readiness block is the answer (the backend's `.status` is not asked there).
     fn draw_package_parts(&mut self, ui: &mut egui::Ui) {
+        if self.settings.runtime() == ImageEditRuntime::SdCpp {
+            return;
+        }
         let format = self.settings.dit_format();
         let encoder = self.settings.encoder_format();
         let Some(status) = self.current_status.filter(|_| !matches!(self.readiness, Flux3ModelReadiness::NoRoot | Flux3ModelReadiness::RootNotAbsolute)) else {
@@ -189,25 +207,35 @@ impl Flux3PanelCtx<'_> {
 /// `flux3_dit_format_row` / `flux3_encoder_format_row` (name, catalog size, ✓ from `status`, the
 /// answer about the CURRENT root) and hovered by its format hint.
 ///
+/// The DiT rows are the selected runtime's (`Flux3DitFormat::offered_on`) and the closed combo
+/// shows the format a run USES (`run_dit_format`); on sd.cpp a stored format it cannot run stays
+/// stored (it returns with PyTorch) and one line under the picker says which format runs
+/// instead (`flux3_sdcpp_format_fallback_line`). Picking a row stores it.
+///
 /// `WheelComboBox` with a fixed `id_salt` each, never `egui::ComboBox` and never an id from the
 /// localized caption (`egui-docs/04-widgets.md` §0.2, `05-ids-and-i18n.md` §2).
 fn draw_format_pickers(ui: &mut egui::Ui, settings: &mut Flux3KleinSettings, status: Option<&Flux3Status>, changed: &mut bool) {
-    let mut format = settings.dit_format();
+    let used = settings.run_dit_format();
+    let mut format = used;
     ui.horizontal_wrapped(|ui| {
         ui.label(t!("cleaning.tools.flux3_klein.format_label")).on_hover_text(t!("cleaning.tools.flux3_klein.dit_format_picker_hint"));
         WheelComboBox::from_id_salt("cleaning_flux3_klein_format")
             .selected_text(flux3_dit_format_row(format, status))
             .show_ui(ui, |ui| {
-                for &candidate in Flux3DitFormat::all() {
+                for &candidate in Flux3DitFormat::offered_on(settings.runtime()) {
                     ui.selectable_value(&mut format, candidate, flux3_dit_format_row(candidate, status)).on_hover_text(flux3_dit_format_hint(candidate));
                 }
             })
             .response
             .on_hover_text(flux3_dit_format_hint(format));
     });
-    if format.wire() != settings.format {
+    // Only a real pick is stored: showing the fallback must not overwrite the stored format.
+    if format != used {
         settings.format = format.wire().to_string();
         *changed = true;
+    }
+    if let Some(line) = flux3_sdcpp_format_fallback_line(settings) {
+        ui.small(line);
     }
     let mut encoder = settings.encoder_format();
     ui.horizontal_wrapped(|ui| {

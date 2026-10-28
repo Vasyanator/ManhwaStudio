@@ -6,8 +6,9 @@ values the application's pinned download catalogs need: exact byte size, sha256,
 40-hex commit of Hugging Face repositories, and size / sha256 / md5 of zip members. Nothing in
 `src/` or `crates/` imports it; it never enters the runtime path. Its output is pasted by hand
 into the owning catalogs (`ms_sysprobe::ai_models::external_catalog`,
-`crates/ms-onnx-runtime/src/ort_manifest.json`, the waifu2x URL table, the watermark weight
-table in `modules/ai_backend/watermark/service.py`).
+`crates/ms-onnx-runtime/src/ort_manifest.json`, the Stable-Diffusion.cpp package rows in
+`crates/ms-sdcpp/src/catalog.rs` (`sdcpp/*` sources: the release zips with every member), the
+waifu2x URL table, the watermark weight table in `modules/ai_backend/watermark/service.py`).
 
 ## Architecture
 ```

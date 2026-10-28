@@ -9,9 +9,11 @@ specs and backend paths. The parent `external_catalog.rs` re-exports every publi
 callers keep naming `external_catalog::<item>`.
 
 Key items:
-- `FLUX2_KLEIN_4B_*` (11 specs) and `FLUX2_KLEIN_9B_*` (17 specs, one of them the ADOPT-ONLY
-  legacy diffusers transformer `FLUX2_KLEIN_9B_TRANSFORMER_BF16_DIFFUSERS`, one the stock
-  encoder's two configs `FLUX2_KLEIN_9B_TEXT_ENCODER_CONFIG`): the statics.
+- `FLUX2_KLEIN_4B_*` (12 specs, one of them the BFL single-file bf16 transformer
+  `FLUX2_KLEIN_4B_TRANSFORMER_BF16_SINGLE` that only the sd.cpp bundle uses) and
+  `FLUX2_KLEIN_9B_*` (17 specs, one of them the ADOPT-ONLY legacy diffusers transformer
+  `FLUX2_KLEIN_9B_TRANSFORMER_BF16_DIFFUSERS`, one the stock encoder's two configs
+  `FLUX2_KLEIN_9B_TEXT_ENCODER_CONFIG`): the statics.
 - `flux2_klein_spec`: the download target of one component (variant, axis, encoder source,
   format); never the legacy spec.
 - `flux2_klein_legacy_transformer_spec`, `Flux2TransformerLayout`,
@@ -20,6 +22,9 @@ Key items:
 - `flux2_klein_package_specs`: the bundle (base [+ 9B stock encoder configs] + transformer +
   encoder) a selection needs.
 - `flux2_klein_weights_path`: the bf16 file / folder or GGUF file the backend is sent.
+- `flux2_klein_package_specs_for` / `flux2_klein_sdcpp_paths`: the bundle per
+  `ms_config::ImageEditRuntime` and the three files Stable-Diffusion.cpp loads (diffusion
+  model, VAE, LLM text encoder).
 - `Flux2SpecRole` + `flux2_klein_spec_role`: reverse lookup spec id -> typed role (display
   names in the UI).
 
@@ -32,20 +37,25 @@ Notes:
   per-variant matches force a spec for every new format.
 - Pins: the Hugging Face tree API at each commit (gated repositories read with a token); small
   files hashed after download (git blob sha1 equal to the tree's).
+- sd.cpp file rule (measured against release `master-1017-be48649`): the diffusers
+  `transformer/` folder does NOT load there (detected as "Flux Control"), so the sd.cpp bf16
+  transformer is always the BFL single file (4B: its own spec, 9B: the primary download target).
+  Everything else maps 1:1 onto the PyTorch files: the diffusers `vae/` weights, the encoder's
+  `model.safetensors.index.json` (stock) or `model.safetensors` (uncensored), any GGUF.
 */
 
 use std::path::{Path, PathBuf};
 
-use ms_config::{Flux2EncoderSource, Flux2Variant, Flux2WeightAxis, Flux2WeightFormat};
+use ms_config::{Flux2EncoderSource, Flux2Variant, Flux2WeightAxis, Flux2WeightFormat, ImageEditRuntime};
 
-use super::join_relative;
+use super::{SdCppComponentPaths, join_relative};
 use crate::ai_models::external::{DirLayout, ExternalFile, ExternalModelSpec, ExternalModelStatus, ExternalSource, external_model_status, unmarked_files_present};
 
 // FLUX.2 klein 4B. The three BFL specs publish into the package root `FLUX.2-klein-4B` (the
 // same relative paths `ms_config::flux2_klein_*_dir` name and the backend's former download
 // produced); each GGUF component has a sibling folder holding one file per quant. The BFL
-// repository carries more (the repo-root single-file checkpoint, sample images); only the
-// diffusers folders the engine loads are listed.
+// repository carries more (sample images); only the diffusers folders the PyTorch engine loads
+// and the repo-root single-file checkpoint the sd.cpp runtime loads are listed.
 
 /// The FLUX.2 klein 4B package root, relative to `side_models`
 /// (`ms_config::Flux2Variant::Klein4B.dir_name()`; a catalog test checks the agreement).
@@ -64,6 +74,15 @@ const FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_DIR: &str = "FLUX.2-klein-4B/text_encoder
 const FLUX2_KLEIN_TRANSFORMER_SUBDIR: &str = "transformer";
 /// The stock bf16 text-encoder folder inside a package root.
 const FLUX2_KLEIN_TEXT_ENCODER_SUBDIR: &str = "text_encoder";
+/// The BFL single-file 4B transformer, relative to the package root.
+const FLUX2_KLEIN_4B_TRANSFORMER_SINGLE_FILE: &str = "flux-2-klein-4b.safetensors";
+/// The VAE weights inside a package root (pinned by both bases; the file sd.cpp loads).
+const FLUX2_KLEIN_VAE_WEIGHTS: &str = "vae/diffusion_pytorch_model.safetensors";
+/// The stock bf16 encoder's shard index inside a package root: the file sd.cpp is given (it
+/// reads the shards the index names).
+const FLUX2_KLEIN_TEXT_ENCODER_INDEX: &str = "text_encoder/model.safetensors.index.json";
+/// The uncensored unquantized encoder's single weights file inside its spec directory.
+const FLUX2_KLEIN_UNCENSORED_ENCODER_WEIGHTS: &str = "model.safetensors";
 
 // Everything the engine needs whatever the weight formats: licence, pipeline index, scheduler,
 // tokenizer, VAE, and the two component configs (a GGUF transformer / encoder takes its config
@@ -107,6 +126,22 @@ pub static FLUX2_KLEIN_4B_TRANSFORMER_BF16: ExternalModelSpec = ExternalModelSpe
     dir: FLUX2_KLEIN_4B_DIR,
     layout: DirLayout::Shared,
     files: &FLUX2_KLEIN_4B_TRANSFORMER_BF16_FILES,
+};
+
+static FLUX2_KLEIN_4B_TRANSFORMER_BF16_SINGLE_FILES: [ExternalFile; 1] = [
+    ExternalFile::direct(FLUX2_KLEIN_4B_TRANSFORMER_SINGLE_FILE, 7_751_105_712, "ec3d4e733a771f61c052fb4856c48b336c55eaf2c65487c2a1faeb9bbda7a343"),
+];
+
+/// FLUX.2 klein 4B bf16 transformer as the BFL single file (BFL key layout, about 7.8 GB) at
+/// the package root: the same weights as [`FLUX2_KLEIN_4B_TRANSFORMER_BF16`] in the layout
+/// Stable-Diffusion.cpp loads (it rejects the diffusers `transformer/` file). Only the sd.cpp
+/// bundle ([`flux2_klein_package_specs_for`]) contains it; [`flux2_klein_spec`] never returns it.
+pub static FLUX2_KLEIN_4B_TRANSFORMER_BF16_SINGLE: ExternalModelSpec = ExternalModelSpec {
+    id: "flux2_klein_4b_transformer_bf16_single",
+    source: FLUX2_KLEIN_4B_BFL_SOURCE,
+    dir: FLUX2_KLEIN_4B_DIR,
+    layout: DirLayout::Shared,
+    files: &FLUX2_KLEIN_4B_TRANSFORMER_BF16_SINGLE_FILES,
 };
 
 static FLUX2_KLEIN_4B_TEXT_ENCODER_BF16_FILES: [ExternalFile; 3] = [
@@ -473,9 +508,10 @@ pub static FLUX2_KLEIN_9B_TEXT_ENCODER_UNCENSORED_GGUF_Q4_K_M: ExternalModelSpec
 
 /// Every FLUX.2 klein spec (both variants, the legacy one included), in catalog order; the
 /// parent's `all_specs()` appends it.
-pub(super) static FLUX2_KLEIN_SPECS: [&ExternalModelSpec; 28] = [
+pub(super) static FLUX2_KLEIN_SPECS: [&ExternalModelSpec; 29] = [
     &FLUX2_KLEIN_4B_BASE,
     &FLUX2_KLEIN_4B_TRANSFORMER_BF16,
+    &FLUX2_KLEIN_4B_TRANSFORMER_BF16_SINGLE,
     &FLUX2_KLEIN_4B_TEXT_ENCODER_BF16,
     &FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q8_0,
     &FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q6_K,
@@ -706,6 +742,85 @@ pub fn flux2_klein_weights_path(side_models_root: &Path, variant: Flux2Variant, 
     Some(if component.is_empty() { dir } else { join_relative(&dir, component) })
 }
 
+/// The BFL single-file bf16 transformer of `variant`: the file Stable-Diffusion.cpp loads for
+/// a bf16 transformer (4B: [`FLUX2_KLEIN_4B_TRANSFORMER_BF16_SINGLE`], 9B: the primary download
+/// target [`FLUX2_KLEIN_9B_TRANSFORMER_BF16`]).
+fn flux2_klein_single_file_transformer_spec(variant: Flux2Variant) -> &'static ExternalModelSpec {
+    match variant {
+        Flux2Variant::Klein4B => &FLUX2_KLEIN_4B_TRANSFORMER_BF16_SINGLE,
+        Flux2Variant::Klein9B => &FLUX2_KLEIN_9B_TRANSFORMER_BF16,
+    }
+}
+
+/// The spec Stable-Diffusion.cpp loads for `variant`'s weights of `axis` / `source` / `format`:
+/// the single-file transformer for a bf16 transformer (sd.cpp rejects the diffusers
+/// `transformer/` layout, so the bf16 transformer layout never matters there), else
+/// [`flux2_klein_spec`]. `None` exactly when [`flux2_klein_spec`] is `None`.
+fn flux2_klein_sdcpp_spec(variant: Flux2Variant, axis: Flux2WeightAxis, source: Flux2EncoderSource, format: Flux2WeightFormat) -> Option<&'static ExternalModelSpec> {
+    let primary = flux2_klein_spec(variant, axis, source, format)?;
+    let bf16_transformer = axis == Flux2WeightAxis::Transformer && format == Flux2WeightFormat::Bf16;
+    Some(if bf16_transformer { flux2_klein_single_file_transformer_spec(variant) } else { primary })
+}
+
+/// The bundle of specs a FLUX.2 klein selection needs installed on `runtime`.
+///
+/// - `PyTorch`: exactly [`flux2_klein_package_specs`] (`layout` applies).
+/// - `SdCpp`: the variant's base part (it holds the VAE), then the transformer spec sd.cpp
+///   loads (the BFL single file for bf16, whatever `layout` says; the GGUF spec otherwise),
+///   then the text-encoder spec of `text_encoder` from `source`. No 9B stock encoder configs:
+///   sd.cpp reads tensors only.
+///
+/// A format the variant does not offer for that component contributes no spec, as in
+/// [`flux2_klein_package_specs`].
+#[must_use]
+pub fn flux2_klein_package_specs_for(runtime: ImageEditRuntime, variant: Flux2Variant, transformer: Flux2WeightFormat, layout: Flux2TransformerLayout, source: Flux2EncoderSource, text_encoder: Flux2WeightFormat) -> Vec<&'static ExternalModelSpec> {
+    match runtime {
+        ImageEditRuntime::PyTorch => flux2_klein_package_specs(variant, transformer, layout, source, text_encoder),
+        ImageEditRuntime::SdCpp => {
+            let mut specs = vec![flux2_klein_base_spec(variant)];
+            specs.extend(flux2_klein_sdcpp_spec(variant, Flux2WeightAxis::Transformer, source, transformer));
+            specs.extend(flux2_klein_sdcpp_spec(variant, Flux2WeightAxis::TextEncoder, source, text_encoder));
+            specs
+        }
+    }
+}
+
+/// The three files Stable-Diffusion.cpp is given for a FLUX.2 klein selection once its sd.cpp
+/// bundle ([`flux2_klein_package_specs_for`] with `SdCpp`) is installed under
+/// `side_models_root` (pass `ms_config::side_models_dir()`). Pure path joining: checks nothing
+/// on disk.
+///
+/// | component | path |
+/// |---|---|
+/// | diffusion, bf16 | `<package>/flux-2-klein-<4b\|9b>.safetensors` (BFL single file) |
+/// | vae | `<package>/vae/diffusion_pytorch_model.safetensors` |
+/// | llm, stock bf16 | `<package>/text_encoder/model.safetensors.index.json` |
+/// | llm, uncensored unquantized | `<package>/text_encoder_uncensored/model.safetensors` |
+/// | any GGUF | the `.gguf` file |
+///
+/// `None` when `transformer` or `text_encoder` is not offered for `variant` / `source`
+/// (`Flux2WeightFormat::offered_for`).
+#[must_use]
+pub fn flux2_klein_sdcpp_paths(side_models_root: &Path, variant: Flux2Variant, transformer: Flux2WeightFormat, source: Flux2EncoderSource, text_encoder: Flux2WeightFormat) -> Option<SdCppComponentPaths> {
+    // The diffusion spec is a single file for every format (the BFL single file or one GGUF;
+    // catalog test), and that file is the component.
+    let diffusion_spec = flux2_klein_sdcpp_spec(variant, Flux2WeightAxis::Transformer, source, transformer)?;
+    let diffusion = diffusion_spec.files.first().map(|file| join_relative(&diffusion_spec.local_dir(side_models_root), file.path))?;
+    let encoder_spec = flux2_klein_sdcpp_spec(variant, Flux2WeightAxis::TextEncoder, source, text_encoder)?;
+    let encoder_dir = encoder_spec.local_dir(side_models_root);
+    let llm = if text_encoder.is_gguf() {
+        // A GGUF spec pins exactly one file (catalog test), which is the component.
+        encoder_spec.files.first().map(|file| join_relative(&encoder_dir, file.path))?
+    } else {
+        match source {
+            Flux2EncoderSource::Stock => join_relative(&encoder_dir, FLUX2_KLEIN_TEXT_ENCODER_INDEX),
+            Flux2EncoderSource::Uncensored => join_relative(&encoder_dir, FLUX2_KLEIN_UNCENSORED_ENCODER_WEIGHTS),
+        }
+    };
+    let vae = join_relative(&flux2_klein_base_spec(variant).local_dir(side_models_root), FLUX2_KLEIN_VAE_WEIGHTS);
+    Some(SdCppComponentPaths { diffusion, vae, llm })
+}
+
 /// What a FLUX.2 klein catalog spec is, for display: the reverse of the lookups above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flux2SpecRole {
@@ -735,6 +850,13 @@ pub enum Flux2SpecRole {
     },
     /// The adopt-only legacy diffusers bf16 transformer of `variant`.
     LegacyTransformer {
+        /// The variant.
+        variant: Flux2Variant,
+    },
+    /// The BFL single-file bf16 transformer of `variant` that only the sd.cpp bundle uses
+    /// ([`FLUX2_KLEIN_4B_TRANSFORMER_BF16_SINGLE`]). The 9B single file is the primary bf16
+    /// download target and reads as `Weights`.
+    SingleFileTransformer {
         /// The variant.
         variant: Flux2Variant,
     },
@@ -768,6 +890,11 @@ pub fn flux2_klein_spec_role(id: &str) -> Option<Flux2SpecRole> {
                 }
             }
         }
+        // Checked after the download targets: the 9B single file is one of them and must read
+        // as `Weights`, so only the sd.cpp-only 4B single file reaches this role.
+        if flux2_klein_single_file_transformer_spec(variant).id == id {
+            return Some(Flux2SpecRole::SingleFileTransformer { variant });
+        }
     }
     None
 }
@@ -799,11 +926,11 @@ mod tests {
 
     #[test]
     fn every_flux2_spec_is_in_the_catalog_list_and_all_specs() {
-        assert_eq!(FLUX2_KLEIN_SPECS.len(), 28);
+        assert_eq!(FLUX2_KLEIN_SPECS.len(), 29);
         let all = all_specs();
         let in_all: Vec<&str> = all.iter().map(|spec| spec.id).filter(|id| id.starts_with("flux2_klein_")).collect();
         assert_eq!(in_all, ids(&FLUX2_KLEIN_SPECS));
-        assert_eq!(FLUX2_KLEIN_SPECS.iter().filter(|spec| spec.id.starts_with("flux2_klein_4b_")).count(), 11);
+        assert_eq!(FLUX2_KLEIN_SPECS.iter().filter(|spec| spec.id.starts_with("flux2_klein_4b_")).count(), 12);
         assert_eq!(FLUX2_KLEIN_SPECS.iter().filter(|spec| spec.id.starts_with("flux2_klein_9b_")).count(), 17);
         for spec in FLUX2_KLEIN_SPECS {
             assert!(validate_spec(spec).is_ok(), "{}", spec.id);
@@ -849,12 +976,12 @@ mod tests {
                 }
             }
         }
-        // Every weights spec is reachable exactly once; only the bases and the legacy spec
-        // are not download targets.
+        // Every weights spec is reachable exactly once; only the bases, the 9B encoder configs,
+        // the legacy spec and the sd.cpp-only 4B single file are not download targets.
         let mut expected: Vec<&str> = FLUX2_KLEIN_SPECS
             .iter()
             .map(|spec| spec.id)
-            .filter(|id| !id.ends_with("_base") && *id != FLUX2_KLEIN_9B_TRANSFORMER_BF16_DIFFUSERS.id && *id != FLUX2_KLEIN_9B_TEXT_ENCODER_CONFIG.id)
+            .filter(|id| !id.ends_with("_base") && *id != FLUX2_KLEIN_9B_TRANSFORMER_BF16_DIFFUSERS.id && *id != FLUX2_KLEIN_9B_TEXT_ENCODER_CONFIG.id && *id != FLUX2_KLEIN_4B_TRANSFORMER_BF16_SINGLE.id)
             .collect();
         expected.sort_unstable();
         resolved.sort_unstable();
@@ -883,6 +1010,7 @@ mod tests {
                 Some(Flux2SpecRole::Base { variant }) => Some(flux2_klein_base_spec(variant)),
                 Some(Flux2SpecRole::TextEncoderConfig { variant }) => flux2_klein_text_encoder_config_spec(variant, Flux2EncoderSource::Stock),
                 Some(Flux2SpecRole::LegacyTransformer { variant }) => flux2_klein_legacy_transformer_spec(variant),
+                Some(Flux2SpecRole::SingleFileTransformer { variant }) => Some(flux2_klein_single_file_transformer_spec(variant)),
                 Some(Flux2SpecRole::Weights { variant, axis, source, format }) => {
                     if axis == Flux2WeightAxis::Transformer {
                         assert_eq!(source, Flux2EncoderSource::Stock, "{}", spec.id);
@@ -895,6 +1023,12 @@ mod tests {
         }
         assert_eq!(flux2_klein_spec_role("flux2_klein_9b_base"), Some(Flux2SpecRole::Base { variant: Flux2Variant::Klein9B }));
         assert_eq!(flux2_klein_spec_role("flux2_klein_9b_text_encoder_config"), Some(Flux2SpecRole::TextEncoderConfig { variant: Flux2Variant::Klein9B }));
+        assert_eq!(flux2_klein_spec_role("flux2_klein_4b_transformer_bf16_single"), Some(Flux2SpecRole::SingleFileTransformer { variant: Flux2Variant::Klein4B }));
+        // The 9B single file is the primary bf16 download target, never the sd.cpp-only role.
+        assert_eq!(
+            flux2_klein_spec_role(FLUX2_KLEIN_9B_TRANSFORMER_BF16.id),
+            Some(Flux2SpecRole::Weights { variant: Flux2Variant::Klein9B, axis: Flux2WeightAxis::Transformer, source: Flux2EncoderSource::Stock, format: Flux2WeightFormat::Bf16 })
+        );
         assert_eq!(flux2_klein_spec_role("baberu_ocr"), None);
         assert_eq!(flux2_klein_spec_role(""), None);
     }
@@ -915,7 +1049,7 @@ mod tests {
         assert_eq!(FLUX2_KLEIN_9B_DIR, Flux2Variant::Klein9B.dir_name());
         // The specs publishing into one package root must not overlap: one file, one owner.
         let roots: Vec<&ExternalModelSpec> = FLUX2_KLEIN_SPECS.iter().copied().filter(|spec| spec.dir == FLUX2_KLEIN_4B_DIR || spec.dir == FLUX2_KLEIN_9B_DIR).collect();
-        assert_eq!(roots.len(), 3 + 5);
+        assert_eq!(roots.len(), 4 + 5);
         for (index, a) in roots.iter().enumerate() {
             for b in roots.iter().skip(index + 1).filter(|b| b.dir == a.dir) {
                 assert!(a.files.iter().all(|file| b.files.iter().all(|other| other.path != file.path)), "{} / {}", a.id, b.id);
@@ -937,9 +1071,10 @@ mod tests {
 
     #[test]
     fn totals_match_the_pinned_tables() {
-        let expected: [(&ExternalModelSpec, u64); 28] = [
+        let expected: [(&ExternalModelSpec, u64); 29] = [
             (&FLUX2_KLEIN_4B_BASE, 184_016_738),
             (&FLUX2_KLEIN_4B_TRANSFORMER_BF16, 7_751_109_744),
+            (&FLUX2_KLEIN_4B_TRANSFORMER_BF16_SINGLE, 7_751_105_712),
             (&FLUX2_KLEIN_4B_TEXT_ENCODER_BF16, 8_045_014_847),
             (&FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q8_0, 4_300_644_928),
             (&FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q6_K, 3_409_273_408),
@@ -1139,5 +1274,120 @@ mod tests {
         let shard = join_relative(&FLUX2_KLEIN_9B_TRANSFORMER_BF16_DIFFUSERS.local_dir(root), FLUX2_KLEIN_9B_TRANSFORMER_BF16_DIFFUSERS_FILES[0].path);
         std::fs::File::create(&shard).unwrap_or_else(|error| panic!("truncate {}: {error}", shard.display()));
         assert_eq!(flux2_klein_transformer_layout(root, Flux2Variant::Klein9B), Flux2TransformerLayout::Primary);
+    }
+
+    #[test]
+    fn the_4b_single_file_transformer_pin() {
+        let spec = &FLUX2_KLEIN_4B_TRANSFORMER_BF16_SINGLE;
+        assert_eq!(spec.id, "flux2_klein_4b_transformer_bf16_single");
+        assert_eq!(spec.source, FLUX2_KLEIN_4B_BASE.source);
+        assert_eq!((spec.dir, spec.layout), (FLUX2_KLEIN_4B_DIR, DirLayout::Shared));
+        assert_eq!(spec.files, [ExternalFile::direct("flux-2-klein-4b.safetensors", 7_751_105_712, "ec3d4e733a771f61c052fb4856c48b336c55eaf2c65487c2a1faeb9bbda7a343")].as_slice());
+        // Never a PyTorch download target: the diffusers file stays the 4B bf16 transformer.
+        assert_eq!(flux2_klein_spec(Flux2Variant::Klein4B, Flux2WeightAxis::Transformer, Flux2EncoderSource::Stock, Flux2WeightFormat::Bf16), Some(&FLUX2_KLEIN_4B_TRANSFORMER_BF16));
+    }
+
+    /// Whether `path` is one pinned file of some spec of `bundle` under `side`.
+    fn is_bundle_file(side: &Path, bundle: &[&'static ExternalModelSpec], path: &Path) -> bool {
+        bundle.iter().any(|spec| spec.files.iter().any(|file| join_relative(&spec.local_dir(side), file.path) == path))
+    }
+
+    /// Every offered combination resolves on sd.cpp to a bundle of base + transformer + encoder
+    /// and to three paths, each a pinned file of that bundle; nothing else resolves.
+    #[test]
+    fn every_offered_format_resolves_to_an_sdcpp_bundle_and_paths() {
+        let side = Path::new("side");
+        let sources = [Flux2EncoderSource::Stock, Flux2EncoderSource::Uncensored];
+        for variant in Flux2Variant::all() {
+            for source in sources {
+                for &transformer in Flux2WeightFormat::all() {
+                    for &encoder in Flux2WeightFormat::all() {
+                        let offered = Flux2WeightFormat::offered_for(variant, Flux2WeightAxis::Transformer, source).contains(&transformer)
+                            && Flux2WeightFormat::offered_for(variant, Flux2WeightAxis::TextEncoder, source).contains(&encoder);
+                        let paths = flux2_klein_sdcpp_paths(side, variant, transformer, source, encoder);
+                        assert_eq!(paths.is_some(), offered, "{variant:?} {source:?} {transformer:?} {encoder:?}");
+                        let Some(paths) = paths else { continue };
+                        let bundle = flux2_klein_package_specs_for(ImageEditRuntime::SdCpp, variant, transformer, Flux2TransformerLayout::LegacyDiffusers, source, encoder);
+                        assert_eq!(bundle.len(), 3, "{variant:?} {source:?} {transformer:?} {encoder:?}");
+                        assert_eq!(bundle[0].id, flux2_klein_base_spec(variant).id);
+                        for path in [&paths.diffusion, &paths.vae, &paths.llm] {
+                            assert!(is_bundle_file(side, &bundle, path), "{} is not a file of the bundle", path.display());
+                        }
+                        // The diffusion spec is exactly one file (the component itself).
+                        assert_eq!(bundle[1].files.len(), 1, "{}", bundle[1].id);
+                        // sd.cpp never gets the diffusers transformer, whatever the layout says.
+                        assert!(bundle.iter().all(|spec| spec.id != FLUX2_KLEIN_4B_TRANSFORMER_BF16.id && spec.id != FLUX2_KLEIN_9B_TRANSFORMER_BF16_DIFFUSERS.id));
+                        assert!(paths.diffusion.extension().is_some_and(|ext| ext == "safetensors" || ext == "gguf"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flux2_klein_sdcpp_path_table() {
+        let side = Path::new("side");
+        let (four, nine) = (side.join("FLUX.2-klein-4B"), side.join("FLUX.2-klein-9B"));
+        let (stock, uncensored) = (Flux2EncoderSource::Stock, Flux2EncoderSource::Uncensored);
+        let paths = |variant, transformer, source, encoder| flux2_klein_sdcpp_paths(side, variant, transformer, source, encoder);
+        let expect = |diffusion: PathBuf, vae: PathBuf, llm: PathBuf| Some(SdCppComponentPaths { diffusion, vae, llm });
+        let vae = |package: &Path| package.join("vae").join("diffusion_pytorch_model.safetensors");
+        assert_eq!(
+            paths(Flux2Variant::Klein4B, Flux2WeightFormat::Bf16, stock, Flux2WeightFormat::Bf16),
+            expect(four.join("flux-2-klein-4b.safetensors"), vae(&four), four.join("text_encoder").join("model.safetensors.index.json"))
+        );
+        assert_eq!(
+            paths(Flux2Variant::Klein4B, Flux2WeightFormat::Q80, stock, Flux2WeightFormat::Q4KM),
+            expect(four.join("transformer_gguf").join("flux-2-klein-4b-Q8_0.gguf"), vae(&four), four.join("text_encoder_gguf").join("Qwen3-4B-Q4_K_M.gguf"))
+        );
+        assert_eq!(
+            paths(Flux2Variant::Klein9B, Flux2WeightFormat::Bf16, stock, Flux2WeightFormat::Q80),
+            expect(nine.join("flux-2-klein-9b.safetensors"), vae(&nine), nine.join("text_encoder_gguf").join("Qwen3-8B-Q8_0.gguf"))
+        );
+        assert_eq!(
+            paths(Flux2Variant::Klein9B, Flux2WeightFormat::Q4KM, uncensored, Flux2WeightFormat::Bf16),
+            expect(nine.join("transformer_gguf").join("flux-2-klein-9b-Q4_K_M.gguf"), vae(&nine), nine.join("text_encoder_uncensored").join("model.safetensors"))
+        );
+        assert_eq!(
+            paths(Flux2Variant::Klein9B, Flux2WeightFormat::Q6K, uncensored, Flux2WeightFormat::Q6K),
+            expect(nine.join("transformer_gguf").join("flux-2-klein-9b-Q6_K.gguf"), vae(&nine), nine.join("text_encoder_uncensored_gguf").join("flux2-klein-9b-uncensored-q6_k.gguf"))
+        );
+        // Not offered: the 4B uncensored encoder, the 9B uncensored Q5_K_M.
+        assert_eq!(paths(Flux2Variant::Klein4B, Flux2WeightFormat::Q80, uncensored, Flux2WeightFormat::Bf16), None);
+        assert_eq!(paths(Flux2Variant::Klein9B, Flux2WeightFormat::Q80, uncensored, Flux2WeightFormat::Q5KM), None);
+    }
+
+    #[test]
+    fn package_specs_per_runtime() {
+        let (primary, legacy) = (Flux2TransformerLayout::Primary, Flux2TransformerLayout::LegacyDiffusers);
+        let (stock, uncensored) = (Flux2EncoderSource::Stock, Flux2EncoderSource::Uncensored);
+        // PyTorch is exactly the existing bundle, for every selection and layout.
+        for variant in Flux2Variant::all() {
+            for source in [stock, uncensored] {
+                for &transformer in Flux2WeightFormat::all() {
+                    for &encoder in Flux2WeightFormat::all() {
+                        for layout in [primary, legacy] {
+                            assert_eq!(
+                                ids(&flux2_klein_package_specs_for(ImageEditRuntime::PyTorch, variant, transformer, layout, source, encoder)),
+                                ids(&flux2_klein_package_specs(variant, transformer, layout, source, encoder))
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let sdcpp = |variant, transformer, layout, source, encoder| ids(&flux2_klein_package_specs_for(ImageEditRuntime::SdCpp, variant, transformer, layout, source, encoder));
+        assert_eq!(sdcpp(Flux2Variant::Klein4B, Flux2WeightFormat::Bf16, primary, stock, Flux2WeightFormat::Bf16), ["flux2_klein_4b_base", "flux2_klein_4b_transformer_bf16_single", "flux2_klein_4b_text_encoder_bf16"]);
+        assert_eq!(sdcpp(Flux2Variant::Klein9B, Flux2WeightFormat::Bf16, legacy, stock, Flux2WeightFormat::Q4KM), ["flux2_klein_9b_base", "flux2_klein_9b_transformer_bf16", "flux2_klein_9b_text_encoder_gguf_q4_k_m"]);
+        assert_eq!(sdcpp(Flux2Variant::Klein9B, Flux2WeightFormat::Q80, primary, uncensored, Flux2WeightFormat::Bf16), ["flux2_klein_9b_base", "flux2_klein_9b_transformer_gguf_q8_0", "flux2_klein_9b_text_encoder_uncensored_bf16"]);
+        // A format not offered contributes no spec, as on PyTorch.
+        assert_eq!(sdcpp(Flux2Variant::Klein4B, Flux2WeightFormat::Q80, primary, uncensored, Flux2WeightFormat::Bf16), ["flux2_klein_4b_base", "flux2_klein_4b_transformer_gguf_q8_0"]);
+        // The base holds the VAE file sd.cpp loads.
+        for variant in Flux2Variant::all() {
+            assert!(flux2_klein_base_spec(variant).files.iter().any(|file| file.path == FLUX2_KLEIN_VAE_WEIGHTS));
+        }
+        assert!(FLUX2_KLEIN_4B_TEXT_ENCODER_BF16.files.iter().any(|file| file.path == FLUX2_KLEIN_TEXT_ENCODER_INDEX));
+        assert!(FLUX2_KLEIN_9B_TEXT_ENCODER_BF16.files.iter().any(|file| file.path == FLUX2_KLEIN_TEXT_ENCODER_INDEX));
+        assert!(FLUX2_KLEIN_9B_TEXT_ENCODER_UNCENSORED_BF16.files.iter().any(|file| file.path == FLUX2_KLEIN_UNCENSORED_ENCODER_WEIGHTS));
     }
 }

@@ -11,7 +11,8 @@ ONLY part of `flux3_klein` that draws. The progress bar and the run line are dra
 ask for, folded by `Flux3KleinEngine::apply_intents` after the frame), and the body ORDER:
 
 ```
-settings-file notice -> prompt (any language) -> preset name + «Кэшировать» / «Переименовать»
+settings-file notice -> runtime switch (PyTorch / Stable-Diffusion.cpp)
+-> prompt (any language) -> preset name + «Кэшировать» / «Переименовать»
 -> the ONE cache line (the `vl_refs` line in its place) -> «Библиотека промптов» toggle + fold
 -> «Референсы» (N of 9, add / remove / remove all)
 -> steps + seed (blank = random; the last seed with «Повторить этот сид»)
@@ -25,8 +26,18 @@ settings-file notice -> prompt (any language) -> preset name + «Кэширов�
 What is touched per edit is never folded; what is set once per machine always is; no section
 nests another.
 
+On Stable-Diffusion.cpp the same order with what that runtime has: the prompt field alone (no
+library), the shared runtime readiness line and then the files line (`flux3_sdcpp_readiness_line`)
+in place of the `.status` line, «Установка модели» with the sd.cpp DiT formats and bundle and the
+shared «Выгрузить модель» instead of the residency block, the shared «Stable-Diffusion.cpp»
+options (`draw_sdcpp_options`) instead of «Память и скорость», and «Для экспертов» with
+«Ограничить референсы» only. Hidden controls keep their stored values.
+
 ## Files and submodules
-- `mod.rs`: the body, the prompt block (the field, then the shared prompt-cache block of
+- `mod.rs`: the body, the runtime switch (`draw_runtime_row`, the shared `draw_runtime_switch`
+  under the salt `cleaning_flux3_klein_runtime`, drawn where the sd.cpp route is available or while it
+  is selected; its PyTorch side is closed while PyTorch is unavailable, `pytorch_unavailable`), the readiness block per runtime (`draw_readiness` / `draw_sdcpp_readiness_block`,
+  one `draw_readiness_line`), `install_verdict` (the fold seeding of either runtime), the prompt block (the field, then the shared prompt-cache block of
   `../../shared/prompt_cache_ui.rs` fed with `flux3_cache_context`, `flux3_encoder_caption`, the
   id salts `cleaning_flux3_klein_prompt_cache_name` / `cleaning_flux3_klein_prompt_library` and
   no notes; `track_uncached` keeps the «Нет» stash, raising `uncached_changed`), references,
@@ -41,11 +52,13 @@ nests another.
   folder row (manual) or the catalog block (repository + licence page, destination, the parts
   present, the token row with `ms_widgets::HfAccessHint` while a gated spec of the bundle is not
   installed, the shared `draw_ocr_model_download` drawn only while its snapshot is the current
-  bundle's), the residency line and «Выгрузить из памяти». It opens itself once on the first
-  definite non-ready verdict unless the user already moved the fold.
+  bundle's), the residency line and «Выгрузить из памяти» (sd.cpp: the DiT rows of
+  `Flux3DitFormat::offered_on`, the format a run uses shown with one fallback line, the
+  sd.cpp «Выгрузить модель»). It opens itself once on the first definite non-ready verdict
+  (`install_verdict`) unless the user already moved the fold.
 - `advanced.rs`: «Для экспертов» — «Референсы и в текстовый энкодер» (`vl_refs`; closed with the
   reason while a GGUF encoder is selected, D6), «Автоэнкодер в bfloat16», the fp8 path (drawn for
-  fp8r only) and «Ограничить референсы». Feather and colour
+  fp8r only) and «Ограничить референсы» (the only one drawn on sd.cpp). Feather and colour
   match are the shared «Постобработка» section (`../../shared/postprocess_section.rs`, body owned
   by `ms_region_postprocess`), drawn last by `mod.rs` under the stable id `cleaning_flux3_klein`; its edits raise
   `Flux3PanelIntents::postprocess_changed` (a save, no forecast question), never `settings_changed`.

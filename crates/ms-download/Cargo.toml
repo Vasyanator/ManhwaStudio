@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 # Resumable, retrying, cancellable HTTP download engine (one file into a `.part`, verified
-# publishing, small in-memory bodies, atomic zip-member extraction) and the process-wide
-# busy guard. GUI-free, no i18n, no config: consumers own the worker thread, the URL,
-# the staging and destination paths, the pins and all user-facing text.
+# publishing, small in-memory bodies, atomic zip-member extraction, all-or-nothing staging of
+# several zip / tar.gz / tar.zst members) and the process-wide busy guard. GUI-free, no i18n,
+# no config: consumers own the worker thread, the URL, the staging and destination paths, the
+# pins and all user-facing text.
 # Native-only: `lib.rs` is `#![cfg(not(target_arch = "wasm32"))]`, so on wasm the crate is
 # empty and pulls nothing in.
 
@@ -24,8 +25,12 @@ sha2.workspace = true
 thiserror.workspace = true
 # Production HTTP client behind `UreqFetcher`.
 ureq.workspace = true
-# Archive reader of `unpack::zip_member_atomic`.
+# Archive readers of `unpack`: zip (`zip_member_atomic`, `stage_members`), gzip + tar and
+# zstd + tar (`stage_members`).
 zip.workspace = true
+flate2.workspace = true
+tar.workspace = true
+zstd.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Unique, self-removing scratch directories for the stream tests.

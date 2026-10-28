@@ -82,7 +82,7 @@ fn mode_wire_roundtrip() {
 
 /// The picker BUTTON must never be Torch-gated, whatever mode is persisted.
 ///
-/// `pytorch_required` feeds both the button's `AiRequirement::Torch` badge and
+/// `ai_requirement` feeds both the button's `AiRequirement` badge and
 /// `CleaningTabState::ensure_active_tool_available`, which runs every frame. While it
 /// followed the mode, the persisted default (`mask_only`) disabled the button on a
 /// Torch-less machine — hiding the one mode that needs nothing — and selecting a network
@@ -97,14 +97,15 @@ fn the_tool_is_never_torch_gated() {
         WatermarkMode::Chapter,
     ] {
         tool.settings.mode = mode.wire().to_string();
-        assert!(
-            !tool.pytorch_required(),
+        assert_eq!(
+            tool.ai_requirement(),
+            None,
             "{mode:?} must not make the tool button Torch-gated"
         );
     }
     // Including an unknown persisted value, which falls back to `mask_only`.
     tool.settings.mode = "bogus".to_string();
-    assert!(!tool.pytorch_required());
+    assert_eq!(tool.ai_requirement(), None);
 }
 
 /// A single-image session never runs the chapter mode — it would key the global library by

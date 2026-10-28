@@ -152,8 +152,9 @@ functions with unit tests, not conditionals inside the drawing code.
   (`catalog_gated_repos_missing`, `catalog_bundle_missing`, `catalog_job_running`,
   `catalog_switch_block_reason`); the settings-file rules re-exported from `region_edit_v2::engine_settings_file`
   (`read_settings_file` quarantines a damaged file, `SettingsSaver` debounces, retries with
-  backoff and flushes at teardown); `mask_for_run`. Nothing there names
-  a model. Own `MODULE_README.md`.
+  backoff and flushes at teardown); `mask_for_run`; the Stable-Diffusion.cpp runtime pieces
+  (`SdCppRunOptions`, `SdCppRunJob`, the runtime switch, readiness line, options and unload
+  widgets). Nothing there names a model. Own `MODULE_README.md`.
 - `lama/`: the «Lama» engine — a DIRECTORY for the same reason `flux2_klein/` is one, and the source
   of exactly ONE picker entry offering FOUR checkpoints. Its own `MODULE_README.md` is the map. The
   user paints what must be REMOVED and gets the background restored under it; there is no prompt and

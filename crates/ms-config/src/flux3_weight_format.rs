@@ -10,8 +10,11 @@ backend treats a GGUF id as opaque and knows only the three native DiT ids.
 
 Key items:
 - `Flux3DitFormat`: the DiT format, its frozen wire id (`wire` / `from_wire`), its GGUF quant
-  token (`quant_token`), `is_gguf` / `is_native`; `all()` is the quality order, best first.
-- `Flux3EncoderFormat`: the text-encoder format, same surface; `all()` best first.
+  token (`quant_token`), `is_gguf` / `is_native`; `all()` is the quality order, best first;
+  `offered_on(runtime)` the formats a runtime can run (PyTorch: all; Stable-Diffusion.cpp: bf16
+  and the GGUF quants, which it reads natively; it has no BFL fp8r / nvfp4 kernels).
+- `Flux3EncoderFormat`: the text-encoder format, same surface; `all()` best first (the same
+  list on both image-edit runtimes).
 - `FLUX3_PROMPT_LIBRARY_ID`: the frozen prompt-library id of FLUX.3 klein (one library for
   every encoder format).
 - `flux3_prompt_cache_precision_order` / `flux3_prompt_cache_precision_rank`: the prompt cache's
@@ -24,6 +27,8 @@ Notes:
 - Wire ids are persisted in the engine's settings file and sent to the backend: frozen. The
   native DiT ids equal the ones the engine persisted before GGUF existed.
 */
+
+use crate::sdcpp_choice::ImageEditRuntime;
 
 /// The weight format of the FLUX.3 klein diffusion transformer.
 ///
@@ -62,11 +67,31 @@ const ALL_DIT_FORMATS: [Flux3DitFormat; 7] = [
     Flux3DitFormat::Q4KM,
 ];
 
+/// The DiT formats Stable-Diffusion.cpp runs: [`ALL_DIT_FORMATS`] without the BFL fp8r / nvfp4
+/// files (no kernels for them there), same order (a test pins the agreement).
+const SDCPP_DIT_FORMATS: [Flux3DitFormat; 5] = [
+    Flux3DitFormat::Bf16,
+    Flux3DitFormat::Q80,
+    Flux3DitFormat::Q6K,
+    Flux3DitFormat::Q5KM,
+    Flux3DitFormat::Q4KM,
+];
+
 impl Flux3DitFormat {
     /// Every DiT format, best quality first (the order format rows and refusal suggestions use).
     #[must_use]
     pub fn all() -> &'static [Self] {
         &ALL_DIT_FORMATS
+    }
+
+    /// The DiT formats `runtime` can run, best quality first: every format on PyTorch; bf16 and
+    /// the GGUF quants on Stable-Diffusion.cpp. The encoder list does not depend on the runtime.
+    #[must_use]
+    pub fn offered_on(runtime: ImageEditRuntime) -> &'static [Self] {
+        match runtime {
+            ImageEditRuntime::PyTorch => &ALL_DIT_FORMATS,
+            ImageEditRuntime::SdCpp => &SDCPP_DIT_FORMATS,
+        }
     }
 
     /// The frozen id this format is persisted and sent on the wire with (matches
@@ -249,6 +274,16 @@ mod tests {
                 None => assert!(format.is_native()),
             }
         }
+    }
+
+    #[test]
+    fn offered_on_lists_every_format_on_pytorch_and_no_bfl_quants_on_sdcpp() {
+        assert_eq!(Flux3DitFormat::offered_on(ImageEditRuntime::PyTorch), Flux3DitFormat::all());
+        let expected: Vec<Flux3DitFormat> =
+            Flux3DitFormat::all().iter().copied().filter(|&format| format == Flux3DitFormat::Bf16 || format.is_gguf()).collect();
+        assert_eq!(Flux3DitFormat::offered_on(ImageEditRuntime::SdCpp), expected.as_slice());
+        assert!(!Flux3DitFormat::offered_on(ImageEditRuntime::SdCpp).contains(&Flux3DitFormat::Fp8r));
+        assert!(!Flux3DitFormat::offered_on(ImageEditRuntime::SdCpp).contains(&Flux3DitFormat::Nvfp4));
     }
 
     #[test]

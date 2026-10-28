@@ -1,0 +1,33 @@
+[package]
+name = "ms-native-package"
+version = "0.1.0"
+edition = "2024"
+
+# The one owner of "install a pinned native package": probe a completion marker, wait for the
+# process-wide busy key, download each pinned archive into a `.part` (identity-bound, resumed,
+# size + sha256 verified by `ms-download`), stage the wanted members, publish them by rename,
+# and write the completion marker atomically last; plus its removal. GUI-free, no i18n, no
+# config: consumers own the directory, the recipe (URLs, pins, members), the busy key, the
+# marker name and format line, and every user-facing text. Native-only like `ms-download`:
+# `lib.rs` is `#![cfg(not(target_arch = "wasm32"))]`, so on wasm the crate is empty.
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The download engine (`fetch_verified`, `RangeFetcher`, `RetryPolicy`), the busy guard and
+# the multi-member archive staging (`unpack::stage_members`).
+ms-download = { path = "../ms-download" }
+# The completion marker is replaced through `write_atomic`; every directory fsync is its
+# `sync_directory`.
+ms-atomic-file = { path = "../ms-atomic-file" }
+# Diagnostics of the transaction (`ms_log::runtime_log`).
+ms-log = { path = "../ms-log" }
+# Typed public error `PackageError`.
+thiserror.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# The scripted in-memory `RangeFetcher` (`ms_download::test_support`).
+ms-download = { path = "../ms-download", features = ["test-support"] }
+# Self-removing scratch package directories.
+tempfile.workspace = true
+# Test archives and their pins.
+zip.workspace = true
+sha2.workspace = true

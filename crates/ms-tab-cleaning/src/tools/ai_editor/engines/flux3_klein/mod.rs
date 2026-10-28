@@ -36,13 +36,16 @@ Submodules:
 - `references.rs`: the session's extra reference images, their capacity and the worker that
   reads a picked file into a wire PNG.
 - `status.rs`: the `.status` answer (`Flux3Status`) and the model verdict derived from it.
+- `sdcpp_files.rs`: the files Stable-Diffusion.cpp loads for the selection and their
+  worker-side validation.
 - `wire.rs`: the run call and its request/response contract, `.status`, `.unload`, and the
   engine's `.prompt_cache.*` method family and header (`FLUX3_PROMPT_CACHE_METHODS`,
   `flux3_prompt_cache_header`).
 - `decisions.rs`: the PURE decisions the panel renders (readiness line, run gate, seed field,
   stage names, run outcome line, the catalog bundle, the format-row captions, the prompt
   library's gate context `flux3_cache_context` and encoder caption `flux3_encoder_caption`).
-- `engine/`: `Flux3KleinEngine`, its `AiEngine` impl and its long operations.
+- `engine/`: `Flux3KleinEngine`, its `AiEngine` impl and its long operations (the
+  Stable-Diffusion.cpp run in `engine/sdcpp.rs`).
 - `ui/`: the parameter panel.
 - `test_support.rs`: `cfg(test)` fixtures.
 
@@ -57,6 +60,15 @@ mode only (in `vl_refs` the encoder also reads the images, so every run encodes 
 «Кэшировать» is closed with that reason). `.status` answers `prompt_cached` about the prompt
 that travelled with it; `Some(true)` in TEXT mode waives the text encoder in the run gate (its
 weights may be absent), and the backend's forecast leaves it out unless it is resident.
+
+Two runtimes (the switch at the top of the panel, persisted as `runtime`): PyTorch (the
+backend calls above) and Stable-Diffusion.cpp (a separate worker process, `ms_sdcpp`, through the
+shared `../shared/sdcpp_run.rs`). On sd.cpp the region is the init image AND reference #0, the
+painted mask (`mask_for_run`) is sd.cpp's latent-blend mask, strength 1.0, cfg 1.0, every
+reference is downscaled in Rust to «Ограничить референсы» before sending, and the answer is the
+same `EnginePoll::DoneRaw` the host post-processes. PyTorch-only controls (the encoder's VL
+mode, the AE dtype, the fp8 path, the memory widget, the prompt library, `.unload`) are hidden
+there, and no backend call is made.
 
 Download: the package is pinned in the app's catalog
 (`ms_sysprobe::ai_models::external_catalog::flux3_klein_package_specs`: base + the root DiT
@@ -73,10 +85,12 @@ use ms_config as config;
 // The two weight-format vocabularies and the prompt library's id and precision order (one owner:
 // `ms_config::flux3_weight_format`).
 use ms_config::{FLUX3_PROMPT_LIBRARY_ID, Flux3DitFormat, Flux3EncoderFormat, flux3_prompt_cache_precision_order, flux3_prompt_cache_precision_rank};
+// The runtime switch's vocabulary (PyTorch / Stable-Diffusion.cpp; one owner: `ms_config::sdcpp_choice`).
+use ms_config::ImageEditRuntime;
 // The catalog package: its pinned specs per format and the files' paths under the package root,
 // and the explicit-download controller and panel block shared with the Translation tab.
 use ms_sysprobe::ai_models::external::ExternalModelSpec;
-use ms_sysprobe::ai_models::external_catalog::{FLUX3_KLEIN_BFL_REPO, flux3_klein_dit_relative_path, flux3_klein_dit_spec, flux3_klein_encoder_relative_path, flux3_klein_encoder_spec, flux3_klein_package_specs};
+use ms_sysprobe::ai_models::external_catalog::{FLUX3_KLEIN_BFL_REPO, flux3_klein_dit_relative_path, flux3_klein_dit_spec, flux3_klein_encoder_relative_path, flux3_klein_encoder_spec, flux3_klein_package_specs_for, flux3_klein_sdcpp_paths};
 use ms_tab_translation::ocr_model_download::{OcrModelDownloadController, OcrModelDownloadState, OcrModelPanelSnapshot, bundle_key};
 use ms_tab_translation::panels::ocr_model_download::{ModelDownloadAction, draw_ocr_model_download};
 use crate::tools::base::RegionEditToolBase;
@@ -90,7 +104,7 @@ use crate::tools::ai_editor::large_model_resources::{ResourcesAction, ResourcesC
 // row, the catalog-download decisions, the settings-file rules, the mask -> working-mode rule and
 // the prompt library (controller, gates, cache line and its drawing).
 use super::shared::*;
-use ms_widgets::{HfAccessHint, WheelComboBox, WheelSlider};
+use ms_widgets::{AiCaps, AiRequirement, HfAccessHint, WheelComboBox, WheelSlider};
 use eframe::egui;
 use egui::Color32;
 // The one wire PNG codec of the cleaning tab.
@@ -112,6 +126,9 @@ use references::*;
 // The `.status` answer and the model verdict derived from it.
 mod status;
 use status::*;
+// The files Stable-Diffusion.cpp loads and their worker-side validation.
+mod sdcpp_files;
+use sdcpp_files::*;
 // The run, `.status` and `.unload` calls and the run's request/response contract.
 mod wire;
 use wire::*;

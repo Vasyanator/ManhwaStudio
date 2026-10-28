@@ -5,8 +5,9 @@ Purpose:
 Crate root of `ms-download` — the native-only HTTP download engine shared by every Rust
 downloader of the application: one file streamed into a `.part` staging file with `Range`
 resume, capped exponential retry of transient failures, connect/read timeouts and cancel,
-verified publishing, small in-memory bodies, atomic zip-member extraction, plus a
-process-wide "one download per id" busy guard.
+verified publishing, small in-memory bodies, atomic zip-member extraction, all-or-nothing
+staging of several zip / tar.gz / tar.zst members, plus a process-wide "one download per id"
+busy guard.
 
 Main responsibilities:
 - `resumable`: the HTTP seam (`RangeFetcher`, `UreqFetcher` + `FetcherConfig`), the retry
@@ -15,7 +16,8 @@ Main responsibilities:
   size / sha256 verification, fsync and replace-rename (`Expected`, `FileRequest`,
   `FileEvent`).
 - `small`: `fetch_small` — a capped in-memory body under the same retry / resume rule.
-- `unpack`: `zip_member_atomic` — one archive member extracted, verified and renamed.
+- `unpack`: `zip_member_atomic` — one archive member extracted, verified and renamed;
+  `stage_members` — several members staged to `<dest>.tmp`, all or nothing (`UnpackError`).
 - `busy`: `BusyGuard::{try_acquire, acquire_waiting}`, `dest_key` — at most one holder per
   id in the process.
 - `error`: `DownloadError`, the typed failure of `file`, `small`, `unpack` and the busy wait.

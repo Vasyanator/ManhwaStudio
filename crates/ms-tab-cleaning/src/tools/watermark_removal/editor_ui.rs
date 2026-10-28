@@ -821,7 +821,7 @@ impl WatermarkEditorCtx<'_> {
     /// mode will do and explains on hover why it is disabled.
     ///
     /// Both network modes need a reachable backend AND a Torch runtime. Since
-    /// `CleaningTool::pytorch_required` is a constant `false` — the tool must stay selectable
+    /// `CleaningTool::ai_requirement` is a constant `None` — the tool must stay selectable
     /// for its AI-free chapter mode — this is the gate that keeps a Torch-less machine from
     /// firing a request that can only fail. The hint is three-way in the same order as the
     /// shared `mask_generation::generate_button_hover_text`: backend first, Torch second,

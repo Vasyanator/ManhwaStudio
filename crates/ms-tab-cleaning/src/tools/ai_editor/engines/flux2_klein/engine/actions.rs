@@ -299,7 +299,9 @@ impl Flux2KleinEngine {
     /// and nothing holds the pipeline (same one-shot arming as `.status`: a failing query must
     /// not spawn a thread per frame).
     pub(super) fn poll_and_maybe_query_prompt_cache_list(&mut self) {
-        let gate_open = self.ai_backend_available && !self.pipeline_busy();
+        // The library lives in the Python backend: not asked on Stable-Diffusion.cpp (the
+        // switch back re-arms it).
+        let gate_open = self.ai_backend_available && !self.pipeline_busy() && self.settings.runtime() == ImageEditRuntime::PyTorch;
         let settings = &self.settings;
         let effects = self.prompt_cache.poll_list(gate_open, |extra| flux2_prompt_cache_header(&settings.normalized(), extra), &FLUX2_PROMPT_CACHE_METHODS);
         self.apply_prompt_cache_effects(effects);

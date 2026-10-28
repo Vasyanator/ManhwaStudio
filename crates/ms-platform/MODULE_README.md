@@ -18,6 +18,8 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
   message. `unavailable_reason()` gives the table's reason per target (`CanvasTouchGestures` on
   Windows: pen and touch indistinguishable until winit handles `PT_PEN`; also off on wasm).
   `Waifu2xUpscaler` is Linux and Windows only (the pinned waifu2x release has no macOS package).
+  `SdCppRuntime` (the Stable-Diffusion.cpp worker runtime) is x86_64 Linux and Windows only (the
+  app pins only the official x86_64 Linux / Windows Vulkan and CPU packages).
   `ShellOpen` and `BrowserExtension` are desktop only.
 - **Shell open** (`shell_open.rs`): `open_url(url)` (default browser) and `reveal_dir(path)`
   (file manager) spawn the platform handler and never wait for it, so they are GUI-thread safe;

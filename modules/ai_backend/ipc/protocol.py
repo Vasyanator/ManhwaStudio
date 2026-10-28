@@ -185,6 +185,10 @@ from __future__ import annotations
 # planned handle's own), so a resident encoder is no longer counted twice in
 # the two-handle sum; a plan with nothing on the device (a CPU-pinned encoder)
 # has `device_peak` 0.
+# New on-disk `user_config` keys `General.sdcpp_build` (string slug, absent =
+# catalog default), `General.sdcpp_device` ("auto" or {name, description}) and
+# `General.sdcpp_threads` (integer, 0 = auto) for the app's Stable-Diffusion.cpp
+# worker; the backend never reads them.
 # ============================================================================
 PROTOCOL_VERSION = 24
 

@@ -8,15 +8,21 @@ the `ui` module whose siblings draw the folded sections.
 Main responsibilities:
 - own `Flux3PanelCtx` (everything the panel reads or mutates for exactly one frame) and
   `Flux3PanelIntents` (what the controls ask the engine to do, folded after the frame);
-- draw the body in its ORDER: the settings-file notice, the prompt block (the field, the
+- draw the body in its ORDER: the settings-file notice, the runtime switch (PyTorch /
+  Stable-Diffusion.cpp, the shared `draw_runtime_switch`; closed with the reason while a job of
+  either runtime runs), the prompt block (the field, the
   preset name with «Кэшировать» / «Переименовать», the one cache line — the `vl_refs` line in
   its place in that mode — the «Библиотека промптов» toggle and fold, all the shared
-  `../../shared/prompt_cache_ui.rs` block fed with FLUX.3's context), «Референсы», steps and
-  seed, the readiness line, then the sibling folds «Установка модели» (`install.rs`),
+  `../../shared/prompt_cache_ui.rs` block fed with FLUX.3's context; on sd.cpp the field
+  alone), «Референсы», steps and seed, the readiness line (on sd.cpp: the shared runtime line,
+  then the files line), then the sibling folds «Установка модели» (`install.rs`),
   «Память и скорость» (the shared `large_model_resources` widget with the DiT format rows and
-  «Энкодер на CPU», then the shared text-encoder format rows) and «Для экспертов»
+  «Энкодер на CPU», then the shared text-encoder format rows; on sd.cpp replaced by the shared
+  «Stable-Diffusion.cpp» options) and «Для экспертов»
   (`advanced.rs`), the mask note, and last the shared
   «Постобработка» section (`shared::draw_postprocess_section`, bottom-docked).
+- hide, never fake, what sd.cpp does not have: the prompt library, the encoder's VL mode, the AE
+  dtype, the fp8 path, the memory widget and the backend's `.unload`.
 
 Key structures:
 - `Flux3PanelCtx`, `Flux3PanelIntents`
@@ -60,8 +66,10 @@ pub(super) struct Flux3PanelIntents {
     pub(super) want_forecast: bool,
     /// What the user did in the memory widget.
     pub(super) resources_actions: Vec<ResourcesAction>,
-    /// «Выгрузить из памяти».
+    /// «Выгрузить из памяти» (the backend's `.unload`, PyTorch).
     pub(super) unload: bool,
+    /// «Выгрузить модель» of the sd.cpp worker process (`spawn_sdcpp_unload`).
+    pub(super) sdcpp_unload: bool,
     /// A file dialog to open.
     pub(super) picker: Option<Flux3PickerPurpose>,
     /// A reference to drop (its index).
@@ -122,6 +130,20 @@ pub(super) struct Flux3PanelCtx<'a> {
     pub(super) prompt_cache_state: Option<bool>,
     /// The entry `.status` named for that prompt (same guard): the encoder the line names first.
     pub(super) prompt_cache_status_entry: Option<&'a PromptLibraryEntry>,
+    /// The process-global Stable-Diffusion.cpp status snapshot of this frame.
+    pub(super) sdcpp_status: &'a ms_sdcpp::SdCppStatus,
+    /// The `--no-ai` / platform gate of the sd.cpp route.
+    pub(super) sdcpp_local: Result<(), ms_local_ai::local_ai::LocalAiOff>,
+    /// The device saved for sd.cpp, as the files worker last read it (`None` = not read yet).
+    pub(super) sdcpp_device: Option<&'a ms_config::SdCppDeviceChoice>,
+    /// What is known about the sd.cpp files of the current selection.
+    pub(super) sdcpp_files: Flux3SdcppFilesState,
+    /// Why the runtime switch is closed (`Flux3KleinEngine::runtime_switch_block_reason`).
+    pub(super) runtime_switch_block: Option<&'a str>,
+    /// Why the PyTorch side alone is closed (PyTorch unavailable, `pytorch_unavailable_reason`).
+    pub(super) pytorch_unavailable: Option<&'static str>,
+    /// Whether the runtime switch is drawn (the sd.cpp route is available, or it is selected).
+    pub(super) show_runtime_switch: bool,
     pub(super) install_section_seeded: &'a mut bool,
     pub(super) install_section_open_prev: &'a mut Option<bool>,
     pub(super) intents: &'a mut Flux3PanelIntents,
@@ -131,12 +153,27 @@ impl Flux3PanelCtx<'_> {
     /// Draws the scrolled body in its designed order (see the file header).
     pub(super) fn draw(&mut self, ui: &mut egui::Ui) {
         self.draw_settings_problem(ui);
+        self.draw_runtime_row(ui);
         self.draw_prompt(ui);
         self.draw_references(ui);
         self.draw_steps_and_seed(ui);
-        let install_requested = self.draw_readiness(ui);
+        let install_requested = match self.settings.runtime() {
+            ImageEditRuntime::PyTorch => self.draw_readiness(ui),
+            ImageEditRuntime::SdCpp => self.draw_sdcpp_readiness_block(ui),
+        };
         self.draw_install_section(ui, install_requested);
-        self.draw_memory_section(ui);
+        match self.settings.runtime() {
+            ImageEditRuntime::PyTorch => self.draw_memory_section(ui),
+            ImageEditRuntime::SdCpp => {
+                // The shared options widget draws no heading: the section titles it, closed by
+                // default like the «Память и скорость» section it replaces.
+                let options = &mut self.settings.sdcpp;
+                let changed = &mut self.intents.settings_changed;
+                RegionEditToolBase::draw_region_editor_collapsible_section(ui, "cleaning_flux3_klein_sdcpp", t!("cleaning.tools.sdcpp.options_heading"), false, |ui| {
+                    *changed |= draw_sdcpp_options(ui, options, "cleaning_flux3_klein_sdcpp_options");
+                });
+            }
+        }
         draw_advanced_section(ui, self.settings, &mut self.intents.settings_changed);
         ui.separator();
         ui.small(t!("cleaning.tools.flux3_klein.mask_hint"));
@@ -162,6 +199,38 @@ impl Flux3PanelCtx<'_> {
         }
     }
 
+    /// The PyTorch / Stable-Diffusion.cpp switch at the top of the body (the shared widget under
+    /// a fixed salt), closed with the reason while a job of either runtime runs. A change is a
+    /// settings change: saved, and the engine re-probes the bundle the new runtime needs.
+    fn draw_runtime_row(&mut self, ui: &mut egui::Ui) {
+        if !self.show_runtime_switch {
+            return;
+        }
+        let mut runtime = self.settings.runtime();
+        if draw_runtime_switch(ui, &mut runtime, self.runtime_switch_block, self.pytorch_unavailable, "cleaning_flux3_klein_runtime") {
+            self.settings.runtime = runtime.wire().to_string();
+            self.intents.settings_changed = true;
+        }
+    }
+
+    /// Whether «Установка модели» has a definite verdict to seed its fold with: `None` = not
+    /// known yet, `Some(true)` = ready, `Some(false)` = something to install or fix. PyTorch reads
+    /// the `.status` verdict, sd.cpp the files state.
+    pub(super) fn install_verdict(&self) -> Option<bool> {
+        match self.settings.runtime() {
+            ImageEditRuntime::PyTorch => match self.readiness {
+                Flux3ModelReadiness::Unknown => None,
+                Flux3ModelReadiness::Ready => Some(true),
+                Flux3ModelReadiness::Missing(_) | Flux3ModelReadiness::NoRoot | Flux3ModelReadiness::RootNotAbsolute => Some(false),
+            },
+            ImageEditRuntime::SdCpp => match self.sdcpp_files {
+                Flux3SdcppFilesState::Checking => None,
+                Flux3SdcppFilesState::Ready => Some(true),
+                Flux3SdcppFilesState::Refused(_) => Some(false),
+            },
+        }
+    }
+
     /// The prompt block, FLUX.2 klein's UX: the field (one, in any language — the encoder is
     /// multilingual), the preset name with «Кэшировать» / «Переименовать», the one line about
     /// the cache, the «Библиотека промптов» toggle and its fold.
@@ -174,6 +243,8 @@ impl Flux3PanelCtx<'_> {
     /// In `vl_refs` the cache serves nothing: «Кэшировать» is closed with that reason
     /// (`flux3_cache_context`) and the VL line takes the cache line's place; the library still
     /// picks, exports and imports texts.
+    ///
+    /// On Stable-Diffusion.cpp only the field is drawn: the library is the backend's.
     fn draw_prompt(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.label(t!("cleaning.tools.flux3_klein.prompt_label")).on_hover_text(t!("cleaning.tools.flux3_klein.prompt_tooltip"));
@@ -185,6 +256,9 @@ impl Flux3PanelCtx<'_> {
                     .desired_rows(3),
             )
             .changed();
+        if self.settings.runtime() == ImageEditRuntime::SdCpp {
+            return;
+        }
         self.intents.uncached_changed |= track_uncached(&mut self.settings.uncached_prompt, self.prompt_cache.library.as_ref(), &self.settings.prompt);
         {
             let ctl = &mut *self.prompt_cache;
@@ -343,6 +417,27 @@ impl Flux3PanelCtx<'_> {
             Flux3ModelReadiness::Missing(_) | Flux3ModelReadiness::NoRoot | Flux3ModelReadiness::RootNotAbsolute | Flux3ModelReadiness::Unknown => None,
         };
         let line = flux3_readiness_line(&self.readiness, self.bundle_missing, memory);
+        let install_requested = self.draw_readiness_line(ui, &line);
+        if let Some(error) = self.status_error {
+            ui.colored_label(ms_theme::status::ERROR, tf!("cleaning.tools.flux3_klein.status_error", err = error));
+        }
+        install_requested
+    }
+
+    /// The readiness of the Stable-Diffusion.cpp runtime: the shared runtime line (installed,
+    /// host requirement, device, version), then the ONE line about the selection's files with
+    /// «Установить» while something is missing and «Обновить» always (it re-checks the files and
+    /// the runtime). Returns whether «Установить» was pressed.
+    fn draw_sdcpp_readiness_block(&mut self, ui: &mut egui::Ui) -> bool {
+        ui.separator();
+        draw_sdcpp_readiness(ui, self.sdcpp_status, self.sdcpp_local, self.sdcpp_device);
+        let line = flux3_sdcpp_readiness_line(&self.sdcpp_files, self.bundle_missing);
+        self.draw_readiness_line(ui, &line)
+    }
+
+    /// One readiness line in its tone, with «Установить» when it offers it and «Обновить».
+    /// Returns whether «Установить» was pressed.
+    fn draw_readiness_line(&mut self, ui: &mut egui::Ui, line: &Flux3ReadinessLine) -> bool {
         let mut install_requested = false;
         ui.horizontal_wrapped(|ui| {
             match line.tone() {
@@ -366,9 +461,6 @@ impl Flux3PanelCtx<'_> {
                 self.intents.want_forecast = true;
             }
         });
-        if let Some(error) = self.status_error {
-            ui.colored_label(ms_theme::status::ERROR, tf!("cleaning.tools.flux3_klein.status_error", err = error));
-        }
         install_requested
     }
 

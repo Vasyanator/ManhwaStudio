@@ -682,8 +682,8 @@ impl AiEngine for SdxlEngine {
     /// than a control greyed out by a second copy of that fact.
     fn set_backend_available(&mut self, _available: bool) {}
 
-    /// Deliberately empty: the run button is the host's `AiButton` with
-    /// `AiRequirement::Torch`, which resolves the runtime's presence itself.
+    /// Deliberately empty: the host's run gate (`RegionEditHost::run_block_reason`)
+    /// applies the PyTorch requirement itself.
     fn set_torch_available(&mut self, _available: bool) {}
 
     /// Deliberately empty: nothing in this engine's panel depends on the rectangle before a

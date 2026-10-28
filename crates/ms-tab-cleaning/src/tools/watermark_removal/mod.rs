@@ -23,8 +23,8 @@ Three modes, all driven from the one region-editor window:
   samples, the background jobs, the reports, the overlay patches and the on-disk
   library (`watermark_library.rs`); it owns no maths.
 
-The Torch requirement lives INSIDE the tool: `pytorch_required()` is a constant
-`false`, so the picker button is never AI-gated and the chapter mode stays
+The Torch requirement lives INSIDE the tool: `ai_requirement()` is a constant
+`None`, so the picker button is never AI-gated and the chapter mode stays
 reachable without Torch, while the two network entries of the mode picker and the
 run button carry the gate and name their own reason.
 

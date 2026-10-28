@@ -9,7 +9,8 @@ runs on the GUI thread.
 Main responsibilities:
 - fold one frame's `Flux3PanelIntents` (`apply_intents`): settings changes, the «Нет» stash,
   the forecast widget's actions, the pickers, the reference list, the token, the catalog
-  block's click, the unload, the prompt-library press;
+  block's click, the unload (the backend's, or the sd.cpp worker's on that runtime), the
+  prompt-library press, «Обновить» (on sd.cpp: the files re-check and the runtime probe);
 - the Hugging Face token (`poll_hf_token`; the catalog download reads the stored token);
 - the file dialogs (`start_picker`, `poll_picker`) and the worker that reads picked
   reference files (`start_reference_read`, `poll_references`);
@@ -42,6 +43,7 @@ impl Flux3KleinEngine {
             want_forecast,
             resources_actions,
             unload,
+            sdcpp_unload,
             picker,
             remove_reference,
             clear_references,
@@ -87,6 +89,12 @@ impl Flux3KleinEngine {
         }
         if want_status {
             self.status_wanted = true;
+            if self.settings.runtime() == ImageEditRuntime::SdCpp {
+                // The files may have changed on disk and the runtime may have been installed
+                // meanwhile: re-check both (each a non-blocking worker spawn).
+                self.sdcpp_files_wanted = true;
+                ms_sdcpp::request_refresh();
+            }
         }
         if want_forecast {
             // The refresh button: the staleness it exists for is caused outside the app — and
@@ -103,6 +111,9 @@ impl Flux3KleinEngine {
         self.apply_catalog_action(catalog_action);
         if unload {
             self.start_unload();
+        }
+        if sdcpp_unload {
+            spawn_sdcpp_unload();
         }
         match prompt_cache_action {
             Some(PromptCacheAction::Build) => self.start_prompt_cache_build(false),
@@ -261,11 +272,13 @@ impl Flux3KleinEngine {
         }
     }
 
-    /// Polls the library listing and asks a new `.list` when one is wanted, the backend is up,
-    /// nothing holds the pipeline and an absolute package root exists (the backend refuses
-    /// relative candidate paths for the whole call, as for `.status`).
+    /// Polls the library listing and asks a new `.list` when one is wanted, PyTorch is the
+    /// runtime (the library is the backend's; sd.cpp has none), the backend is up, nothing holds
+    /// the pipeline and an absolute package root exists (the backend refuses relative candidate
+    /// paths for the whole call, as for `.status`).
     pub(super) fn poll_and_maybe_query_prompt_cache_list(&mut self) {
-        let gate_open = self.ai_backend_available && !self.pipeline_busy() && self.settings.has_usable_root();
+        let pytorch = self.settings.runtime() == ImageEditRuntime::PyTorch;
+        let gate_open = pytorch && self.ai_backend_available && !self.pipeline_busy() && self.settings.has_usable_root();
         let settings = &self.settings;
         let effects = self.prompt_cache.poll_list(gate_open, |extra| flux3_prompt_cache_header(&settings.normalized(), extra), &FLUX3_PROMPT_CACHE_METHODS);
         self.apply_prompt_cache_effects(effects);

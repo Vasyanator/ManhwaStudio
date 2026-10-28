@@ -16,8 +16,12 @@ dylib RESOLUTION only: it does not link, initialize, or run onnxruntime.
 
 ## Architecture
 `ms_config::data_dir()/onnxruntime/<build_slug>/<version>/` is the per-build,
-per-version cache root. Resolution flow (`resolve_or_download_ort_dylib(build, cancel,
-progress)`; the download-row half is `resolve_download_entry` over an injected fetcher):
+per-version cache root, and a download row's cache is an `ms-native-package` package
+(marker `.ort-cache-complete`, format line `ms-onnx-runtime cache v1`, recipe fields
+`build` + `version`, busy key `ort:<build>:<version>`). Resolution flow
+(`resolve_or_download_ort_dylib(build, cancel, progress)`; the download-row half is
+`resolve_download_entry` over an injected fetcher, an adapter over
+`ms_native_package::ensure_installed`; the steps below run inside that crate):
 
 ```
 PlatformFeature::NativeOnnxRuntime unavailable (wasm) -> Unavailable, nothing touched
@@ -76,23 +80,32 @@ normalized by stripping a leading `./` so the GNU-tar-packed 1.27.0 macOS archiv
 
 Multi-source entries: an entry may name `additional_sources` (extra archives) whose
 libraries are extracted into the SAME cache directory as the primary source, using
-one shared download+verify+extract path (`fetch_source`). The probe fast path skips
+one shared download+verify+extract path (one package source each). The probe fast path skips
 the download only when EVERY expected member (primary + extras + additional-source
 members) is already on disk, so a partial cache always re-fetches.
 
 This module produces the dylib path that `ms-onnx` consumes; it never depends on
-`ms-onnx`'s loading internals.
+`ms-onnx`'s loading internals. The download / verify / extract / publish / marker transaction
+is `ms-native-package`'s (archive staging: `ms_download::unpack::stage_members`); this crate
+supplies the recipe (`with_package`: sources in fetch order, members flattened, the primary
+library renamed to the versioned name and listed last) and maps `PackageError` onto its
+localized errors (`map_package_error`, the key table in its doc comment). The placeholder
+set of every `onnx_runtime.*` call site is pinned against the `en` / `ru` catalogs by
+`localized_call_sites_supply_exactly_the_catalog_placeholders` (a source scan, since test
+binaries render bare keys).
 
 ## Files and submodules
 - `lib.rs`: crate root and public API — `OrtRuntimeError`, `OrtDownloadProgress`/`OrtDownloadStage`,
   `ort_dylib_dir`, `resolve_or_download_ort_dylib(build, cancel, progress)`,
   `ort_build_installed(build)` (the single owner of "is this build installed": the same
-  marker + member-size rule as the resolver's fast path; stat-only, worker thread). Owns the
-  per-build busy wait, the `.part` identity (`claim_part`), the mapping of `ms-download`
-  events / errors onto progress / `OrtRuntimeError`, atomic archive extraction (zip /
-  tar.gz / tar.zst, with `./` tar-key normalization), and the cfg-selected expected
-  library filename. Edit here for download/extract/progress behavior; the HTTP, retry and
-  verification mechanics themselves are `ms-download`'s.
+  marker + member-size rule as the resolver's fast path, `ms_native_package::is_installed`;
+  stat-only, worker thread). Owns the manifest-row -> package mapping (`with_package`), the
+  busy key, the 1:1 progress mapping (`ort_progress`), the mapping of `PackageError` /
+  `DownloadError` / `UnpackError` onto `OrtRuntimeError` with the `onnx_runtime.download.*`
+  texts (`map_package_error`, `map_download_error`), the bundled-library lookup and the
+  cfg-selected expected library filename. The transaction itself (busy wait, `.part`
+  identity, verified download, staging, publication, marker) is `ms-native-package`'s; HTTP,
+  retry and verification mechanics are `ms-download`'s.
 - `builds.rs`: the static build catalog (`OrtBuild`, `BuildCategory`) and its API
   (`all_builds`, `build_by_slug`, `build_execution_providers`,
   `default_build_for_current_os`, `default_build_for_provider`). Edit here to add a
@@ -139,7 +152,9 @@ This module produces the dylib path that `ms-onnx` consumes; it never depends on
   the second caller waits (`WaitingForOtherDownload`) and then takes the fast path.
 - Atomic extraction: a member is published only by renaming its fsynced `<dest>.tmp`, and
   only once every member of the archive was found; the primary library is renamed last.
-- Cache trust = the completion marker (`CACHE_MARKER`, format line `CACHE_MARKER_FORMAT`):
+- Cache trust = the completion marker (`CACHE_MARKER`, format line `CACHE_MARKER_FORMAT`; the
+  bytes are `ms-native-package`'s marker format and must stay readable by every release, so
+  caches written by earlier versions remain trusted — pinned by the `golden_*` tests):
   its recipe header (format, build, version, every source's url + sha256 in fetch order)
   must equal the current manifest row, it must list exactly the expected member file
   names, and each must exist at the recorded size (sizes only on the fast path; the
@@ -167,7 +182,7 @@ This module produces the dylib path that `ms-onnx` consumes; it never depends on
   OpenVINO install on Windows.
 - Multi-source entries: `additional_sources` names extra archives whose `members`
   are extracted into the SAME cache directory as the primary source (the primary and
-  every additional source share `fetch_source`). No shipped entry uses it today (all
+  every additional source are sources of one package). No shipped entry uses it today (all
   builds are single-archive); it exists so a build that must bundle libs from a second
   archive can do so without new extraction code.
 - WebGPU: the PyPI `onnxruntime-webgpu` **1.27.0** wheel (a zip; native libs under
@@ -210,7 +225,10 @@ This module produces the dylib path that `ms-onnx` consumes; it never depends on
   `builds.rs`.
 - Add a build that needs libraries from a second archive: add `additional_sources` to
   its `ort_manifest.json` entry; no code change (the loader already fetches them).
-- Change download/progress/extraction behavior: `lib.rs`.
+- Change which files a build places, its recipe fields, busy key or error texts: `lib.rs`
+  (`with_package`, `resolve_download_entry`, `map_package_error`). Change the transaction
+  (ordering, identity, marker, progress throttle): `ms-native-package`; archive formats and
+  member staging: `ms_download::unpack`.
 - Change manifest schema, lookup, platform keys, hashing, or the version shims:
   `manifest.rs`.
 - Resolve a build's dylib: call `resolve_or_download_ort_dylib(build, cancel, progress)`

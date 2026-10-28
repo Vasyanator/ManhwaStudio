@@ -17,7 +17,9 @@ loading, word checks, and dictionary writes still run off the GUI thread.
 ## Crate boundary
 `ms-widgets` is the reusable UI-primitive layer of the workspace. It knows NOTHING about the
 project domain: it may depend on `ms-config`, `ms-log`, `ms-i18n`, `ms-text-util`, `ms-sysprobe`,
-`ms-gifs`, `ms-thread`, `ms-theme`, `ms-fonts` and `ms-download` (the last two native-only), and it may NOT depend on
+`ms-gifs`, `ms-thread`, `ms-theme`, `ms-fonts` and `ms-download` (the last two native-only) and
+`ms-sdcpp` (desktop only, the root's gate: not wasm, not Android; `AiButton`'s sd.cpp
+readiness), and it may NOT depend on
 `ms-project`, `ms-models`, `ms-canvas` or anything in `src/` — the canvas, the tabs and the
 launcher depend on IT. The binary re-exports the crate as `crate::widgets` and its
 crate-root leaves as `crate::ui_fonts` and `crate::bubble_status` (`input_util` has no root
@@ -59,7 +61,12 @@ crate's `[dev-dependencies]`, so no production build carries them.
 - `bubble_status.rs`: the egui half of the bubble-status feature — it paints a rule's border
   with a bare `Painter` and re-exports the GUI-free rule model from `ms_config::bubble_status`.
 - `ai_button.rs`: AI-tool button gating itself on the process-global AI capabilities
-  (`ai_backend_capabilities`: backend/torch/onnxruntime) via `AiCaps::current()`. The
+  (`ai_backend_capabilities`: backend/torch/onnxruntime, plus sd.cpp = that module's route slot
+  combined with `ms_sdcpp::ready`; a fixed `Some(false)` where the runtime is not linked) via
+  `AiCaps::current()`. Requirements: `Backend | Torch | Onnx | TorchOrOnnx | Sdcpp |
+  TorchOrSdcpp`. `AiCaps.backend_starting` (the supervisor's "a backend start is underway") is
+  a fact, not a capability: no requirement reads it; decisions that must tell "down" from
+  "booting" do. The
   optional marker badge is painter-only and must never allocate a second interactive
   rect (that would carve a hole in the button hitbox). Because it is painted OUTSIDE
   the button's rect, a caller budgeting a button's width asks `marker_badge_overhang`

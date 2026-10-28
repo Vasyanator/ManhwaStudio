@@ -23,6 +23,10 @@ Main types:
   (`start_with_autostart_gate` there, so autostart waits for storage-mode conversions).
 - `AutostartGate` / `AutostartDeferral`: the one-shot, gate-deferred autostart polled on the
   worker tick; a user Start/Restart/Stop or autostart-off cancels it.
+- `settle_start_watch`: the process worker's "backend starting" fact
+  (`ai_backend_capabilities::set_backend_starting`): an armed autostart, or a launch until the
+  first connect the health snapshot reports after it, a failed launch, an exit, a Stop or
+  `BACKEND_START_WATCH_DEADLINE` (180 s).
 - `check_backend_spawnable` / `BackendSpawnBlocker` (native-only): the spawn preconditions
   (platform has a Python backend first, then the disk checks),
   silent, shared by the spawn and by inspection callers (settings checks).
@@ -60,7 +64,7 @@ use ms_log::runtime_log;
 use ms_local_ai::backend_health::{
     AiBackendHealthSnapshot, AiBackendProbeCommand, spawn_ai_backend_probe,
 };
-use ms_local_ai::local_ai::{LocalAiAvailability, LocalAiOff, LocalAiOffReason, LocalRuntime};
+use ms_local_ai::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOff, LocalAiOffReason, LocalRuntime};
 use serde_json::Value;
 use std::collections::VecDeque;
 #[cfg(not(target_arch = "wasm32"))]
@@ -313,8 +317,10 @@ impl AiBackendSupervisor {
     /// Also primes the process-global AI capability hints: backend / torch / backend-ORT are
     /// `None` (unknown until the first health snapshot) when the backend is allowed, else
     /// `Some(false)`; native-ORT is `None` (the tab's route-inputs refresh publishes it) when
-    /// native ONNX is allowed, else `Some(false)`. `--no-ai` switches off the LOCAL runtimes
-    /// only (backend and native ONNX); cloud AI API features are not capability-gated here.
+    /// native ONNX is allowed, else `Some(false)`; the sd.cpp route slot is
+    /// `AiRouteKind::SdCpp.availability`, and an open route starts one sd.cpp status refresh.
+    /// `--no-ai` switches off the LOCAL runtimes only (backend, native ONNX, sd.cpp); cloud AI
+    /// API features are not capability-gated here.
     pub fn start(local_ai: LocalAiAvailability) -> Self {
         Self::start_with_autostart_gate(local_ai, None)
     }
@@ -334,6 +340,15 @@ impl AiBackendSupervisor {
         ms_sysprobe::ai_backend_capabilities::set_backend_available(backend_primed);
         ms_sysprobe::ai_backend_capabilities::set_backend_ort_available(backend_primed);
         ms_sysprobe::ai_backend_capabilities::set_native_ort_available(native_primed);
+        // The sd.cpp route answer comes from the route owner, never re-derived here. When the
+        // route is open, one non-blocking status refresh makes "is sd.cpp installed" known at
+        // startup, so `AiButton`s gated on sd.cpp do not stay unknown until a settings visit.
+        let sdcpp_route = AiRouteKind::SdCpp.availability(&local_ai);
+        ms_sysprobe::ai_backend_capabilities::set_sdcpp_route_allowed(Some(sdcpp_route.is_ok()));
+        #[cfg(not(target_arch = "wasm32"))]
+        if sdcpp_route.is_ok() {
+            ms_sdcpp::request_refresh();
+        }
         if let Err(off) = local_ai.backend {
             runtime_log::log_info(format!(
                 "[ai-backend] supervisor inert: Python backend off ({:?}); native ONNX: {:?}",
@@ -343,6 +358,10 @@ impl AiBackendSupervisor {
 
         let user_settings_file = config::user_config_path();
         let auto_start = load_ai_backend_autostart(&user_settings_file);
+        // An armed autostart is a start underway from the first frame on; the process worker
+        // keeps the flag current from here (`settle_start_watch`). Nothing starts on wasm or with
+        // the backend off.
+        ms_sysprobe::ai_backend_capabilities::set_backend_starting(cfg!(not(target_arch = "wasm32")) && local_ai.backend.is_ok() && auto_start);
 
         let health = Arc::new(Mutex::new(match local_ai.backend {
             Ok(()) => AiBackendHealthSnapshot::default(),
@@ -361,6 +380,7 @@ impl AiBackendSupervisor {
             #[cfg(not(target_arch = "wasm32"))]
             let process_runtime = Some(spawn_ai_backend_process_worker(
                 Arc::clone(&process_snapshot),
+                Arc::clone(&health),
                 user_settings_file,
                 AutostartDeferral::new(auto_start, gate),
             ));
@@ -470,6 +490,11 @@ impl AutostartDeferral {
         AutostartPoll::Deferred
     }
 
+    /// Whether the autostart is still armed (neither fired nor cancelled): a start underway.
+    fn is_armed(&self) -> bool {
+        self.armed
+    }
+
     /// Cancels a still-armed autostart; returns whether one was pending.
     fn cancel(&mut self) -> bool {
         let was_armed = self.armed;
@@ -491,7 +516,8 @@ fn command_cancels_autostart(command: &AiBackendProcessCommand) -> bool {
 }
 
 /// Runs one autostart poll on the worker: starts the backend when the gate opened, and
-/// reports the deferral once (status + log) the first time the gate is found closed.
+/// reports the deferral once (status + log) the first time the gate is found closed. Returns
+/// whether this poll launched the backend (the start watch begins then).
 #[cfg(not(target_arch = "wasm32"))]
 fn run_autostart_poll(
     deferral: &mut AutostartDeferral,
@@ -499,9 +525,9 @@ fn run_autostart_poll(
     child: &mut Option<ManagedPythonChild>,
     snapshot: &Arc<Mutex<AiBackendProcessSnapshot>>,
     output_tx: &Sender<AiBackendOutputEvent>,
-) {
+) -> bool {
     match deferral.poll() {
-        AutostartPoll::Idle => {}
+        AutostartPoll::Idle => false,
         AutostartPoll::Deferred => {
             if !*deferral_reported {
                 *deferral_reported = true;
@@ -509,29 +535,71 @@ fn run_autostart_poll(
                 update_process_status(snapshot, false, t!("ai_backend.supervisor.autostart_deferred_status").to_string());
                 append_process_log(snapshot, t!("ai_backend.supervisor.autostart_deferred_log").to_string());
             }
+            false
         }
         AutostartPoll::Fire => {
             if *deferral_reported {
                 runtime_log::log_info("[ai-backend] deferred autostart released: starting the backend");
             }
-            if let Err(err) = start_ai_backend_process(child, snapshot, output_tx) {
-                update_process_status(
-                    snapshot,
-                    false,
-                    tf!("ai_backend.supervisor.autostart_failed_status", err = err),
-                );
-                append_process_log(
-                    snapshot,
-                    tf!("ai_backend.supervisor.autostart_failed_log", err = err),
-                );
+            match start_ai_backend_process(child, snapshot, output_tx) {
+                Ok(()) => true,
+                Err(err) => {
+                    update_process_status(
+                        snapshot,
+                        false,
+                        tf!("ai_backend.supervisor.autostart_failed_status", err = err),
+                    );
+                    append_process_log(
+                        snapshot,
+                        tf!("ai_backend.supervisor.autostart_failed_log", err = err),
+                    );
+                    false
+                }
             }
         }
     }
 }
 
+/// How long a launched backend counts as "starting" at most. A process that stays alive but
+/// never reports a connect (a hung import, a refused handshake) must not hold the flag forever:
+/// past this the backend counts as not starting, so a user whose Python is broken still gets the
+/// sd.cpp fallback. Three minutes is well above a cold start of the backend with a CUDA / ROCm
+/// torch import on a slow disk, which takes tens of seconds.
+#[cfg(not(target_arch = "wasm32"))]
+const BACKEND_START_WATCH_DEADLINE: Duration = Duration::from_secs(180);
+
+/// The start watch after one worker tick: `since` is when the current launch began, stamped
+/// AFTER any old process was stopped (`None`: no launch awaiting its connect). It ends when the
+/// process is gone (`child_alive == false`: the launch failed, the process exited, or it was
+/// stopped), when the backend reported a connect at or after the launch (`connected_at`: the
+/// health snapshot's `checked_at` while it says connected — an earlier stamp belongs to the
+/// previous process), or at [`BACKEND_START_WATCH_DEADLINE`] after the launch (`now`). Pure.
+#[cfg(not(target_arch = "wasm32"))]
+fn settle_start_watch(since: Option<Instant>, child_alive: bool, connected_at: Option<Instant>, now: Instant) -> Option<Instant> {
+    let started = since?;
+    let expired = now.saturating_duration_since(started) >= BACKEND_START_WATCH_DEADLINE;
+    if !child_alive || expired || connected_at.is_some_and(|at| at >= started) {
+        return None;
+    }
+    Some(started)
+}
+
+/// When the health snapshot last reported the backend connected (`None` while it says not
+/// connected). One short lock; worker thread only.
+#[cfg(not(target_arch = "wasm32"))]
+fn connected_at(health: &Mutex<AiBackendHealthSnapshot>) -> Option<Instant> {
+    let guard = health.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.connected { guard.checked_at } else { None }
+}
+
+/// The process worker: the one owner of the backend process. Besides the commands and the
+/// autostart it keeps `ai_backend_capabilities::set_backend_starting` current every tick: an
+/// armed autostart, or a launch (`start_since`) that has not connected yet
+/// ([`settle_start_watch`] over the shared `health` snapshot).
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_ai_backend_process_worker(
     snapshot: Arc<Mutex<AiBackendProcessSnapshot>>,
+    health: Arc<Mutex<AiBackendHealthSnapshot>>,
     user_settings_file: PathBuf,
     mut autostart: AutostartDeferral,
 ) -> AiBackendProcessRuntime {
@@ -540,8 +608,12 @@ fn spawn_ai_backend_process_worker(
         let (output_tx, output_rx) = mpsc::channel::<AiBackendOutputEvent>();
         let mut child: Option<ManagedPythonChild> = None;
         let mut deferral_reported = false;
+        let mut start_since: Option<Instant> = None;
 
-        run_autostart_poll(&mut autostart, &mut deferral_reported, &mut child, &snapshot, &output_tx);
+        let launch_at = Instant::now();
+        if run_autostart_poll(&mut autostart, &mut deferral_reported, &mut child, &snapshot, &output_tx) {
+            start_since = Some(launch_at);
+        }
 
         let mut should_exit = false;
         while !should_exit {
@@ -559,6 +631,7 @@ fn spawn_ai_backend_process_worker(
                         &snapshot,
                         &output_tx,
                         &user_settings_file,
+                        &mut start_since,
                     );
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -566,10 +639,15 @@ fn spawn_ai_backend_process_worker(
             }
 
             if !should_exit {
-                run_autostart_poll(&mut autostart, &mut deferral_reported, &mut child, &snapshot, &output_tx);
+                let launch_at = Instant::now();
+                if run_autostart_poll(&mut autostart, &mut deferral_reported, &mut child, &snapshot, &output_tx) {
+                    start_since = Some(launch_at);
+                }
             }
             drain_backend_output(&snapshot, &output_rx);
             poll_backend_exit(&snapshot, &mut child);
+            start_since = settle_start_watch(start_since, child.is_some(), connected_at(&health), Instant::now());
+            ms_sysprobe::ai_backend_capabilities::set_backend_starting(!should_exit && (autostart.is_armed() || start_since.is_some()));
         }
 
         stop_ai_backend_process(&mut child, &snapshot, t!("ai_backend.supervisor.app_closing"));
@@ -578,6 +656,9 @@ fn spawn_ai_backend_process_worker(
     AiBackendProcessRuntime { tx, thread }
 }
 
+/// Executes one user command on the process worker; returns whether the worker must exit.
+/// Keeps the start watch (`start_watch`, see [`settle_start_watch`]): a launching Start or a
+/// Restart stamps it (a Restart only after the old process was stopped), a Stop clears it.
 #[cfg(not(target_arch = "wasm32"))]
 fn handle_process_command(
     command: AiBackendProcessCommand,
@@ -585,21 +666,38 @@ fn handle_process_command(
     snapshot: &Arc<Mutex<AiBackendProcessSnapshot>>,
     output_tx: &Sender<AiBackendOutputEvent>,
     user_settings_file: &Path,
+    start_watch: &mut Option<Instant>,
 ) -> bool {
     match command {
         AiBackendProcessCommand::Start => {
-            if let Err(err) = start_ai_backend_process(child, snapshot, output_tx) {
-                update_process_status(snapshot, false, tf!("ai_backend.supervisor.start_failed_status", err = err));
-                append_process_log(snapshot, tf!("ai_backend.supervisor.start_failed_log", err = err));
+            // A Start while a process runs launches nothing (`already_running`): no new watch.
+            let launches = child.is_none();
+            let launch_at = Instant::now();
+            match start_ai_backend_process(child, snapshot, output_tx) {
+                Ok(()) => {
+                    if launches {
+                        *start_watch = Some(launch_at);
+                    }
+                }
+                Err(err) => {
+                    update_process_status(snapshot, false, tf!("ai_backend.supervisor.start_failed_status", err = err));
+                    append_process_log(snapshot, tf!("ai_backend.supervisor.start_failed_log", err = err));
+                }
             }
             false
         }
         AiBackendProcessCommand::Stop => {
             stop_ai_backend_process(child, snapshot, t!("ai_backend.supervisor.stopped_by_user"));
+            *start_watch = None;
             false
         }
         AiBackendProcessCommand::Restart => {
             stop_ai_backend_process(child, snapshot, t!("ai_backend.supervisor.restart_by_user"));
+            // Stamped AFTER the old process is gone: a health answer of the old process that
+            // completed during the stop carries an earlier `checked_at` and cannot end the new
+            // watch (`settle_start_watch`).
+            let launch_at = Instant::now();
+            *start_watch = None;
             if let Err(err) = start_ai_backend_process(child, snapshot, output_tx) {
                 update_process_status(
                     snapshot,
@@ -610,6 +708,8 @@ fn handle_process_command(
                     snapshot,
                     tf!("ai_backend.supervisor.restart_failed_log", err = err),
                 );
+            } else {
+                *start_watch = Some(launch_at);
             }
             false
         }
@@ -1162,9 +1262,55 @@ mod tests {
     use super::{
         AiBackendProcessCommand, AutostartDeferral, AutostartPoll, BackendSpawnBlocker, WsPortLine, backend_payload_is_current,
         check_backend_spawnable, check_backend_spawnable_on, command_cancels_autostart, load_ai_backend_autostart, parse_ws_port_line, save_ai_backend_autostart,
+        BACKEND_START_WATCH_DEADLINE, settle_start_watch,
     };
+    use web_time::{Duration, Instant};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The start watch ends on a connect AFTER the launch, or when the process is gone; an
+    /// older connect (the previous process) and a live, silent process keep it.
+    #[test]
+    fn start_watch_ends_on_a_fresh_connect_or_a_dead_process() {
+        let launch = Instant::now();
+        let now = launch + Duration::from_secs(1);
+        let later = launch + Duration::from_millis(500);
+        let earlier = launch.checked_sub(Duration::from_millis(500));
+        assert_eq!(settle_start_watch(None, true, Some(later), now), None, "no launch, nothing to watch");
+        assert_eq!(settle_start_watch(Some(launch), true, None, now), Some(launch), "still booting");
+        assert_eq!(settle_start_watch(Some(launch), true, Some(later), now), None, "connected after the launch");
+        assert_eq!(settle_start_watch(Some(launch), true, Some(launch), now), None, "connected at the launch instant");
+        if let Some(earlier) = earlier {
+            assert_eq!(settle_start_watch(Some(launch), true, Some(earlier), now), Some(launch), "a connect of the previous process");
+        }
+        assert_eq!(settle_start_watch(Some(launch), false, None, now), None, "the process is gone");
+    }
+
+    /// Restart: the new watch is stamped after the old process was stopped, so the old
+    /// process's last health answer — completed during the stop, stamped before the new launch —
+    /// keeps the new watch running; only the new process's connect ends it.
+    #[test]
+    fn restart_watch_ignores_the_old_process_late_answer() {
+        let Some(old_launch) = Instant::now().checked_sub(Duration::from_secs(10)) else {
+            return;
+        };
+        let old_answer = old_launch + Duration::from_secs(9);
+        let new_launch = old_launch + Duration::from_secs(9) + Duration::from_millis(1);
+        let now = new_launch + Duration::from_millis(200);
+        assert_eq!(settle_start_watch(Some(new_launch), true, Some(old_answer), now), Some(new_launch));
+        let new_answer = new_launch + Duration::from_millis(100);
+        assert_eq!(settle_start_watch(Some(new_launch), true, Some(new_answer), now), None);
+    }
+
+    /// A launched process that never connects stops counting as "starting" at the deadline.
+    #[test]
+    fn start_watch_expires_at_the_deadline() {
+        let launch = Instant::now();
+        let just_before = launch + BACKEND_START_WATCH_DEADLINE - Duration::from_millis(1);
+        let at_deadline = launch + BACKEND_START_WATCH_DEADLINE;
+        assert_eq!(settle_start_watch(Some(launch), true, None, just_before), Some(launch));
+        assert_eq!(settle_start_watch(Some(launch), true, None, at_deadline), None);
+    }
 
     /// Without a gate the autostart fires on the first poll, exactly once.
     #[test]

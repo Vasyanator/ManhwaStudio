@@ -9,7 +9,7 @@ Submodules:
 - `large_models`: the one Rust client of the backend's large-model pool (`large_models.*`):
   wire types and strict parsers, the step vocabulary with its labels, the calls (worker-only),
   and the latest-wins `ProfilesQuery` / debounced `LimitsWriter`.
-- `local_ai`: which local AI runtimes (Python backend, native ONNX) the process may use
+- `local_ai`: which local AI runtimes (Python backend, native ONNX, Stable-Diffusion.cpp) the process may use
   (`--no-ai` + platform), the one route-availability rule (`AiRouteKind::availability`) and
   the effective-runtime helper (`effective_ai_runtime`).
 

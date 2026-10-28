@@ -44,7 +44,7 @@ pub(super) fn test_reference(name: &str, marker: u8) -> Flux3Reference {
 }
 
 /// Every `cleaning.tools.flux3_klein.<key>` without placeholders (the catalog test walks it).
-pub(super) const FLUX3_PLAIN_KEYS: [&str; 91] = [
+pub(super) const FLUX3_PLAIN_KEYS: [&str; 94] = [
     "advanced_heading", "ae_bf16_hint", "ae_bf16_label", "browse_folder_tooltip",
     "bundle_missing_status", "cancel_pending_error", "download_destination_label", "catalog_download_hint",
     "empty_mask_error", "format_bf16_hint", "format_bf16_label", "format_fp8r_hint",
@@ -69,6 +69,7 @@ pub(super) const FLUX3_PLAIN_KEYS: [&str; 91] = [
     "text_encoder_format_label", "title", "unload_button", "unload_disabled_tooltip",
     "unload_done_status", "unload_hint", "unload_nothing_status", "unload_requested_status",
     "vl_refs_gguf_disabled_hint", "vl_refs_hint", "vl_refs_label",
+    "switch_busy_reason", "sdcpp_files_checking_status", "sdcpp_files_ready_status",
 ];
 
 /// The FULL keys of the shared «Постобработка» section this panel draws (owned by
@@ -82,7 +83,7 @@ pub(super) const POSTPROCESS_KEYS: [&str; 10] = [
 ];
 
 /// Every `cleaning.tools.flux3_klein.<key>` with the placeholders the code fills.
-pub(super) const FLUX3_PLACEHOLDER_KEYS: [(&str, &[&str]); 26] = [
+pub(super) const FLUX3_PLACEHOLDER_KEYS: [(&str, &[&str]); 30] = [
     ("blob_length_error", &["{actual}", "{declared}"]),
     ("download_repo_status", &["{repo}"]),
     ("format_gguf_label", &["{quant}"]),
@@ -109,6 +110,10 @@ pub(super) const FLUX3_PLACEHOLDER_KEYS: [(&str, &[&str]); 26] = [
     ("status_error", &["{err}"]),
     ("too_many_references_error", &["{max}"]),
     ("write_settings_error", &["{err}"]),
+    ("sdcpp_format_fallback_status", &["{stored}", "{used}"]),
+    ("sdcpp_files_error", &["{err}"]),
+    ("sdcpp_seed_range_error", &["{max}"]),
+    ("sdcpp_reference_error", &["{err}"]),
 ];
 
 /// The retired `cleaning.tools.flux3_klein.<key>`s: the backend download's (its progress lines,

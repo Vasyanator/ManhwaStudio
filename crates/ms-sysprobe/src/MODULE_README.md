@@ -44,10 +44,11 @@ Callers own the threading: nothing here spawns a worker for you.
   — Linux via sysfs + KFD, Windows via SetupAPI + the driver registry key (no rocminfo, lspci,
   WMI or OpenCL). Owns the ONE pinned PCI device-id -> gfx table (`device_ids.rs`, sources
   pinned in its header). Detail: `amd_adapters/MODULE_README.md`.
-- `ai_backend_capabilities.rs`: one process-global atomic tri-state mirroring whether the
-  running AI backend has Torch, so a UI gate is an atomic load rather than an IPC round
-  trip. The health-snapshot handler is the only writer; `Unknown` (never probed) is a
-  distinct state and must not be rendered as "absent". No I/O at all — it lives here
+- `ai_backend_capabilities.rs`: process-global atomic tri-states mirroring the AI runtimes a
+  UI gate asks about (backend reachable, Torch, onnxruntime native / backend, and the sd.cpp
+  ROUTE — `--no-ai` + platform, published by the supervisor; sd.cpp readiness itself is
+  `ms_sdcpp::ready`), so a gate is an atomic load rather than an IPC round trip. `Unknown`
+  (never probed) is a distinct state and must not be rendered as "absent". No I/O at all — it lives here
   because it is the cached answer to a host question the rest of the modules ask directly.
 - `ai_models.rs`: the app-managed model catalog (`Vasyanator2/ManhwaStudio_AI_Models`).
   Resolves the files a given model needs, then STREAMS each one straight into a

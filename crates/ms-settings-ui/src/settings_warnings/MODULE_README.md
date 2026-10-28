@@ -103,9 +103,10 @@ GUI frame: poll() -> WarningSet -> item_warning_badge / section_level / overall_
   badges are GUI-thread safe. The worker exits when the owner drops (request channel
   disconnect) or its result cannot be delivered.
 - **wasm.** `checks.rs` is compiled out; `SettingsWarnings::start` returns an inert instance.
-- **Groups.** `SettingLocation::group` is reserved for collapsible lists; `SettingGroupId`
-  is uninhabited today. Aggregation goes through one `worst_where` predicate, so a
-  `group_level` is a one-liner when the first group exists. Every key must stay in General,
+- **Groups.** `SettingLocation::group` names a sub-tab or list inside a section:
+  `SettingGroupId::{AiTorch, AiOnnx}` are the AI-backend pane's sub-tabs, whose labels paint
+  `paint_corner_badge` at `WarningSet::group_level`. A group gets a variant only once a key
+  maps to it. Aggregation goes through one `worst_where` predicate. Every key must stay in General,
   AiBackend or SystemRegistration (sections the launcher lists without a dynamic hide on the
   platforms that check their keys): a unit test pins it.
 - **Badges.** Painting registers no hitbox; `item_warning_badge` allocates exactly one
@@ -125,6 +126,6 @@ GUI frame: poll() -> WarningSet -> item_warning_badge / section_level / overall_
   `checks.rs`, and the `SettingChange` that rechecks it.
 - To change a severity: `WarningReason::level` only. Which OS records are broken is not
   decided here: `ms_os_integration::report` (`Defect::severity`, `badge_worthy`).
-- To add a collapsible group: a `SettingGroupId` variant and the key mapping in
-  `SettingKey::location`.
+- To add a group (a sub-tab or list): a `SettingGroupId` variant and the key mapping in
+  `SettingKey::location`; the drawing pane badges it with `group_level`.
 - To change the badge look: `badge.rs`.

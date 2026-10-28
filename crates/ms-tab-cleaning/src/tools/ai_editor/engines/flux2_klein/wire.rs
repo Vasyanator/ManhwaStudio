@@ -25,6 +25,7 @@ Key structures:
 
 Key functions:
 - `run_flux2_klein()`, `run_flux2_klein_pass()`
+- `validate_flux2_run_input()`, `flux2_latent_mask()` (shared with the sd.cpp request builder)
 - `flux2_status_header()`, `fetch_flux2_status()`, `parse_flux2_status()`,
   `parse_flux2_component_snapshot()`
 - `unload_flux2_klein()`, `flux2_component_action_header()`,
@@ -120,55 +121,10 @@ pub(super) fn run_flux2_klein_pass(
     progress: &Arc<Mutex<EngineProgress>>,
     claim: &ProgressClaim,
 ) -> Result<Flux2RunOutcome, String> {
-    let Flux2RunInput {
-        region: image,
-        reference,
-        mask,
-        whole_region,
-        mask_size,
-    } = input;
-    let (whole_region, mask_size) = (*whole_region, *mask_size);
-    if image.size != mask_size {
-        return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
-    }
-    let (width, height) = (image.size[0], image.size[1]);
-    if mask.len() != width.saturating_mul(height) {
-        return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
-    }
-    // Re-checked on the worker, not only in the button gate: the gate is UI state and
-    // a run can be started from a session whose region was re-derived by ratio.
-    if let Some(reason) = region_block_reason(image.size) {
-        return Err(reason);
-    }
-    // Unreachable through `mask_for_run`, which turns an empty layer into the solid mask
-    // of the whole-region mode; kept because this function validates what it is HANDED
-    // rather than trusting its caller, exactly as the two size checks above do, and an
-    // all-zero mask would otherwise reach the backend as "change nothing".
-    if !mask.iter().any(|value| *value > 0) {
-        return Err(t!("cleaning.tools.flux2_klein.empty_mask_error").to_string());
-    }
-
-    // The backend feeds the reference through the very preprocessing the region gets
-    // (the same downscale cap, the same grid floor), which is the SAME transform only
-    // for an image of the same size; a reference of any other size would be aligned to
-    // nothing, so it is refused rather than sent.
-    if reference.as_ref().is_some_and(|reference| reference.size != mask_size) {
-        return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
-    }
-
-    // The LATENT mask (protocol 17): the painted mask grown by `mask_dilate_px` with the
-    // cv2-exact ellipse, built HERE on the worker (a 1 MP dilation is not GUI-thread work).
-    // A whole-region run has no contour to grow, so its solid mask is only binarized. The
-    // backend uses it verbatim, and the host colour-matches against the same mask afterwards
-    // (`RawRegionResult::sample_mask`), so the two can never disagree.
-    let radius = if whole_region { 0 } else { settings.mask_dilate_px };
-    let latent_mask = dilate_ellipse(mask, width, height, radius).map_err(|err| {
-        ms_log::runtime_log::log_error(format!(
-            "[cleaning] {FLUX2_LOG_LABEL}: latent mask dilation failed (region {width}x{height}, mask {} bytes, radius {radius} px): {err}",
-            mask.len()
-        ));
-        t!("cleaning.inpaint.size_mismatch_error").to_string()
-    })?;
+    let Flux2RunInput { region: image, reference, mask, whole_region, .. } = input;
+    let whole_region = *whole_region;
+    let [width, height] = validate_flux2_run_input(input)?;
+    let latent_mask = flux2_latent_mask(mask, width, height, whole_region, settings.mask_dilate_px)?;
     let image_png = encode_color_image_png_rgba(image)?;
     let mask_png = encode_mask_png_l8(&latent_mask, width, height)?;
     let reference_png = reference
@@ -233,6 +189,62 @@ pub(super) fn run_flux2_klein_pass(
             .unwrap_or(false),
         applied: parse_applied_flags(&response_header),
         degraded: parse_degraded(&response_header),
+    })
+}
+
+/// Validates what one run is HANDED, for both runtimes, and returns the region's
+/// `[width, height]`: region, mask and optional reference are all `mask_size`, the region obeys
+/// the model's size contract, and the mask permits at least one pixel.
+///
+/// # Errors
+/// A localized message naming the broken rule.
+pub(super) fn validate_flux2_run_input(input: &Flux2RunInput) -> Result<[usize; 2], String> {
+    let Flux2RunInput { region: image, reference, mask, mask_size, .. } = input;
+    if image.size != *mask_size {
+        return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
+    }
+    let (width, height) = (image.size[0], image.size[1]);
+    if mask.len() != width.saturating_mul(height) {
+        return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
+    }
+    // Re-checked on the worker, not only in the button gate: the gate is UI state and
+    // a run can be started from a session whose region was re-derived by ratio.
+    if let Some(reason) = region_block_reason(image.size) {
+        return Err(reason);
+    }
+    // Unreachable through `mask_for_run`, which turns an empty layer into the solid mask
+    // of the whole-region mode; kept because this function validates what it is HANDED
+    // rather than trusting its caller, exactly as the two size checks above do, and an
+    // all-zero mask would otherwise reach the model as "change nothing".
+    if !mask.iter().any(|value| *value > 0) {
+        return Err(t!("cleaning.tools.flux2_klein.empty_mask_error").to_string());
+    }
+    // Both runtimes feed the reference through the very preprocessing the region gets
+    // (the same downscale cap, the same grid floor), which is the SAME transform only
+    // for an image of the same size; a reference of any other size would be aligned to
+    // nothing, so it is refused rather than sent.
+    if reference.as_ref().is_some_and(|reference| reference.size != *mask_size) {
+        return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
+    }
+    Ok([width, height])
+}
+
+/// The LATENT mask of a run (protocol 17), THE one builder both runtimes use: the run's mask
+/// grown by `mask_dilate_px` with the cv2-exact ellipse, or — for a whole-region run, which has
+/// no contour to grow — its solid mask only binarized. The model uses it verbatim, and the host
+/// colour-matches against the same mask afterwards (`RawRegionResult::sample_mask`), so the two
+/// can never disagree. A 1 MP dilation is not GUI-thread work: worker threads only.
+///
+/// # Errors
+/// A localized size-mismatch message when `mask` is not `width * height` bytes (logged).
+pub(super) fn flux2_latent_mask(mask: &[u8], width: usize, height: usize, whole_region: bool, mask_dilate_px: u32) -> Result<Vec<u8>, String> {
+    let radius = if whole_region { 0 } else { mask_dilate_px };
+    dilate_ellipse(mask, width, height, radius).map_err(|err| {
+        ms_log::runtime_log::log_error(format!(
+            "[cleaning] {FLUX2_LOG_LABEL}: latent mask dilation failed (region {width}x{height}, mask {} bytes, radius {radius} px): {err}",
+            mask.len()
+        ));
+        t!("cleaning.inpaint.size_mismatch_error").to_string()
     })
 }
 

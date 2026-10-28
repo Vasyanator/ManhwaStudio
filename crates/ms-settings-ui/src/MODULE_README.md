@@ -29,7 +29,8 @@ one draw entry the launcher calls with its own frame, one the settings tab calls
 theirs. Adding a pane means adding a `SettingsSectionId` variant and both entries.
 
 Layer position: above `ms-widgets` / `ms-config` / `ms-sysprobe` / `ms-backend-ipc` /
-`ms-memory` / `ms-onnx` (native only) / `ms-project` (the storage-mode driver) / `ms-os-integration`
+`ms-memory` / `ms-onnx` (native only) / `ms-sdcpp` + `ms-native-package` (native only: the sd.cpp
+package and its progress type) / `ms-project` (the storage-mode driver) / `ms-os-integration`
 (native only: the OS-record probe behind the registration warnings) and `ms-local-ai`
 (`backend_health`: the health snapshot and probe-command model; `local_ai`: the process's
 local-AI availability and effective runtime). It depends on NO tab crate, and the tabs never
@@ -87,7 +88,10 @@ not the dependency list.
   and this crate never writes those `user_config` keys), and «Выгрузить большие модели» /
   «Сбросить выученные ограничения» on a worker. Offline it draws no editor. A pending edit is
   sent by the section's own poll, or on a worker when the pane state is dropped.
-- `ai_backend_panel.rs`: AI runtime selection, ONNX provider/device/build, model limit,
+- `ai_backend_panel/`: the AI pane (own `MODULE_README.md`): a shared model limit above three
+  sub-tabs «Основной PyTorch» / «ONNXruntime» / «Stable-Diffusion.cpp» (each listed only where
+  its platform feature exists; sd.cpp install / remove / status over `ms-sdcpp`); AI runtime
+  selection, ONNX provider/device/build, model limit,
   backend health readout (incl. the PyTorch build line and its kernel-mismatch warning, read
   from `AiBackendHealthSnapshot::torch_build`, texts from `torch_build_text.rs`), ORT crash-guard reset. The provider list is the UNION of the offline
   native set and the providers the backend reports; backend-only providers (e.g. MIGraphX,
@@ -143,7 +147,15 @@ not the dependency list.
   native ONNX, the platform decides on its own). With the backend off no process worker and no
   probe start; the health snapshot is the fixed `AiBackendHealthSnapshot::unavailable` (checked,
   not connected, naming the reason) so backend routes are refused, and the capability hints are
-  primed `Some(false)` for every runtime that is off (`None` = unknown otherwise).
+  primed `Some(false)` for every runtime that is off (`None` = unknown otherwise). The sd.cpp
+  route slot (`set_sdcpp_route_allowed`) is published from `AiRouteKind::SdCpp.availability`,
+  and an open route starts one `ms_sdcpp::request_refresh` at startup, so the `AiButton` sd.cpp
+  gate knows the install state without a Settings visit. The process worker also owns the
+  "backend starting" fact (`set_backend_starting`): an armed autostart (gate pending included) or
+  a launch (stamped after a Restart's stop) until the first connect reported after it
+  (`settle_start_watch` over the health snapshot), the launch failing, the process exiting, a
+  Stop, or `BACKEND_START_WATCH_DEADLINE` (180 s: a hung backend must not block the sd.cpp
+  fallback forever).
 - `settings_warnings/`: per-setting warnings ("!" badges) of the shared panes — the
   GUI-free model (`SettingKey`, `WarningReason` owning the level, `WarningSet`
   aggregation), the native-only checks, the `SettingsWarnings` worker runtime
@@ -218,7 +230,7 @@ not the dependency list.
 - To change how native builds are grouped or labelled, or the wording of a fallback reason, see
   `native_builds.rs` (and `settings_warnings/model.rs` `FallbackCause::label`); how a PyTorch
   build report is worded, `torch_build_text.rs`.
-- To change what the AI pane offers or reports, see `ai_backend_panel.rs`; which device ids
+- To change what the AI pane offers or reports, see `ai_backend_panel/` (its editing map); which device ids
   an EP offers or what the capability probe gathers, `onnx_caps.rs`; how the backend process
   is started, watched or stopped (and what blocks a spawn), `ai_backend_supervisor.rs`.
 - To change a persisted settings key, add the writer in `ms-config` first, then call it here.

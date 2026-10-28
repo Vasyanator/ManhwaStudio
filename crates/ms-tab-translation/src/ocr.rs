@@ -2881,6 +2881,8 @@ mod tests {
                         no_ai,
                         platform(backend_platform, PlatformFeature::PythonBackend),
                         platform(native_platform, PlatformFeature::NativeOnnxRuntime),
+                        // OCR never runs on sd.cpp, so its platform answer is irrelevant here.
+                        Ok(()),
                     );
                     for engine in all_engines() {
                         for model in ["base_onnx", "base_torch"] {
@@ -2920,6 +2922,7 @@ mod tests {
                                                 assert_eq!(off.reason, expected, "{case}");
                                             }
                                         }
+                                        AiRouteKind::SdCpp => panic!("no OCR route runs on sd.cpp: {case}"),
                                     }
                                 }
                             }
@@ -2935,11 +2938,12 @@ mod tests {
     #[test]
     fn cloud_ocr_runs_with_every_local_runtime_off() {
         for local in [
-            LocalAiAvailability::resolve(true, Ok(()), Ok(())),
+            LocalAiAvailability::resolve(true, Ok(()), Ok(()), Ok(())),
             LocalAiAvailability::resolve(
                 false,
                 platform(false, PlatformFeature::PythonBackend),
                 platform(false, PlatformFeature::NativeOnnxRuntime),
+                platform(false, PlatformFeature::SdCppRuntime),
             ),
         ] {
             for engine in [OcrEngine::AiApi, OcrEngine::NeuroLate] {

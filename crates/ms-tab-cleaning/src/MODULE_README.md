@@ -73,7 +73,10 @@ window's own frame and would blank out this window's top-left corner.
 Long-running AI, image processing and mask loading work runs on worker threads.
 The GUI thread polls job receivers and applies already prepared results.
 AI-backed tools receive backend health/Torch availability from the tab, then run model checks and
-backend requests inside tool worker paths. App-managed inpaint weights must be resolved through
+backend requests inside tool worker paths. A tool declares the local runtime it needs as ONE answer,
+`CleaningTool::ai_requirement()` (`None`, `Torch`, or `TorchOrSdcpp` for the AI region editor);
+the tab's tool button (`AiButton`, badge from `cleaning_tool_marker`), its width budget and
+`ensure_active_tool_available` all read it against the strict `AiCaps`. App-managed inpaint weights must be resolved through
 `ms_sysprobe::ai_models` before calling Python backend endpoints.
 
 ## Files and submodules
@@ -154,7 +157,9 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   runs while one is in flight. The region-edit tools' jobs are still polled only while the tab
   draws (their polls need the canvas and the open editor session). At teardown
   `flush_debounced_stores_blocking` writes what the tools' settings writers still owe
-  (`CleaningTool::flush_settings_blocking` of every tool; the region-edit engines' `SettingsSaver`s).
+  (`CleaningTool::flush_settings_blocking` of every tool; the region-edit engines' `SettingsSaver`s),
+  then (native) stops the sd.cpp worker process when one runs (`ms_sdcpp::service().unload()`;
+  that hook runs only from the studio teardown worker, so the blocking unload is allowed there).
 - `text_mask_storage.rs`: reads a page's stored text-detector mask (`{idx:05}_mask.png`) with
   the `source_size` / `mask_size` its `{idx:05}_blocks.json` records — an adapter over the
   format's one reader `ms_tab_translation::text_detector::read_text_detection_page` (never a

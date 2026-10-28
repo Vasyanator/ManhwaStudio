@@ -14,6 +14,8 @@ Key structures:
 Key functions:
 - `flux3_readiness_line()`, `flux3_run_block_reason()`, `parse_seed_input()`,
   `flux3_stage_label()`, `flux3_run_done_status()`
+- the Stable-Diffusion.cpp runtime: `flux3_sdcpp_readiness_line()`, `flux3_torch_block_reason()`,
+  `flux3_sdcpp_run_block_reason()`, `flux3_sdcpp_format_fallback_line()`, `FLUX3_SDCPP_SEED_MAX`
 - `flux3_catalog_bundle()`; the gated-repository / bundle-state / job rules over it are the
   shared `../shared/catalog_download.rs`
 - `flux3_dit_format_name()`, `flux3_encoder_format_name()`, `flux3_dit_format_hint()`,
@@ -63,6 +65,13 @@ pub(super) enum Flux3ReadinessLine {
     RootNotAbsolute,
     /// No answer yet: neutral, no button.
     Unknown,
+    /// Stable-Diffusion.cpp: the files of the selection are being checked (neutral, no button).
+    SdcppFilesChecking,
+    /// Stable-Diffusion.cpp: the files are there and fit together.
+    SdcppFilesReady,
+    /// Stable-Diffusion.cpp: the files are missing or unusable (the localized reason);
+    /// «Установить» is offered.
+    SdcppFilesRefused(String),
 }
 
 impl Flux3ReadinessLine {
@@ -70,15 +79,15 @@ impl Flux3ReadinessLine {
     pub(super) fn tone(&self) -> Flux3LineTone {
         match self {
             Self::Ready { memory: Some(summary) } if !summary.fits => Flux3LineTone::Warn,
-            Self::Ready { .. } => Flux3LineTone::Ok,
-            Self::Missing { .. } | Self::BundleMissing | Self::NoRoot | Self::RootNotAbsolute => Flux3LineTone::Warn,
-            Self::Unknown => Flux3LineTone::Neutral,
+            Self::Ready { .. } | Self::SdcppFilesReady => Flux3LineTone::Ok,
+            Self::Missing { .. } | Self::BundleMissing | Self::NoRoot | Self::RootNotAbsolute | Self::SdcppFilesRefused(_) => Flux3LineTone::Warn,
+            Self::Unknown | Self::SdcppFilesChecking => Flux3LineTone::Neutral,
         }
     }
 
     /// Whether «Установить» is offered beside the line.
     pub(super) fn offers_install(&self) -> bool {
-        matches!(self, Self::Missing { .. } | Self::BundleMissing | Self::NoRoot | Self::RootNotAbsolute)
+        matches!(self, Self::Missing { .. } | Self::BundleMissing | Self::NoRoot | Self::RootNotAbsolute | Self::SdcppFilesRefused(_))
     }
 
     /// The localized text.
@@ -91,6 +100,9 @@ impl Flux3ReadinessLine {
             Self::NoRoot => t!("cleaning.tools.flux3_klein.model_root_missing_status").to_string(),
             Self::RootNotAbsolute => t!("cleaning.tools.flux3_klein.model_root_not_absolute_status").to_string(),
             Self::Unknown => t!("cleaning.tools.flux3_klein.model_readiness_unknown_status").to_string(),
+            Self::SdcppFilesChecking => t!("cleaning.tools.flux3_klein.sdcpp_files_checking_status").to_string(),
+            Self::SdcppFilesReady => t!("cleaning.tools.flux3_klein.sdcpp_files_ready_status").to_string(),
+            Self::SdcppFilesRefused(reason) => tf!("cleaning.tools.flux3_klein.sdcpp_files_error", err = reason),
         }
     }
 }
@@ -111,6 +123,74 @@ pub(super) fn flux3_readiness_line(readiness: &Flux3ModelReadiness, bundle_missi
         Flux3ModelReadiness::RootNotAbsolute => Flux3ReadinessLine::RootNotAbsolute,
         Flux3ModelReadiness::Unknown => Flux3ReadinessLine::Unknown,
     }
+}
+
+/// The files line of the Stable-Diffusion.cpp runtime (the runtime's own readiness is the shared
+/// line above it). `bundle_missing` (download mode, the catalog bundle known incomplete) takes a
+/// checking, ready or file-refused state, so the line offers the block that fetches the files; a
+/// root problem keeps its own line.
+#[must_use]
+pub(super) fn flux3_sdcpp_readiness_line(files: &Flux3SdcppFilesState, bundle_missing: bool) -> Flux3ReadinessLine {
+    match files {
+        Flux3SdcppFilesState::Refused(Flux3SdcppFilesError::NoRoot) => Flux3ReadinessLine::NoRoot,
+        Flux3SdcppFilesState::Refused(Flux3SdcppFilesError::RootNotAbsolute) => Flux3ReadinessLine::RootNotAbsolute,
+        Flux3SdcppFilesState::Checking | Flux3SdcppFilesState::Ready | Flux3SdcppFilesState::Refused(Flux3SdcppFilesError::Files(_)) if bundle_missing => Flux3ReadinessLine::BundleMissing,
+        Flux3SdcppFilesState::Checking => Flux3ReadinessLine::SdcppFilesChecking,
+        Flux3SdcppFilesState::Ready => Flux3ReadinessLine::SdcppFilesReady,
+        Flux3SdcppFilesState::Refused(Flux3SdcppFilesError::Files(err)) => Flux3ReadinessLine::SdcppFilesRefused(err.to_string()),
+    }
+}
+
+/// The largest seed a Stable-Diffusion.cpp run takes: its seed is a signed 64-bit integer whose
+/// negative values mean "random".
+pub(super) const FLUX3_SDCPP_SEED_MAX: u64 = i64::MAX.unsigned_abs();
+
+/// The engine's half of the PyTorch requirement: PyTorch selected while Torch is missing names
+/// the way out (switch to Stable-Diffusion.cpp) — but only where the sd.cpp route is available
+/// (`sdcpp_available`: the shared `sdcpp_route_available`, platform and `--no-ai` included);
+/// elsewhere `None`, and the host's generic «needs PyTorch» refusal applies.
+#[must_use]
+pub(super) fn flux3_torch_block_reason(runtime: ImageEditRuntime, torch_available: bool, sdcpp_available: bool) -> Option<String> {
+    match runtime {
+        ImageEditRuntime::PyTorch if !torch_available && sdcpp_available => Some(t!("cleaning.tools.sdcpp.torch_missing_hint").to_string()),
+        ImageEditRuntime::PyTorch | ImageEditRuntime::SdCpp => None,
+    }
+}
+
+/// The first reason a run on Stable-Diffusion.cpp cannot start, or `None`.
+///
+/// In order: the runtime itself (`runtime_block`, the shared readiness's
+/// `SdCppReadiness::run_block_reason`), the files (still being checked — a run needs the
+/// validated paths —, or refused with their reason), an empty prompt, an invalid seed field and a
+/// pinned seed above [`FLUX3_SDCPP_SEED_MAX`].
+#[must_use]
+pub(super) fn flux3_sdcpp_run_block_reason(settings: &Flux3KleinSettings, runtime_block: Option<String>, files: &Flux3SdcppFilesState, seed: Flux3SeedInput) -> Option<String> {
+    if runtime_block.is_some() {
+        return runtime_block;
+    }
+    match files {
+        Flux3SdcppFilesState::Checking => return Some(t!("cleaning.tools.flux3_klein.sdcpp_files_checking_status").to_string()),
+        Flux3SdcppFilesState::Refused(err) => return Some(err.message()),
+        Flux3SdcppFilesState::Ready => {}
+    }
+    if settings.prompt.trim().is_empty() {
+        return Some(t!("cleaning.tools.flux3_klein.prompt_required_error").to_string());
+    }
+    match seed {
+        Flux3SeedInput::Invalid => Some(t!("cleaning.tools.flux3_klein.seed_invalid_error").to_string()),
+        Flux3SeedInput::Pinned(value) if value > FLUX3_SDCPP_SEED_MAX => Some(tf!("cleaning.tools.flux3_klein.sdcpp_seed_range_error", max = FLUX3_SDCPP_SEED_MAX)),
+        Flux3SeedInput::Pinned(_) | Flux3SeedInput::Random => None,
+    }
+}
+
+/// The one line under the DiT picker on Stable-Diffusion.cpp when the stored format is one it
+/// cannot run (fp8r, nvfp4): which format runs instead. `None` on PyTorch or for an offered
+/// format.
+#[must_use]
+pub(super) fn flux3_sdcpp_format_fallback_line(settings: &Flux3KleinSettings) -> Option<String> {
+    let stored = settings.dit_format();
+    let used = settings.run_dit_format();
+    (stored != used).then(|| tf!("cleaning.tools.flux3_klein.sdcpp_format_fallback_status", stored = flux3_dit_format_name(stored), used = flux3_dit_format_name(used)))
 }
 
 /// What the seed field holds.
@@ -221,14 +301,14 @@ pub(super) fn flux3_run_done_status(seed: u64, degraded: Option<&RunDegraded>) -
     }
 }
 
-/// The catalog bundle (`flux3_klein_package_specs`: base, root DiT config for bf16 / GGUF, DiT,
-/// encoder) the CURRENT selection
-/// needs in download mode; empty in manual mode, which never draws or probes a catalog block.
-/// Pure: no disk access.
+/// The catalog bundle the CURRENT selection needs in download mode, for the selected runtime
+/// (`flux3_klein_package_specs_for`): on PyTorch base, root DiT config for bf16 / GGUF, DiT,
+/// encoder; on Stable-Diffusion.cpp base, the DiT format it runs (`run_dit_format`), encoder.
+/// Empty in manual mode, which never draws or probes a catalog block. Pure: no disk access.
 #[must_use]
 pub(super) fn flux3_catalog_bundle(settings: &Flux3KleinSettings) -> Vec<&'static ExternalModelSpec> {
     match settings.source_mode() {
-        Flux3SourceMode::Download => flux3_klein_package_specs(settings.dit_format(), settings.encoder_format()),
+        Flux3SourceMode::Download => flux3_klein_package_specs_for(settings.runtime(), settings.run_dit_format(), settings.encoder_format()),
         Flux3SourceMode::Manual => Vec::new(),
     }
 }
@@ -502,6 +582,11 @@ mod tests {
                 }
                 expected.extend([flux3_klein_dit_spec(dit).id, flux3_klein_encoder_spec(encoder).id]);
                 assert_eq!(ids, expected, "{dit:?} {encoder:?}");
+                // sd.cpp: no DiT config, and the DiT it runs (fp8r / nvfp4 fall back).
+                let sdcpp = Flux3KleinSettings { runtime: "sdcpp".to_string(), ..settings.clone() };
+                let ids: Vec<&str> = flux3_catalog_bundle(&sdcpp).iter().map(|spec| spec.id).collect();
+                let run = flux3_closest_offered(dit, ImageEditRuntime::SdCpp);
+                assert_eq!(ids, vec!["flux3_klein_base", flux3_klein_dit_spec(run).id, flux3_klein_encoder_spec(encoder).id], "sd.cpp {dit:?} {encoder:?}");
                 let manual = Flux3KleinSettings { source_mode: "manual".to_string(), model_root: "/m".to_string(), ..settings };
                 assert!(flux3_catalog_bundle(&manual).is_empty(), "manual mode has no catalog block");
             }
@@ -546,6 +631,73 @@ mod tests {
             // `status_with` reports only the aggregate flag, which covers the selection.
             assert!(row.ends_with('✓'), "{row}");
         }
+    }
+
+    /// The PyTorch requirement: only PyTorch without Torch on an sd.cpp platform names the way
+    /// out; elsewhere the engine says nothing (the host's own refusal applies).
+    #[test]
+    fn the_torch_gate_table() {
+        let _locale = english();
+        for runtime in ImageEditRuntime::ALL {
+            for torch in [false, true] {
+                for platform in [false, true] {
+                    let reason = flux3_torch_block_reason(runtime, torch, platform);
+                    let expected = runtime == ImageEditRuntime::PyTorch && !torch && platform;
+                    assert_eq!(reason.is_some(), expected, "{runtime:?} torch {torch} platform {platform}");
+                    if expected {
+                        assert_eq!(reason.as_deref(), Some(t!("cleaning.tools.sdcpp.torch_missing_hint")));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The sd.cpp gate, in order: the runtime's own block, the files (checking or refused), the
+    /// prompt, the seed field and the seed range.
+    #[test]
+    fn the_sdcpp_run_gate_table() {
+        let _locale = english();
+        let settings = Flux3KleinSettings { runtime: "sdcpp".to_string(), ..Flux3KleinSettings::default() };
+        let ready = Flux3SdcppFilesState::Ready;
+        assert_eq!(flux3_sdcpp_run_block_reason(&settings, None, &ready, Flux3SeedInput::Random), None);
+        assert_eq!(flux3_sdcpp_run_block_reason(&settings, Some("runtime".to_string()), &ready, Flux3SeedInput::Random).as_deref(), Some("runtime"), "the runtime first");
+        assert_eq!(flux3_sdcpp_run_block_reason(&settings, None, &Flux3SdcppFilesState::Checking, Flux3SeedInput::Random).as_deref(), Some(t!("cleaning.tools.flux3_klein.sdcpp_files_checking_status")));
+        let refused = Flux3SdcppFilesState::Refused(Flux3SdcppFilesError::NoRoot);
+        assert_eq!(flux3_sdcpp_run_block_reason(&settings, None, &refused, Flux3SeedInput::Random).as_deref(), Some(t!("cleaning.tools.flux3_klein.model_root_required_error")));
+        let blank = Flux3KleinSettings { prompt: " ".to_string(), ..settings.clone() };
+        assert!(flux3_sdcpp_run_block_reason(&blank, None, &ready, Flux3SeedInput::Random).is_some());
+        assert!(flux3_sdcpp_run_block_reason(&settings, None, &ready, Flux3SeedInput::Invalid).is_some());
+        assert_eq!(flux3_sdcpp_run_block_reason(&settings, None, &ready, Flux3SeedInput::Pinned(FLUX3_SDCPP_SEED_MAX)), None, "the largest int64 seed runs");
+        assert!(flux3_sdcpp_run_block_reason(&settings, None, &ready, Flux3SeedInput::Pinned(FLUX3_SDCPP_SEED_MAX + 1)).is_some(), "above int64 is refused");
+    }
+
+    /// The sd.cpp files line: root problems keep their lines, an incomplete bundle offers the
+    /// download, refused files name the reason and offer «Установить».
+    #[test]
+    fn the_sdcpp_files_line_follows_the_state() {
+        let _locale = english();
+        assert_eq!(flux3_sdcpp_readiness_line(&Flux3SdcppFilesState::Checking, false), Flux3ReadinessLine::SdcppFilesChecking);
+        assert_eq!(flux3_sdcpp_readiness_line(&Flux3SdcppFilesState::Ready, false).tone(), Flux3LineTone::Ok);
+        assert_eq!(flux3_sdcpp_readiness_line(&Flux3SdcppFilesState::Ready, true), Flux3ReadinessLine::BundleMissing);
+        let root = Flux3SdcppFilesState::Refused(Flux3SdcppFilesError::RootNotAbsolute);
+        assert_eq!(flux3_sdcpp_readiness_line(&root, true), Flux3ReadinessLine::RootNotAbsolute);
+        let missing = Flux3SdcppFilesState::Refused(Flux3SdcppFilesError::Files(ms_sdcpp::ModelFilesError::Missing { role: ms_sdcpp::ComponentRole::Vae, path: PathBuf::from("/m/ae.safetensors") }));
+        let line = flux3_sdcpp_readiness_line(&missing, false);
+        assert!(matches!(line, Flux3ReadinessLine::SdcppFilesRefused(_)));
+        assert!(line.offers_install() && line.tone() == Flux3LineTone::Warn);
+        assert_eq!(flux3_sdcpp_readiness_line(&missing, true), Flux3ReadinessLine::BundleMissing);
+    }
+
+    /// The fallback line appears only on sd.cpp with a stored format it cannot run.
+    #[test]
+    fn the_format_fallback_line_names_both_formats() {
+        let _locale = english();
+        assert!(flux3_sdcpp_format_fallback_line(&Flux3KleinSettings::default()).is_none(), "PyTorch runs fp8r");
+        let sdcpp = Flux3KleinSettings { runtime: "sdcpp".to_string(), ..Flux3KleinSettings::default() };
+        let line = flux3_sdcpp_format_fallback_line(&sdcpp).expect("fp8r falls back");
+        assert!(line.contains(&flux3_dit_format_name(Flux3DitFormat::Fp8r)) && line.contains("Q8_0"), "{line}");
+        let offered = Flux3KleinSettings { format: "q4_k_m".to_string(), ..sdcpp };
+        assert!(flux3_sdcpp_format_fallback_line(&offered).is_none());
     }
 
     /// Every stage the backend sends has a name; an unknown one falls back to the label.

@@ -773,6 +773,8 @@ mod tests {
                         no_ai,
                         platform(backend_platform, PlatformFeature::PythonBackend),
                         platform(native_platform, PlatformFeature::NativeOnnxRuntime),
+                        // No detector runs on sd.cpp, so its platform answer is irrelevant here.
+                        Ok(()),
                     );
                     let backend_ok = backend_platform && !no_ai;
                     let native_ok = native_platform && !no_ai;
@@ -805,6 +807,7 @@ mod tests {
                                     DetectorUnavailable::LocalAi(off) => match off.runtime {
                                         LocalRuntime::NativeOnnx => "native",
                                         LocalRuntime::PythonBackend => "backend",
+                                        LocalRuntime::SdCpp => "sdcpp",
                                     },
                                     DetectorUnavailable::TorchMissing => "torch",
                                 });

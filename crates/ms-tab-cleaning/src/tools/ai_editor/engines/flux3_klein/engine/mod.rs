@@ -4,7 +4,8 @@ File: cleaning/tools/ai_editor/engines/flux3_klein/engine/mod.rs
 Purpose:
 The FLUX.3 klein engine itself: the state it keeps between frames, its `AiEngine` contract with
 the host, and the polling that keeps that state current. The start/poll pairs of its long
-operations live in `actions.rs` beside it.
+operations live in `actions.rs` beside it, the Stable-Diffusion.cpp run and files check in
+`sdcpp.rs`.
 
 Main responsibilities:
 - own `Flux3KleinEngine` — the settings and their saver, the seed field, the `.status` answer,
@@ -13,14 +14,19 @@ Main responsibilities:
   the run channel and the progress bar;
 - implement `AiEngine`: one mask layer, the FLUX.3 frame constraints, marks as a separate
   reference while the reference list has room (else composited onto the region), the run it
-  starts, mid-run cancel, the poll it answers with (`EnginePoll::DoneRaw`: the raw region, its
-  mask and mode) and the live «Постобработка» settings the host finishes it with
-  (`postprocess_settings`);
+  starts ON THE SELECTED RUNTIME (PyTorch backend or Stable-Diffusion.cpp), mid-run cancel, the
+  poll it answers with (`EnginePoll::DoneRaw`: the raw region, its mask and mode, either runtime)
+  and the live «Постобработка» settings the host finishes it with (`postprocess_settings`); the
+  PyTorch requirement follows the runtime (`requires_torch`, the engine's own
+  `torch_missing_hint`), the picker gate covers both runtimes (`ai_requirement`), and selecting
+  the engine without PyTorch moves it to sd.cpp (`on_selected`, `switch_runtime`);
+- close the runtime switch while any job of either runtime is in flight
+  (`runtime_switch_block_reason`);
 - validate a run request and turn it into the run's pixels (`run_input`);
 - keep the derived state honest: load the settings once, save them when they settle, re-ask
   `.status` when the package root or the cache question (prompt, encoder mode) changes, re-ask
   the library listing when the encoder or the root changes, re-arm the forecast on a settled
-  region SIZE;
+  region SIZE — the backend questions only on PyTorch; on sd.cpp the files worker instead;
 - answer whether the typed prompt is served from the cache (`prompt_cache_state`, guarded to
   the prompt `.status` was asked about), which waives the text encoder in TEXT mode
   (`model_readiness`);
@@ -33,10 +39,10 @@ Key structures:
 
 Key functions:
 - `AiEngine::{start, poll, cancel, draw_parameters, marks_support, postprocess_settings,
-  switch_block_reason}`,
+  switch_block_reason, requires_torch, ai_requirement, on_selected, run_block_reason}`,
   `Flux3KleinEngine::{run_input, frame_constraints, model_readiness, prompt_cache_state,
   prompt_cache_status_entry, profiles_request, catalog_snapshot, poll_catalog_bundle,
-  apply_catalog_action, fold_panel_frame}`
+  apply_catalog_action, fold_panel_frame, runtime_switch_block_reason}`
 
 Notes:
 Nothing here blocks the GUI thread: every start hands its work to an `ms_thread` worker and every
@@ -47,6 +53,9 @@ use super::*;
 
 // The start/poll pairs of the long operations: token, pickers, references, unload.
 mod actions;
+// The Stable-Diffusion.cpp run (prep worker + shared job) and the files worker.
+mod sdcpp;
+use sdcpp::*;
 
 /// The file dialog a running picker serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,8 +81,22 @@ pub struct Flux3KleinEngine {
     pub(super) run_status: Option<String>,
     /// The seed the last finished run used, offered as «Повторить этот сид».
     pub(super) last_seed: Option<u64>,
-    /// The run in flight.
+    /// The PyTorch run in flight.
     pub(super) run_rx: Option<Receiver<Result<Flux3RunOutcome, String>>>,
+    /// The Stable-Diffusion.cpp run in flight (its request prep, then the shared job).
+    pub(super) sdcpp_run: Option<Flux3SdcppRun>,
+    /// The last answer of the sd.cpp files worker (counts only for the selection it names) and
+    /// the saved sd.cpp device read with it.
+    pub(super) sdcpp_files: Option<Flux3SdcppFilesAnswer>,
+    pub(super) sdcpp_files_rx: Option<Receiver<Flux3SdcppFilesAnswer>>,
+    /// Re-check the sd.cpp files even when the answer names the current selection («Обновить»,
+    /// the end of a catalog job: the disk may have changed).
+    pub(super) sdcpp_files_wanted: bool,
+    /// The `ms_sdcpp` status revision the last files question was asked at (`None` = never):
+    /// a refresh re-reads the saved device (and the files) with it.
+    pub(super) sdcpp_status_revision: Option<u64>,
+    /// Whether the PyTorch runtime is present, as the host last pushed it.
+    pub(super) torch_available: bool,
     /// Cancelled runs whose workers have not ended; while one is running nothing new starts
     /// (`pipeline_busy`), so quick start/cancel cycles cannot stack backend requests.
     pub(super) abandoned: AbandonedJobs,
@@ -82,6 +105,10 @@ pub struct Flux3KleinEngine {
     pub(super) settings_problem: Option<SettingsProblem>,
     pub(super) settings_save_blocked: bool,
     pub(super) settings_loaded: bool,
+    /// A selection event (`AiEngine::on_selected`) arrived while the settings load was in
+    /// flight: decided right after the load is applied (`poll_settings_load_with`), on the
+    /// FILE's runtime.
+    pub(super) selection_pending: bool,
     /// Raised by every parameter change; also what makes an edit outrank a late settings load.
     pub(super) dirty: bool,
     pub(super) saver: SettingsSaver<Flux3KleinSettings>,
@@ -173,12 +200,19 @@ impl Flux3KleinEngine {
             run_status: None,
             last_seed: None,
             run_rx: None,
+            sdcpp_run: None,
+            sdcpp_files: None,
+            sdcpp_files_rx: None,
+            sdcpp_files_wanted: false,
+            sdcpp_status_revision: None,
+            torch_available: false,
             abandoned: AbandonedJobs::default(),
             settings: Flux3KleinSettings::default(),
             settings_rx: None,
             settings_problem: None,
             settings_save_blocked: false,
             settings_loaded: false,
+            selection_pending: false,
             dirty: false,
             saver: SettingsSaver::new(save_flux3_settings, FLUX3_LOG_LABEL),
             seed_input: String::new(),
@@ -220,8 +254,15 @@ impl Flux3KleinEngine {
 
     /// Applies a finished settings load — unless the user already edited something, in which
     /// case the edit wins and the file's document is discarded whole (FLUX.2 klein's rule). A
-    /// disconnected loader unblocks saving with the in-memory settings.
+    /// disconnected loader unblocks saving with the in-memory settings. A selection event
+    /// deferred while the load was in flight (`selection_pending`) is decided right after it.
     pub(super) fn poll_settings_load(&mut self) {
+        self.poll_settings_load_with(AiCaps::current);
+    }
+
+    /// [`Self::poll_settings_load`] with the capability source of a deferred selection decision
+    /// injected (tests pass a fixed snapshot; production reads `AiCaps::current`).
+    pub(super) fn poll_settings_load_with(&mut self, caps: impl FnOnce() -> AiCaps) {
         let Some(rx) = self.settings_rx.as_ref() else {
             return;
         };
@@ -238,11 +279,28 @@ impl Flux3KleinEngine {
                 self.settings_loaded = true;
                 self.settings_rx = None;
             }
-            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
                 self.settings_loaded = true;
                 self.settings_rx = None;
+                // The file was never read: the in-memory settings are DEFAULTS, and a switch
+                // decided on them would be saved over that file. The deferred event is dropped;
+                // the next selection decides on what the session then holds.
+                self.selection_pending = false;
             }
+        }
+        if std::mem::take(&mut self.selection_pending) {
+            self.decide_runtime_on_selection(&caps());
+        }
+    }
+
+    /// The selection-time runtime decision on LOADED settings: leaves an out-of-reach PyTorch
+    /// for sd.cpp (the shared `sdcpp_auto_switch` rule) through the path a click on the switch
+    /// takes, and logs it.
+    fn decide_runtime_on_selection(&mut self, caps: &AiCaps) {
+        if sdcpp_auto_switch(self.settings.runtime(), caps, sdcpp_route_available(), self.runtime_switch_block_reason().is_some()) {
+            log_sdcpp_auto_switch(self.id());
+            self.switch_runtime(ImageEditRuntime::SdCpp);
         }
     }
 
@@ -259,7 +317,8 @@ impl Flux3KleinEngine {
         );
     }
 
-    /// Drains the `.status` query and asks a new one when it is wanted, the backend is up,
+    /// Drains the `.status` query and asks a new one when it is wanted, PyTorch is the runtime
+    /// (sd.cpp asks the backend nothing), the backend is up,
     /// nothing holds it and an ABSOLUTE package root exists (`has_usable_root`; otherwise the
     /// verdict is `NoRoot` / `RootNotAbsolute`, decided locally, and the GGUF candidate paths
     /// would not be absolute). The answer is recorded
@@ -287,7 +346,8 @@ impl Flux3KleinEngine {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        if self.status_wanted && self.ai_backend_available && self.status_rx.is_none() && !self.pipeline_busy() && self.settings.has_usable_root() {
+        let pytorch = self.settings.runtime() == ImageEditRuntime::PyTorch;
+        if pytorch && self.status_wanted && self.ai_backend_available && self.status_rx.is_none() && !self.pipeline_busy() && self.settings.has_usable_root() {
             self.status_wanted = false;
             let normalized = self.settings.normalized();
             // Taken from the value that builds the params, so what is recorded is what travelled.
@@ -368,19 +428,23 @@ impl Flux3KleinEngine {
 
     /// Drains the forecast and asks the next question when one is armed. The gate also needs an
     /// absolute package root (`has_usable_root`): the backend refuses a forecast without
-    /// `source_root` or with relative candidate paths.
+    /// `source_root` or with relative candidate paths. PyTorch only: the forecast is the
+    /// backend's large-model manager's, which an sd.cpp run never meets.
     pub(super) fn poll_and_maybe_query_profiles(&mut self) {
         let region = self.region.map(|rect| [rect.w, rect.h]);
-        let gate_open = self.ai_backend_available && !self.pipeline_busy() && self.settings.has_usable_root();
+        let pytorch = self.settings.runtime() == ImageEditRuntime::PyTorch;
+        let gate_open = pytorch && self.ai_backend_available && !self.pipeline_busy() && self.settings.has_usable_root();
         let Self { resources, settings, references, marks_reference, .. } = self;
         resources.poll_query(region, gate_open, |size| Self::profiles_request(settings, references, *marks_reference, size));
     }
 
     /// Folds one drawn frame of the panel: its intents (`apply_intents`), then — when the
-    /// weight-format selection moved during the frame (the install pickers, the forecast's DiT
-    /// or encoder rows, a format suggestion) — re-probes the new catalog bundle and re-asks
-    /// `.status`. `selection_before` is [`Self::catalog_selection`] taken before the panel drew.
-    pub(super) fn fold_panel_frame(&mut self, intents: Flux3PanelIntents, selection_before: (Flux3DitFormat, Flux3EncoderFormat, Flux3SourceMode)) {
+    /// weight-format selection or the runtime moved during the frame (the install pickers, the
+    /// forecast's DiT or encoder rows, a format suggestion, the runtime switch) — re-probes the
+    /// new catalog bundle and re-asks `.status` (asked only on PyTorch; the sd.cpp files worker
+    /// follows the selection's key by itself). `selection_before` is [`Self::catalog_selection`]
+    /// taken before the panel drew.
+    pub(super) fn fold_panel_frame(&mut self, intents: Flux3PanelIntents, selection_before: (Flux3DitFormat, Flux3EncoderFormat, Flux3SourceMode, ImageEditRuntime)) {
         self.apply_intents(intents);
         let selection = self.catalog_selection();
         if selection != selection_before {
@@ -389,8 +453,9 @@ impl Flux3KleinEngine {
             // `available` and `prompt_cached` describe the selection the question carried: ask
             // again.
             self.status_wanted = true;
-            if selection.1 != selection_before.1 || selection.2 != selection_before.2 {
-                // Every listed entry's `current_encoder` follows the encoder.
+            if selection.1 != selection_before.1 || selection.2 != selection_before.2 || selection.3 != selection_before.3 {
+                // Every listed entry's `current_encoder` follows the encoder; back on PyTorch the
+                // listing was not asked while sd.cpp ran.
                 self.prompt_cache.arm_list();
             }
         }
@@ -416,13 +481,23 @@ impl Flux3KleinEngine {
         }
     }
 
-    /// Whether an operation holds the backend and the shared progress bar: a run, a cancelled
-    /// run still ending (the run gate names the latter itself, `cancel_pending_error`), or a
-    /// prompt-cache operation (a build streams on the same bar and reads the encoder). The
-    /// catalog download is not one: it runs in the app, not in the backend, and has its own
-    /// progress in its block.
+    /// Whether an operation holds the backend or the sd.cpp worker and the shared progress bar:
+    /// a run of either runtime, a cancelled run still ending (the run gate names the latter
+    /// itself, `cancel_pending_error`), or a prompt-cache operation (a build streams on the same
+    /// bar and reads the encoder). The catalog download is not one: it runs in the app, not in
+    /// the backend, and has its own progress in its block.
     pub(super) fn pipeline_busy(&self) -> bool {
-        self.run_rx.is_some() || self.abandoned.busy() || self.prompt_cache.busy()
+        self.run_rx.is_some() || self.sdcpp_run.is_some() || self.abandoned.busy() || self.prompt_cache.busy()
+    }
+
+    /// Why the PyTorch / Stable-Diffusion.cpp switch is closed right now: a run of either
+    /// runtime (or its prep), a cancelled run still ending, a prompt-cache operation or a
+    /// `.unload` in flight — each belongs to the runtime it started on — or a catalog job (the
+    /// runtime picks the bundle, so a switch would move the bundle under the running job).
+    /// `None` = it may switch.
+    pub(super) fn runtime_switch_block_reason(&self) -> Option<String> {
+        catalog_switch_block_reason(self.downloads.as_ref().and_then(OcrModelDownloadController::running_job))
+            .or_else(|| (self.pipeline_busy() || self.unload_rx.is_some()).then(|| t!("cleaning.tools.flux3_klein.switch_busy_reason").to_string()))
     }
 
     /// The download block's view of the catalog bundle the current selection needs
@@ -452,6 +527,7 @@ impl Flux3KleinEngine {
         let running = catalog_job_running(&downloads.panel_snapshot(&bundle));
         if self.catalog_job_running && !running {
             self.status_wanted = true;
+            self.sdcpp_files_wanted = true;
             self.resources.invalidate();
             // The encoder files may have changed: the listing's `current_encoder` follows them.
             self.prompt_cache.arm_list();
@@ -460,9 +536,20 @@ impl Flux3KleinEngine {
         repaint
     }
 
-    /// What the catalog bundle follows: the two weight formats and the source mode.
-    pub(super) fn catalog_selection(&self) -> (Flux3DitFormat, Flux3EncoderFormat, Flux3SourceMode) {
-        (self.settings.dit_format(), self.settings.encoder_format(), self.settings.source_mode())
+    /// What the catalog bundle follows: the two weight formats, the source mode and the runtime
+    /// (sd.cpp fetches another set).
+    pub(super) fn catalog_selection(&self) -> (Flux3DitFormat, Flux3EncoderFormat, Flux3SourceMode, ImageEditRuntime) {
+        (self.settings.dit_format(), self.settings.encoder_format(), self.settings.source_mode(), self.settings.runtime())
+    }
+
+    /// Moves the runtime to `runtime` the way a click on the panel's switch does: the runtime
+    /// is written and folded as a frame whose only intent is a settings change (saved, and the
+    /// selection change re-probes the bundle). Used by the automatic switch
+    /// (`AiEngine::on_selected`).
+    fn switch_runtime(&mut self, runtime: ImageEditRuntime) {
+        let selection_before = self.catalog_selection();
+        self.settings.runtime = runtime.wire().to_string();
+        self.fold_panel_frame(Flux3PanelIntents { settings_changed: true, ..Flux3PanelIntents::default() }, selection_before);
     }
 
     /// Re-probes the bundle the CURRENT selection needs (even specs probed before: the user may
@@ -566,7 +653,8 @@ impl Flux3KleinEngine {
         })
     }
 
-    /// Drains the run channel: a finished run records its seed and invalidates the forecast.
+    /// Drains the PyTorch run channel: a finished run records its seed and invalidates the
+    /// forecast.
     fn poll_run(&mut self) -> EnginePoll {
         let Some(rx) = self.run_rx.as_ref() else {
             return EnginePoll::Idle;
@@ -604,11 +692,11 @@ impl Flux3KleinEngine {
     /// Abandons the run in flight: its answer is never read, its progress generation retired,
     /// and the backend told to stop (it checks at every stage and every denoise step) — sticky,
     /// so a cancel before the request id exists is sent the moment the worker publishes it. The
-    /// worker is kept in `abandoned` until it ends; no new run starts meanwhile. Returns whether
-    /// there was a run.
+    /// worker is kept in `abandoned` until it ends; no new run starts meanwhile. An sd.cpp run is
+    /// cancelled through `cancel_sdcpp_run`. Returns whether there was a run.
     pub(super) fn cancel_run(&mut self) -> bool {
         let Some(rx) = self.run_rx.take() else {
-            return false;
+            return self.cancel_sdcpp_run();
         };
         self.abandoned.push(rx);
         retire_progress_generation(&self.progress, FLUX3_LOG_LABEL);
@@ -658,8 +746,29 @@ impl AiEngine for Flux3KleinEngine {
         EngineSection::WithPrompt
     }
 
+    /// Only the PyTorch runtime needs Torch.
     fn requires_torch(&self) -> bool {
-        true
+        self.settings.runtime() == ImageEditRuntime::PyTorch
+    }
+
+    /// PyTorch or Stable-Diffusion.cpp, whichever the switch shows: the picker button is open
+    /// while either runtime is available (`AiCaps` folds `--no-ai`, the platform and the sd.cpp
+    /// install into the sd.cpp half).
+    fn ai_requirement(&self) -> Option<AiRequirement> {
+        Some(AiRequirement::TorchOrSdcpp)
+    }
+
+    /// Decides the runtime on the user's selection (`decide_runtime_on_selection`) — but NEVER
+    /// on settings that have not been loaded: the defaults say PyTorch, and a change made now
+    /// would make the late load discard the user's file. While the load is in flight the event
+    /// is remembered and decided when it lands.
+    fn on_selected(&mut self, caps: &AiCaps) {
+        self.poll_settings_load();
+        if self.settings_rx.is_some() {
+            self.selection_pending = true;
+            return;
+        }
+        self.decide_runtime_on_selection(caps);
     }
 
     fn constraints(&self) -> FrameConstraints {
@@ -719,6 +828,17 @@ impl AiEngine for Flux3KleinEngine {
         // destructure below borrows the fields apart).
         let prompt_cache_state = self.prompt_cache_state();
         let prompt_cache_status_entry = self.prompt_cache_status_entry().cloned();
+        // The Stable-Diffusion.cpp facts the panel reads: the process-global status (one short
+        // lock), the `--no-ai` / platform gate, the saved device and the files state of the
+        // selection; the switch's block reason and whether the switch is offered at all.
+        let sdcpp_status = ms_sdcpp::snapshot();
+        let sdcpp_local = sdcpp_route_gate();
+        let sdcpp_device = self.sdcpp_files.as_ref().map(|answer| answer.device.clone());
+        let sdcpp_files = self.sdcpp_files_state();
+        let runtime_switch_block = self.runtime_switch_block_reason();
+        let pytorch_unavailable = pytorch_unavailable_reason(&AiCaps::current());
+        // Offered where the sd.cpp route is available, and always while it is selected (a way back).
+        let show_runtime_switch = sdcpp_route_available() || self.settings.runtime() == ImageEditRuntime::SdCpp;
         let mut intents = Flux3PanelIntents::default();
         {
             let Self {
@@ -768,6 +888,13 @@ impl AiEngine for Flux3KleinEngine {
                 prompt_cache,
                 prompt_cache_state,
                 prompt_cache_status_entry: prompt_cache_status_entry.as_ref(),
+                sdcpp_status: &sdcpp_status,
+                sdcpp_local,
+                sdcpp_device: sdcpp_device.as_ref(),
+                sdcpp_files,
+                runtime_switch_block: runtime_switch_block.as_deref(),
+                pytorch_unavailable,
+                show_runtime_switch,
                 install_section_seeded,
                 install_section_open_prev,
                 intents: &mut intents,
@@ -808,26 +935,37 @@ impl AiEngine for Flux3KleinEngine {
         if self.prompt_cache.busy() {
             return Some(t!("cleaning.tools.flux3_klein.prompt_cache_busy_error").to_string());
         }
-        flux3_run_block_reason(&self.settings, &self.model_readiness(), parse_seed_input(&self.seed_input))
+        let seed = parse_seed_input(&self.seed_input);
+        match self.settings.runtime() {
+            // The engine's half of the Torch rule wins over the host's generic refusal: it names
+            // the way out (the sd.cpp runtime) where this platform has it.
+            ImageEditRuntime::PyTorch => flux3_torch_block_reason(ImageEditRuntime::PyTorch, self.torch_available, sdcpp_route_available())
+                .or_else(|| flux3_run_block_reason(&self.settings, &self.model_readiness(), seed)),
+            ImageEditRuntime::SdCpp => flux3_sdcpp_run_block_reason(&self.settings, self.sdcpp_readiness().run_block_reason(), &self.sdcpp_files_state(), seed),
+        }
     }
 
     /// Refuses the switch while a job of THIS engine's catalog controller runs (download,
     /// verify or automatic adoption, the shared [`catalog_switch_block_reason`]): a
     /// multi-gigabyte transfer no frame state describes, and the host polls only the selected
-    /// engine, so a job left behind by a switch would run unseen.
+    /// engine, so a job left behind by a switch would run unseen. An sd.cpp run (its prep
+    /// included) refuses it too — and so does a cancelled run still ending (`abandoned`): a
+    /// cancelled sd.cpp job keeps the service's generation slot until its worker answered, so
+    /// the next engine's sd.cpp run would be refused with a misleading text.
     fn switch_block_reason(&self) -> Option<String> {
         catalog_switch_block_reason(self.downloads.as_ref().and_then(OcrModelDownloadController::running_job))
+            .or_else(|| (self.sdcpp_run.is_some() || self.abandoned.busy()).then(|| t!("cleaning.tools.flux3_klein.switch_busy_reason").to_string()))
     }
 
-    /// Validates the request and starts the run on a worker.
+    /// Validates the request and starts the run on a worker, on the selected runtime.
     ///
     /// # Errors
     /// A localized message when a run is in flight or a cancelled one still ends, the
     /// references are still loading, a prompt-cache operation holds the pipeline, the seed
-    /// field is invalid, or
-    /// [`Flux3KleinEngine::run_input`] refuses it.
+    /// field is invalid, the runtime's gate refuses (Torch missing; sd.cpp not ready or its
+    /// files not validated), or [`Flux3KleinEngine::run_input`] refuses it.
     fn start(&mut self, request: EngineRunRequest) -> Result<(), String> {
-        if self.run_rx.is_some() {
+        if self.run_rx.is_some() || self.sdcpp_run.is_some() {
             return Err(t!("cleaning.mask_editor.processing_already_running_status").to_string());
         }
         if let Some(reason) = self.run_block_reason() {
@@ -838,6 +976,9 @@ impl AiEngine for Flux3KleinEngine {
         if self.marks_reference != input.marks_reference.is_some() {
             self.marks_reference = input.marks_reference.is_some();
             self.resources.arm();
+        }
+        if self.settings.runtime() == ImageEditRuntime::SdCpp {
+            return self.start_sdcpp(input);
         }
         let settings = self.settings.normalized();
         let claim = begin_progress_generation(&self.progress);
@@ -859,6 +1000,7 @@ impl AiEngine for Flux3KleinEngine {
         }
         self.poll_settings_load();
         self.poll_and_maybe_query_status();
+        self.poll_and_maybe_resolve_sdcpp_files();
         self.poll_unload();
         self.poll_hf_token();
         self.poll_prompt_cache();
@@ -867,11 +1009,15 @@ impl AiEngine for Flux3KleinEngine {
         self.poll_picker();
         self.poll_references();
         self.resources.poll_side_jobs(Instant::now());
-        let run = self.poll_run();
+        // At most one runtime has a run: the PyTorch one answers first, else the sd.cpp one.
+        let run = match self.poll_run() {
+            EnginePoll::Idle => self.poll_sdcpp_run(),
+            answered @ (EnginePoll::Running | EnginePoll::Done(_) | EnginePoll::DoneRaw(_) | EnginePoll::Failed(_)) => answered,
+        };
         self.poll_and_maybe_query_profiles();
         let now = Instant::now();
         self.poll_and_maybe_save(now);
-        if self.resources.wants_repaint() || self.references_rx.is_some() || self.prompt_cache.list_busy() || catalog_repaint {
+        if self.resources.wants_repaint() || self.references_rx.is_some() || self.prompt_cache.list_busy() || self.sdcpp_files_rx.is_some() || catalog_repaint {
             ctx.request_repaint_after(LIMITS_EDIT_DEBOUNCE);
         }
         // The settings save debounce, a failed save's retry and a write in flight: the saver
@@ -899,8 +1045,12 @@ impl AiEngine for Flux3KleinEngine {
         self.ai_backend_available = available;
     }
 
-    /// Empty: the host's `AiButton` resolves the Torch requirement itself.
-    fn set_torch_available(&mut self, _available: bool) {}
+    /// Stored for the engine's own half of the Torch rule (`flux3_torch_block_reason`: PyTorch
+    /// selected without Torch names the sd.cpp runtime); the host's run gate still applies its
+    /// generic requirement after it (`requires_torch`).
+    fn set_torch_available(&mut self, available: bool) {
+        self.torch_available = available;
+    }
 
     /// Stores the rectangle every frame; arms the forecast only on a SETTLED size change, and
     /// cancels a run whose rectangle moved (its answer would describe another place).
@@ -1028,6 +1178,8 @@ mod tests {
     #[test]
     fn the_run_gate_reads_the_engine_state() {
         let mut engine = Flux3KleinEngine::at_rest();
+        // The host pushes the Torch flag every frame; this test is about the PyTorch gate.
+        engine.set_torch_available(true);
         assert!(engine.run_block_reason().is_none(), "no answer yet never blocks");
         engine.seed_input = "not a number".to_string();
         assert!(engine.run_block_reason().is_some());
@@ -1131,6 +1283,7 @@ mod tests {
     #[test]
     fn a_cached_prompt_opens_the_run_gate_without_the_encoder() {
         let mut engine = Flux3KleinEngine::at_rest();
+        engine.set_torch_available(true);
         let mut status = status_with(&[Flux3DitFormat::Fp8r], true, false);
         status.prompt_cached = Some(true);
         status.prompt_cache_asked_about = Some(engine.settings.prompt.trim().to_string());
@@ -1228,6 +1381,7 @@ mod tests {
     #[test]
     fn a_cancelled_run_blocks_the_next_one_until_its_worker_ends() {
         let mut engine = Flux3KleinEngine::at_rest();
+        engine.set_torch_available(true);
         let (tx, rx) = mpsc::channel();
         engine.run_rx = Some(rx);
         engine.progress = Arc::new(Mutex::new(EngineProgress { canceller: Some(Arc::new(|_, _| {})), ..EngineProgress::default() }));

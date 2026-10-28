@@ -3,7 +3,7 @@ FILE OVERVIEW: crates/ms-settings-ui/src/settings_warnings/model.rs
 GUI-free, wasm-clean data model of the settings warnings (no egui, no I/O).
 
 Purpose:
-Names every checked setting, where it is drawn (section + reserved group level), why it is
+Names every checked setting, where it is drawn (section + optional group), why it is
 flagged, how severe that is, and aggregates the current warnings per item, section and
 overall. The worker (`checks.rs` / `runtime.rs`) fills a `WarningSet`; the panes and the
 launcher only read it.
@@ -17,8 +17,8 @@ Key items:
   `WarningReason::message()`, so a UI-language switch re-renders it.
 - `SettingChange` + `affected_keys()`: what a pane reports after a write landed, and which
   keys that re-evaluates.
-- `WarningSet`: per-key storage and the aggregation (`item_level`, `section_level`,
-  `overall_level`, all through one `worst_where`).
+- `WarningSet`: per-key storage and the aggregation (`item_level`, `group_level`,
+  `section_level`, `overall_level`, all through one `worst_where`).
 
 Notes:
 `FallbackCause` mirrors `ms_native_runtime::NativeFallbackReason` (the 1:1 mapping is
@@ -123,41 +123,46 @@ impl SettingKey {
 
     /// Where the key's item is drawn. Every key lives in a section the launcher always
     /// lists on the platforms that check it (General, AiBackend, and SystemRegistration on
-    /// Windows / Linux), so a badge never propagates from a hidden tab; no key belongs to a
-    /// group yet.
+    /// Windows / Linux), so a badge never propagates from a hidden tab. The AI-backend keys
+    /// also name the pane's sub-tab they sit on (`AiTorch` / `AiOnnx`); the others are
+    /// top-level items.
     #[must_use]
     pub const fn location(self) -> SettingLocation {
-        let section = match self {
-            SettingKey::ProjectsRoot | SettingKey::UiLanguage => SettingsSectionId::General,
+        match self {
+            SettingKey::ProjectsRoot | SettingKey::UiLanguage => SettingLocation { section: SettingsSectionId::General, group: None },
+            SettingKey::BackendAutostart => SettingLocation { section: SettingsSectionId::AiBackend, group: Some(SettingGroupId::AiTorch) },
             SettingKey::AiRuntime
-            | SettingKey::BackendAutostart
             | SettingKey::OnnxBuild
             | SettingKey::OnnxProvider
             | SettingKey::OnnxDevice
-            | SettingKey::OrtCrashGuard => SettingsSectionId::AiBackend,
+            | SettingKey::OrtCrashGuard => SettingLocation { section: SettingsSectionId::AiBackend, group: Some(SettingGroupId::AiOnnx) },
             SettingKey::RegistrationStartMenu
             | SettingKey::RegistrationProgramEntry
-            | SettingKey::RegistrationOpenWith => SettingsSectionId::SystemRegistration,
-        };
-        SettingLocation { section, group: None }
+            | SettingKey::RegistrationOpenWith => SettingLocation { section: SettingsSectionId::SystemRegistration, group: None },
+        }
     }
 }
 
-/// Where an item sits: its settings section and, optionally, a collapsible group inside
-/// that section. `group` is the reserved level for future collapsible lists.
+/// Where an item sits: its settings section and, optionally, a group inside that section
+/// (a sub-tab or collapsible list the section draws).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SettingLocation {
     /// The tab the item is drawn on.
     pub section: SettingsSectionId,
-    /// The collapsible group inside the section; `None` for a top-level item.
+    /// The group inside the section; `None` for a top-level item.
     pub group: Option<SettingGroupId>,
 }
 
-/// Collapsible groups inside a section. No group exists yet (the enum is uninhabited):
-/// adding one means adding a variant and mapping keys to it in [`SettingKey::location`];
-/// the aggregation in [`WarningSet`] needs no change.
+/// Groups inside a section. Adding one means adding a variant and mapping keys to it in
+/// [`SettingKey::location`]; the aggregation in [`WarningSet`] needs no change. A group gets
+/// a variant only once a key maps to it (no empty group).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SettingGroupId {}
+pub enum SettingGroupId {
+    /// The AI-backend pane's «Основной PyTorch» sub-tab (the Python backend process).
+    AiTorch,
+    /// The AI-backend pane's «ONNXruntime» sub-tab (runtime switch, ONNX selection, guard).
+    AiOnnx,
+}
 
 /// Severity of a warning. Declaration order makes `Red > Yellow`, so `max` picks the
 /// worst one.
@@ -477,6 +482,13 @@ impl WarningSet {
         self.worst_where(|location| location.section == section)
     }
 
+    /// The worst level over every item of `group` (the badge of a sub-tab label), `None`
+    /// when all are clean.
+    #[must_use]
+    pub fn group_level(&self, group: SettingGroupId) -> Option<WarningLevel> {
+        self.worst_where(|location| location.group == Some(group))
+    }
+
     /// The worst level over every item, `None` when everything is clean.
     #[must_use]
     pub fn overall_level(&self) -> Option<WarningLevel> {
@@ -507,8 +519,8 @@ impl WarningSet {
 #[cfg(test)]
 mod tests {
     use super::{
-        NATIVE_FAMILY, REGISTRATION_FAMILY, RegistrationProblem, RegistrationRecord, SettingChange, SettingKey,
-        SettingWarning, WarningLevel, WarningReason, WarningSet,
+        NATIVE_FAMILY, REGISTRATION_FAMILY, RegistrationProblem, RegistrationRecord, SettingChange, SettingGroupId,
+        SettingKey, SettingWarning, WarningLevel, WarningReason, WarningSet,
     };
     use crate::settings_shared::{SettingsSectionId, SettingsSurface, sections_for};
 
@@ -568,7 +580,8 @@ mod tests {
 
     /// Every key checked on this platform must live in a section the launcher lists here
     /// and never hides (General, AiBackend, SystemRegistration — never TorchUpgrade, which
-    /// hides with the AI install type), and no key uses the reserved group level.
+    /// hides with the AI install type). Groups are AI-backend sub-tabs only (see
+    /// `ai_backend_keys_map_to_their_sub_tab`).
     /// SystemRegistration joined the set deliberately (system-registration plan, F3): its
     /// keys exist only where its row is listed.
     #[test]
@@ -585,8 +598,45 @@ mod tests {
                 ),
                 "{key:?} must stay in General, AiBackend or SystemRegistration"
             );
-            assert_eq!(location.group, None, "{key:?}");
+            if location.section != SettingsSectionId::AiBackend {
+                assert_eq!(location.group, None, "{key:?}");
+            }
         }
+    }
+
+    /// Each AI-backend key names the sub-tab it is drawn on: the autostart checkbox sits on
+    /// the PyTorch tab, the runtime switch and the ONNX selection on the ONNX tab.
+    #[test]
+    fn ai_backend_keys_map_to_their_sub_tab() {
+        use SettingKey as K;
+        assert_eq!(K::BackendAutostart.location().group, Some(SettingGroupId::AiTorch));
+        for key in [K::AiRuntime, K::OnnxBuild, K::OnnxProvider, K::OnnxDevice, K::OrtCrashGuard] {
+            assert_eq!(key.location().section, SettingsSectionId::AiBackend, "{key:?}");
+            assert_eq!(key.location().group, Some(SettingGroupId::AiOnnx), "{key:?}");
+        }
+        for key in [K::ProjectsRoot, K::UiLanguage] {
+            assert_eq!(key.location().group, None, "{key:?}");
+        }
+    }
+
+    /// `group_level` aggregates exactly the items of one group: a red ONNX item colours the
+    /// ONNX tab only, and the section still reports the worst of both groups.
+    #[test]
+    fn group_level_aggregates_one_sub_tab() {
+        let mut set = WarningSet::default();
+        assert_eq!(set.group_level(SettingGroupId::AiTorch), None);
+        assert_eq!(set.group_level(SettingGroupId::AiOnnx), None);
+        set.replace_key(SettingKey::OnnxDevice, vec![red(SettingKey::OnnxDevice)]);
+        set.replace_key(SettingKey::BackendAutostart, vec![yellow(SettingKey::BackendAutostart)]);
+        assert_eq!(set.group_level(SettingGroupId::AiOnnx), Some(WarningLevel::Red));
+        assert_eq!(set.group_level(SettingGroupId::AiTorch), Some(WarningLevel::Yellow));
+        assert_eq!(set.section_level(SettingsSectionId::AiBackend), Some(WarningLevel::Red));
+        set.replace_key(SettingKey::OnnxDevice, Vec::new());
+        assert_eq!(set.group_level(SettingGroupId::AiOnnx), None);
+        // A key outside the AI pane never reaches a group.
+        set.replace_key(SettingKey::UiLanguage, vec![red(SettingKey::UiLanguage)]);
+        assert_eq!(set.group_level(SettingGroupId::AiOnnx), None);
+        assert_eq!(set.group_level(SettingGroupId::AiTorch), Some(WarningLevel::Yellow));
     }
 
     #[test]

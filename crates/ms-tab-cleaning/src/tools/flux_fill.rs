@@ -23,7 +23,7 @@ use ms_canvas::CanvasView;
 use ms_config as config;
 use ms_project::ProjectData;
 use ms_local_ai::backend_health::ai_backend_offline_error;
-use ms_widgets::{WheelComboBox, WheelSlider};
+use ms_widgets::{AiRequirement, WheelComboBox, WheelSlider};
 use eframe::egui;
 use super::region_png::{encode_color_image_png_rgba, encode_mask_png_luma};
 use serde::{Deserialize, Serialize};
@@ -330,8 +330,8 @@ impl CleaningTool for FluxFillInpaintTool {
         t!("cleaning.tools.flux.title")
     }
 
-    fn pytorch_required(&self) -> bool {
-        true
+    fn ai_requirement(&self) -> Option<AiRequirement> {
+        Some(AiRequirement::Torch)
     }
 
     fn deactivate(&mut self, _canvas: &mut CanvasView) {

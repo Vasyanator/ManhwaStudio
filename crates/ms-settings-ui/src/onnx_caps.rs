@@ -13,7 +13,7 @@ Key items:
   facts the native availability rule consults.
 - `probe_onnx_caps()`: runs every probe (blocking system commands): worker threads only.
 - `ep_device_ids(ep, &caps)`: the device ids the panel's device combo offers for an EP
-  (`ai_backend_panel::ep_device_options` zips its labels onto these ids).
+  (`ai_backend_panel::onnx_selection::ep_device_options` zips its labels onto these ids).
 - `device_id_offered(ep, id, &caps)`: the one rule "does this persisted id name an offered
   device", judged on the id as the native runtime parses it
   (`ms_native_runtime::device_selection_for`); used by the settings device check and the
@@ -21,7 +21,7 @@ Key items:
 
 Notes:
 Build availability is NOT decided here: it is `ms_native_runtime::native_fallback_reason`
-over `OnnxCaps::native_facts()`. Labels and pickers stay in `ai_backend_panel.rs` (UI).
+over `OnnxCaps::native_facts()`. Labels and pickers stay in `ai_backend_panel/` (UI).
 */
 
 use ms_onnx::{ExecutionProvider, NativeDeviceSelection};

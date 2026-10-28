@@ -1,0 +1,60 @@
+[package]
+name = "ms-sdcpp"
+version = "0.1.0"
+edition = "2024"
+
+# The Stable-Diffusion.cpp (sd.cpp) runtime of the app: the pinned release catalog (one zip per
+# OS x build), its installation as a pinned native package under `data_dir()/sdcpp/`, the host
+# requirement probes (glibc / VC++ runtime / Vulkan loader), the process-global "is sd.cpp
+# ready" status and the model-family-agnostic request types. GUI-free. Native-only: `lib.rs` is
+# `#![cfg(not(target_arch = "wasm32"))]`, so on wasm the crate is empty; on Android and macOS it
+# compiles but `PlatformFeature::SdCppRuntime` refuses and the catalog has no row.
+# It never depends on `ms-local-ai`: the `--no-ai` gate is the consumers'
+# (`AiRouteKind::SdCpp.availability`).
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The pinned-package transaction (probe, busy wait, verified download, staged members, marker).
+ms-native-package = { path = "../ms-native-package" }
+# The production HTTP fetcher, retry schedule and the archive kind of a catalog row.
+ms-download = { path = "../ms-download" }
+# `data_dir()` (package root), the persisted choice (`SdCppChoice`) and the read-only
+# `user_config` reader of the status refresh.
+ms-config = { path = "../ms-config" }
+# The capability gate `PlatformFeature::SdCppRuntime` and its typed `Unavailable`.
+ms-platform = { path = "../ms-platform" }
+# Diagnostics (`ms_log::runtime_log`).
+ms-log = { path = "../ms-log" }
+# Localized `Display` of `SdCppError` / `RequirementProblem` and the build labels (`t!` / `tf!`).
+ms-i18n = { path = "../ms-i18n" }
+# The status refresh worker.
+ms-thread = { path = "../ms-thread" }
+# The worker wire (`protocol`) is framed with the backend IPC's frame codec
+# (`read_frame` / `write_frame`, header <= 1 MiB, blob <= 32 MiB).
+ms-backend-ipc = { path = "../ms-backend-ipc" }
+# Loads the ggml / sd.cpp shared libraries of an installed package inside the worker process.
+libloading.workspace = true
+# The request types are plain serde data (the worker wire of `ms-sdcpp` builds on them).
+serde.workspace = true
+serde_json.workspace = true
+# Typed public errors.
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# `gnu_get_libc_version` (glibc floor) and `dlopen` of the Vulkan loader (Linux); the worker's
+# stdout redirection (`dup` / `dup2`) and `prctl(PR_SET_PDEATHSIG)` (Linux).
+libc.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# `GetSystemDirectoryW` and the version resource of `msvcp140.dll` (VC++ runtime floor); the
+# worker's stdout redirection (`GetStdHandle` / `SetStdHandle` / `DuplicateHandle`) and its DLL
+# directory (`SetDllDirectoryW`).
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_SystemInformation", "Win32_System_Console", "Win32_System_Threading", "Win32_System_LibraryLoader"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# The scripted in-memory `RangeFetcher` (`ms_download::test_support`) for the install tests.
+ms-download = { path = "../ms-download", features = ["test-support"] }
+# Self-removing scratch package directories.
+tempfile.workspace = true
+# The test archive and its pin.
+zip.workspace = true
+sha2.workspace = true

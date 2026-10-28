@@ -136,6 +136,11 @@ android/app/src/main/assets/
 # include_str!. Without this the crate does not build from a Git clone.
 !crates/ms-onnx-runtime/src/ort_manifest.json
 
+# The vendored stable-diffusion.cpp C header (pinned release, sha256 checked by ms-sdcpp's tests)
+# and its LICENSE: the hand-written bindings of ms-sdcpp are checked against them.
+!crates/ms-sdcpp/vendor/
+!crates/ms-sdcpp/vendor/*
+
 # Golden split/join fixtures of the document store, shared by the Rust crate and the
 # Python codec (docstore.py). Both implementations are tested against them.
 !crates/ms-docstore/fixtures/*.json

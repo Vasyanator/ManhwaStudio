@@ -190,7 +190,7 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
     `../watermark_chapter/`, plus the on-disk library in `watermark_library.rs`. Its editing UI
     lives inside the SAME region-editor window; only the library MANAGEMENT screen is a surface
     of its own, and that one is a dock tab (`watermark_library_window.rs`).
-  `pytorch_required()` is a CONSTANT `false` here: the chapter mode needs nothing, so the picker
+  `ai_requirement()` is a CONSTANT `None` here: the chapter mode needs nothing, so the picker
   button must never be AI-gated, and that answer also feeds `ensure_active_tool_available` every
   frame. The Torch gate is inside the tool instead — the two network entries of the mode picker
   and the run button, both worded from the same keys as `mask_generation.rs` and reading the same

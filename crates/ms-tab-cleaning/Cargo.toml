@@ -117,6 +117,14 @@ ms-platform = { path = "../ms-platform" }
 # fsync with its `sync_directory`. A level-0 leaf (std + thiserror).
 ms-atomic-file = { path = "../ms-atomic-file" }
 
+# The Stable-Diffusion.cpp runtime of the FLUX klein region editors (`tools/ai_editor/engines/
+# shared/sdcpp_*`): the worker client (`service().generate` / `unload`), the process-global
+# readiness status, the catalog's build choice and the request types. Not on wasm, where the
+# crate is empty anyway; compiled on Android like in `ms-settings-ui` (already in that build),
+# where `PlatformFeature::SdCppRuntime` refuses at run time.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ms-sdcpp = { path = "../ms-sdcpp" }
+
 [dev-dependencies]
 # Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for test
 # builds: it exposes `locale_store::GLOBAL_LOCALE_LOCK`, the process-wide lock every test

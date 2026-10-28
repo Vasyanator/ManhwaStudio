@@ -38,6 +38,12 @@ poll_x()   -> try_recv, apply the outcome, clear the Receiver
   `poll_catalog_bundle`, `poll_installed_formats`, `catalog_snapshot`, `apply_catalog_action`)
   and folds a change of the weight selection — formats or encoder source
   (`fold_resources_and_formats` over `Flux2WeightSelection`, `note_weight_formats_changed`).
+- `sdcpp.rs`: the Stable-Diffusion.cpp state (`Flux2SdcppState`): the sd.cpp status worker
+  (the files of `../sdcpp_files.rs` and the saved sd.cpp device, re-asked when the settings' key,
+  the `ms_sdcpp` status revision or a refresh asks), and the run in two stages — `Preparing` (the
+  request built on a worker by `../sdcpp_request.rs`) then `Running` (the shared `SdCppRunJob`,
+  started on the GUI thread so it claims the progress in click order); `cancel` parks either in
+  `abandoned`; `flux2_sdcpp_raw_result` pairs the answer exactly like the PyTorch one.
 - `actions.rs`: the per-component load/unload actions, the Hugging Face token field, the
   prompt translation, the native file pickers, and the `.prompt_cache.*` jobs (build — also a
   rename — export, import, and the library listing), which run through the shared
@@ -102,6 +108,10 @@ poll_x()   -> try_recv, apply the outcome, clear the Receiver
   `marks_support()`: a region-sized reference (sent as the run's extra reference image),
   or nothing; a transparent layer is unsupported and refused by `run_input`. This module never touches `CanvasView` or
   `CleanOverlaysModel`.
+
+- **On Stable-Diffusion.cpp nothing is asked of the Python backend**: `.status`, the forecast
+  and `.prompt_cache.list` are gated on `ImageEditRuntime::PyTorch`; `note_runtime_changed`
+  re-arms them on the way back and re-probes the catalog bundle (it follows the runtime).
 
 ## Editing map
 - To change what the host sees — the sections, the mask layer, the size constraints, the

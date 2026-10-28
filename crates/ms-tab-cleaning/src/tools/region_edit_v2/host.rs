@@ -17,6 +17,11 @@ Main responsibilities:
   (D15/D16)
 - push the per-frame facts an engine may not cache: backend/Torch availability and the frame
   rectangle
+- gate «Обработать» (`run_block_reason`: the engine's reason, then the host's PyTorch rule) and
+  the tool button (`ai_requirement`: the union of the catalog's engine requirements,
+  `catalog_requirement`)
+- tell the selected engine when the user starts working with it (`AiEngine::on_selected`: the
+  picker's switch and the tool's activation), so FLUX can leave an unavailable PyTorch
 - run one job: load the source region on a worker, hand it to the engine, poll it, and turn
   the answer into the frame's pending result or into a user-facing failure (D14)
 - run mask generation into the selected mask layer through the same region load
@@ -86,7 +91,7 @@ use crate::input::{self, CleaningLabels};
 use ms_input::{ContextId, InputFrame};
 use ms_canvas::{CanvasView, OverlayRectPx};
 use ms_project::ProjectData;
-use ms_widgets::{ColorPresets, PresetDefaults, ViewportColorSelector};
+use ms_widgets::{AiCaps, AiRequirement, ColorPresets, PresetDefaults, ViewportColorSelector};
 use eframe::egui;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -566,6 +571,24 @@ impl RegionEditHost {
         self.engine().and_then(AiEngine::switch_block_reason)
     }
 
+    /// Why «Обработать» must refuse for the selected engine right now, localized; `None` when
+    /// the engine side allows a run (the frame's own rules are checked by the frame).
+    ///
+    /// ONE rule, read by the button AND by [`Self::start_run`], so a greyed-out button and a
+    /// refused click cannot disagree. The engine's own reason wins — it is the more specific
+    /// one ("no model selected") — and only then the host's PyTorch rule: the tool button is
+    /// gated on the UNION of its engines' requirements (`ai_requirement`) and an engine's
+    /// picker button on what it OFFERS, so a Torch-needing configuration can still be selected
+    /// and is refused here, by name.
+    #[must_use]
+    pub(super) fn run_block_reason(&self) -> Option<String> {
+        let engine = self.engine()?;
+        engine.run_block_reason().or_else(|| {
+            (engine.requires_torch() && !self.torch_available)
+                .then(|| tf!("cleaning.region_edit.torch_required_error", engine = engine.title()))
+        })
+    }
+
     /// Whether the mask may still be edited: no result waits and nothing is running.
     ///
     /// Editing the mask under a pending result would make that result describe a mask that no
@@ -631,6 +654,17 @@ impl RegionEditHost {
         self.frame.set_constraints(constraints);
         self.frame.set_mask_layers(&layers);
         self.frame.set_allows_empty_mask(allows_empty);
+        self.notify_engine_selected();
+    }
+
+    /// Tells the selected engine the user now works with it (`AiEngine::on_selected`), with
+    /// this moment's strict capability snapshot. Called on the two user events only — a picker
+    /// switch and the tool's activation — never per frame.
+    fn notify_engine_selected(&mut self) {
+        let caps = AiCaps::current();
+        if let Some(engine) = self.engines.get_mut(self.selected) {
+            engine.on_selected(&caps);
+        }
     }
 
     /// The marks modes the selected engine accepts; the default set with no engine.
@@ -736,8 +770,8 @@ impl RegionEditHost {
             );
             return;
         };
-        if let Some(reason) = engine.run_block_reason() {
-            let detail = format!("engine {} refused the run", engine.id());
+        if let Some(reason) = self.run_block_reason() {
+            let detail = format!("engine {} refused the run (torch available: {})", engine.id(), self.torch_available);
             self.report_error(reason, &detail);
             return;
         }
@@ -1420,15 +1454,47 @@ fn cancel_status_text(had_result: bool) -> String {
     }
 }
 
+/// The requirement of a tool hosting engines that need `requirements` (one per engine): met
+/// whenever ONE engine's is. `None` — no button gate — for an empty catalog or when some engine
+/// needs no local runtime. The union is expressible for the region-edit runtimes (`Torch`,
+/// `Sdcpp`, `TorchOrSdcpp`: any mix of them is `TorchOrSdcpp` unless all are equal); a catalog
+/// mixing in another requirement has no single `AiRequirement` that is met exactly when one
+/// engine is, so the button is then not gated (`None`) and the picker and the run gate still
+/// refuse per engine. Pure.
+#[must_use]
+fn catalog_requirement(requirements: impl IntoIterator<Item = Option<AiRequirement>>) -> Option<AiRequirement> {
+    let mut union: Option<AiRequirement> = None;
+    for requirement in requirements {
+        let requirement = requirement?;
+        union = Some(match union {
+            None => requirement,
+            Some(acc) if acc == requirement => acc,
+            Some(acc) => match (acc, requirement) {
+                (AiRequirement::Torch | AiRequirement::Sdcpp | AiRequirement::TorchOrSdcpp, AiRequirement::Torch | AiRequirement::Sdcpp | AiRequirement::TorchOrSdcpp) => AiRequirement::TorchOrSdcpp,
+                (AiRequirement::Backend | AiRequirement::Torch | AiRequirement::Onnx | AiRequirement::TorchOrOnnx | AiRequirement::Sdcpp | AiRequirement::TorchOrSdcpp, _) => return None,
+            },
+        });
+    }
+    union
+}
+
 impl CleaningTool for RegionEditHost {
     fn title(&self) -> &'static str {
         (self.spec.title)()
     }
 
-    /// Whatever the SELECTED engine needs. The tab gates the tool button on this, so a tool
-    /// whose current engine wants Torch is offered exactly like the Torch tools beside it.
-    fn pytorch_required(&self) -> bool {
-        self.engine().is_some_and(AiEngine::requires_torch)
+    /// The union of the catalog's engine requirements ([`catalog_requirement`]): the tool is
+    /// usable as soon as ONE engine is. The tab gates the tool button on this; an engine whose
+    /// own requirement is unmet is then closed in the picker, and a selected configuration that
+    /// needs a missing runtime is refused at «Обработать» ([`RegionEditHost::run_block_reason`]).
+    fn ai_requirement(&self) -> Option<AiRequirement> {
+        catalog_requirement(self.engines.iter().map(|engine| engine.ai_requirement()))
+    }
+
+    /// Activating the tool is a user event for the selected engine too: FLUX moves itself to
+    /// sd.cpp here when PyTorch is unavailable (`AiEngine::on_selected`).
+    fn activate(&mut self, _canvas: &mut CanvasView) {
+        self.notify_engine_selected();
     }
 
     /// Every engine of the catalog, not only the selected one: an engine switched away from
@@ -1789,6 +1855,7 @@ mod tests {
             grid: Arc::clone(&grid),
             marks: Arc::new(Mutex::new(MarksSupport::OVERLAY_ONLY)),
             postprocess: Arc::new(Mutex::new(None)),
+            gate: RunGate::default(),
         })];
         tool.selected = 0;
         tool.frame.place_for_test(0, rect(0, 0, 12, 20));
@@ -1803,13 +1870,102 @@ mod tests {
         assert_eq!(tool.frame.masks().layer_count(), 1, "nor re-creates the mask stack");
     }
 
-    /// The tab gates the tool button on this, so it must describe the engine that would
-    /// actually run rather than the tool as a category.
+    /// An idle recording engine with the given run-gate answers.
+    fn gated_engine(gate: RunGate) -> Box<dyn AiEngine> {
+        Box::new(RecordingEngine { gate, ..RecordingEngine::idle() })
+    }
+
+    /// The tab gates the whole tool button on `ai_requirement`, the UNION of the engines':
+    /// the tool is usable as soon as one engine is. An all-Torch catalog needs Torch; one engine
+    /// that also runs on Stable-Diffusion.cpp widens it to "Torch or sd.cpp"; a runtime-free
+    /// engine (or an empty catalog) leaves the button ungated.
     #[test]
-    fn the_torch_requirement_comes_from_the_selected_engine() {
-        let tool = test_host();
-        let expected = tool.engine().is_some_and(AiEngine::requires_torch);
-        assert_eq!(tool.pytorch_required(), expected);
+    fn the_tool_requirement_is_the_union_of_the_engines() {
+        let torch = || RunGate { requires_torch: true, ..RunGate::default() };
+        let mut tool = test_host();
+
+        tool.engines = vec![gated_engine(torch()), gated_engine(torch())];
+        tool.selected = 0;
+        assert_eq!(tool.ai_requirement(), Some(AiRequirement::Torch), "every engine needs Torch: the tool is gated on it");
+
+        // FLUX: needs Torch as configured but offers Stable-Diffusion.cpp too.
+        tool.engines = vec![gated_engine(torch()), gated_engine(RunGate { sdcpp_runtime: true, ..torch() })];
+        assert_eq!(tool.ai_requirement(), Some(AiRequirement::TorchOrSdcpp), "a mixed catalog is met by either runtime");
+
+        tool.engines = vec![gated_engine(torch()), gated_engine(RunGate::default())];
+        assert_eq!(tool.ai_requirement(), None, "a runtime-free engine in the catalog keeps the tool open");
+
+        tool.engines = Vec::new();
+        assert_eq!(tool.ai_requirement(), None, "an empty catalog needs nothing");
+    }
+
+    /// The union rule itself, over every pair the region-edit runtimes form and the
+    /// inexpressible mixes.
+    #[test]
+    fn catalog_requirement_unions_the_region_edit_runtimes() {
+        use AiRequirement::{Onnx, Sdcpp, Torch, TorchOrOnnx, TorchOrSdcpp};
+        assert_eq!(catalog_requirement([]), None);
+        assert_eq!(catalog_requirement([Some(Torch)]), Some(Torch));
+        assert_eq!(catalog_requirement([Some(Torch), Some(Torch)]), Some(Torch));
+        assert_eq!(catalog_requirement([Some(Sdcpp), Some(Sdcpp)]), Some(Sdcpp));
+        assert_eq!(catalog_requirement([Some(Torch), Some(Sdcpp)]), Some(TorchOrSdcpp));
+        assert_eq!(catalog_requirement([Some(Torch), Some(TorchOrSdcpp), Some(Torch)]), Some(TorchOrSdcpp));
+        assert_eq!(catalog_requirement([Some(TorchOrSdcpp), Some(Sdcpp)]), Some(TorchOrSdcpp));
+        assert_eq!(catalog_requirement([Some(Torch), None]), None, "a runtime-free engine ungates the tool");
+        assert_eq!(catalog_requirement([Some(Onnx), Some(Onnx)]), Some(Onnx), "equal requirements of any kind merge");
+        assert_eq!(catalog_requirement([Some(Torch), Some(TorchOrOnnx)]), None, "no single requirement is met exactly when either is");
+    }
+
+    /// Picking an engine and activating the tool are the two events the selected engine hears
+    /// about (`AiEngine::on_selected`); a refused switch is not one.
+    #[test]
+    fn the_selected_engine_hears_the_switch_and_the_activation() {
+        let first_calls = Arc::new(Mutex::new(EngineCalls::default()));
+        let second_calls = Arc::new(Mutex::new(EngineCalls::default()));
+        let (first, _) = RecordingEngine::with_marks(MarksSupport::OVERLAY_ONLY, &first_calls);
+        let (second, _) = RecordingEngine::with_marks(MarksSupport::OVERLAY_ONLY, &second_calls);
+        let mut tool = test_host();
+        tool.engines = vec![Box::new(first), Box::new(second)];
+        tool.selected = 0;
+
+        tool.select_engine(1);
+        assert_eq!(recorded(&second_calls).selected_notices, 1, "the picked engine is told");
+        assert_eq!(recorded(&first_calls).selected_notices, 0);
+        tool.select_engine(1);
+        assert_eq!(recorded(&second_calls).selected_notices, 1, "re-picking the selected engine is no event");
+
+        let mut canvas = CanvasView::default();
+        tool.activate(&mut canvas);
+        assert_eq!(recorded(&second_calls).selected_notices, 2, "activating the tool tells the selected engine");
+        assert_eq!(recorded(&first_calls).selected_notices, 0);
+    }
+
+    /// In an ungated tool a Torch-needing engine may still be selected; without Torch its run
+    /// is refused at «Обработать» with the host's sentence naming the engine. `start_run` and
+    /// the button both read this one rule. The expectation is built through the same key, so
+    /// the test holds whatever catalog is installed.
+    #[test]
+    fn a_torch_engine_without_torch_is_refused_with_the_host_text() {
+        let mut tool = test_host();
+        tool.engines = vec![gated_engine(RunGate { requires_torch: true, sdcpp_runtime: true, refusal: None })];
+        tool.selected = 0;
+        tool.torch_available = false;
+
+        let expected = tf!("cleaning.region_edit.torch_required_error", engine = "recording");
+        assert_eq!(tool.run_block_reason(), Some(expected));
+
+        tool.torch_available = true;
+        assert!(tool.run_block_reason().is_none(), "with Torch present the host has nothing to refuse");
+    }
+
+    /// The engine's own reason is the more specific one and wins over the host's Torch rule.
+    #[test]
+    fn an_engine_reason_wins_over_the_torch_rule() {
+        let mut tool = test_host();
+        tool.engines = vec![gated_engine(RunGate { requires_torch: true, sdcpp_runtime: false, refusal: Some("no model".to_string()) })];
+        tool.selected = 0;
+        tool.torch_available = false;
+        assert_eq!(tool.run_block_reason().as_deref(), Some("no model"));
     }
 
     /// D5, pinned. The editor-window context switches off the clean-overlay undo and the canvas
@@ -2155,6 +2311,8 @@ mod tests {
         progress_draws: usize,
         /// The context of every `draw_run_options` call, in order.
         run_options: Vec<RunOptionsCtx>,
+        /// How often `on_selected` was called.
+        selected_notices: usize,
     }
 
     /// Locks a value the test shares with a [`RecordingEngine`]. The engine sits behind `Arc` +
@@ -2183,6 +2341,19 @@ mod tests {
         /// settings of a pending raw result. `None` (the trait default, final pixels) everywhere
         /// but the raw-answer tests.
         postprocess: Arc<Mutex<Option<PostprocessSettings>>>,
+        /// What it answers to the run-gate questions. Torch-free and never refusing
+        /// ([`RunGate::default`]) everywhere but the gate tests.
+        gate: RunGate,
+    }
+
+    /// The run-gate answers of one [`RecordingEngine`]: `requires_torch()`, whether it also
+    /// offers the Stable-Diffusion.cpp runtime (`ai_requirement()` is then `TorchOrSdcpp`, like
+    /// FLUX) and its own `run_block_reason()`.
+    #[derive(Debug, Default)]
+    struct RunGate {
+        requires_torch: bool,
+        sdcpp_runtime: bool,
+        refusal: Option<String>,
     }
 
     impl RecordingEngine {
@@ -2195,6 +2366,7 @@ mod tests {
                 grid: Arc::new(AtomicUsize::new(1)),
                 marks: Arc::new(Mutex::new(MarksSupport::OVERLAY_ONLY)),
                 postprocess: Arc::new(Mutex::new(None)),
+                gate: RunGate::default(),
             }
         }
 
@@ -2208,6 +2380,7 @@ mod tests {
                 grid: Arc::new(AtomicUsize::new(1)),
                 marks: Arc::clone(&marks),
                 postprocess: Arc::new(Mutex::new(None)),
+                gate: RunGate::default(),
             };
             (engine, marks)
         }
@@ -2224,7 +2397,17 @@ mod tests {
             EngineSection::WithoutPrompt
         }
         fn requires_torch(&self) -> bool {
-            false
+            self.gate.requires_torch
+        }
+        fn ai_requirement(&self) -> Option<AiRequirement> {
+            if self.gate.sdcpp_runtime {
+                Some(AiRequirement::TorchOrSdcpp)
+            } else {
+                self.gate.requires_torch.then_some(AiRequirement::Torch)
+            }
+        }
+        fn on_selected(&mut self, _caps: &AiCaps) {
+            recorded(&self.calls).selected_notices += 1;
         }
         fn constraints(&self) -> FrameConstraints {
             FrameConstraints { multiple: self.grid.load(Ordering::Relaxed), min_side: 1, ..FrameConstraints::UNCONSTRAINED }
@@ -2245,7 +2428,7 @@ mod tests {
             recorded(&self.calls).run_options.push(ctx);
         }
         fn run_block_reason(&self) -> Option<String> {
-            None
+            self.gate.refusal.clone()
         }
         fn switch_block_reason(&self) -> Option<String> {
             self.switch_block.clone()
@@ -2295,6 +2478,7 @@ mod tests {
             grid: Arc::new(AtomicUsize::new(1)),
             marks: Arc::new(Mutex::new(MarksSupport::OVERLAY_ONLY)),
             postprocess: Arc::new(Mutex::new(None)),
+            gate: RunGate::default(),
         })];
         tool.selected = 0;
         (tool, calls)
@@ -2313,6 +2497,7 @@ mod tests {
             grid: Arc::new(AtomicUsize::new(1)),
             marks: Arc::new(Mutex::new(MarksSupport::OVERLAY_ONLY)),
             postprocess: Arc::new(Mutex::new(None)),
+            gate: RunGate::default(),
         };
         let mut tool = test_host();
         tool.engines = vec![Box::new(busy(Some("downloading"))), Box::new(busy(None))];
@@ -2398,6 +2583,7 @@ mod tests {
             grid: Arc::new(AtomicUsize::new(1)),
             marks: Arc::clone(&marks),
             postprocess: Arc::new(Mutex::new(None)),
+            gate: RunGate::default(),
         })];
         tool.selected = 0;
         tool.marks_mode = MarksMode::SeparateReference;
@@ -2701,6 +2887,7 @@ mod tests {
             grid: Arc::new(AtomicUsize::new(1)),
             marks: Arc::new(Mutex::new(MarksSupport::OVERLAY_ONLY)),
             postprocess: Arc::clone(postprocess),
+            gate: RunGate::default(),
         }
     }
 

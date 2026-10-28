@@ -54,6 +54,17 @@ downloads nothing. Every request carries every format CANDIDATE (`dit_formats`, 
 `text_encoder_formats`, absolute paths under the root), so `.status` answers per-format
 presence and no installed-formats probe exists.
 
+Two runtimes behind one switch (`settings.runtime`, `ms_config::ImageEditRuntime`, default
+PyTorch, absent in older files = PyTorch): the PyTorch backend (everything above) and
+Stable-Diffusion.cpp, a separate worker process driven through the shared
+`../shared/sdcpp_run.rs`. On sd.cpp the engine asks the backend nothing: `sdcpp_files.rs` maps
+the selection onto the catalog files under the same package root (`flux3_klein_sdcpp_paths`;
+a stored fp8r / nvfp4 runs as its closest sd.cpp format, `flux3_closest_offered`) and a worker
+validates them (`ms_sdcpp::validate_model_files`); the run sends init = region, mask =
+`mask_for_run`, strength 1, cfg 1, references = [region, user refs…, marks?] each downscaled to
+«Ограничить референсы» in Rust, and answers the same `DoneRaw`. The catalog bundle follows the
+runtime (`flux3_klein_package_specs_for`).
+
 The model-agnostic parts are not here: `../shared/` (progress + `stream_call`, the token row and
 its worker, the catalog-download decisions, the settings-file quarantine and save backoff,
 `mask_for_run`) and `../../large_model_resources/` (`ResourcesController` + the two-axis widget
@@ -84,11 +95,15 @@ encoder, and its forecast (`profiles.encoder`) leaves the encoder out unless it 
 - `settings.rs`: `Flux3KleinSettings` (+ `Flux3SourceMode`, `Flux3Fp8Compute`; the formats are
   `ms_config::{Flux3DitFormat, Flux3EncoderFormat}` via `dit_format()` / `encoder_format()`),
   `normalized()` (D6: `vl_refs` off with a GGUF encoder), `text_mode_in_effect()` (the encoder
-  mode the wire carries), `effective_root()` (THE package root of both modes), `to_params()`
+  mode the wire carries), `runtime()` / `run_dit_format()` / `flux3_closest_offered()` (the
+  runtime and the DiT format it loads), the persisted `sdcpp: SdCppRunOptions` (never sent), `effective_root()` (THE package root of both modes), `to_params()`
   (exactly the backend's 18 `FIELDS`, the format candidates and the prompt-library id and
   precision order included), `package_path()`, the flattened `postprocess: PostprocessSettings`
   and the «Нет» stash `uncached_prompt` (both persisted, never sent), the settings-file
   load/save.
+- `sdcpp_files.rs`: the sd.cpp `ModelFiles` of the selection (`flux3_sdcpp_model_files`, pure;
+  `resolve_flux3_sdcpp_files`, worker: header validation), the key an answer counts for
+  (`flux3_sdcpp_files_key`) and the state the panel and the gate read (`Flux3SdcppFilesState`).
 - `references.rs`: `Flux3References` (session list, capacity, marks-reference room) and
   `read_reference_file` (worker: decode any image, re-encode through the tab's PNG codec).
 - `status.rs`: `Flux3Status` (per-format rows keyed by wire id: `formats` for the DiT,
@@ -166,12 +181,18 @@ encoder, and its forecast (`profiles.encoder`) leaves the encoder out unless it 
   bundle and re-asks `.status` (and the listing when the encoder or the mode moved). The controller is `None` in a test build (its adoption would hash the
   developer's real files). The token is the process-wide `ms_sysprobe::hf_token`, edited by the
   shared row while a gated spec of the bundle is not installed; never persisted or logged here.
+- **sd.cpp asks the backend nothing and hides, never fakes, what it lacks**: the prompt library,
+  the VL encoder mode, the AE dtype, the fp8 path, the memory widget and `.unload` are PyTorch's;
+  `runtime` and `sdcpp` are persisted but never travel (the backend refuses unknown keys). The
+  run gate on sd.cpp needs the shared runtime readiness and VALIDATED files (a wrong encoder
+  pairing would abort sd.cpp mid-run), and a seed ≤ `i64::MAX`.
 - **A damaged settings file is never overwritten** (shared rules); a JSON array is no document.
 
 ## Editing map
 - A persisted parameter: `settings.rs`, then the `ui/` file that draws it. Feather / colour
   match: `ms_region_postprocess` (settings, ranges, body UI) and `../shared/postprocess_section.rs`.
 - What a line or refusal SAYS: `decisions.rs` + its test; what `.status` MEANS: `status.rs`.
+- The Stable-Diffusion.cpp files: `sdcpp_files.rs`; its run and request: `engine/sdcpp.rs`.
 - A request or response shape: `wire.rs` (and `to_params` in `settings.rs`) — a protocol
   change (bump `PROTOCOL_VERSION` on both sides; the Python split is
   `ipc/handlers/flux3_klein.py`).

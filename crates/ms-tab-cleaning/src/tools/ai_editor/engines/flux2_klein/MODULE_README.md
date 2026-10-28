@@ -47,6 +47,17 @@ Only ONE variant is resident at a time — the backend holds one pipeline and on
 encoder, keyed by those paths — so selecting the other engine unloads this one. This side
 orchestrates nothing and only says so, in one line at the top of «Установка модели».
 
+TWO RUNTIMES, ONE ENGINE. `settings.runtime` (`ms_config::ImageEditRuntime`, persisted as
+`pytorch` / `sdcpp`, absent = PyTorch) is the switch at the TOP of the panel. On PyTorch
+everything below holds as written. On Stable-Diffusion.cpp the run goes to the sd.cpp worker
+process through the shared `SdCppRunJob` (`../shared/sdcpp_run.rs`): the files come from
+`sdcpp_files.rs` (resolved on the engine's sd.cpp status worker), the request from
+`sdcpp_request.rs`, and nothing is asked of the Python backend (`.status`, the forecast and the
+prompt-cache listing are not armed). PyTorch-only features are HIDDEN there, never faked: the
+memory forecast, the component list and unload, the prompt library and «Кэшировать», dtype /
+fp8 / guidance, «Внимание только к маске» (a diffusers attention option). The «Stable-Diffusion.cpp» section (the shared options and «Выгрузить
+модель») takes the place of «Память и скорость».
+
 ## Architecture
 `mod.rs` is the root and holds NO logic: the module header, the module declarations and
 the constants everything below shares (the selection limits, the parameter ranges, the
@@ -183,6 +194,17 @@ sentences.
   `.component_action` calls (streaming through the shared `stream_call`) and their
   parsers, the prompt translation and the run request packing `flux2_run_request`
   (header + `image ++ mask [++ reference]` blob; the PNGs come from `tools/region_png.rs`).
+- `sdcpp_files.rs`: which three FILES sd.cpp loads (`flux2_sdcpp_model_files`, worker only, it
+  stats the disk): download mode = `external_catalog::flux2_klein_sdcpp_paths`; manual mode maps
+  an encoder folder to its `model.safetensors.index.json` (or single `model.safetensors`), a VAE
+  folder to `diffusion_pytorch_model.safetensors`, and refuses a transformer FOLDER (diffusers)
+  with the hint to pick a single file or a GGUF; the found files are then checked with
+  `ms_sdcpp::validate_model_files` (family, encoder pairing). `Flux2SdcppFilesKey` says when the answer is
+  stale; `Flux2SdcppFilesError::message` is the refusal.
+- `sdcpp_request.rs`: the sd.cpp request of a run (`flux2_sdcpp_prepare`, worker only): the
+  SAME validation and latent mask as the PyTorch pass (`wire.rs`), init image and first
+  reference = the region, second reference = the marks, guidance 1.0, the seed rule
+  (`flux2_sdcpp_seed`: pinned or `-1` random); `color_image_from_rgb` turns the answer back.
 - `test_support.rs`: `cfg(test)` only. The fixtures every `mod tests` here is built from
   (`runnable_settings`, `cacheable_settings`, `status_with_present`,
   `status_with_components`, `FLUX2_ALL_COMPONENTS`, `region_rect`,
@@ -246,6 +268,23 @@ sentences.
 - **A damaged settings file is never overwritten.** It is moved aside before defaults load
   and the panel says where; if it cannot be moved (or cannot be read at all), saving is
   blocked for the session and the panel says so (the shared `SettingsProblem`).
+- **One latent mask, two runtimes.** `wire.rs::flux2_latent_mask` (and
+  `validate_flux2_run_input`) is used by the PyTorch pass AND the sd.cpp request builder, so the
+  mask sd.cpp gets equals the PyTorch wire mask byte for byte (pinned by a test), and both
+  answer `DoneRaw` with that mask as `sample_mask`.
+- **The runtime switch is closed while a catalog job or any operation of either runtime is in
+  flight** (`flux2_runtime_switch_block_reason`; the bundle follows the runtime, and after a
+  switch the running job would show only as "another download" without its cancel), and an sd.cpp run (or a cancelled one still ending)
+  also closes the engine picker (the sd.cpp service runs one generation at a time).
+- **`requires_torch()` is the runtime**; `ai_requirement()` is `TorchOrSdcpp` whichever runtime
+  is selected (the picker's `AiButton` gate), and `on_selected` moves an out-of-reach PyTorch to
+  sd.cpp (the shared `sdcpp_auto_switch`, through `switch_runtime`: `set_runtime` +
+  `note_settings_changed` + `note_runtime_changed`, a click's path). It never decides on
+  unloaded settings: while the load is in flight the event is kept (`selection_pending`) and
+  decided in `poll_settings_load_with` right after the load lands (dropped if the loader died: the defaults are never decided on) — a change before it would make
+  the load discard the user's file. On PyTorch without Torch
+  the engine's own gate refuses with `cleaning.tools.sdcpp.torch_missing_hint` only where sd.cpp
+  can run; elsewhere it says nothing and the host's plain «PyTorch required» line applies.
 - **`mask_for_run` is the only place the working mode is decided** (`../shared/region_mask.rs`): a
   painted mask is used with `whole_region = false`; an empty one becomes a
   SOLID mask, because the backend refuses `whole_region = true` otherwise.
@@ -342,6 +381,9 @@ sentences.
   both sides.
 - To change which marks modes the engine accepts or how a marks reference is validated,
   see `marks_support` and `run_input` in `engine/mod.rs`.
+- To change what an sd.cpp run loads or sends, see `sdcpp_files.rs` / `sdcpp_request.rs`; its
+  lifecycle (status worker, two-stage run, cancel) is `engine/sdcpp.rs`; what the panel shows
+  on sd.cpp is `ui/mod.rs` (`draw` by runtime) and `ui/install.rs` (`draw_sdcpp_derived_paths`).
 - To change the progress bar's arithmetic or how it looks, see `../shared/` (it is every
   large-model engine's bar). The bar and the run status are drawn by `AiEngine::draw_progress`
   (`draw_flux2_progress_section`), which the host pins above the scrolled parameters.

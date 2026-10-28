@@ -6,13 +6,14 @@ family: FLUX.2 klein 4B / 9B and FLUX.3 klein. The parent re-exports every publi
 callers name `ms_sysprobe::ai_models::external_catalog::<item>`.
 
 ## Files and submodules
-- `flux2_klein.rs`: the FLUX.2 klein statics (11 specs for 4B, 17 for 9B), the lookups from a
+- `flux2_klein.rs`: the FLUX.2 klein statics (12 specs for 4B, 17 for 9B), the lookups from a
   typed engine selection (`ms_config::Flux2Variant` + `Flux2WeightAxis` + `Flux2EncoderSource` +
-  `Flux2WeightFormat`) to specs and backend paths, the bf16 transformer layout rule, the spec
-  role reverse lookup, and their tests (validation, totals, path tables, a sparse-file temp
+  `Flux2WeightFormat`) to specs and backend paths, the per-runtime bundle and sd.cpp file map,
+  the bf16 transformer layout rule, the spec role reverse lookup, and their tests (validation, totals, path tables, a sparse-file temp
   root for the layout rule). `FLUX2_KLEIN_SPECS` is appended by the parent's `all_specs()`.
 - `flux3_klein.rs`: the FLUX.3 klein statics (12 specs), the lookups from a typed selection
-  (`ms_config::Flux3DitFormat` + `Flux3EncoderFormat`) to specs and package-relative paths,
+  (`ms_config::Flux3DitFormat` + `Flux3EncoderFormat`) to specs and package-relative paths, the
+  per-runtime bundle and sd.cpp file map,
   the spec role reverse lookup, and their tests (validation, totals, gated flags, path
   agreement with `ms_config::flux3_klein_dir`, a sparse-file temp root for the adoption
   contract). `FLUX3_KLEIN_SPECS` is appended by the parent's `all_specs()`.
@@ -73,12 +74,29 @@ callers name `ms_sysprobe::ai_models::external_catalog::<item>`.
 - FLUX.3 gated: only the BFL repository (base, native DiTs, bf16 encoder); both GGUF
   repositories are public.
 
+- Runtimes (`ms_config::ImageEditRuntime`): `*_package_specs_for(PyTorch, ..)` is exactly the
+  PyTorch bundle above. `*_package_specs_for(SdCpp, ..)` is base (it holds the VAE) + DiT +
+  encoder, never a JSON-config-only spec (sd.cpp reads tensors only). `*_sdcpp_paths` returns
+  `SdCppComponentPaths { diffusion, vae, llm }`, each a FILE pinned by that bundle (test), or
+  `None` for a format not offered (FLUX.2: `offered_for`; FLUX.3: `offered_on(SdCpp)`, no
+  fp8r / nvfp4). FLUX.2 joins onto `side_models`, FLUX.3 onto the package root (manual mode).
+- sd.cpp file rule (measured on release `master-1017-be48649`): the diffusers `transformer/`
+  does NOT load there, so a bf16 FLUX.2 transformer is always the BFL single file:
+  `flux2_klein_4b_transformer_bf16_single` (`flux-2-klein-4b.safetensors`, sd.cpp-only, never
+  a `flux2_klein_spec` answer, role `SingleFileTransformer`; same weights as the diffusers file,
+  so a user with both runtimes stores them twice) and, for 9B, the primary
+  `flux-2-klein-9b.safetensors` (whatever the layout). VAE: `vae/diffusion_pytorch_model.safetensors`
+  / FLUX.3 `ae.safetensors`; encoder: the bf16 shard index `model.safetensors.index.json`, the
+  uncensored `model.safetensors`, or the GGUF file. Pairing DiT <-> encoder width is not checked
+  here (the sd.cpp layer's job: a mismatch aborts the sd.cpp process).
+
 ## Editing map
 - New weight format / encoder source / variant: `ms_config::flux2_weight_format` first, then
   the statics and the exhaustive `flux2_klein_4b_weights_spec` / `flux2_klein_9b_weights_spec`
   matches, `FLUX2_KLEIN_SPECS`, the per-spec totals test and `tools/model_pins/sources.json`.
 - Where a component is sent to the backend: `flux2_klein_weights_path` +
-  `unquantized_component_path`.
+  `unquantized_component_path`; to sd.cpp: `flux2_klein_sdcpp_paths` /
+  `flux3_klein_sdcpp_paths` (and the `*_package_specs_for` `SdCpp` arm when the file set changes).
 - Which bf16 transformer layout an install uses: `flux2_klein_transformer_layout`.
 - New FLUX.3 klein DiT or encoder format: `ms_config::flux3_weight_format` first, then the
   static, the exhaustive `flux3_klein_dit_spec` / `flux3_klein_encoder_spec` and

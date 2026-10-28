@@ -137,6 +137,27 @@ const CLEANING_WATERMARK_LIBRARY_TAB: TabId = TabId::new("cleaning.watermark_lib
 /// (`dev-docs/i18n_exclusions.md` §A10).
 const CLEANING_AI_TOOL_MARKER: &str = "Torch";
 
+/// Runtime marker of a tool that runs on PyTorch OR Stable-Diffusion.cpp (the AI region
+/// editor). Runtime NAMES, a literal for the same reason as [`CLEANING_AI_TOOL_MARKER`].
+const CLEANING_AI_TOOL_MARKER_TORCH_OR_SDCPP: &str = "Torch / SD.cpp";
+
+/// Runtime marker of a tool that runs on Stable-Diffusion.cpp only (same literal rule).
+const CLEANING_AI_TOOL_MARKER_SDCPP: &str = "SD.cpp";
+
+/// The badge a tool button with `requirement` carries: the runtime names it needs. `None`
+/// (no badge) for the requirements no cleaning tool declares — they are backend / onnxruntime
+/// facts this tab has no tool for. Pure; the button and the width budget both read it, so the
+/// drawn badge and the reserved room cannot drift.
+#[must_use]
+fn cleaning_tool_marker(requirement: AiRequirement) -> Option<&'static str> {
+    match requirement {
+        AiRequirement::Torch => Some(CLEANING_AI_TOOL_MARKER),
+        AiRequirement::TorchOrSdcpp => Some(CLEANING_AI_TOOL_MARKER_TORCH_OR_SDCPP),
+        AiRequirement::Sdcpp => Some(CLEANING_AI_TOOL_MARKER_SDCPP),
+        AiRequirement::Backend | AiRequirement::Onnx | AiRequirement::TorchOrOnnx => None,
+    }
+}
+
 /// Smallest outer HEIGHT, in points, the dock may shrink the «Клин» panel to. Its
 /// body scrolls, so the floor only has to keep the two control rows on screen. The
 /// WIDTH half of the floor is measured per frame from the captions
@@ -432,9 +453,10 @@ fn cleaning_caption_width(ctx: &egui::Context, style: &egui::Style, label: &str)
 /// Width, in points, `label` needs as a cleaning tool button under `style`.
 ///
 /// The caption's laid-out width plus the style's horizontal button padding on both
-/// sides plus [`CLEANING_TOOL_BUTTON_WIDTH_SLACK_PX`]. For a `badged` (Torch-gated)
-/// button it also adds the marker badge's overhang, which is painted OUTSIDE the
-/// button's own rect (`widgets::marker_badge_overhang`).
+/// sides plus [`CLEANING_TOOL_BUTTON_WIDTH_SLACK_PX`]. For a button that carries a
+/// `marker` badge (an AI-gated tool, [`cleaning_tool_marker`]) it also adds that badge's
+/// overhang, which is painted OUTSIDE the button's own rect
+/// (`widgets::marker_badge_overhang`).
 ///
 /// What that badge term buys is narrow and worth stating exactly: it keeps the
 /// badge inside the panel for a button that starts a row at the tab's WIDTH FLOOR,
@@ -451,13 +473,9 @@ fn cleaning_tool_button_width(
     ctx: &egui::Context,
     style: &egui::Style,
     label: &str,
-    badged: bool,
+    marker: Option<&str>,
 ) -> f32 {
-    let badge = if badged {
-        ms_widgets::marker_badge_overhang(ctx, style, CLEANING_AI_TOOL_MARKER)
-    } else {
-        0.0
-    };
+    let badge = marker.map_or(0.0, |marker| ms_widgets::marker_badge_overhang(ctx, style, marker));
     cleaning_caption_width(ctx, style, label)
         + style.spacing.button_padding.x * 2.0
         + CLEANING_TOOL_BUTTON_WIDTH_SLACK_PX
@@ -591,14 +609,14 @@ fn cleaning_clean_tab_size_bounds(ctx: &egui::Context, style: &egui::Style) -> (
             ctx,
             style,
             t!("cleaning.tab.clear_current_layer_button"),
-            false,
+            None,
         ),
     ];
     let quick_clean = cleaning_tool_button_width(
         ctx,
         style,
         t!("cleaning.tab.quick_clean_heading"),
-        false,
+        None,
     );
     let reserve = cleaning_scrollbar_reserve(style);
     let min_width = cleaning_tab_outer_width(
@@ -648,9 +666,9 @@ fn cleaning_quick_clean_tab_size_bounds(ctx: &egui::Context, style: &egui::Style
             ctx,
             style,
             t!("cleaning.tab.clean_current_page_button"),
-            false,
+            None,
         ),
-        cleaning_tool_button_width(ctx, style, t!("cleaning.tab.clean_all_pages_button"), false),
+        cleaning_tool_button_width(ctx, style, t!("cleaning.tab.clean_all_pages_button"), None),
     ];
     let reserve = cleaning_scrollbar_reserve(style);
     let gap = style.spacing.item_spacing.x;
@@ -1166,11 +1184,12 @@ impl CleaningTabState {
     }
 
     fn tool_available(&self, idx: usize) -> bool {
-        // PyTorch tools gate on the process-global Torch capability (strict), the
-        // same signal their `AiButton` selection buttons use, so the active-tool
-        // auto-switch and the button enabled state stay in agreement.
+        // AI tools gate on their requirement against the process-global capabilities
+        // (strict), the same signal their `AiButton` selection buttons use, so the
+        // active-tool auto-switch and the button enabled state stay in agreement.
         self.tools.get(idx).is_some_and(|tool| {
-            !tool.pytorch_required() || AiRequirement::Torch.satisfied(&AiCaps::current())
+            tool.ai_requirement()
+                .is_none_or(|requirement| requirement.satisfied(&AiCaps::current()))
         })
     }
 
@@ -2076,17 +2095,16 @@ fn draw_tool_button_rows(
             // construction would keep the language the app started in.
             let label = tool.title();
             let is_selected = *activate_tool_idx == idx;
-            // AI tools use a self-gating `AiButton` (Torch requirement, framed to
-            // match the plain tool buttons) with a "Torch" runtime marker; it
-            // disables itself and shows the reason when Torch is unavailable.
-            // Non-AI tools stay plain always-enabled buttons.
-            let clicked = if tool.pytorch_required() {
-                AiButton::new(label, AiRequirement::Torch)
-                    .selected(is_selected)
-                    .marker(CLEANING_AI_TOOL_MARKER)
-                    .draw(ui)
-                    .response
-                    .clicked()
+            // AI tools use a self-gating `AiButton` (the tool's requirement, framed
+            // to match the plain tool buttons) with a runtime marker naming what it
+            // needs; it disables itself and shows the reason when that runtime is
+            // unavailable. Non-AI tools stay plain always-enabled buttons.
+            let clicked = if let Some(requirement) = tool.ai_requirement() {
+                let mut button = AiButton::new(label, requirement).selected(is_selected);
+                if let Some(marker) = cleaning_tool_marker(requirement) {
+                    button = button.marker(marker);
+                }
+                button.draw(ui).response.clicked()
             } else {
                 ui.add(egui::Button::new(label).selected(is_selected))
                     .clicked()
@@ -2234,7 +2252,7 @@ impl CanvasHooks for CleaningHooks<'_> {
                             ctx,
                             &style,
                             tool.title(),
-                            tool.pytorch_required(),
+                            tool.ai_requirement().and_then(cleaning_tool_marker),
                         )
                     })
                 }),

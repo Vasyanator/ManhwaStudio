@@ -621,7 +621,7 @@ mod tests {
         } else {
             Err(Unavailable::new(PlatformFeature::PythonBackend, UnavailableReason::NotOnThisPlatform))
         };
-        LocalAiAvailability::resolve(no_ai, backend, Ok(()))
+        LocalAiAvailability::resolve(no_ai, backend, Ok(()), Ok(()))
     }
 
     fn titles(cards: &[ReportCard]) -> Vec<&str> {

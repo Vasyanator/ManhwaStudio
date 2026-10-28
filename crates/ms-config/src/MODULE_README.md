@@ -100,8 +100,18 @@ that defines the type.
   the frozen prompt-library id `FLUX3_PROMPT_LIBRARY_ID` (`flux3_klein`, one library for every
   encoder format) and the prompt cache's precision order
   (`flux3_prompt_cache_precision_order`: the encoder format ids, best first; `_rank` places an id
-  in it, unknown last). The files of each
+  in it, unknown last). `offered_on(ImageEditRuntime)` is the DiT list per runtime (PyTorch: all;
+  Stable-Diffusion.cpp: bf16 + GGUF, no BFL fp8r / nvfp4); the encoder list is runtime-independent
+  and `Flux2WeightFormat` needs no runtime split (same set). The files of each
   format are pinned in `ms_sysprobe::ai_models::external_catalog` (`flux3_klein.rs`).
+- `sdcpp_choice.rs`: the Stable-Diffusion.cpp runtime choice in `General` — `sdcpp_build`
+  (opaque build slug, NOT in the default tree: absent = the `ms-sdcpp` catalog default),
+  `sdcpp_device` (`"auto"` or `{name, description}`), `sdcpp_threads` (`0` = auto) — read by
+  `sdcpp_choice_from_user_settings` (absent -> default silently, malformed -> default with a
+  warning, per field) and written by `save_sdcpp_build` / `_device` / `_threads` (one
+  `ms_docstore::update` each, blocking: never on the GUI thread). Also `ImageEditRuntime`
+  (`pytorch` / `sdcpp`, frozen wire ids, default PyTorch), the vocabulary engine settings files
+  persist. The Python backend never reads these keys.
 - `app_tab.rs`: `AppTab` — the editor tab set. `ALL` + `key()` (the persistence contract) and
   the localized `title()` (display only). Edit when a tab is added or removed.
 - `bubble_status.rs`: the GUI-free half of the bubble status rule model — kinds, fields,
@@ -304,3 +314,6 @@ binary that installs a UI locale). Those crates enable `test-support` from their
   `flux2_weight_format.rs`, then its pinned spec in `ms_sysprobe::ai_models::external_catalog`.
 - A new FLUX.3 klein DiT or encoder format: `flux3_weight_format.rs`, then its pinned spec in
   `ms_sysprobe::ai_models::external_catalog` (`flux3_klein.rs`; its exhaustive matches force it).
+  Which runtime may run it: `Flux3DitFormat::offered_on`.
+- A new Stable-Diffusion.cpp setting or image-edit runtime: `sdcpp_choice.rs` (and the
+  `General` default tree in `lib.rs` when the key has a default).

@@ -12,7 +12,7 @@ translated (bubbles, OCR, machine translation), cleaned (clean layers, inpaintin
 (rendered text layers) and exported.
 
 - **Rust application** — a Cargo workspace: the root package `manhwastudio_rs` (`src/`: a
-  library holding the application, plus a thin binary entry) over 48 `ms-*` library crates in
+  library holding the application, plus a thin binary entry) over 50 `ms-*` library crates in
   `crates/`. Builds for Linux and Windows (mandatory), macOS, `wasm32` (web entry,
   `src/web_entry.rs`; currently inactive and not kept building, `PROJECT_RULES.md`) and, in progress, Android (`dev-docs/ANDROID_PORT.md`; the library target
   exists so that build can export `android_main`).
@@ -51,15 +51,15 @@ root package (src/: lib.rs + thin main.rs, startup/, shell/, studio.rs, tabs/set
   <- ms-models / ms-tabs-simple / ms-installer / ms-ai-api
   <- ms-studio-tab / ms-region-postprocess
   <- ms-project / ms-widgets / ms-native-runtime / ms-local-ai
-  <- ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-window-geometry / ms-os-integration / ms-input
-  <- ms-config / ms-text-render
+  <- ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-sdcpp / ms-window-geometry / ms-os-integration / ms-input
+  <- ms-config / ms-text-render / ms-native-package
   <- ms-backend-ipc / ms-docstore / ms-download / ms-fonts / ms-memory / ms-onnx / ms-platform / ms-browser-bridge
   <- ms-log / ms-text-detect
   <- ms-actions / ms-atomic-file / ms-browser-ext / ms-custom-fonts / ms-gifs / ms-i18n / ms-raster / ms-storage / ms-text-util / ms-theme / ms-thread
 ```
 
 Non-obvious edges: `ms-tools` sits ABOVE `ms-canvas`; `ms-widgets` does NOT depend on
-`ms-models`; `ms-models` depends on `ms-text-render` (layer effects); the browser bridge is used
+`ms-models`; `ms-widgets` depends on `ms-sdcpp` (desktop only) so `AiButton` reads sd.cpp readiness; `ms-models` depends on `ms-text-render` (layer effects); the browser bridge is used
 only by `ms-tab-translation` (with `ms-browser-ext`) and by the root (version registration), and
 does not depend on `ms-platform` (its consumers gate on `PlatformFeature::BrowserExtension`). Tab-to-tab edges exist and
 point down only: page-manager -> ps-editor -> typing; cleaning -> translation -> tabs-simple;
@@ -103,8 +103,9 @@ shared wiki view). The studio never references
 - `ms-docstore` — named logical documents (`DocRef`): per-document lock, atomic writes, JSON or
   SQLite. Must not depend on `ms-config`.
 - `ms-download` — native-only resumable HTTP download engine (`RangeFetcher` / `UreqFetcher`,
-  `RetryPolicy`, `ResumableFetch::fetch_part` into a `.part`, process-wide `BusyGuard`); GUI-free, no
-  i18n; consumers own threads, URLs, verification, publishing and UI text.
+  `RetryPolicy`, `ResumableFetch::fetch_part` into a `.part`, process-wide `BusyGuard`) and archive
+  member staging (`unpack`: zip / tar.gz / tar.zst); GUI-free, no i18n; consumers own threads, URLs,
+  verification, publishing and UI text.
 - `ms-fonts` — the bundled `fonts/ui` stack, shared by egui UI fonts and the text renderer.
 - `ms-memory` — image-memory profiles and eviction policy, host RAM total / available on every
   platform (`current_memory_availability`); owns no pixels.
@@ -126,6 +127,10 @@ shared wiki view). The studio never references
   app's config (`ensure_started_for_app`), re-unpacks a stale folder and reloads stale peers.
 
 **Core (levels 3-7)**
+- `ms-native-package` — the one owner of installing a pinned native-library package: probe,
+  busy wait, resumable `.part` with identity, sha256 check, member staging and publish, completion
+  marker written last, removal (marker first). GUI-free, no i18n, no config; consumers (`ms-onnx-runtime`)
+  own their catalog, error texts and UI.
 - `ms-config` — runtime root (`data_dir` / `program_dir`), `user_config` sections and defaults,
   `ConfigSaver`, storage-mode startup, `AppTab`, version formatting.
 - `ms-text-render` — the production text renderer (cosmic-text shaping, vector-first glyph
@@ -136,6 +141,11 @@ shared wiki view). The studio never references
   GPU fact sheet behind the launcher's system-information view (`system_facts`);
   `python_manager` is the only way to find or spawn Python.
 - `ms-onnx-runtime` — locates, downloads and loads the native onnxruntime library per build.
+- `ms-sdcpp` — the stable-diffusion.cpp runtime: the pinned official release (per OS + ggml
+  backend: Vulkan, CPU), its install / removal through `ms-native-package`, the host requirement
+  probes (glibc, Visual C++ runtime, Vulkan loader), the process-global readiness snapshot and the
+  model-family-agnostic generation request types. GUI-free; never depends on `ms-local-ai`
+  (consumers apply `--no-ai` through `AiRouteKind::SdCpp`).
 - `ms-window-geometry` — startup monitor and window geometry; the only direct `winit` user.
 - `ms-os-integration` — the OS records of a program copy (Windows Uninstall / App Paths /
   "Open with" keys, `.lnk` shortcuts, elevation probe and UAC relaunch; Linux `.desktop` entry
@@ -215,7 +225,9 @@ shared wiki view). The studio never references
 ## 3. Startup and process lifetime
 
 - **One main window.** `src/startup/` (`run_native`, called by `lib.rs::native_main`) decides one
-  `RunMode` right after parsing (`mode.rs`: service flags, test launcher, main run), builds the
+  `RunMode` right after parsing (`mode.rs`: service flags — among them the hidden
+  `--sdcpp-worker`, which runs `ms_sdcpp::worker` without the session log and exits —, test
+  launcher, main run), builds the
   `ProcessServices` in the fixed startup order (`services.rs`), runs the startup prompt windows
   (installer, missing environment, `--update`) once, then ONE `eframe::run_native` — the main window
   (`src/shell/`, `AppShell`) — that hosts the launcher and the studio as SCREENS and stays open
@@ -466,7 +478,17 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   user explicitly chose the backend (`General.ai_runtime_configured`) on a platform that has it.
   `--no-ai` turns off the LOCAL runtimes only (backend and native ONNX); cloud AI API OCR / MT and
   non-AI machine translation are never gated by it. Per-route availability has one owner,
-  `ms_local_ai::local_ai::AiRouteKind::availability` (cloud / native / backend).
+  `ms_local_ai::local_ai::AiRouteKind::availability` (cloud / native / backend / sd.cpp).
+- **stable-diffusion.cpp runtime** (`ms-sdcpp`, Linux and Windows desktop): a third local runtime
+  for FLUX.2 / FLUX.3 klein region editing, chosen per engine by a PyTorch / sd.cpp switch in the
+  engine panel. The pinned official library package (Vulkan or CPU build) is downloaded only on
+  explicit request; the library is loaded ONLY in a child process of the app itself
+  (`--sdcpp-worker`, framed pipes over `ms_backend_ipc::frame`), so a ggml abort ends that
+  process, never the editor; the client validates the model / encoder pairing before any launch,
+  keeps one warm worker per build, cancels cooperatively and then kills, and unloads at studio
+  teardown. Engines send RAW region output through the same post-process path as PyTorch.
+  `--no-ai` turns it off too (`AiRouteKind::SdCpp`). No memory arbiter spans it and the Python
+  backend.
 - **Backend boundary.** Framed, multiplexed IPC (`ms-backend-ipc`): AF_UNIX socket on unix,
   token-authenticated loopback WebSocket on Windows. Every Rust caller uses
   `ms_backend_ipc::shared_client()`. Method and topic names live in
@@ -614,6 +636,7 @@ logged error); the GUI thread only polls and applies results.
 | Text detection plan / tiles / stitch / postprocess (one plan for worker and panel notice) | `ms-text-detect`, driven by `ms-tab-translation/src/text_detector/` |
 | Native ONNX load and inference | `ms-native-runtime` (called from those workers) |
 | AI backend process supervisor | `ms-settings-ui/src/ai_backend_supervisor.rs` |
+| sd.cpp package install / removal / status refresh; device probe (short-lived worker); generation in the warm `--sdcpp-worker` child | `ms-sdcpp` (`install`, `status`, `client`, `worker`), driven by `ms-settings-ui` `ai_backend_panel/sdcpp_tab.rs` and the cleaning engines' `shared/sdcpp_run.rs` |
 | Large-model run (admission, per-phase loads and block moves with prefetch, degrade retries) | `modules/ai_backend/runtime/large_models/` (`Session`), driven by the FLUX klein services |
 | Storage-mode conversion job | `ms-settings-ui/src/storage_mode_job.rs` |
 | Structural page ops, thumbnails, viewer clean decode | `ms-tab-page-manager` + `ms-page-ops` |

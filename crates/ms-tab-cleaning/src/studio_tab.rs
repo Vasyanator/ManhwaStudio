@@ -18,7 +18,9 @@ Key items:
   - `poll_background`: the text-mask load and quick text clean polls
     (`CleaningTabState::poll_background_jobs`), with a slow repaint while one runs;
   - `flush_debounced_stores_blocking`: the tools' settings writers
-    (`CleaningTabState::flush_tool_settings_blocking`: the region-edit engines' `SettingsSaver`s).
+    (`CleaningTabState::flush_tool_settings_blocking`: the region-edit engines' `SettingsSaver`s),
+    then (native) the sd.cpp worker process is stopped when one runs (`ms_sdcpp::service()`), so
+    a model the region editor loaded does not outlive the studio.
 
 Notes:
 - No exit-only setting: that hook keeps its no-op default. The region-edit
@@ -99,9 +101,22 @@ impl StudioTab for CleaningTabState {
 
     /// The region-edit engines' debounced settings writers (`SettingsSaver`): the value each one
     /// still owes is written now, on the teardown worker, instead of by a detached drop flush the
-    /// process exit could cut off (`CleaningTabState::flush_tool_settings_blocking`).
+    /// process exit could cut off (`CleaningTabState::flush_tool_settings_blocking`). Then the
+    /// sd.cpp worker process the region editor may have started is stopped (its model freed):
+    /// this hook runs only from the studio teardown (`StudioApp::shutdown_blocking`), so the
+    /// blocking unload (at most `ms_sdcpp::client::SHUTDOWN_WAIT`) never reaches the GUI thread.
+    /// A generation still running shuts its worker down when it ends (the engine's dropped job
+    /// raises its cancel flag).
     fn flush_debounced_stores_blocking(&mut self) {
         self.flush_tool_settings_blocking();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let service = ms_sdcpp::service();
+            if service.is_worker_running() {
+                ms_log::runtime_log::log_info("[cleaning] studio teardown: stopping the sd.cpp worker");
+                service.unload();
+            }
+        }
     }
 }
 

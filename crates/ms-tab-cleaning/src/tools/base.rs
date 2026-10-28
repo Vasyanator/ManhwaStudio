@@ -112,7 +112,7 @@ use ms_tab_translation::model_download_status::{ModelDownloadStatus, draw_model_
 use crate::input::{self, CleaningLabels, StrokeModes};
 use ms_input::{ActionId, ContextId, HitPhase, InputFrame, ViewId, ViewSurface, view};
 use ms_tools::{MaskBrush, SoftDabSampling, SoftDabTip, paint_soft_line_mask};
-use ms_widgets::WheelSlider;
+use ms_widgets::{AiRequirement, WheelSlider};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, TextureHandle, TextureOptions};
 use std::collections::HashSet;
@@ -170,8 +170,13 @@ pub struct CleaningCursorOccluder {
 pub trait CleaningTool: Send {
     fn title(&self) -> &'static str;
 
-    fn pytorch_required(&self) -> bool {
-        false
+    /// The local AI runtime the tool needs to be usable, or `None` when it needs none (the
+    /// default). The ONE answer the tab gates on: the tool button is an `AiButton` with this
+    /// requirement (badge per requirement), and `ensure_active_tool_available` leaves a tool
+    /// whose requirement is unmet (strict `AiCaps`), so the two cannot disagree. Must stay
+    /// cheap: read every frame.
+    fn ai_requirement(&self) -> Option<AiRequirement> {
+        None
     }
 
     fn activate(&mut self, _canvas: &mut CanvasView) {}

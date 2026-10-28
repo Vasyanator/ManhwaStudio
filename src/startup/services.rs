@@ -6,7 +6,8 @@ comment states it); the order of its config-driven steps is data (`PRE_SETTINGS_
 `SETTINGS_STEPS`) that the function iterates and a unit test pins.
 
 Key items:
-- `ProcessServices`: the user-settings snapshot, the process's `LocalAiAvailability` and the
+- `ProcessServices`: the user-settings snapshot, the process's `LocalAiAvailability` (also
+  installed process-wide, `ms_local_ai::local_ai::install_process`) and the
   launcher's `LauncherHost`; `start_ai_backend_supervisor` is the one construction of the AI
   backend supervisor (same availability, same storage-conversion autostart gate) for both the
   test launcher and the main window.
@@ -34,8 +35,8 @@ pub(super) struct ProcessServices {
     /// The merged user settings (`config::load_user_settings_for_startup`), read after the
     /// on-disk locale reconcile; handed to the main window.
     pub(super) user_settings: serde_json::Value,
-    /// Which local AI runtimes this process may use: `--no-ai` switches off the Python backend
-    /// AND native ONNX; the platform decides on its own (`LocalAiAvailability::for_process`).
+    /// Which local AI runtimes this process may use: `--no-ai` switches off the Python backend,
+    /// native ONNX AND sd.cpp; the platform decides on its own (`LocalAiAvailability::for_process`).
     /// Cloud AI API and machine translation are never gated by it.
     pub(super) local_ai: LocalAiAvailability,
     /// The launcher's process facts (`--ignore-installed`, version core).
@@ -209,7 +210,9 @@ impl SettingsStep {
 ///   version); never for `--check-venv`, which exits right after this function.
 ///
 /// The pure facts of [`ProcessServices`] (`local_ai`, `host`) have no side effect, so where they
-/// are computed is not part of the contract. The AI backend supervisor is not started here (see
+/// are computed is not part of the contract; `local_ai` is also installed as the process-global
+/// answer (`ms_local_ai::local_ai::install_process`, once per process: only this function does
+/// it). The AI backend supervisor is not started here (see
 /// [`ProcessServices::start_ai_backend_supervisor`]).
 ///
 /// # Errors
@@ -242,7 +245,9 @@ pub(super) fn init_full(cli: &Cli) -> anyhow::Result<ProcessServices> {
     if !cli.check_venv {
         tabs::translation::mt_transport::start_browser_bridge_if_used();
     }
-    Ok(ProcessServices { user_settings, local_ai: LocalAiAvailability::for_process(cli.no_ai), host: launcher_host(cli.ignore_installed) })
+    let local_ai = LocalAiAvailability::for_process(cli.no_ai);
+    ms_local_ai::local_ai::install_process(local_ai);
+    Ok(ProcessServices { user_settings, local_ai, host: launcher_host(cli.ignore_installed) })
 }
 
 #[cfg(test)]

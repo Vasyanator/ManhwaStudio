@@ -26,23 +26,22 @@ ms-onnx = { path = "../ms-onnx" }
 # entries.
 serde.workspace = true
 serde_json.workspace = true
-# The download engine: resumable `.part`, retry with backoff, timeouts, cancel, exact
-# size + SHA256 verification (`fetch_verified`) and the per-build busy guard.
+# The download engine's types the resolver hands to the package transaction (`UreqFetcher`,
+# `RetryPolicy`) and the failures it maps onto its localized errors (`DownloadError`,
+# `unpack::UnpackError`).
 ms-download = { path = "../ms-download" }
-# The one atomic-write owner: the cache completion marker is replaced through `write_atomic`,
-# and every directory fsync (member publish, marker removal) is its `sync_directory`.
+# The pinned-package transaction a download row is: probe of the completion marker, per-build
+# busy wait, `.part` identity, verified download, member staging + publication, marker.
+ms-native-package = { path = "../ms-native-package" }
+# `AtomicWriteError` of a failed marker write / directory fsync, mapped onto the localized
+# `write_error` / `save_error` texts.
 ms-atomic-file = { path = "../ms-atomic-file" }
-# SHA256 of every extracted library, recorded in the cache completion marker.
-sha2.workspace = true
-# The archive shapes the official releases ship in: .zip, .tgz (gzip + tar) and
-# .tar.zst (zstd + tar).
-zip.workspace = true
-flate2.workspace = true
-tar.workspace = true
-zstd.workspace = true
 
 [dev-dependencies]
 # The scripted in-memory `RangeFetcher` (`ms_download::test_support`) for the download tests.
 ms-download = { path = "../ms-download", features = ["test-support"] }
 # Self-removing scratch cache directories for the download tests.
 tempfile.workspace = true
+# Test archives (zip writer) and their pins (sha256).
+zip.workspace = true
+sha2.workspace = true

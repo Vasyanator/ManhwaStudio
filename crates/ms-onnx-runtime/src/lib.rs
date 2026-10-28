@@ -5,9 +5,9 @@ Purpose:
 App-layer loader that lazily resolves the official ONNX Runtime dynamic library
 for the current platform/provider so the `ms-onnx` crate can dlopen it. On first
 use it probes a portable, per-build cache directory; if the library is absent it
-downloads the pinned official release archive through `ms-download` (resumable `.part`,
-retry with backoff, cancel, exact size + SHA256), extracts the loadable libraries
-atomically, and returns its on-disk path. The app starts fine without the library
+installs the pinned official release archive as an `ms-native-package` package
+(resumable `.part`, retry with backoff, cancel, exact size + SHA256, atomic extraction,
+completion marker), and returns its on-disk path. The app starts fine without the library
 present — resolution happens only when a caller asks for it.
 
 Key types:
@@ -24,11 +24,12 @@ Key functions:
   locate the library the app package ships (bundled rows); worker-thread only
 - ort_build_installed          : the one "is this build ready without a download" answer
   (the resolver's fast-path rule; used by the settings panel's presence probe)
-- resolve_download_entry       : the download-row half over an injected fetcher (tests)
-- fetch_source / claim_part    : one archive via `ms_download::fetch_verified`, with the
-  `.part.id` identity that keeps a `.part` from resuming another row's bytes
-- extract_wanted               : members staged to `<dest>.tmp` + fsync, renamed only when
-  all were found, primary library last
+- resolve_download_entry       : the download-row half over an injected fetcher (tests):
+  an adapter over `ms_native_package::ensure_installed`
+- with_package                 : the manifest row as a package (layout, recipe fields,
+  sources in fetch order, primary library last)
+- map_package_error            : `PackageError` -> the localized `onnx_runtime.download.*`
+  texts the resolver has always produced (table in its doc comment)
 - build_source_kind_here / ort_downloads_offered_here: download vs bundled, for the UI
 
 Notes:
@@ -36,7 +37,7 @@ The onnxruntime version is per manifest ENTRY, not global: the resolved cache di
 and versioned library name come from the looked-up entry's `version` (WebGPU on
 1.27.0 coexists with the 1.20.1 providers). An entry may pull extra libraries from
 `additional_sources` (extra archives) into the same cache directory; the primary
-and every additional source share one download+verify+extract path. One resolution per
+and every additional source are sources of one package. One resolution per
 build runs at a time in the process (busy id `ort:<build>:<version>`), so the settings
 panel's auto-download and a native OCR load never write the same files. Downloads and
 disk I/O are blocking; `resolve_or_download_ort_dylib` MUST run on a worker thread,
@@ -44,8 +45,11 @@ never on the GUI thread. This module owns dylib RESOLUTION only; it never links,
 initializes, or runs onnxruntime — that is `ms-onnx`'s job, and it consumes the
 path returned here. A BUNDLED build (Android: the `onnxruntime-android` AAR merged into the
 APK) has no recipe: resolution returns `<package native library dir>/<library>` after an
-existence check, with no network and no cache directory. Storage lives under `ms_config::data_dir()`. The binary names this crate directly as
-`ms_onnx_runtime::`.
+existence check, with no network and no cache directory. Storage lives under
+`ms_config::data_dir()`. The cache layout (`.ort-cache-complete` marker with format line
+`ms-onnx-runtime cache v1`, `.download/<archive>.part` + `.part.id`) is a persistence
+contract: caches written by earlier program versions stay trusted. The binary names this
+crate directly as `ms_onnx_runtime::`.
 */
 
 #![warn(clippy::all)]
@@ -54,19 +58,16 @@ existence check, with no network and no cache directory. Storage lives under `ms
 #[macro_use]
 extern crate ms_i18n;
 
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use flate2::read::GzDecoder;
-use sha2::{Digest, Sha256};
-use ms_download::busy::BusyGuard;
-use ms_download::resumable::{RangeFetcher, ResumableFetch, RetryPolicy, StreamEvent, UreqFetcher};
-use ms_download::{DownloadError, Expected, FileEvent, FileRequest, fetch_verified};
-use tar::Archive as TarArchive;
-use zip::ZipArchive;
+use ms_download::DownloadError;
+use ms_download::resumable::{RangeFetcher, RetryPolicy, UreqFetcher};
+use ms_download::unpack::UnpackError;
+use ms_native_package::{
+    ArchiveKind, FetchEnv, InstallOutcome, PackageError, PackageIoOp, PackageLayout, PackageMember, PackageProgress, PackageRecipe, PackageSource,
+    PackageStage,
+};
 
 use ms_config as config;
 use ms_log::runtime_log;
@@ -87,9 +88,6 @@ mod manifest;
 // directly.
 #[allow(unused_imports)]
 pub use manifest::{ORT_VERSION, OrtBuildSourceKind, build_shipped_here, build_source_kind_here, build_version, ort_downloads_offered_here, provider_version};
-
-/// Minimum number of bytes between throttled progress reports (transfer and hashing).
-const PROGRESS_EMIT_INTERVAL_BYTES: u64 = 512 * 1024;
 
 /// Log prefix of this crate (also the `ms_download` engine's tag for its retry lines).
 const LOG_TAG: &str = "[onnx-runtime]";
@@ -343,20 +341,13 @@ struct DownloadEnv<'a> {
     cancel: &'a AtomicBool,
 }
 
-/// One pinned archive of a manifest row (the primary source or an additional one).
-#[derive(Debug, Clone, Copy)]
-struct SourceRecipe<'a> {
-    url: &'a str,
-    size: u64,
-    sha256: &'a str,
-    archive: manifest::ArchiveKind,
-}
-
 /// Download-row half of [`resolve_or_download_ort_dylib`] for `entry` into the cache
-/// directory `dir`: probe (completion marker + member sizes), per-build busy wait,
-/// re-probe, marker invalidated, then every source fetched and extracted (additional
-/// sources first, the primary archive LAST, so the primary library is the last member
-/// published), and finally the completion marker written atomically.
+/// directory `dir`, as an adapter over `ms_native_package::ensure_installed`: the package is
+/// this row's recipe ([`with_package`]: fields `build` + `version`, the additional sources
+/// first and the primary archive LAST, so the primary library is the last member published),
+/// the busy key is `ort:<build>:<version>` and the marker is [`CACHE_MARKER`] with format line
+/// [`CACHE_MARKER_FORMAT`]. Progress maps 1:1 ([`ort_progress`]), failures through
+/// [`map_package_error`].
 ///
 /// # Errors
 /// As [`resolve_or_download_ort_dylib`] for download rows.
@@ -369,88 +360,31 @@ fn resolve_download_entry(
 ) -> Result<PathBuf, OrtRuntimeError> {
     let provider_id = entry.provider.as_str();
     let version = entry.version.as_str();
-    let primary_name = expected_primary_dylib_filename(version);
-    let primary_path = dir.join(&primary_name);
-    let expected_members = expected_member_paths(dir, &primary_name, entry)?;
-    let recipe = cache_recipe(build, entry);
-
-    emit(progress, OrtDownloadStage::Probing, 0, None);
-    // Fast path: the one "installed" rule (`installed_primary`, also behind the public
-    // `ort_build_installed`); anything short of a complete cache is rebuilt below.
-    if installed_primary(build, entry, dir)?.is_some() {
-        runtime_log::log_info(format!(
+    let primary_path = dir.join(expected_primary_dylib_filename(version));
+    // One resolution of this build per process: the settings panel's auto-download and a
+    // native OCR load may ask for the same build at once; the second caller waits, then
+    // normally finds the cache complete.
+    let busy_key = format!("ort:{build}:{version}");
+    let log_context = format!("build={build} version={version}");
+    let fetch_env = FetchEnv { fetcher: env.fetcher, retry: env.retry, cancel: env.cancel, log_tag: LOG_TAG, log_context: &log_context };
+    let outcome = with_package(build, entry, dir, |layout, recipe| {
+        ms_native_package::ensure_installed(&fetch_env, layout, recipe, &busy_key, &mut |update| progress(ort_progress(update)))
+    })?
+    .map_err(map_package_error)?;
+    match outcome {
+        InstallOutcome::AlreadyInstalled => runtime_log::log_info(format!(
             "[onnx-runtime] found cached library for build '{build}' (provider '{provider_id}') at {}",
             primary_path.display()
-        ));
-        emit(progress, OrtDownloadStage::Done, 0, None);
-        return Ok(primary_path);
-    }
-
-    // One resolution of this build per process: the settings panel's auto-download and
-    // a native OCR load may ask for the same build at once, and two writers of one
-    // `.part` / one set of extracted libraries would corrupt each other. The second
-    // caller waits, then normally finds the cache complete below.
-    let busy_key = format!("ort:{build}:{version}");
-    let _busy = BusyGuard::acquire_waiting(&busy_key, env.cancel, env.retry, &mut || {
-        runtime_log::log_info(format!("[onnx-runtime] build '{build}' {version} is being prepared by another task; waiting"));
-        emit(progress, OrtDownloadStage::WaitingForOtherDownload, 0, None);
-    })
-    .map_err(|err| map_download_error(&entry.url, err))?;
-    if installed_primary(build, entry, dir)?.is_some() {
-        runtime_log::log_info(format!(
+        )),
+        InstallOutcome::InstalledByOther => runtime_log::log_info(format!(
             "[onnx-runtime] build '{build}' was prepared by another task: {}",
             primary_path.display()
-        ));
-        emit(progress, OrtDownloadStage::Done, 0, None);
-        return Ok(primary_path);
+        )),
+        InstallOutcome::Installed => runtime_log::log_info(format!(
+            "[onnx-runtime] ready for build '{build}' (provider '{provider_id}'): {}",
+            primary_path.display()
+        )),
     }
-
-    fs::create_dir_all(dir).map_err(|err| {
-        OrtRuntimeError::Io(tf!("onnx_runtime.download.create_dir_error", dir = dir.display(), err = err))
-    })?;
-    let download_dir = dir.join(".download");
-    fs::create_dir_all(&download_dir).map_err(|err| {
-        OrtRuntimeError::Io(tf!("onnx_runtime.download.create_download_dir_error", download_dir = download_dir.display(), err = err))
-    })?;
-    // The cache is about to be (re)published member by member: drop the marker durably
-    // FIRST, so a crash between two member renames leaves no marker and the next call
-    // repairs the set instead of trusting a mixed generation.
-    invalidate_cache_marker(dir)?;
-    let mut published = Vec::with_capacity(expected_members.len());
-
-    // Additional sources: extra archives (e.g. sidecar runtime DLLs) extracted into the
-    // SAME cache directory via the exact same fetch path as the primary source.
-    for source in &entry.additional_sources {
-        let mut wanted = Vec::with_capacity(source.members.len());
-        add_flattened_members(&mut wanted, &source.members, dir)?;
-        runtime_log::log_info(format!(
-            "[onnx-runtime] downloading additional source for build '{build}' from {}",
-            source.url
-        ));
-        let recipe = SourceRecipe { url: &source.url, size: source.size, sha256: &source.sha256, archive: source.archive };
-        published.extend(fetch_source(env, recipe, &wanted, &download_dir, build, progress)?);
-    }
-
-    // Primary source: the onnxruntime archive itself. Its `dylib_member` is renamed to
-    // the version-scoped `primary_name` and listed LAST, so it is published after every
-    // extra library of the archive; `extra_members` keep their filenames.
-    let mut primary_wanted = Vec::with_capacity(entry.extra_members.len().saturating_add(1));
-    add_flattened_members(&mut primary_wanted, &entry.extra_members, dir)?;
-    primary_wanted.push((entry.dylib_member.clone(), primary_path.clone()));
-    runtime_log::log_info(format!(
-        "[onnx-runtime] downloading ONNX Runtime {version} for build '{build}' (provider '{provider_id}') from {}",
-        entry.url
-    ));
-    let source = SourceRecipe { url: &entry.url, size: entry.size, sha256: &entry.sha256, archive: entry.archive };
-    published.extend(fetch_source(env, source, &primary_wanted, &download_dir, build, progress)?);
-    // Only now, with every member renamed into place, does the cache become trusted.
-    write_cache_marker(dir, &cache_marker_text(&recipe, &published))?;
-
-    runtime_log::log_info(format!(
-        "[onnx-runtime] ready for build '{build}' (provider '{provider_id}'): {}",
-        primary_path.display()
-    ));
-    emit(progress, OrtDownloadStage::Done, 0, None);
     Ok(primary_path)
 }
 
@@ -483,17 +417,17 @@ pub fn ort_build_installed(build: &str) -> bool {
 }
 
 /// The primary library path of `entry` in cache directory `dir` when the cache is
-/// complete for it, else `None`: the completion marker records EXACTLY this manifest row
-/// (build, version, every source's url + sha256) and every expected member (primary +
-/// extras + additional-source members) is on disk at the recorded size. A partial,
-/// truncated, mixed-generation or foreign cache is `None` (the resolver rebuilds it).
+/// complete for it, else `None`: `ms_native_package::is_installed` over this row's package
+/// ([`with_package`]) — the completion marker records EXACTLY this manifest row (build,
+/// version, every source's url + sha256) and every expected member (primary + extras +
+/// additional-source members) is on disk at the recorded size. A partial, truncated,
+/// mixed-generation or foreign cache is `None` (the resolver rebuilds it).
 ///
 /// # Errors
 /// [`OrtRuntimeError::Extraction`] if a manifest member path has no file name.
 fn installed_primary(build: &str, entry: &manifest::ManifestEntry, dir: &Path) -> Result<Option<PathBuf>, OrtRuntimeError> {
-    let primary_name = expected_primary_dylib_filename(&entry.version);
-    let expected_members = expected_member_paths(dir, &primary_name, entry)?;
-    Ok(cache_complete(dir, &cache_recipe(build, entry), &expected_members).then(|| dir.join(primary_name)))
+    let installed = with_package(build, entry, dir, ms_native_package::is_installed)?;
+    Ok(installed.then(|| dir.join(expected_primary_dylib_filename(&entry.version))))
 }
 
 /// The app package's native library directory, where bundled libraries live.
@@ -539,216 +473,73 @@ fn bundled_library_path(dir: &Path, entry: &manifest::BundledEntry) -> Result<Pa
     }
 }
 
-/// The on-disk paths of every library an entry is expected to place in `dir`.
-///
-/// Includes the primary library (as `primary_name`) plus each `extra_members` and
-/// `additional_sources` member, flattened to its filename. Used by the probe fast
-/// path to require a COMPLETE cache before skipping the download.
-///
-/// # Errors
-/// [`OrtRuntimeError::Extraction`] if any member path has no filename component.
-fn expected_member_paths(
-    dir: &Path,
-    primary_name: &str,
-    entry: &manifest::ManifestEntry,
-) -> Result<Vec<PathBuf>, OrtRuntimeError> {
-    let mut paths = vec![dir.join(primary_name)];
-    for member in &entry.extra_members {
-        paths.push(dir.join(member_file_name(member)?));
-    }
-    for source in &entry.additional_sources {
-        for member in &source.members {
-            paths.push(dir.join(member_file_name(member)?));
-        }
-    }
-    Ok(paths)
-}
-
-/// Appends each `members` archive path to `wanted`, flattened to its filename in `dir`
-/// (so archive-path traversal is impossible), in `members` order.
+/// Runs `f` over the `ms-native-package` view of download row `entry` cached in `dir`:
+/// layout `dir` + [`CACHE_MARKER`] + [`CACHE_MARKER_FORMAT`]; recipe fields
+/// `[("build", build), ("version", entry.version)]`; sources = every `additional_sources`
+/// archive, then the primary archive (staged under the last URL segment,
+/// [`archive_file_name`]); members flattened to their file names, except the primary
+/// `dylib_member`, which is published as [`expected_primary_dylib_filename`] and listed LAST
+/// of the primary archive (after its `extra_members`).
 ///
 /// # Errors
-/// [`OrtRuntimeError::Extraction`] if a member path has no filename component.
-fn add_flattened_members(
-    wanted: &mut Vec<(String, PathBuf)>,
-    members: &[String],
-    dir: &Path,
-) -> Result<(), OrtRuntimeError> {
-    for member in members {
-        wanted.push((member.clone(), dir.join(member_file_name(member)?)));
+/// [`OrtRuntimeError::Extraction`] (`invalid_member_path`) for the first member path without
+/// a file name, `extra_members` checked before `additional_sources` members.
+fn with_package<R>(build: &str, entry: &manifest::ManifestEntry, dir: &Path, f: impl FnOnce(&PackageLayout<'_>, &PackageRecipe<'_>) -> R) -> Result<R, OrtRuntimeError> {
+    /// `members` as package members published under their flattened file names.
+    fn flattened(members: &[String]) -> Result<Vec<PackageMember<'_>>, OrtRuntimeError> {
+        members.iter().map(|member| Ok(PackageMember { archive_path: member, file_name: member_file_name(member)? })).collect()
     }
-    Ok(())
+    let primary_name = expected_primary_dylib_filename(&entry.version);
+    let mut primary_members = flattened(&entry.extra_members)?;
+    let additional_members = entry.additional_sources.iter().map(|source| flattened(&source.members)).collect::<Result<Vec<_>, _>>()?;
+    primary_members.push(PackageMember { archive_path: &entry.dylib_member, file_name: &primary_name });
+    let additional_names: Vec<String> = entry.additional_sources.iter().map(|source| archive_file_name(&source.url)).collect();
+    let primary_archive = archive_file_name(&entry.url);
+
+    let mut sources: Vec<PackageSource<'_>> = entry
+        .additional_sources
+        .iter()
+        .zip(&additional_names)
+        .zip(&additional_members)
+        .map(|((source, file_name), members)| PackageSource { url: &source.url, file_name, size: source.size, sha256: &source.sha256, archive: package_archive_kind(source.archive), members })
+        .collect();
+    sources.push(PackageSource { url: &entry.url, file_name: &primary_archive, size: entry.size, sha256: &entry.sha256, archive: package_archive_kind(entry.archive), members: &primary_members });
+    let fields = [("build", build), ("version", entry.version.as_str())];
+    let layout = PackageLayout { dir, marker_file: CACHE_MARKER, marker_format: CACHE_MARKER_FORMAT };
+    Ok(f(&layout, &PackageRecipe { fields: &fields, sources: &sources }))
 }
 
-/// The trailing filename of an archive-internal member path.
+/// The `ms-download` archive kind of a manifest archive kind (1:1).
+fn package_archive_kind(kind: manifest::ArchiveKind) -> ArchiveKind {
+    match kind {
+        manifest::ArchiveKind::Zip => ArchiveKind::Zip,
+        manifest::ArchiveKind::TarGz => ArchiveKind::TarGz,
+        manifest::ArchiveKind::TarZst => ArchiveKind::TarZst,
+    }
+}
+
+/// The trailing filename of an archive-internal member path
+/// (`ms_native_package::flatten_member_name`).
 ///
 /// # Errors
 /// [`OrtRuntimeError::Extraction`] if `member` has no filename component.
-fn member_file_name(member: &str) -> Result<PathBuf, OrtRuntimeError> {
-    Path::new(member)
-        .file_name()
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            OrtRuntimeError::Extraction(tf!("onnx_runtime.download.invalid_member_path", member = member))
-        })
+fn member_file_name(member: &str) -> Result<&str, OrtRuntimeError> {
+    ms_native_package::flatten_member_name(member).map_err(map_package_error)
 }
 
-/// Downloads, verifies, and extracts one source archive into the cache directory.
-///
-/// Shared by the primary source and every additional source: claims the `.part` for this
-/// recipe (`claim_part`), lets `ms_download::fetch_verified` resume / stream / verify
-/// (exact size + SHA256) / publish it as `.download/<archive>`, extracts exactly the
-/// `wanted` members atomically, and removes the archive. `wanted` lists each
-/// archive-internal member path with its destination in the cache directory; the members
-/// are published in this order and returned with their size and SHA256 (for the cache
-/// completion marker).
-///
-/// # Errors
-/// - [`OrtRuntimeError::Cancelled`] when the cancel flag stopped the transfer.
-/// - [`OrtRuntimeError::Download`] on a permanent failure, exhausted retries or a size
-///   mismatch.
-/// - [`OrtRuntimeError::ChecksumMismatch`] if the SHA256 does not match (`.part` deleted).
-/// - [`OrtRuntimeError::Extraction`] / [`OrtRuntimeError::DylibNotFoundInArchive`]
-///   if the archive cannot be unpacked or a wanted member is absent.
-/// - [`OrtRuntimeError::Io`] on filesystem failure.
-fn fetch_source(
-    env: &DownloadEnv<'_>,
-    source: SourceRecipe<'_>,
-    wanted: &[(String, PathBuf)],
-    download_dir: &Path,
-    build: &str,
-    progress: &mut dyn FnMut(OrtDownloadProgress),
-) -> Result<Vec<PublishedMember>, OrtRuntimeError> {
-    let archive_name = archive_file_name(source.url);
-    let archive_path = download_dir.join(&archive_name);
-    let part_path = download_dir.join(format!("{archive_name}.part"));
-    let identity_path = download_dir.join(format!("{archive_name}.part.id"));
-    claim_part(&part_path, &identity_path, source)?;
-
-    let log_context = format!("build={build} archive={archive_name}");
-    let engine = ResumableFetch { fetcher: env.fetcher, retry: env.retry, cancel: env.cancel, log_tag: LOG_TAG, log_context: &log_context };
-    let request = FileRequest {
-        url: source.url,
-        part: &part_path,
-        dest: &archive_path,
-        expected: Expected::SizeSha256 { size: source.size, sha256: source.sha256 },
+/// The resolver's progress snapshot of a package progress snapshot (stages map 1:1, byte
+/// counters unchanged).
+fn ort_progress(update: PackageProgress) -> OrtDownloadProgress {
+    let stage = match update.stage {
+        PackageStage::Probing => OrtDownloadStage::Probing,
+        PackageStage::WaitingForOtherDownload => OrtDownloadStage::WaitingForOtherDownload,
+        PackageStage::Downloading => OrtDownloadStage::Downloading,
+        PackageStage::Retrying { attempt, max_attempts, delay_secs } => OrtDownloadStage::Retrying { attempt, max_attempts, delay_secs },
+        PackageStage::Verifying => OrtDownloadStage::Verifying,
+        PackageStage::Extracting => OrtDownloadStage::Extracting,
+        PackageStage::Done => OrtDownloadStage::Done,
     };
-    let mut throttle = ProgressThrottle::default();
-    let fetched = fetch_verified(&engine, &request, &mut |event| forward_file_event(event, source.size, &mut throttle, progress));
-    if let Err(err) = fetched {
-        match &err {
-            DownloadError::Cancelled => runtime_log::log_info(format!("{LOG_TAG} download cancelled ({log_context}); the staged bytes are kept")),
-            _ => runtime_log::log_error(format!("{LOG_TAG} download failed ({log_context}): {err}")),
-        }
-        return Err(map_download_error(source.url, err));
-    }
-    runtime_log::log_info(format!("{LOG_TAG} size and SHA256 verified for '{}'", archive_path.display()));
-    // The `.part` became the archive: its identity file is stale now. A leftover one is
-    // harmless (the next `claim_part` rewrites it), so a failure only warns.
-    remove_file_logged(&identity_path, "stale download identity");
-
-    emit(progress, OrtDownloadStage::Extracting, 0, None);
-    let published = extract_wanted(&archive_path, source.archive, wanted)?;
-
-    // The archive is no longer needed once its libraries are extracted; a cleanup
-    // failure is non-fatal (the cache directory still holds the extracted files).
-    remove_file_logged(&archive_path, "archive");
-    Ok(published)
-}
-
-/// Makes `part` belong to `source` before a download resumes it.
-///
-/// `identity` (`<archive>.part.id`) records the URL and SHA256 the `.part` was staged
-/// for. A `.part` whose identity is missing, unreadable or names another recipe (same
-/// archive name, e.g. a re-pinned row after a manifest change) is deleted, because its
-/// bytes cannot be proven to belong to this archive; then the identity is (re)written.
-/// The identity file is written non-atomically on purpose: a torn one only mismatches
-/// next time, which discards the `.part` — never resumes foreign bytes.
-///
-/// # Errors
-/// [`OrtRuntimeError::Io`] when the foreign `.part` cannot be removed or the identity
-/// cannot be written.
-fn claim_part(part: &Path, identity: &Path, source: SourceRecipe<'_>) -> Result<(), OrtRuntimeError> {
-    let expected = format!("{}\n{}\n", source.url, source.sha256);
-    let owned = match fs::read(identity) {
-        Ok(bytes) => bytes == expected.as_bytes(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-        Err(err) => {
-            runtime_log::log_warn(format!("{LOG_TAG} cannot read download identity '{}' ({err}); restarting that download", identity.display()));
-            false
-        }
-    };
-    if owned {
-        return Ok(());
-    }
-    match fs::remove_file(part) {
-        Ok(()) => runtime_log::log_info(format!("{LOG_TAG} discarded '{}': it was staged for another archive", part.display())),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(OrtRuntimeError::Io(tf!("onnx_runtime.download.remove_temp_error", partial_path = part.display(), err = err)));
-        }
-    }
-    fs::write(identity, expected.as_bytes()).map_err(|err| {
-        OrtRuntimeError::Io(tf!("onnx_runtime.download.write_error", path = identity.display(), err = err))
-    })
-}
-
-/// Removes `path` if it exists; any other failure is logged as a warning naming `what`.
-fn remove_file_logged(path: &Path, what: &str) {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => runtime_log::log_warn(format!("{LOG_TAG} failed to remove {what} '{}': {err}", path.display())),
-    }
-}
-
-/// Rate limit of byte-counting progress reports: a report is sent when the stage
-/// changes, when [`PROGRESS_EMIT_INTERVAL_BYTES`] more bytes passed, or at the end.
-#[derive(Debug, Default)]
-struct ProgressThrottle {
-    /// Stage and byte count of the last report sent.
-    last: Option<(OrtDownloadStage, u64)>,
-}
-
-impl ProgressThrottle {
-    /// Whether a `(stage, bytes)` report of a `total`-byte operation should be sent; records it when so.
-    fn admit(&mut self, stage: OrtDownloadStage, bytes: u64, total: u64) -> bool {
-        let send = match self.last {
-            Some((last_stage, last_bytes)) => last_stage != stage || bytes.saturating_sub(last_bytes) >= PROGRESS_EMIT_INTERVAL_BYTES || bytes >= total,
-            None => true,
-        };
-        if send {
-            self.last = Some((stage, bytes));
-        }
-        send
-    }
-}
-
-/// Maps one `fetch_verified` event of a `size`-byte archive onto the caller's progress.
-fn forward_file_event(event: FileEvent, size: u64, throttle: &mut ProgressThrottle, progress: &mut dyn FnMut(OrtDownloadProgress)) {
-    match event {
-        // `fetch_verified`'s own destination guard: unreachable while the per-build busy id
-        // is held (every writer of this archive holds it first), reported anyway.
-        FileEvent::Waiting => emit(progress, OrtDownloadStage::WaitingForOtherDownload, 0, None),
-        FileEvent::Verifying { done, total } => {
-            if throttle.admit(OrtDownloadStage::Verifying, done, total) {
-                emit(progress, OrtDownloadStage::Verifying, done, Some(total));
-            }
-        }
-        FileEvent::Stream(StreamEvent::Downloading { staged, total }) => {
-            let total = total.unwrap_or(size);
-            if throttle.admit(OrtDownloadStage::Downloading, staged, total) {
-                emit(progress, OrtDownloadStage::Downloading, staged, Some(total));
-            }
-        }
-        FileEvent::Stream(StreamEvent::Retrying { attempt, max_attempts, delay_secs, staged }) => {
-            let stage = OrtDownloadStage::Retrying { attempt, max_attempts, delay_secs };
-            // Every countdown step is a distinct stage value, so each one is sent.
-            if throttle.admit(stage, staged, size) {
-                emit(progress, stage, staged, Some(size));
-            }
-        }
-    }
+    OrtDownloadProgress { downloaded: update.downloaded, total: update.total, stage }
 }
 
 /// Maps an `ms_download` failure of `url` onto the resolver's typed error. The wrapped
@@ -766,213 +557,79 @@ fn map_download_error(url: &str, err: DownloadError) -> OrtRuntimeError {
     }
 }
 
-/// Extracts exactly the `wanted` members from `archive_path` into their destinations,
-/// atomically per member.
+/// Maps a package failure onto the resolver's typed error, reproducing the localized text the
+/// resolver produced before the transaction moved to `ms-native-package` (same variant, same
+/// `onnx_runtime.download.*` key, same placeholders, the same underlying error rendered):
 ///
-/// `wanted` lists each archive-internal member path with its destination path (already
-/// flattened to a controlled filename inside the cache directory, so archive-path
-/// traversal is impossible). Only the listed members are unpacked (so, e.g., the 300 MB
-/// Windows `.pdb` is never touched); symlink and directory entries matching a member path
-/// are skipped in favor of the real file. Every member is first written and fsynced to
-/// `<dest>.tmp`; only when ALL of them were found are the temporaries renamed onto their
-/// destinations in `wanted` order (the caller lists the primary library last) and the
-/// directory fsynced (unix). On any failure every temporary is removed and no destination
-/// is touched. Several renames are not one atomic step: the caller invalidates the cache
-/// marker before and rewrites it after (see `resolve_download_entry`).
-///
-/// # Errors
-/// [`OrtRuntimeError::DylibNotFoundInArchive`] names the first missing member;
-/// [`OrtRuntimeError::Extraction`] / [`OrtRuntimeError::Io`] on read / write failure.
-fn extract_wanted(
-    archive_path: &Path,
-    archive: manifest::ArchiveKind,
-    wanted: &[(String, PathBuf)],
-) -> Result<Vec<PublishedMember>, OrtRuntimeError> {
-    let digests = match stage_members(archive_path, archive, wanted) {
-        Ok(digests) => digests,
-        Err(err) => {
-            for (_, dest) in wanted {
-                remove_file_logged(&staging_path(dest), "extraction temporary");
+/// | `PackageError` | `OrtRuntimeError` |
+/// |---|---|
+/// | `Cancelled` | `Cancelled` |
+/// | `ChecksumMismatch` | `ChecksumMismatch { expected, actual }` |
+/// | `Download { url, source }` | [`map_download_error`]`(url, source)` (`transfer_error`, or `Io` = the raw `DownloadError` text) |
+/// | `Unpack`: `OpenArchive` | `Extraction(open_archive_error { archive_path, err })` |
+/// | `Unpack`: `ZipRead` / `ZipEntry` / `ZstdOpen` | `Extraction(zip_read_error { err })` / `(zip_entry_error { index, err })` / `(zstd_open_error { err })` |
+/// | `Unpack`: `TarRead` / `TarEntry` / `TarInvalidPath` | `Extraction(tar_read_error / tar_entry_error / tar_invalid_path { err })` |
+/// | `Unpack`: `CreateDir` / `CreateFile` | `Io(extract_create_dir_error { parent, err })` / `Io(extract_create_file_error { out_path, err })` |
+/// | `Unpack`: `CopyMember` | `Extraction(extract_element_error { out_path, err })` |
+/// | `Unpack`: `SyncFile` | `Io(save_error { path, err })` |
+/// | `Unpack`: `MemberMissing` | `DylibNotFoundInArchive(member)` |
+/// | `Io`: `CreateDir` / `CreateDownloadDir` | `Io(create_dir_error { dir, err })` / `Io(create_download_dir_error { download_dir, err })` |
+/// | `Io`: `RemovePart` / `RemoveMarker` | `Io(remove_temp_error { partial_path, err })` |
+/// | `Io`: `WriteIdentity` | `Io(write_error { path, err })` |
+/// | `Io`: `RemoveDir` (never reached: the resolver removes no package) | `Io(remove_temp_error { partial_path, err })` |
+/// | `Publish` | `Io(publish_member_error { from, to, err })` |
+/// | `SyncDir` | `Io(save_error { path: dir, err })` |
+/// | `WriteMarker`: temp write / rename | `Io(write_error { path: marker, err })` |
+/// | `WriteMarker`: directory fsync | `Io(save_error { path: dir, err })` |
+/// | `InvalidMemberPath` / `InvalidFileName` / `DuplicateFileName` (the last two never reached: manifest names are flattened, plain and distinct) | `Extraction(invalid_member_path { member })` |
+fn map_package_error(err: PackageError) -> OrtRuntimeError {
+    match err {
+        PackageError::Cancelled => OrtRuntimeError::Cancelled,
+        PackageError::ChecksumMismatch { url: _, expected, actual } => OrtRuntimeError::ChecksumMismatch { expected, actual },
+        PackageError::Download { url, source } => map_download_error(&url, *source),
+        PackageError::Unpack { archive: _, source } => map_unpack_error(*source),
+        PackageError::Io { op, path, source: err } => OrtRuntimeError::Io(match op {
+            PackageIoOp::CreateDir => tf!("onnx_runtime.download.create_dir_error", dir = path.display(), err = err),
+            PackageIoOp::CreateDownloadDir => tf!("onnx_runtime.download.create_download_dir_error", download_dir = path.display(), err = err),
+            PackageIoOp::RemovePart | PackageIoOp::RemoveMarker | PackageIoOp::RemoveDir => {
+                tf!("onnx_runtime.download.remove_temp_error", partial_path = path.display(), err = err)
             }
-            return Err(err);
+            PackageIoOp::WriteIdentity => tf!("onnx_runtime.download.write_error", path = path.display(), err = err),
+        }),
+        PackageError::Publish { from, to, source: err } => {
+            OrtRuntimeError::Io(tf!("onnx_runtime.download.publish_member_error", from = from.display(), to = to.display(), err = err))
         }
-    };
-    let mut published = Vec::with_capacity(wanted.len());
-    for (member, dest) in wanted {
-        let staged = staging_path(dest);
-        fs::rename(&staged, dest).map_err(|err| {
-            OrtRuntimeError::Io(tf!("onnx_runtime.download.publish_member_error", from = staged.display(), to = dest.display(), err = err))
-        })?;
-        // `stage_members` returned Ok, so every wanted member has a digest.
-        if let Some((size, sha256)) = digests.get(member.as_str()) {
-            published.push(PublishedMember { file_name: dest.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(), size: *size, sha256: sha256.clone() });
-        }
-    }
-    let mut synced: HashSet<&Path> = HashSet::new();
-    for (_, dest) in wanted {
-        if let Some(parent) = dest.parent()
-            && synced.insert(parent)
-        {
-            sync_dir(parent)?;
-        }
-    }
-    Ok(published)
-}
-
-/// Writes every `wanted` member of the archive to its `<dest>.tmp` (fsynced), checks
-/// that all of them were found, and returns each member's `(size, sha256)`.
-fn stage_members(archive_path: &Path, archive: manifest::ArchiveKind, wanted: &[(String, PathBuf)]) -> Result<HashMap<String, (u64, String)>, OrtRuntimeError> {
-    let lookup: HashMap<&str, &Path> = wanted.iter().map(|(member, dest)| (member.as_str(), dest.as_path())).collect();
-    let mut found: HashMap<String, (u64, String)> = HashMap::new();
-    let open = || {
-        File::open(archive_path).map_err(|err| {
-            OrtRuntimeError::Extraction(tf!("onnx_runtime.download.open_archive_error", archive_path = archive_path.display(), err = err))
-        })
-    };
-
-    match archive {
-        manifest::ArchiveKind::Zip => {
-            let mut zip = ZipArchive::new(open()?).map_err(|err| {
-                OrtRuntimeError::Extraction(tf!("onnx_runtime.download.zip_read_error", err = err))
-            })?;
-            for index in 0..zip.len() {
-                let mut file_in_zip = zip.by_index(index).map_err(|err| {
-                    OrtRuntimeError::Extraction(tf!("onnx_runtime.download.zip_entry_error", index = index, err = err))
-                })?;
-                let name = file_in_zip.name().to_string();
-                if let Some(dest) = lookup.get(name.as_str()) {
-                    if file_in_zip.is_dir() {
-                        continue;
-                    }
-                    let digest = write_stream(&mut file_in_zip, &staging_path(dest))?;
-                    found.insert(name, digest);
-                }
+        PackageError::SyncDir { dir, source: err } => OrtRuntimeError::Io(tf!("onnx_runtime.download.save_error", path = dir.display(), err = err)),
+        PackageError::WriteMarker { path, dir, source: err } => match *err {
+            ms_atomic_file::AtomicWriteError::TempWrite { .. } | ms_atomic_file::AtomicWriteError::Rename { .. } => {
+                OrtRuntimeError::Io(tf!("onnx_runtime.download.write_error", path = path.display(), err = err))
             }
-        }
-        manifest::ArchiveKind::TarGz => {
-            extract_tar_members(GzDecoder::new(open()?), &lookup, &mut found)?;
-        }
-        manifest::ArchiveKind::TarZst => {
-            let decoder = zstd::stream::read::Decoder::new(open()?).map_err(|err| {
-                OrtRuntimeError::Extraction(tf!("onnx_runtime.download.zstd_open_error", err = err))
-            })?;
-            extract_tar_members(decoder, &lookup, &mut found)?;
+            ms_atomic_file::AtomicWriteError::DirSync { .. } => OrtRuntimeError::Io(tf!("onnx_runtime.download.save_error", path = dir.display(), err = err)),
+        },
+        PackageError::InvalidMemberPath { member } | PackageError::InvalidFileName { name: member } | PackageError::DuplicateFileName { name: member } => {
+            OrtRuntimeError::Extraction(tf!("onnx_runtime.download.invalid_member_path", member = member))
         }
     }
-
-    // Every requested member must have been extracted; report the first miss in order.
-    match wanted.iter().find(|(member, _)| !found.contains_key(member)) {
-        Some((member, _)) => Err(OrtRuntimeError::DylibNotFoundInArchive(member.clone())),
-        None => Ok(found),
-    }
 }
 
-/// Stages the wanted members of a tar stream `reader` (see [`stage_members`]), recording
-/// found keys.
-///
-/// Directory and symlink entries are skipped so only the real library files land
-/// in the cache directory (the versioned `.so`/`.dylib` file, not its symlinks).
-fn extract_tar_members<R: Read>(
-    reader: R,
-    wanted: &HashMap<&str, &Path>,
-    found: &mut HashMap<String, (u64, String)>,
-) -> Result<(), OrtRuntimeError> {
-    let mut archive = TarArchive::new(reader);
-    let entries = archive.entries().map_err(|err| {
-        OrtRuntimeError::Extraction(tf!("onnx_runtime.download.tar_read_error", err = err))
-    })?;
-    for entry in entries {
-        let mut entry = entry.map_err(|err| {
-            OrtRuntimeError::Extraction(tf!("onnx_runtime.download.tar_entry_error", err = err))
-        })?;
-        let path = entry.path().map_err(|err| {
-            OrtRuntimeError::Extraction(tf!("onnx_runtime.download.tar_invalid_path", err = err))
-        })?;
-        // Normalize separators and strip a leading `./`. GNU-tar-packed archives store
-        // members as `./onnxruntime-.../lib/...` (the onnxruntime 1.27.0 macOS archives
-        // do this; 1.20.1 did not), and the manifest `dylib_member`/`extra_members`
-        // paths are written without the `./` prefix. Stripping it here lets one clean
-        // manifest path match both archive styles.
-        let normalized = path.to_string_lossy().replace('\\', "/");
-        let key = normalized.strip_prefix("./").unwrap_or(&normalized);
-        if let Some(dest) = wanted.get(key) {
-            // Only the real regular file is wanted; the archive's `.so`/`.dylib`
-            // symlinks point at it and are intentionally ignored.
-            if !entry.header().entry_type().is_file() {
-                continue;
-            }
-            let digest = write_stream(&mut entry, &staging_path(dest))?;
-            found.insert(key.to_string(), digest);
+/// The `Unpack` rows of [`map_package_error`].
+fn map_unpack_error(err: UnpackError) -> OrtRuntimeError {
+    match err {
+        UnpackError::OpenArchive { path, source: err } => {
+            OrtRuntimeError::Extraction(tf!("onnx_runtime.download.open_archive_error", archive_path = path.display(), err = err))
         }
+        UnpackError::ZipRead { source: err } => OrtRuntimeError::Extraction(tf!("onnx_runtime.download.zip_read_error", err = err)),
+        UnpackError::ZipEntry { index, source: err } => OrtRuntimeError::Extraction(tf!("onnx_runtime.download.zip_entry_error", index = index, err = err)),
+        UnpackError::ZstdOpen { source: err } => OrtRuntimeError::Extraction(tf!("onnx_runtime.download.zstd_open_error", err = err)),
+        UnpackError::TarRead { source: err } => OrtRuntimeError::Extraction(tf!("onnx_runtime.download.tar_read_error", err = err)),
+        UnpackError::TarEntry { source: err } => OrtRuntimeError::Extraction(tf!("onnx_runtime.download.tar_entry_error", err = err)),
+        UnpackError::TarInvalidPath { source: err } => OrtRuntimeError::Extraction(tf!("onnx_runtime.download.tar_invalid_path", err = err)),
+        UnpackError::CreateDir { path, source: err } => OrtRuntimeError::Io(tf!("onnx_runtime.download.extract_create_dir_error", parent = path.display(), err = err)),
+        UnpackError::CreateFile { path, source: err } => OrtRuntimeError::Io(tf!("onnx_runtime.download.extract_create_file_error", out_path = path.display(), err = err)),
+        UnpackError::CopyMember { path, source: err } => OrtRuntimeError::Extraction(tf!("onnx_runtime.download.extract_element_error", out_path = path.display(), err = err)),
+        UnpackError::SyncFile { path, source: err } => OrtRuntimeError::Io(tf!("onnx_runtime.download.save_error", path = path.display(), err = err)),
+        UnpackError::MemberMissing { member } => OrtRuntimeError::DylibNotFoundInArchive(member),
     }
-    Ok(())
-}
-
-/// The temporary sibling `<dest file name>.tmp` an extracted member is staged in.
-fn staging_path(dest: &Path) -> PathBuf {
-    // Every destination is `cache dir / member_file_name(..)`, which always has a file
-    // name; an empty name would still give a distinct `.tmp` sibling.
-    let mut name = dest.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
-    name.push(".tmp");
-    dest.with_file_name(name)
-}
-
-/// Copies a readable archive member into a fresh `out_path` (creating parent dirs),
-/// fsyncs it and returns its `(size, lowercase sha256)`.
-fn write_stream<R: Read>(reader: &mut R, out_path: &Path) -> Result<(u64, String), OrtRuntimeError> {
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
-            OrtRuntimeError::Io(tf!("onnx_runtime.download.extract_create_dir_error", parent = parent.display(), err = err))
-        })?;
-    }
-    let mut output = File::create(out_path).map_err(|err| {
-        OrtRuntimeError::Io(tf!("onnx_runtime.download.extract_create_file_error", out_path = out_path.display(), err = err))
-    })?;
-    let mut hashing = HashingWriter { inner: &mut output, hasher: Sha256::new() };
-    let size = std::io::copy(reader, &mut hashing).map_err(|err| {
-        OrtRuntimeError::Extraction(tf!("onnx_runtime.download.extract_element_error", out_path = out_path.display(), err = err))
-    })?;
-    let sha256 = hex_lower(&hashing.hasher.finalize());
-    output.sync_all().map_err(|err| {
-        OrtRuntimeError::Io(tf!("onnx_runtime.download.save_error", path = out_path.display(), err = err))
-    })?;
-    Ok((size, sha256))
-}
-
-/// A writer that hashes everything it forwards to `inner`.
-struct HashingWriter<'a> {
-    inner: &'a mut File,
-    hasher: Sha256,
-}
-
-impl Write for HashingWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let written = self.inner.write(buf)?;
-        // Only the bytes the file accepted are hashed; `io::copy` resubmits the rest.
-        self.hasher.update(&buf[..written]);
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-/// Lowercase hex form of a digest.
-fn hex_lower(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    // Both nibbles are < 16, so the indexing is always in bounds.
-    bytes.iter().flat_map(|byte| [DIGITS[usize::from(byte >> 4)], DIGITS[usize::from(byte & 0x0f)]]).map(char::from).collect()
-}
-
-/// Fsyncs directory `dir` so the renames / removals inside it are durable
-/// (`ms_atomic_file::sync_directory`: unix; a documented no-op elsewhere, where directory
-/// handles cannot be fsynced).
-///
-/// # Errors
-/// [`OrtRuntimeError::Io`] naming `dir` when the fsync fails.
-fn sync_dir(dir: &Path) -> Result<(), OrtRuntimeError> {
-    ms_atomic_file::sync_directory(dir).map_err(|err| OrtRuntimeError::Io(tf!("onnx_runtime.download.save_error", path = dir.display(), err = err)))
 }
 
 /// File name of a build cache directory's completion marker.
@@ -980,110 +637,6 @@ const CACHE_MARKER: &str = ".ort-cache-complete";
 
 /// First line of the completion marker: bump it when the marker's meaning changes.
 const CACHE_MARKER_FORMAT: &str = "ms-onnx-runtime cache v1";
-
-/// One library recorded in the completion marker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PublishedMember {
-    /// File name inside the cache directory.
-    file_name: String,
-    /// Exact byte size at publication.
-    size: u64,
-    /// Lowercase sha256 at publication (diagnostic; the fast path checks sizes only, so
-    /// a cached probe never hashes hundreds of MB).
-    sha256: String,
-}
-
-/// The recipe header of the completion marker for `entry`: format, build, version and
-/// every source's url + sha256 in fetch order. A marker is trusted only when it starts
-/// with exactly this text, so any manifest change (re-pin, version bump, new source)
-/// makes the cache stale.
-fn cache_recipe(build: &str, entry: &manifest::ManifestEntry) -> String {
-    let mut recipe = format!("{CACHE_MARKER_FORMAT}\nbuild {build}\nversion {}\n", entry.version);
-    for source in &entry.additional_sources {
-        recipe.push_str(&format!("source {} {}\n", source.url, source.sha256));
-    }
-    recipe.push_str(&format!("source {} {}\n", entry.url, entry.sha256));
-    recipe
-}
-
-/// The full marker: the recipe followed by one `member <name> <size> <sha256>` line per
-/// published library.
-fn cache_marker_text(recipe: &str, members: &[PublishedMember]) -> String {
-    let mut text = recipe.to_owned();
-    for member in members {
-        text.push_str(&format!("member {} {} {}\n", member.file_name, member.size, member.sha256));
-    }
-    text
-}
-
-/// Whether the cache in `dir` is complete for `recipe`: the marker exists, starts with
-/// exactly `recipe`, lists exactly the file names of `expected_members`, and each of them
-/// is a regular file of the recorded size. Every doubt (missing, unreadable or malformed
-/// marker) answers `false`, which rebuilds the cache.
-fn cache_complete(dir: &Path, recipe: &str, expected_members: &[PathBuf]) -> bool {
-    let marker_path = dir.join(CACHE_MARKER);
-    let text = match fs::read_to_string(&marker_path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(err) => {
-            runtime_log::log_warn(format!("{LOG_TAG} cannot read cache marker '{}' ({err}); rebuilding the cache", marker_path.display()));
-            return false;
-        }
-    };
-    let Some(members) = text.strip_prefix(recipe) else { return false };
-    let mut recorded: Vec<(&str, u64)> = Vec::new();
-    for line in members.lines() {
-        // `member <name> <size> <sha256>`; names never contain spaces (archive file names).
-        let mut fields = line.split(' ');
-        let (Some("member"), Some(name), Some(size), Some(_sha256), None) = (fields.next(), fields.next(), fields.next(), fields.next(), fields.next()) else {
-            return false;
-        };
-        let Ok(size) = size.parse::<u64>() else { return false };
-        recorded.push((name, size));
-    }
-    let mut expected: Vec<String> = expected_members.iter().filter_map(|path| path.file_name()).map(|name| name.to_string_lossy().into_owned()).collect();
-    expected.sort();
-    let mut recorded_names: Vec<&str> = recorded.iter().map(|(name, _)| *name).collect();
-    recorded_names.sort_unstable();
-    if expected.len() != expected_members.len() || recorded_names != expected {
-        return false;
-    }
-    recorded.iter().all(|(name, size)| fs::metadata(dir.join(name)).is_ok_and(|meta| meta.is_file() && meta.len() == *size))
-}
-
-/// Removes the completion marker of `dir` (if any) and fsyncs `dir`, so the removal is
-/// durable before any member is replaced.
-///
-/// # Errors
-/// [`OrtRuntimeError::Io`] when the marker exists but cannot be removed, or on the fsync.
-fn invalidate_cache_marker(dir: &Path) -> Result<(), OrtRuntimeError> {
-    let marker_path = dir.join(CACHE_MARKER);
-    match fs::remove_file(&marker_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(OrtRuntimeError::Io(tf!("onnx_runtime.download.remove_temp_error", partial_path = marker_path.display(), err = err)));
-        }
-    }
-    sync_dir(dir)
-}
-
-/// Publishes the completion marker `text` atomically through `ms_atomic_file` with
-/// `Durability::ContentsAndDirectory`: hidden sibling temp, fsync, rename (retried on Windows
-/// sharing violations), fsync of `dir`; the temp is removed on failure.
-///
-/// # Errors
-/// [`OrtRuntimeError::Io`] on any write, rename or fsync failure (the cache then stays
-/// untrusted and the next call rebuilds it).
-fn write_cache_marker(dir: &Path, text: &str) -> Result<(), OrtRuntimeError> {
-    let marker_path = dir.join(CACHE_MARKER);
-    ms_atomic_file::write_atomic(&marker_path, text.as_bytes(), ms_atomic_file::Durability::ContentsAndDirectory).map_err(|err| match err {
-        ms_atomic_file::AtomicWriteError::TempWrite { .. } | ms_atomic_file::AtomicWriteError::Rename { .. } => {
-            OrtRuntimeError::Io(tf!("onnx_runtime.download.write_error", path = marker_path.display(), err = err))
-        }
-        ms_atomic_file::AtomicWriteError::DirSync { .. } => OrtRuntimeError::Io(tf!("onnx_runtime.download.save_error", path = dir.display(), err = err)),
-    })
-}
 
 /// The onnxruntime library filename to place and return for this build target.
 ///
@@ -1137,6 +690,49 @@ fn emit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::fs;
+    use std::io::Write;
+
+    use ms_download::busy::BusyGuard;
+    use sha2::Digest;
+
+    // Golden, independent writers of the `ms-onnx-runtime cache v1` completion marker (the
+    // format a cache written by any earlier program version carries). The flow tests build
+    // markers with them, so a change of the format in `ms-native-package` fails here.
+
+    /// One library recorded in the completion marker.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PublishedMember {
+        file_name: String,
+        size: u64,
+        sha256: String,
+    }
+
+    /// The recipe header of the marker for `entry`: format, build, version and every source's
+    /// url + sha256 in fetch order (additional sources first).
+    fn cache_recipe(build: &str, entry: &manifest::ManifestEntry) -> String {
+        let mut recipe = format!("ms-onnx-runtime cache v1\nbuild {build}\nversion {}\n", entry.version);
+        for source in &entry.additional_sources {
+            recipe.push_str(&format!("source {} {}\n", source.url, source.sha256));
+        }
+        recipe.push_str(&format!("source {} {}\n", entry.url, entry.sha256));
+        recipe
+    }
+
+    /// The full marker: the recipe followed by one `member <name> <size> <sha256>` line per library.
+    fn cache_marker_text(recipe: &str, members: &[PublishedMember]) -> String {
+        let mut text = recipe.to_owned();
+        for member in members {
+            text.push_str(&format!("member {} {} {}\n", member.file_name, member.size, member.sha256));
+        }
+        text
+    }
+
+    /// Writes `text` as the completion marker of `dir`.
+    fn write_cache_marker(dir: &Path, text: &str) -> std::io::Result<()> {
+        fs::write(dir.join(CACHE_MARKER), text)
+    }
 
     #[test]
     fn ort_dylib_dir_has_provider_and_version_tail() {
@@ -1173,7 +769,7 @@ mod tests {
     fn member_file_name_flattens_and_rejects_empty() {
         assert_eq!(
             member_file_name("onnxruntime/capi/dxil.dll").expect("has filename"),
-            PathBuf::from("dxil.dll")
+            "dxil.dll"
         );
         // A root path has no filename component (a trailing slash, by contrast, is
         // stripped by `Path`, so `"bin/x64/"` would still yield `"x64"`).
@@ -1184,9 +780,10 @@ mod tests {
     }
 
     #[test]
-    fn expected_member_paths_covers_primary_extras_and_additional_sources() {
-        // Deserialize a multi-source entry and confirm the fast-path probe demands
-        // every library filename (primary + extras + additional-source members).
+    fn package_view_covers_primary_extras_and_additional_sources() {
+        // Deserialize a multi-source entry and confirm the package view demands every
+        // library filename (primary + extras + additional-source members), fetches the
+        // additional source first and publishes the primary library last.
         let json = r#"{
             "os": "windows", "arch": "x86_64", "provider": "example", "build": "example",
             "version": "9.9.9",
@@ -1205,20 +802,146 @@ mod tests {
         let entry: manifest::ManifestEntry =
             serde_json::from_str(json).expect("entry parses");
         let dir = Path::new("/cache");
-        let paths = expected_member_paths(dir, "primary.dll", &entry).expect("paths");
-        let names: HashSet<String> = paths
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let (names, archives, fields, last) = with_package("example", &entry, dir, |layout, recipe| {
+            assert_eq!(layout.dir, dir);
+            assert_eq!((layout.marker_file, layout.marker_format), (CACHE_MARKER, CACHE_MARKER_FORMAT));
+            let names: HashSet<String> = recipe.sources.iter().flat_map(|source| source.members.iter().map(|member| member.file_name.to_owned())).collect();
+            let archives: Vec<String> = recipe.sources.iter().map(|source| source.file_name.to_owned()).collect();
+            let fields: Vec<(String, String)> = recipe.fields.iter().map(|(key, value)| ((*key).to_owned(), (*value).to_owned())).collect();
+            let last = recipe.sources.last().and_then(|source| source.members.last()).map(|member| (member.archive_path.to_owned(), member.file_name.to_owned()));
+            (names, archives, fields, last)
+        })
+        .expect("package view");
         assert_eq!(
             names,
             HashSet::from([
-                "primary.dll".to_string(),
+                expected_primary_dylib_filename("9.9.9"),
                 "side.dll".to_string(),
                 "dxil.dll".to_string(),
             ])
         );
-        assert!(paths.iter().all(|p| p.starts_with(dir)));
+        assert_eq!(archives, vec!["extra.zip".to_owned(), "primary.zip".to_owned()]);
+        assert_eq!(fields, vec![("build".to_owned(), "example".to_owned()), ("version".to_owned(), "9.9.9".to_owned())]);
+        assert_eq!(last, Some(("lib/primary.dll".to_owned(), expected_primary_dylib_filename("9.9.9"))));
+    }
+
+    /// Every `tf!` / `t!` call site of an `onnx_runtime.*` key in this file, as
+    /// `(key, supplied argument names)`, read from the real source text (balanced
+    /// parentheses, string literals skipped), so the table cannot drift from the code.
+    fn localized_call_sites(source: &str) -> Vec<(String, Vec<String>)> {
+        let mut sites = Vec::new();
+        for (macro_name, takes_args) in [("tf!(", true), ("t!(", false)] {
+            let mut rest = source;
+            while let Some(found) = rest.find(macro_name) {
+                // `t!(` also matches the tail of `tf!(`'s neighbours like `wait!(`: require a
+                // non-identifier character before the macro name.
+                let before = rest[..found].chars().next_back();
+                let body_start = found + macro_name.len();
+                rest = &rest[body_start..];
+                if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let args = split_top_level_args(rest);
+                let Some(key) = args.first().and_then(|arg| arg.trim().strip_prefix('"')).and_then(|arg| arg.strip_suffix('"')) else { continue };
+                if !key.starts_with("onnx_runtime.") {
+                    continue;
+                }
+                let names: Vec<String> = if takes_args {
+                    args[1..].iter().filter_map(|arg| arg.split_once('=')).map(|(name, _)| name.trim().to_owned()).filter(|name| !name.is_empty()).collect()
+                } else {
+                    Vec::new()
+                };
+                sites.push((key.to_owned(), names));
+            }
+        }
+        sites
+    }
+
+    /// The top-level comma-separated arguments of a macro call whose body starts at `text`
+    /// (just after the opening parenthesis), up to the matching closing parenthesis.
+    fn split_top_level_args(text: &str) -> Vec<String> {
+        let mut args = vec![String::new()];
+        let mut depth = 0_u32;
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => {
+                    let current = args.last_mut().expect("args never empty");
+                    current.push(c);
+                    while let Some(inner) = chars.next() {
+                        current.push(inner);
+                        if inner == '\\' {
+                            if let Some(escaped) = chars.next() {
+                                current.push(escaped);
+                            }
+                        } else if inner == '"' {
+                            break;
+                        }
+                    }
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    args.last_mut().expect("args never empty").push(c);
+                }
+                ')' | ']' | '}' if depth == 0 => break,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    args.last_mut().expect("args never empty").push(c);
+                }
+                ',' if depth == 0 => args.push(String::new()),
+                _ => args.last_mut().expect("args never empty").push(c),
+            }
+        }
+        args.retain(|arg| !arg.trim().is_empty());
+        args
+    }
+
+    /// The `{name}` placeholders of a catalog text.
+    fn placeholders(text: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut rest = text;
+        while let Some(open) = rest.find('{') {
+            rest = &rest[open + 1..];
+            let Some(close) = rest.find('}') else { break };
+            let name = &rest[..close];
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                names.push(name.to_owned());
+            }
+            rest = &rest[close + 1..];
+        }
+        names
+    }
+
+    /// The placeholder contract of every localized text this crate renders: each call site
+    /// supplies EXACTLY the placeholders the catalog text of its key contains, in both required
+    /// locales (`en`, `ru`). Independent of rendering (test binaries have no active catalog, so
+    /// `tf!` there renders the bare key): the call sites come from this file's source, the
+    /// texts from the tracked catalogs.
+    #[test]
+    fn localized_call_sites_supply_exactly_the_catalog_placeholders() {
+        let sites = localized_call_sites(include_str!("lib.rs"));
+        let locales = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ms-i18n/locales");
+        for locale in ["en", "ru"] {
+            let path = locales.join(format!("{locale}.json"));
+            let text = fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            let catalog: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).expect("catalog is a JSON object");
+            for (key, supplied) in &sites {
+                let template = catalog.get(key).and_then(serde_json::Value::as_str).unwrap_or_else(|| panic!("{locale}: key {key} missing"));
+                let mut expected = placeholders(template);
+                expected.sort();
+                expected.dedup();
+                let mut supplied = supplied.clone();
+                supplied.sort();
+                supplied.dedup();
+                assert_eq!(supplied, expected, "{locale}: call site of {key} vs catalog text {template:?}");
+            }
+            // Every `onnx_runtime.download.*` / `onnx_runtime.error.*` text of the catalog has a call site here.
+            for key in catalog.keys().filter(|key| key.starts_with("onnx_runtime.download.") || key.starts_with("onnx_runtime.error.")) {
+                assert!(sites.iter().any(|(site, _)| site == key), "{locale}: no call site found for {key}");
+            }
+        }
+        // Sanity: the scan sees the production mapping (e.g. the publish frame's three arguments).
+        assert!(sites.iter().any(|(key, names)| key == "onnx_runtime.download.publish_member_error" && names.len() == 3), "{sites:?}");
     }
 
     #[test]
@@ -1592,25 +1315,171 @@ mod tests {
             assert!(offsets.is_empty(), "no request after the other holder finished");
         }
 
+        /// Compile-time guard of `map_package_error_covers_every_variant`: a new
+        /// `PackageError`, `PackageIoOp` or `UnpackError` variant breaks this match until
+        /// the table below gains its row.
+        fn table_row_name(err: &PackageError) -> &'static str {
+            match err {
+                PackageError::Cancelled => "cancelled",
+                PackageError::ChecksumMismatch { .. } => "checksum",
+                PackageError::Download { source, .. } if matches!(source.as_ref(), DownloadError::Io { .. }) => "download-io",
+                PackageError::Download { .. } => "download",
+                PackageError::Unpack { source, .. } => match source.as_ref() {
+                    UnpackError::OpenArchive { .. } => "unpack-open",
+                    UnpackError::ZipRead { .. } => "unpack-zip-read",
+                    UnpackError::ZipEntry { .. } => "unpack-zip-entry",
+                    UnpackError::ZstdOpen { .. } => "unpack-zstd",
+                    UnpackError::TarRead { .. } => "unpack-tar-read",
+                    UnpackError::TarEntry { .. } => "unpack-tar-entry",
+                    UnpackError::TarInvalidPath { .. } => "unpack-tar-path",
+                    UnpackError::CreateDir { .. } => "unpack-create-dir",
+                    UnpackError::CreateFile { .. } => "unpack-create-file",
+                    UnpackError::CopyMember { .. } => "unpack-copy",
+                    UnpackError::SyncFile { .. } => "unpack-sync",
+                    UnpackError::MemberMissing { .. } => "unpack-missing",
+                },
+                PackageError::Io { op, .. } => match op {
+                    PackageIoOp::CreateDir => "io-create-dir",
+                    PackageIoOp::CreateDownloadDir => "io-create-download-dir",
+                    PackageIoOp::RemovePart => "io-remove-part",
+                    PackageIoOp::WriteIdentity => "io-write-identity",
+                    PackageIoOp::RemoveMarker => "io-remove-marker",
+                    PackageIoOp::RemoveDir => "io-remove-dir",
+                },
+                PackageError::Publish { .. } => "publish",
+                PackageError::SyncDir { .. } => "sync-dir",
+                PackageError::WriteMarker { source, .. } => match source.as_ref() {
+                    ms_atomic_file::AtomicWriteError::TempWrite { .. } => "marker-temp",
+                    ms_atomic_file::AtomicWriteError::Rename { .. } => "marker-rename",
+                    ms_atomic_file::AtomicWriteError::DirSync { .. } => "marker-dir-sync",
+                },
+                PackageError::InvalidMemberPath { .. } => "invalid-member",
+                PackageError::InvalidFileName { .. } => "invalid-name",
+                PackageError::DuplicateFileName { .. } => "duplicate-name",
+            }
+        }
+
         #[test]
-        fn extraction_stages_every_member_before_publishing_any() {
-            let temp = tempfile::tempdir().expect("temp dir");
-            let zip_path = temp.path().join("fixture.zip");
-            fs::write(&zip_path, zip_bytes(&[("capi/onnxruntime.dll", b"primary".as_slice()), ("capi/dxil.dll", b"dxil".as_slice())])).expect("write zip");
-            let out = temp.path().join("out");
-
-            // One wanted member is absent: nothing may be published, no temporary left.
-            let incomplete = vec![("capi/dxil.dll".to_string(), out.join("dxil.dll")), ("capi/absent.dll".to_string(), out.join("absent.dll"))];
-            let err = extract_wanted(&zip_path, manifest::ArchiveKind::Zip, &incomplete).expect_err("missing member");
-            assert!(matches!(&err, OrtRuntimeError::DylibNotFoundInArchive(member) if member == "capi/absent.dll"), "{err:?}");
-            assert!(!out.join("dxil.dll").exists(), "a member was published before the set was complete");
-            assert_no_temporaries(&out);
-
-            let complete = vec![("capi/dxil.dll".to_string(), out.join("dxil.dll")), ("capi/onnxruntime.dll".to_string(), out.join("onnxruntime.dll"))];
-            extract_wanted(&zip_path, manifest::ArchiveKind::Zip, &complete).expect("extract");
-            assert_eq!(fs::read(out.join("onnxruntime.dll")).expect("primary"), b"primary");
-            assert_eq!(fs::read(out.join("dxil.dll")).expect("dxil"), b"dxil");
-            assert_no_temporaries(&out);
+        fn map_package_error_covers_every_variant() {
+            let io = || std::io::Error::other("os says no");
+            let p = |name: &str| PathBuf::from(format!("/cache/{name}"));
+            let dir_sync = || ms_atomic_file::AtomicWriteError::DirSync { dir: p(""), reason: "fsync".to_owned() };
+            let unpack = |source: UnpackError| PackageError::Unpack { archive: p(".download/a.zip"), source: Box::new(source) };
+            let rows: Vec<(PackageError, OrtRuntimeError)> = vec![
+                (PackageError::Cancelled, OrtRuntimeError::Cancelled),
+                (
+                    PackageError::ChecksumMismatch { url: "u".to_owned(), expected: "e".to_owned(), actual: "a".to_owned() },
+                    OrtRuntimeError::ChecksumMismatch { expected: "e".to_owned(), actual: "a".to_owned() },
+                ),
+                (
+                    PackageError::Download { url: "https://x/a.zip".to_owned(), source: Box::new(DownloadError::SizeMismatch { expected: 1, actual: 2 }) },
+                    OrtRuntimeError::Download(tf!("onnx_runtime.download.transfer_error", url = "https://x/a.zip", detail = DownloadError::SizeMismatch { expected: 1, actual: 2 })),
+                ),
+                (
+                    PackageError::Download { url: "u".to_owned(), source: Box::new(DownloadError::Io { path: p("x"), source: io() }) },
+                    OrtRuntimeError::Io(DownloadError::Io { path: p("x"), source: io() }.to_string()),
+                ),
+                (
+                    unpack(UnpackError::OpenArchive { path: p("a.zip"), source: io() }),
+                    OrtRuntimeError::Extraction(tf!("onnx_runtime.download.open_archive_error", archive_path = p("a.zip").display(), err = io())),
+                ),
+                (
+                    unpack(UnpackError::ZipRead { source: zip::result::ZipError::FileNotFound }),
+                    OrtRuntimeError::Extraction(tf!("onnx_runtime.download.zip_read_error", err = zip::result::ZipError::FileNotFound)),
+                ),
+                (
+                    unpack(UnpackError::ZipEntry { index: 7, source: zip::result::ZipError::FileNotFound }),
+                    OrtRuntimeError::Extraction(tf!("onnx_runtime.download.zip_entry_error", index = 7_usize, err = zip::result::ZipError::FileNotFound)),
+                ),
+                (unpack(UnpackError::ZstdOpen { source: io() }), OrtRuntimeError::Extraction(tf!("onnx_runtime.download.zstd_open_error", err = io()))),
+                (unpack(UnpackError::TarRead { source: io() }), OrtRuntimeError::Extraction(tf!("onnx_runtime.download.tar_read_error", err = io()))),
+                (unpack(UnpackError::TarEntry { source: io() }), OrtRuntimeError::Extraction(tf!("onnx_runtime.download.tar_entry_error", err = io()))),
+                (unpack(UnpackError::TarInvalidPath { source: io() }), OrtRuntimeError::Extraction(tf!("onnx_runtime.download.tar_invalid_path", err = io()))),
+                (
+                    unpack(UnpackError::CreateDir { path: p("d"), source: io() }),
+                    OrtRuntimeError::Io(tf!("onnx_runtime.download.extract_create_dir_error", parent = p("d").display(), err = io())),
+                ),
+                (
+                    unpack(UnpackError::CreateFile { path: p("f.tmp"), source: io() }),
+                    OrtRuntimeError::Io(tf!("onnx_runtime.download.extract_create_file_error", out_path = p("f.tmp").display(), err = io())),
+                ),
+                (
+                    unpack(UnpackError::CopyMember { path: p("f.tmp"), source: io() }),
+                    OrtRuntimeError::Extraction(tf!("onnx_runtime.download.extract_element_error", out_path = p("f.tmp").display(), err = io())),
+                ),
+                (
+                    unpack(UnpackError::SyncFile { path: p("f.tmp"), source: io() }),
+                    OrtRuntimeError::Io(tf!("onnx_runtime.download.save_error", path = p("f.tmp").display(), err = io())),
+                ),
+                (unpack(UnpackError::MemberMissing { member: "lib/x.so".to_owned() }), OrtRuntimeError::DylibNotFoundInArchive("lib/x.so".to_owned())),
+                (
+                    PackageError::Io { op: PackageIoOp::CreateDir, path: p(""), source: io() },
+                    OrtRuntimeError::Io(tf!("onnx_runtime.download.create_dir_error", dir = p("").display(), err = io())),
+                ),
+                (
+                    PackageError::Io { op: PackageIoOp::CreateDownloadDir, path: p(".download"), source: io() },
+                    OrtRuntimeError::Io(tf!("onnx_runtime.download.create_download_dir_error", download_dir = p(".download").display(), err = io())),
+                ),
+                (
+                    PackageError::Io { op: PackageIoOp::RemovePart, path: p("a.part"), source: io() },
+                    OrtRuntimeError::Io(tf!("onnx_runtime.download.remove_temp_error", partial_path = p("a.part").display(), err = io())),
+                ),
+                (
+                    PackageError::Io { op: PackageIoOp::WriteIdentity, path: p("a.part.id"), source: io() },
+                    OrtRuntimeError::Io(tf!("onnx_runtime.download.write_error", path = p("a.part.id").display(), err = io())),
+                ),
+                (
+                    PackageError::Io { op: PackageIoOp::RemoveMarker, path: p(CACHE_MARKER), source: io() },
+                    OrtRuntimeError::Io(tf!("onnx_runtime.download.remove_temp_error", partial_path = p(CACHE_MARKER).display(), err = io())),
+                ),
+                (
+                    PackageError::Io { op: PackageIoOp::RemoveDir, path: p(""), source: io() },
+                    OrtRuntimeError::Io(tf!("onnx_runtime.download.remove_temp_error", partial_path = p("").display(), err = io())),
+                ),
+                (
+                    PackageError::Publish { from: p("x.tmp"), to: p("x"), source: io() },
+                    OrtRuntimeError::Io(tf!("onnx_runtime.download.publish_member_error", from = p("x.tmp").display(), to = p("x").display(), err = io())),
+                ),
+                (PackageError::SyncDir { dir: p(""), source: Box::new(dir_sync()) }, OrtRuntimeError::Io(tf!("onnx_runtime.download.save_error", path = p("").display(), err = dir_sync()))),
+                (
+                    PackageError::WriteMarker {
+                        path: p(CACHE_MARKER),
+                        dir: p(""),
+                        source: Box::new(ms_atomic_file::AtomicWriteError::TempWrite { path: p(".tmp"), reason: "full".to_owned(), kind: std::io::ErrorKind::Other }),
+                    },
+                    OrtRuntimeError::Io(tf!(
+                        "onnx_runtime.download.write_error",
+                        path = p(CACHE_MARKER).display(),
+                        err = ms_atomic_file::AtomicWriteError::TempWrite { path: p(".tmp"), reason: "full".to_owned(), kind: std::io::ErrorKind::Other }
+                    )),
+                ),
+                (
+                    PackageError::WriteMarker {
+                        path: p(CACHE_MARKER),
+                        dir: p(""),
+                        source: Box::new(ms_atomic_file::AtomicWriteError::Rename { path: p(CACHE_MARKER), reason: "busy".to_owned(), kind: std::io::ErrorKind::Other }),
+                    },
+                    OrtRuntimeError::Io(tf!(
+                        "onnx_runtime.download.write_error",
+                        path = p(CACHE_MARKER).display(),
+                        err = ms_atomic_file::AtomicWriteError::Rename { path: p(CACHE_MARKER), reason: "busy".to_owned(), kind: std::io::ErrorKind::Other }
+                    )),
+                ),
+                (
+                    PackageError::WriteMarker { path: p(CACHE_MARKER), dir: p(""), source: Box::new(dir_sync()) },
+                    OrtRuntimeError::Io(tf!("onnx_runtime.download.save_error", path = p("").display(), err = dir_sync())),
+                ),
+                (PackageError::InvalidMemberPath { member: "/".to_owned() }, OrtRuntimeError::Extraction(tf!("onnx_runtime.download.invalid_member_path", member = "/"))),
+                (PackageError::InvalidFileName { name: "..".to_owned() }, OrtRuntimeError::Extraction(tf!("onnx_runtime.download.invalid_member_path", member = ".."))),
+                (PackageError::DuplicateFileName { name: "a.dll".to_owned() }, OrtRuntimeError::Extraction(tf!("onnx_runtime.download.invalid_member_path", member = "a.dll"))),
+            ];
+            let names: HashSet<&str> = rows.iter().map(|(err, _)| table_row_name(err)).collect();
+            assert_eq!(names.len(), rows.len(), "every row covers a distinct variant");
+            assert_eq!(names.len(), 30, "one row per PackageError / PackageIoOp / UnpackError / marker-write variant (+ Download Io)");
+            for (err, expected) in rows {
+                let name = table_row_name(&err);
+                assert_eq!(format!("{:?}", map_package_error(err)), format!("{expected:?}"), "row {name}");
+            }
         }
 
         #[test]
@@ -1619,6 +1488,228 @@ mod tests {
             assert!(matches!(map_download_error("u", DownloadError::HashMismatch { expected: "a".into(), actual: "b".into() }), OrtRuntimeError::ChecksumMismatch { .. }));
             assert!(matches!(map_download_error("u", DownloadError::SizeMismatch { expected: 1, actual: 2 }), OrtRuntimeError::Download(_)));
             assert!(matches!(map_download_error("u", DownloadError::Archive { detail: "x".into() }), OrtRuntimeError::Extraction(_)));
+        }
+
+        // ---- Characterization (golden) tests: they pin the on-disk bytes, the progress
+        // sequence, the busy key and the localized error keys of the resolver, so the
+        // extraction of its transaction into `ms-native-package` is provably behaviour-
+        // preserving. Expected texts are spelled out literally (or through the same `tf!`
+        // key + placeholders), never through the code under test.
+
+        const PRIMARY_URL: &str = "https://example.invalid/ort-test.zip";
+        const EXTRA_URL: &str = "https://example.invalid/ort-extra.zip";
+
+        /// A row with one additional source (the same scripted body under another URL; its
+        /// member is the archive's README).
+        fn two_source_entry(body: &[u8]) -> manifest::ManifestEntry {
+            let sha = sha_hex(body);
+            let json = serde_json::json!({
+                "os": "linux", "arch": "x86_64", "provider": "cpu", "build": "test",
+                "version": VERSION,
+                "url": PRIMARY_URL, "sha256": sha, "size": body.len(), "archive": "zip",
+                "dylib_member": PRIMARY_MEMBER,
+                "extra_members": [SIDE_MEMBER],
+                "additional_sources": [
+                    { "url": EXTRA_URL, "sha256": sha, "size": body.len(), "archive": "zip", "members": ["pkg/README"] }
+                ]
+            });
+            serde_json::from_value(json).expect("two-source entry parses")
+        }
+
+        /// Stages with consecutive duplicates removed (byte-progress repeats collapse).
+        fn stage_sequence(updates: &[OrtDownloadProgress]) -> Vec<OrtDownloadStage> {
+            let mut stages: Vec<OrtDownloadStage> = updates.iter().map(|update| update.stage).collect();
+            stages.dedup();
+            stages
+        }
+
+        /// Sorted file names inside `dir`.
+        fn sorted_names(dir: &Path) -> Vec<String> {
+            let mut names: Vec<String> = fs::read_dir(dir).expect("list dir").map(|item| item.expect("dir entry").file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        }
+
+        #[test]
+        fn golden_marker_bytes_two_sources() {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let (body, primary) = archive(1000);
+            let entry = two_source_entry(&body);
+            let fetcher = ScriptedFetcher::new(&body, &[]);
+            resolve(&fetcher, &policy(0), &AtomicBool::new(false), "test-golden", &entry, temp.path(), &mut Vec::new()).expect("resolves");
+            // Fetch order: additional sources first, the primary archive last.
+            assert_eq!(fetcher.urls(), vec![EXTRA_URL.to_owned(), PRIMARY_URL.to_owned()]);
+            let sha = sha_hex(&body);
+            let expected = format!(
+                "ms-onnx-runtime cache v1\nbuild test-golden\nversion 9.9.9\nsource {EXTRA_URL} {sha}\nsource {PRIMARY_URL} {sha}\nmember README 4 {}\nmember side.so 4 {}\nmember libonnxruntime.so.9.9.9 1000 {}\n",
+                sha_hex(b"skip"),
+                sha_hex(b"side"),
+                sha_hex(&primary)
+            );
+            assert_eq!(fs::read_to_string(temp.path().join(".ort-cache-complete")).expect("marker"), expected);
+        }
+
+        #[test]
+        fn golden_part_identity_bytes() {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let (body, _) = archive(1_600_000);
+            let entry = entry_for(&body, None);
+            let fetcher = ScriptedFetcher::new(&body, &[]);
+            let cancel = AtomicBool::new(false);
+            let retry = policy(0);
+            let env = DownloadEnv { fetcher: &fetcher, retry: &retry, cancel: &cancel };
+            let err = resolve_download_entry(&env, "test-identity", &entry, temp.path(), &mut |update| {
+                if update.stage == OrtDownloadStage::Downloading && update.downloaded > 0 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            })
+            .expect_err("cancelled");
+            assert!(matches!(err, OrtRuntimeError::Cancelled), "{err:?}");
+            let identity = fs::read(download_dir(temp.path()).join("ort-test.zip.part.id")).expect("identity");
+            assert_eq!(identity, format!("{PRIMARY_URL}\n{}\n", sha_hex(&body)).into_bytes());
+            assert_eq!(sorted_names(&download_dir(temp.path())), vec!["ort-test.zip.part".to_owned(), "ort-test.zip.part.id".to_owned()]);
+        }
+
+        #[test]
+        fn golden_stage_sequence_fresh_download() {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let (body, _) = archive(1000);
+            let entry = entry_for(&body, None);
+            let mut updates = Vec::new();
+            resolve(&ScriptedFetcher::new(&body, &[]), &policy(0), &AtomicBool::new(false), "test-stages", &entry, temp.path(), &mut updates).expect("resolves");
+            assert_eq!(stage_sequence(&updates), vec![OrtDownloadStage::Probing, OrtDownloadStage::Downloading, OrtDownloadStage::Extracting, OrtDownloadStage::Done]);
+            // Byte counters: Downloading reports staged / pinned size; the others report nothing.
+            assert!(updates.iter().filter(|update| update.stage != OrtDownloadStage::Downloading).all(|update| update.downloaded == 0 && update.total.is_none()), "{updates:?}");
+            assert_eq!(updates.iter().rev().find(|update| update.stage == OrtDownloadStage::Downloading).map(|update| (update.downloaded, update.total)), Some((chunk_u64(body.len()), Some(chunk_u64(body.len())))));
+
+            // The fast path: Probing then Done, nothing else.
+            let mut cached = Vec::new();
+            resolve(&ScriptedFetcher::new(&body, &[]), &policy(0), &AtomicBool::new(false), "test-stages", &entry, temp.path(), &mut cached).expect("cached");
+            assert_eq!(stage_sequence(&cached), vec![OrtDownloadStage::Probing, OrtDownloadStage::Done]);
+        }
+
+        #[test]
+        fn golden_stage_sequence_resume_hashes_the_prefix() {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let (body, _) = archive(4000);
+            let entry = entry_for(&body, None);
+            resolve(&ScriptedFetcher::new(&body, &[Step::Drop(1500)]), &policy(0), &AtomicBool::new(false), "test-stages-resume", &entry, temp.path(), &mut Vec::new()).expect_err("dropped");
+            let mut updates = Vec::new();
+            resolve(&ScriptedFetcher::new(&body, &[]), &policy(0), &AtomicBool::new(false), "test-stages-resume", &entry, temp.path(), &mut updates).expect("resumes");
+            assert_eq!(
+                stage_sequence(&updates),
+                vec![OrtDownloadStage::Probing, OrtDownloadStage::Verifying, OrtDownloadStage::Downloading, OrtDownloadStage::Extracting, OrtDownloadStage::Done]
+            );
+            assert!(updates.iter().any(|update| update.stage == OrtDownloadStage::Verifying && update.downloaded == 1500 && update.total == Some(1500)), "{updates:?}");
+        }
+
+        #[test]
+        fn golden_cache_listing_after_success() {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let (body, _) = archive(1000);
+            let entry = two_source_entry(&body);
+            resolve(&ScriptedFetcher::new(&body, &[]), &policy(0), &AtomicBool::new(false), "test-listing", &entry, temp.path(), &mut Vec::new()).expect("resolves");
+            assert_eq!(
+                sorted_names(temp.path()),
+                vec![".download".to_owned(), ".ort-cache-complete".to_owned(), "README".to_owned(), "libonnxruntime.so.9.9.9".to_owned(), "side.so".to_owned()]
+            );
+            assert!(sorted_names(&download_dir(temp.path())).is_empty());
+        }
+
+        #[test]
+        fn busy_key_is_ort_build_version() {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let dir = temp.path().to_path_buf();
+            let (body, _) = archive(1000);
+            let entry = entry_for(&body, None);
+            let holder = BusyGuard::try_acquire("ort:test-busy-key:9.9.9").expect("key free");
+            let cancel = std::sync::Arc::new(AtomicBool::new(false));
+            let (stage_tx, stage_rx) = std::sync::mpsc::channel();
+            let worker_cancel = std::sync::Arc::clone(&cancel);
+            let worker = std::thread::spawn(move || {
+                let fetcher = ScriptedFetcher::new(&body, &[]);
+                let retry = policy(0);
+                let env = DownloadEnv { fetcher: &fetcher, retry: &retry, cancel: &worker_cancel };
+                // A send fails only once the test stopped listening; the stage is then moot.
+                let result = resolve_download_entry(&env, "test-busy-key", &entry, &dir, &mut |update| {
+                    stage_tx.send(update.stage).ok();
+                });
+                (result, fetcher.offsets())
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let stage = stage_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).expect("worker reports waiting");
+                if stage == OrtDownloadStage::WaitingForOtherDownload {
+                    break;
+                }
+            }
+            cancel.store(true, Ordering::Relaxed);
+            let (result, offsets) = worker.join().expect("worker thread");
+            assert!(matches!(result, Err(OrtRuntimeError::Cancelled)), "{result:?}");
+            assert!(offsets.is_empty(), "no request while the key was held");
+            drop(holder);
+        }
+
+        /// Asserts that `text` is `template` rendered with one unknown `detail` part that
+        /// contains `needle` (`template` renders the sentinel `@@DETAIL@@` in its place). A
+        /// test binary has no active catalog, so `tf!` renders the bare key (no placeholders):
+        /// then `text` must be exactly that key.
+        fn assert_frame(text: &str, template: &str, needle: &str) {
+            let Some((prefix, suffix)) = template.split_once("@@DETAIL@@") else {
+                assert_eq!(text, template);
+                return;
+            };
+            assert!(text.starts_with(prefix) && text.ends_with(suffix), "{text:?} does not match frame {template:?}");
+            let middle = &text[prefix.len()..text.len() - suffix.len()];
+            assert!(middle.contains(needle), "{middle:?} lacks {needle:?}");
+        }
+
+        #[test]
+        fn error_mapping_golden() {
+            // No manifest row: typed, before any I/O.
+            let err = resolve_or_download_ort_dylib("no-such-build", &AtomicBool::new(false), &mut |_| {}).expect_err("no row");
+            assert!(matches!(&err, OrtRuntimeError::NoManifestEntry { build, .. } if build == "no-such-build"), "{err:?}");
+            let (os, arch) = manifest::current_platform();
+            assert_eq!(err.to_string(), tf!("onnx_runtime.error.no_manifest_entry", os = os, arch = arch, build = "no-such-build"));
+
+            // Hash mismatch.
+            let temp = tempfile::tempdir().expect("temp dir");
+            let (body, _) = archive(1000);
+            let zeros = "0".repeat(64);
+            let err = resolve(&ScriptedFetcher::new(&body, &[]), &policy(0), &AtomicBool::new(false), "test-err-hash", &entry_for(&body, Some(&zeros)), temp.path(), &mut Vec::new()).expect_err("mismatch");
+            assert!(matches!(&err, OrtRuntimeError::ChecksumMismatch { expected, actual } if *expected == zeros && *actual == sha_hex(&body)), "{err:?}");
+            assert_eq!(err.to_string(), tf!("onnx_runtime.error.checksum_mismatch", expected = zeros, actual = sha_hex(&body)));
+
+            // A wanted member absent from the archive: the first missing one in publish order.
+            let temp = tempfile::tempdir().expect("temp dir");
+            let mut absent = entry_for(&body, None);
+            absent.dylib_member = "pkg/lib/absent.bin".to_owned();
+            let err = resolve(&ScriptedFetcher::new(&body, &[]), &policy(0), &AtomicBool::new(false), "test-err-member", &absent, temp.path(), &mut Vec::new()).expect_err("member missing");
+            assert!(matches!(&err, OrtRuntimeError::DylibNotFoundInArchive(member) if member == "pkg/lib/absent.bin"), "{err:?}");
+            assert_eq!(err.to_string(), tf!("onnx_runtime.error.dylib_not_found", member = "pkg/lib/absent.bin"));
+            assert!(!temp.path().join("side.so").exists(), "nothing is published when a member is missing");
+
+            // HTTP 404: the transfer frame names the url and the engine's detail.
+            let temp = tempfile::tempdir().expect("temp dir");
+            let err = resolve(&ScriptedFetcher::new(&body, &[Step::Status(404, None)]), &policy(0), &AtomicBool::new(false), "test-err-404", &entry_for(&body, None), temp.path(), &mut Vec::new()).expect_err("404");
+            let OrtRuntimeError::Download(detail) = &err else { panic!("expected Download, got {err:?}") };
+            assert_frame(detail, &tf!("onnx_runtime.download.transfer_error", url = PRIMARY_URL, detail = "@@DETAIL@@"), "404");
+            assert_eq!(err.to_string(), tf!("onnx_runtime.error.download", detail = detail));
+
+            // Cancel before anything: the busy wait sees the flag.
+            let temp = tempfile::tempdir().expect("temp dir");
+            let err = resolve(&ScriptedFetcher::new(&body, &[]), &policy(0), &AtomicBool::new(true), "test-err-cancel", &entry_for(&body, None), temp.path(), &mut Vec::new()).expect_err("cancelled");
+            assert!(matches!(err, OrtRuntimeError::Cancelled), "{err:?}");
+            assert_eq!(err.to_string(), t!("onnx_runtime.error.cancelled"));
+
+            // A verified archive that is not a zip: the zip-read key with the reader's error.
+            let temp = tempfile::tempdir().expect("temp dir");
+            let junk = b"definitely not a zip archive".to_vec();
+            let err = resolve(&ScriptedFetcher::new(&junk, &[]), &policy(0), &AtomicBool::new(false), "test-err-zip", &entry_for(&junk, None), temp.path(), &mut Vec::new()).expect_err("not a zip");
+            let zip_err = zip::ZipArchive::new(std::io::Cursor::new(junk.clone())).expect_err("junk is not a zip");
+            let expected_detail = tf!("onnx_runtime.download.zip_read_error", err = zip_err);
+            assert!(matches!(&err, OrtRuntimeError::Extraction(detail) if *detail == expected_detail), "{err:?}");
+            assert_eq!(err.to_string(), tf!("onnx_runtime.error.extraction", detail = expected_detail));
         }
     }
 }

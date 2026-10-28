@@ -34,7 +34,8 @@ holds no state between calls: process-global services it starts (AI backend supe
   re-opens the log).
 - `services.rs`: `init_full`, the ONE owner of the startup-order contract (its doc comment lists
   rules (a)-(f)), returning `ProcessServices` (user-settings snapshot, `LocalAiAvailability`,
-  `LauncherHost`); `ProcessServices::start_ai_backend_supervisor`, the one construction of the
+  `LauncherHost`) and installing the same `LocalAiAvailability` process-wide
+  (`ms_local_ai::local_ai::install_process`, its only caller); `ProcessServices::start_ai_backend_supervisor`, the one construction of the
   AI backend supervisor with the storage-conversion autostart gate. The config-driven steps are
   data (`PRE_SETTINGS_STEPS`, `SETTINGS_STEPS`) that `init_full` iterates.
 - `routing.rs`: where the main window starts (`StartPlan`, `resolve_start`, CLI project / image
@@ -70,6 +71,7 @@ process-wide side effects that run before the mode's own action (`log` = session
 |---|---|---|---|---|
 | 1 | `Service(UsageError)` | `args::conflicting_installed_copy_flags` / `conflicting_image_flags` / `conflicting_project_flags` non-empty, or `args::windows_only_flags` off Windows | log (unless `--system-registration-apply`), probe | exit 2 |
 | 2 | `Service(RegistrationHelper)` | `--system-registration-apply` (+ result), every OS | probe | exit with the helper's code (off Windows: 2) |
+| 2b | `Service(SdCppWorker)` | `--sdcpp-worker` (started only by the app's sd.cpp client) | nothing | exit with `ms_sdcpp::worker::run_worker_main`'s code (Android: error) |
 | 3 | `Service(WindowsStartMenuShortcut)` | `--create-start-menu-shortcut-install-dir` (Windows; rejected at 1 elsewhere) | log, min | return |
 | 4 | `Service(WindowsUninstall)` | `--uninstall` (Windows; rejected at 1 elsewhere) | log, min | return |
 | 5 | `Service(CheckVenv)` | `--check-venv` | log, min, full | exit 0 / 1 |
@@ -79,7 +81,7 @@ process-wide side effects that run before the mode's own action (`log` = session
 | 9 | `Main(Main)` | default (startup prompts, launcher, `--project`, images) | log, min, full, preludes | return / launcher-requested update |
 
 No flag is dropped silently: a Windows-only service flag on another OS, and `--project` (like an
-image) with `--check-venv` / `--test-launcher`, are usage errors; a self-update without
+image) with `--check-venv` / `--test-launcher` / `--sdcpp-worker`, are usage errors; a self-update without
 `InstalledCopyManagement` is refused exactly like a launcher-requested one
 (`routing::run_launcher_requested_update`: logged, no window; the CLI refusal also prints one
 localized stderr line). Each rule has named rows in
@@ -91,7 +93,9 @@ Startup order in `run_native` (each step's position is load-bearing; the match a
 the prefix their mode needs, see "Run modes"):
 1. CLI parse; session-log init (skipped for the system-registration helper: the init rotates
    `last.log` while the launcher that started the helper still writes it; the helper's outcomes
-   reach the log through the launcher, which logs every result-file entry).
+   reach the log through the launcher, which logs every result-file entry. Skipped for the
+   sd.cpp worker for the same reason: the app that started it owns the log, and the worker's
+   stderr reaches it through the client's drain thread).
 2. Usage error (`decide`'s first rule, reported by `exit_with_usage_error`): before any other
    action, because several service flags act on an installed copy immediately.
    `--ignore-installed` with a flag that manages an installed copy (`args::INSTALLED_COPY_FLAGS` — visible `--update` and the hidden

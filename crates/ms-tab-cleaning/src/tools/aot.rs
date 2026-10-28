@@ -28,7 +28,7 @@ use ms_backend_ipc::{self as backend_ipc, CallError};
 use ms_canvas::CanvasView;
 use ms_project::ProjectData;
 use ms_local_ai::backend_health::ai_backend_offline_error;
-use ms_widgets::WheelSlider;
+use ms_widgets::{AiRequirement, WheelSlider};
 use ms_config as config;
 use ms_sysprobe::ai_models::{self, EnsureCtx, ModelEnsureError};
 use eframe::egui;
@@ -135,8 +135,8 @@ impl CleaningTool for AotInpaintTool {
         t!("cleaning.tools.aot.title")
     }
 
-    fn pytorch_required(&self) -> bool {
-        true
+    fn ai_requirement(&self) -> Option<AiRequirement> {
+        Some(AiRequirement::Torch)
     }
 
     fn deactivate(&mut self, _canvas: &mut CanvasView) {

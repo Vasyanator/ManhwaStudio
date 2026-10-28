@@ -9,6 +9,10 @@ module, whose siblings draw the individual blocks it calls into.
 Main responsibilities:
 - own `Flux2PanelCtx`: everything the panel may read or mutate, borrowed for exactly one
   frame, with the intents the controls raise travelling back as plain flags;
+- draw the PyTorch / Stable-Diffusion.cpp switch at the top (`draw_runtime_switch`, the shared
+  widget) and, on sd.cpp, the body without its PyTorch-only parts plus the sd.cpp readiness
+  line (`draw_sdcpp_readiness_line`) and the «Stable-Diffusion.cpp» section
+  (`draw_sdcpp_section`) in place of «Память и скорость»;
 - draw the body in its designed ORDER: the prompt block (field, preset name with
   «Кэшировать» / «Переименовать», the cache line, the two unfolding toggles; the library fold
   holds the shared preset picker, «Экспорт» and «Импорт» — all of it the shared prompt-cache
@@ -24,7 +28,7 @@ Main responsibilities:
   effect (download mode, either variant); manual mode passes none.
 
 Key structures:
-- `Flux2PanelCtx`
+- `Flux2PanelCtx`, `Flux2SdcppPanel` (the sd.cpp facts of one frame)
 
 Key functions:
 - `Flux2PanelCtx::draw()` and the per-block methods it calls
@@ -203,6 +207,33 @@ pub(super) struct Flux2PanelCtx<'a> {
     pub(super) bundle_missing: bool,
     /// The catalog download block's click this frame (download / verify / cancel).
     pub(super) catalog_action: &'a mut ModelDownloadAction,
+    /// The runtime switch and the Stable-Diffusion.cpp blocks.
+    pub(super) sdcpp: Flux2SdcppPanel<'a>,
+}
+
+/// What the panel needs of Stable-Diffusion.cpp for one frame.
+pub(super) struct Flux2SdcppPanel<'a> {
+    /// Whether the runtime switch is drawn: this process can run sd.cpp (the shared
+    /// `sdcpp_route_available`), or the settings select it (so a user can always switch back).
+    pub(super) offered: bool,
+    /// An sd.cpp run of this engine is in flight (either stage) or a cancelled one still ends:
+    /// «Выгрузить модель» is closed meanwhile (an unload sent before the job starts would be
+    /// lost: the service clears the request when a generation begins).
+    pub(super) run_busy: bool,
+    /// Why the switch is closed right now ([`flux2_runtime_switch_block_reason`]).
+    pub(super) switch_blocked: Option<&'a str>,
+    /// Why the PyTorch side alone is closed (PyTorch unavailable, `pytorch_unavailable_reason`).
+    pub(super) pytorch_unavailable: Option<&'static str>,
+    /// The process-global sd.cpp status snapshot.
+    pub(super) status: &'a ms_sdcpp::SdCppStatus,
+    /// The `--no-ai` / platform gate of the sd.cpp route.
+    pub(super) local: Result<(), LocalAiOff>,
+    /// The saved sd.cpp device as the status worker last read it.
+    pub(super) device: Option<&'a ms_config::SdCppDeviceChoice>,
+    /// The files sd.cpp would load for the current settings; `None` while being resolved.
+    pub(super) files: Option<&'a Result<ms_sdcpp::ModelFiles, Flux2SdcppFilesError>>,
+    /// Set when «Выгрузить модель» was pressed.
+    pub(super) unload_requested: &'a mut bool,
 }
 
 impl Flux2PanelCtx<'_> {
@@ -225,28 +256,100 @@ impl Flux2PanelCtx<'_> {
     /// every frame; that is the inversion this order exists to undo.
     pub(super) fn draw(&mut self, ui: &mut egui::Ui, region: Option<[usize; 2]>) {
         self.draw_settings_problem(ui);
+        // At the TOP, above the prompt: the runtime decides which of the blocks below exist.
+        self.draw_runtime_switch(ui);
         self.draw_prompt(ui);
         self.draw_strength(ui);
-        // Handed in, not derived: the readiness line reports it and the setup section
-        // decides its INITIAL open state from it, and the run gate answers the same
-        // question — two derivations could disagree, and only the engine holds the paths
-        // the catalog was asked about.
-        let readiness = self.readiness;
-        // Pressed THIS frame, and the section below is drawn after — so «Установить» opens
-        // it without a session flag and without forcing it open on any later frame.
-        let install_requested = self.draw_readiness(ui, readiness);
-        self.draw_install_section(ui, region, readiness, install_requested);
-        self.draw_memory_section(ui);
-        // Read before the `&mut` borrow of the settings, and derived by the same pure
-        // decision the tests assert: only a positive `guidance_supported: false` closes the
-        // dial, so a backend that never reports the field leaves it exactly as it was.
-        let guidance_supported = flux2_guidance_supported(self.status);
-        draw_advanced_section(ui, self.settings, guidance_supported, self.settings_changed);
+        match self.settings.runtime() {
+            ImageEditRuntime::PyTorch => {
+                // Handed in, not derived: the readiness line reports it and the setup section
+                // decides its INITIAL open state from it, and the run gate answers the same
+                // question — two derivations could disagree, and only the engine holds the paths
+                // the catalog was asked about.
+                let readiness = self.readiness;
+                // Pressed THIS frame, and the section below is drawn after — so «Установить» opens
+                // it without a session flag and without forcing it open on any later frame.
+                let install_requested = self.draw_readiness(ui, readiness);
+                self.draw_install_section(ui, region, readiness, install_requested);
+                self.draw_memory_section(ui);
+                // Read before the `&mut` borrow of the settings, and derived by the same pure
+                // decision the tests assert: only a positive `guidance_supported: false` closes the
+                // dial, so a backend that never reports the field leaves it exactly as it was.
+                let guidance_supported = flux2_guidance_supported(self.status);
+                draw_advanced_section(ui, self.settings, guidance_supported, self.settings_changed);
+            }
+            // PyTorch-only blocks are hidden, not faked: no forecast, no component list, no
+            // dtype / fp8 / guidance. The sd.cpp options take the place of «Память и скорость».
+            ImageEditRuntime::SdCpp => {
+                self.draw_sdcpp_readiness_line(ui);
+                // `Unknown` never seeds the fold open: the sd.cpp line above carries the verdict.
+                self.draw_install_section(ui, region, Flux2ModelReadiness::Unknown, false);
+                self.draw_sdcpp_section(ui);
+                draw_advanced_section(ui, self.settings, true, self.settings_changed);
+            }
+        }
         draw_flux2_mask_hint(ui);
         // LAST, by the shared section's contract: it docks at the bottom of the body's free
         // room. The values are the host's live post-process (`AiEngine::postprocess_settings`),
         // so an edit here re-derives a pending result without a new run.
         *self.postprocess_changed |= draw_postprocess_section(ui, "cleaning_flux2_klein", &mut self.settings.postprocess);
+    }
+
+    /// Draws the PyTorch / Stable-Diffusion.cpp switch (the shared `draw_runtime_switch`), only
+    /// where sd.cpp is offered. A flip stores the runtime and raises the settings change; the
+    /// engine re-arms what the runtime decides (`note_runtime_changed`).
+    pub(super) fn draw_runtime_switch(&mut self, ui: &mut egui::Ui) {
+        if !self.sdcpp.offered {
+            return;
+        }
+        let mut runtime = self.settings.runtime();
+        if draw_runtime_switch(ui, &mut runtime, self.sdcpp.switch_blocked, self.sdcpp.pytorch_unavailable, "cleaning_flux2_klein_runtime") {
+            *self.settings_changed |= self.settings.set_runtime(runtime);
+        }
+    }
+
+    /// The sd.cpp counterpart of the readiness line: the runtime's readiness (the shared
+    /// `draw_sdcpp_readiness`), the model files' state, and the refresh button (re-resolves the
+    /// files and refreshes the runtime status).
+    pub(super) fn draw_sdcpp_readiness_line(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        draw_sdcpp_readiness(ui, self.sdcpp.status, self.sdcpp.local, self.sdcpp.device);
+        ui.horizontal_wrapped(|ui| {
+            match self.sdcpp.files {
+                None => {
+                    ui.small(t!("cleaning.tools.flux2_klein.sdcpp_files_checking_status"));
+                }
+                Some(Err(err)) => {
+                    ui.colored_label(ms_theme::status::WARNING, err.message());
+                }
+                Some(Ok(_)) => {
+                    ui.colored_label(ms_theme::status::SUCCESS, t!("cleaning.tools.flux2_klein.sdcpp_files_ready_status"));
+                }
+            }
+            if ui
+                .small_button(t!("cleaning.tools.flux2_klein.refresh_state_button"))
+                .on_hover_text(t!("cleaning.tools.flux2_klein.sdcpp_refresh_hint"))
+                .clicked()
+            {
+                // The refresh intent (not `want_status`, which every prompt keystroke raises).
+                *self.want_forecast = true;
+            }
+        });
+    }
+
+    /// «Stable-Diffusion.cpp»: the engine's sd.cpp options (the shared `draw_sdcpp_options`) and
+    /// «Выгрузить модель». Closed by default, like «Память и скорость» it replaces.
+    pub(super) fn draw_sdcpp_section(&mut self, ui: &mut egui::Ui) {
+        let options = &mut self.settings.sdcpp;
+        let changed = &mut *self.settings_changed;
+        let unload_requested = &mut *self.sdcpp.unload_requested;
+        let unload_open = self.sdcpp.status.worker_running && !self.sdcpp.run_busy;
+        RegionEditToolBase::draw_region_editor_collapsible_section(ui, "cleaning_flux2_klein_sdcpp", t!("cleaning.tools.sdcpp.options_heading"), false, |ui| {
+            *changed |= draw_sdcpp_options(ui, options, "cleaning_flux2_klein_sdcpp_options");
+            if draw_sdcpp_unload_button(ui, unload_open) {
+                *unload_requested = true;
+            }
+        });
     }
 
     /// Draws what is wrong with the settings file, when something is: a write that failed
@@ -327,10 +430,15 @@ impl Flux2PanelCtx<'_> {
         // and also waives the encoder in the run gate, so this is everyday information.
         let line = prompt_cache_line(hit.map(|text| &text.selected), self.prompt_cache_status_entry, self.prompt_cache_state, text_encoder_available, &flux2_encoder_caption);
         let notes = self.prompt_library_notes();
-        if let Some(action) = draw_cache_row(ui, &mut self.prompt_cache_view(&gates, &notes)) {
-            *self.prompt_cache_action = Some(action);
+        // The prompt library is the Python backend's: on Stable-Diffusion.cpp the cache row,
+        // its line and the library are not drawn (sd.cpp encodes the prompt on every run).
+        let pytorch = self.settings.runtime() == ImageEditRuntime::PyTorch;
+        if pytorch {
+            if let Some(action) = draw_cache_row(ui, &mut self.prompt_cache_view(&gates, &notes)) {
+                *self.prompt_cache_action = Some(action);
+            }
+            draw_prompt_cache_line(ui, &line);
         }
-        draw_prompt_cache_line(ui, &line);
 
         ui.horizontal_wrapped(|ui| {
             *self.settings_changed |= ui
@@ -340,13 +448,15 @@ impl Flux2PanelCtx<'_> {
                 )
                 .on_hover_text(t!("cleaning.tools.flux2_klein.translate_prompt_hint"))
                 .changed();
-            draw_prompt_library_toggle(ui, &mut self.prompt_cache.library_open);
+            if pytorch {
+                draw_prompt_library_toggle(ui, &mut self.prompt_cache.library_open);
+            }
         });
 
         if self.settings.translate_prompt {
             self.draw_translator(ui);
         }
-        if self.prompt_cache.library_open {
+        if pytorch && self.prompt_cache.library_open {
             let output = draw_prompt_cache_library(ui, &mut self.prompt_cache_view(&gates, &notes));
             if output.prompt_changed {
                 self.note_prompt_changed();
@@ -673,7 +783,11 @@ impl Flux2PanelCtx<'_> {
                 // the state the sentence explains. The backend holds ONE pipeline keyed by
                 // the component paths, so running the other variant unloads this one; this
                 // side orchestrates nothing and only says so.
-                ui.small(t!("cleaning.tools.flux2_klein.variant_residency_hint"));
+                let sdcpp = settings.runtime() == ImageEditRuntime::SdCpp;
+                // About the backend's ONE pipeline: meaningless on Stable-Diffusion.cpp.
+                if !sdcpp {
+                    ui.small(t!("cleaning.tools.flux2_klein.variant_residency_hint"));
+                }
                 // The switch sits ABOVE everything it governs: exactly one of the two
                 // bodies below is drawn, and the user has to see which one he is in before
                 // he reads it.
@@ -778,6 +892,11 @@ impl Flux2PanelCtx<'_> {
                     ),
                 }
 
+                // The component list and «Выгрузить» are the Python backend's residency; sd.cpp's
+                // unload is in its own section.
+                if sdcpp {
+                    return;
+                }
                 ui.separator();
                 draw_component_list_ui(
                     ui,

@@ -22,7 +22,7 @@ ms-backend-ipc = { path = "../ms-backend-ipc" }
 ms-config = { path = "../ms-config" }
 # Diagnostics (`runtime_log`) of the probe thread and the device-control calls.
 ms-log = { path = "../ms-log" }
-# The capability table (`PlatformFeature::{PythonBackend, NativeOnnxRuntime}`) and its typed
+# The capability table (`PlatformFeature::{PythonBackend, NativeOnnxRuntime, SdCppRuntime}`) and its typed
 # `Unavailable` reasons behind `LocalAiAvailability`.
 ms-platform = { path = "../ms-platform" }
 # `ai_backend_capabilities`: the process-wide torch / backend / backend-ORT availability slots

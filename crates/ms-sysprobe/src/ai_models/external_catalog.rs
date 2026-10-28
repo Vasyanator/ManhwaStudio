@@ -22,12 +22,16 @@ Key items:
   FLUX.2 klein lookups (`flux2_klein_spec`, `flux2_klein_package_specs`,
   `flux2_klein_weights_path`, `flux2_klein_legacy_transformer_spec`,
   `flux2_klein_transformer_layout` + `Flux2TransformerLayout`, `flux2_klein_spec_role` +
-  `Flux2SpecRole`).
+  `Flux2SpecRole`, the per-runtime bundle `flux2_klein_package_specs_for` and the sd.cpp file
+  map `flux2_klein_sdcpp_paths`).
 - Re-exported from `flux3_klein`: the `FLUX3_KLEIN_*` statics, the gated repository id
   `FLUX3_KLEIN_BFL_REPO` and the FLUX.3 klein lookups
   (`flux3_klein_dit_spec`, `flux3_klein_encoder_spec`, `flux3_klein_package_specs`,
   `flux3_klein_dit_reads_root_config`, `flux3_klein_dit_relative_path`, `flux3_klein_encoder_relative_path`,
-  `flux3_klein_spec_role` + `Flux3SpecRole`).
+  `flux3_klein_spec_role` + `Flux3SpecRole`, `flux3_klein_package_specs_for`,
+  `flux3_klein_sdcpp_paths`).
+- `SdCppComponentPaths`: the three files Stable-Diffusion.cpp loads for one image-edit model
+  (diffusion, VAE, LLM text encoder), as both FLUX submodules resolve them.
 - `all_specs()`: every spec of the application (catalog + EasyOCR), for whole-catalog
   checks.
 - `BaberuFiles` + `baberu_files()`: the one owner of the Baberu on-disk layout names; uses
@@ -50,7 +54,7 @@ mod flux2_klein;
 mod flux3_klein;
 
 pub use flux2_klein::{
-    FLUX2_KLEIN_4B_BASE, FLUX2_KLEIN_4B_TEXT_ENCODER_BF16, FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q4_K_M, FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q5_K_M,
+    FLUX2_KLEIN_4B_BASE, FLUX2_KLEIN_4B_TEXT_ENCODER_BF16, FLUX2_KLEIN_4B_TRANSFORMER_BF16_SINGLE, FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q4_K_M, FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q5_K_M,
     FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q6_K, FLUX2_KLEIN_4B_TEXT_ENCODER_GGUF_Q8_0, FLUX2_KLEIN_4B_TRANSFORMER_BF16, FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q4_K_M,
     FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q5_K_M, FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q6_K, FLUX2_KLEIN_4B_TRANSFORMER_GGUF_Q8_0, FLUX2_KLEIN_9B_BASE,
     FLUX2_KLEIN_9B_TEXT_ENCODER_BF16, FLUX2_KLEIN_9B_TEXT_ENCODER_CONFIG, FLUX2_KLEIN_9B_TEXT_ENCODER_GGUF_Q4_K_M, FLUX2_KLEIN_9B_TEXT_ENCODER_GGUF_Q5_K_M, FLUX2_KLEIN_9B_TEXT_ENCODER_GGUF_Q6_K,
@@ -58,14 +62,29 @@ pub use flux2_klein::{
     FLUX2_KLEIN_9B_TEXT_ENCODER_UNCENSORED_GGUF_Q6_K, FLUX2_KLEIN_9B_TEXT_ENCODER_UNCENSORED_GGUF_Q8_0, FLUX2_KLEIN_9B_TRANSFORMER_BF16,
     FLUX2_KLEIN_9B_TRANSFORMER_BF16_DIFFUSERS, FLUX2_KLEIN_9B_TRANSFORMER_GGUF_Q4_K_M, FLUX2_KLEIN_9B_TRANSFORMER_GGUF_Q5_K_M, FLUX2_KLEIN_9B_TRANSFORMER_GGUF_Q6_K,
     FLUX2_KLEIN_9B_TRANSFORMER_GGUF_Q8_0, Flux2SpecRole, Flux2TransformerLayout, flux2_klein_legacy_transformer_spec, flux2_klein_package_specs,
-    flux2_klein_spec, flux2_klein_spec_role, flux2_klein_transformer_layout, flux2_klein_weights_path,
+    flux2_klein_package_specs_for, flux2_klein_sdcpp_paths, flux2_klein_spec, flux2_klein_spec_role, flux2_klein_transformer_layout, flux2_klein_weights_path,
 };
 pub use flux3_klein::{
     FLUX3_KLEIN_BASE, FLUX3_KLEIN_BFL_REPO, FLUX3_KLEIN_DIT_BF16, FLUX3_KLEIN_DIT_CONFIG, FLUX3_KLEIN_DIT_FP8R, FLUX3_KLEIN_DIT_GGUF_Q4_K_M, FLUX3_KLEIN_DIT_GGUF_Q5_K_M, FLUX3_KLEIN_DIT_GGUF_Q6_K,
     FLUX3_KLEIN_DIT_GGUF_Q8_0, FLUX3_KLEIN_DIT_NVFP4, FLUX3_KLEIN_TEXT_ENCODER_BF16, FLUX3_KLEIN_TEXT_ENCODER_GGUF_Q4_K_M, FLUX3_KLEIN_TEXT_ENCODER_GGUF_Q8_0,
     Flux3SpecRole, flux3_klein_dit_reads_root_config, flux3_klein_dit_relative_path, flux3_klein_dit_spec, flux3_klein_encoder_relative_path, flux3_klein_encoder_spec, flux3_klein_package_specs,
-    flux3_klein_spec_role,
+    flux3_klein_package_specs_for, flux3_klein_sdcpp_paths, flux3_klein_spec_role,
 };
+
+/// The three model files Stable-Diffusion.cpp is given for one image-edit selection (its
+/// `diffusion_model_path`, `vae_path` and `llm_path`), as the catalog resolves them
+/// (`flux2_klein_sdcpp_paths`, `flux3_klein_sdcpp_paths`). Every path names one FILE: a
+/// safetensors file, a shard index (`*.safetensors.index.json`, sd.cpp reads the shards it names)
+/// or a GGUF file. Pure paths: nothing was checked on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdCppComponentPaths {
+    /// The diffusion model (FLUX DiT): a BFL single-file safetensors or a GGUF.
+    pub diffusion: PathBuf,
+    /// The VAE / autoencoder weights.
+    pub vae: PathBuf,
+    /// The LLM text encoder (Qwen3 / Qwen3-VL): a shard index, a single safetensors or a GGUF.
+    pub llm: PathBuf,
+}
 
 /// Baberu vision encoder (fp16 ONNX), relative to the model directory.
 const BABERU_VISION: &str = "onnx/vision_fp16.onnx";

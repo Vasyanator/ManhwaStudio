@@ -154,6 +154,7 @@ fn flux2_klein_display_name(spec: &ExternalModelSpec) -> Option<String> {
         Flux2SpecRole::TextEncoderConfig { variant } => {
             tf!("translation.ocr_model.flux2_klein_text_encoder_config_name", variant = variant.size_token())
         }
+        Flux2SpecRole::SingleFileTransformer { variant } => tf!("translation.ocr_model.flux2_klein_transformer_single_name", variant = variant.size_token()),
         Flux2SpecRole::LegacyTransformer { variant } => {
             tf!("translation.ocr_model.flux2_klein_transformer_legacy_name", variant = variant.size_token())
         }
@@ -728,7 +729,7 @@ mod tests {
             let Some(role) = flux2_klein_spec_role(spec.id) else { continue };
             let name = external_model_display_name(spec);
             let variant = match role {
-                Flux2SpecRole::Base { variant } | Flux2SpecRole::TextEncoderConfig { variant } | Flux2SpecRole::LegacyTransformer { variant } => variant,
+                Flux2SpecRole::Base { variant } | Flux2SpecRole::TextEncoderConfig { variant } | Flux2SpecRole::LegacyTransformer { variant } | Flux2SpecRole::SingleFileTransformer { variant } => variant,
                 Flux2SpecRole::Weights { variant, axis, source, format } => {
                     match (axis, format.quant_token()) {
                         (_, Some(quant)) => assert!(name.contains(quant), "{name}"),
@@ -741,7 +742,7 @@ mod tests {
             assert!(name.contains(variant.size_token()), "{name}");
             names.push(name);
         }
-        assert_eq!(names.len(), 28, "every FLUX.2 klein catalog spec is named");
+        assert_eq!(names.len(), 29, "every FLUX.2 klein catalog spec is named");
         let count = names.len();
         names.sort();
         names.dedup();

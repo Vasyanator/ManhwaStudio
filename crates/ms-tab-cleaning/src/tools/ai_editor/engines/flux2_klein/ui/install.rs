@@ -23,7 +23,8 @@ Key structures:
 - `Flux2CatalogDownloadView`, `Flux2CatalogDownloadOut`, `Flux2PathRow`
 
 Key functions:
-- `draw_source_mode_switch()`, `draw_path_row()`, `draw_derived_paths()`
+- `draw_source_mode_switch()`, `draw_path_row()`, `draw_derived_paths()`,
+  `draw_sdcpp_derived_paths()` (the three files sd.cpp loads, download mode on sd.cpp)
 - `draw_catalog_download_block()`, `draw_encoder_source_toggle()`, `draw_weight_format_combo()`
 
 Notes:
@@ -130,6 +131,27 @@ pub(super) fn draw_derived_paths(ui: &mut egui::Ui, settings: &Flux2KleinSetting
     }
 }
 
+/// Draws the three files Stable-Diffusion.cpp loads in download mode (the catalog's sd.cpp map,
+/// `flux2_klein_sdcpp_paths`), read-only and selectable. Pure path arithmetic: no disk access
+/// (whether they exist is the status worker's answer on the readiness line).
+pub(super) fn draw_sdcpp_derived_paths(ui: &mut egui::Ui, settings: &Flux2KleinSettings) {
+    let selection = settings.weight_selection();
+    let Some(paths) = flux2_klein_sdcpp_paths(&config::side_models_dir(), settings.variant(), selection.transformer, selection.source, selection.text_encoder) else {
+        ui.colored_label(ms_theme::status::WARNING, t!("cleaning.tools.flux2_klein.sdcpp_selection_unsupported_error"));
+        return;
+    };
+    ui.label(t!("cleaning.tools.flux2_klein.download.derived_paths_label"));
+    for (label, path) in [
+        (t!("cleaning.tools.engine_progress.component_text_encoder_label"), &paths.llm),
+        (t!("cleaning.tools.engine_progress.component_transformer_label"), &paths.diffusion),
+        (t!("cleaning.tools.engine_progress.component_vae_label"), &paths.vae),
+    ] {
+        ui.small(label);
+        // Selectable so the user can copy the path out; a path is data, not prose.
+        ui.add(egui::Label::new(egui::RichText::new(path.to_string_lossy()).small()).selectable(true));
+    }
+}
+
 /// Everything the CATALOG download block reads (download mode, either variant) and the token
 /// field it edits.
 pub(super) struct Flux2CatalogDownloadView<'a> {
@@ -186,8 +208,17 @@ pub(super) fn draw_catalog_download_block(ui: &mut egui::Ui, settings: &mut Flux
     for axis in Flux2WeightAxis::all() {
         draw_weight_format_combo(ui, settings, axis, out.changed);
     }
-    // After the combos: the transformer and encoder paths follow the formats.
-    draw_derived_paths(ui, settings, view.status);
+    // After the combos: the transformer and encoder paths follow the formats. On
+    // Stable-Diffusion.cpp they are the three FILES sd.cpp loads (its own bundle).
+    match settings.runtime() {
+        ImageEditRuntime::PyTorch => draw_derived_paths(ui, settings, view.status),
+        ImageEditRuntime::SdCpp => {
+            if flux2_sdcpp_single_file_hint(settings) {
+                ui.colored_label(ms_theme::status::WARNING, t!("cleaning.tools.flux2_klein.sdcpp_bf16_single_file_hint"));
+            }
+            draw_sdcpp_derived_paths(ui, settings);
+        }
+    }
     // The token is needed only to fetch from a gated repository; once those specs are
     // installed (or for 4B, whose repositories are open) the row would ask for nothing. The
     // per-repository access verdicts and the repository links are the bundle block's own

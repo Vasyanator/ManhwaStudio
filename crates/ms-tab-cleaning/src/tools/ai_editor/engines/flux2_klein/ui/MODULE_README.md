@@ -9,6 +9,9 @@ panel and every block under it. This is the ONLY part of `flux2_klein` that draw
 exactly one frame, and the `draw` method whose ORDER is the design:
 
 ```
+the settings-file problem -> the RUNTIME switch (PyTorch / Stable-Diffusion.cpp, the shared
+`draw_runtime_switch`, only where sd.cpp is offered; its PyTorch side is closed while PyTorch
+is unavailable, `Flux2SdcppPanel::pytorch_unavailable`) ->
 the PROMPT block (English field, preset name + «Кэшировать» / «Переименовать», the one
 cache line, the translator and library toggles; the library fold = the shared preset picker,
 «Экспорт», «Импорт» and the outcome / migration lines)
@@ -16,6 +19,15 @@ cache line, the translator and library toggles; the library fold = the shared pr
 («Установка модели» / «Память и скорость» / «Для экспертов») -> the mask note
 -> «Постобработка» (the shared `draw_postprocess_section`, LAST: it docks at the bottom)
 ```
+
+On Stable-Diffusion.cpp the same order holds with the PyTorch-only parts left out: the prompt
+block without the cache row, line and library; «Сила изменения»; the sd.cpp readiness line
+(`draw_sdcpp_readiness_line`: the shared `draw_sdcpp_readiness`, the files' state, refresh);
+«Установка модели» without the residency hint, the component list and «Выгрузить» (download
+mode shows the three files sd.cpp loads, `draw_sdcpp_derived_paths`, and for 4B bf16 the
+single-file hint); «Stable-Diffusion.cpp» (`draw_sdcpp_section`: the shared options and
+«Выгрузить модель») in place of «Память и скорость»; «Для экспертов» with steps, seed and mask
+growth only.
 
 Two more parts are drawn OUTSIDE that scrolled body, in the sections the host pins around it:
 `draw_flux2_progress_section` (progress bar + run status, top, via `AiEngine::draw_progress`)

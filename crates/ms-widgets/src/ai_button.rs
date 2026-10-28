@@ -1,15 +1,17 @@
 /*
 FILE HEADER (widgets/ai_button.rs)
 - Purpose: a button for launching an AI tool that gates its own availability on
-  three process-global capability signals (`ai_backend_capabilities`):
-  backend / torch / onnxruntime. It disables itself automatically when the
+  four process-global capability signals: backend / torch / onnxruntime from
+  `ms_sysprobe::ai_backend_capabilities`, and Stable-Diffusion.cpp (the route slot
+  there combined with `ms_sdcpp::ready`). It disables itself automatically when the
   required runtime is unavailable and shows the reason on hover.
 - Key items:
-  - `AiRequirement`: which runtime a tool needs (Backend/Torch/Onnx/TorchOrOnnx).
+  - `AiRequirement`: which runtime a tool needs (Backend/Torch/Onnx/TorchOrOnnx/
+    Sdcpp/TorchOrSdcpp).
     `satisfied` is the strict check; `is_met(caps, unknown_ok)` adds an opt-in
     optimistic mode where an unknown capability counts as available.
-  - `AiCaps`: a pure snapshot of the three global signals (keeps `satisfied`/
-    `is_met` unit-testable without touching globals).
+  - `AiCaps`: a pure snapshot of the four signals (keeps `satisfied`/`is_met`
+    unit-testable without touching globals); `combine_sdcpp` is its pure sd.cpp rule.
   - `AiButton`: builder widget (text + requirement + optional selected/marker/
     min_size/extra enable condition/`enabled_on_unknown` optimistic gating).
   - `AiButtonResponse`: per-frame result (`response`, `enabled`).
@@ -35,6 +37,10 @@ pub enum AiRequirement {
     Torch,
     Onnx,
     TorchOrOnnx,
+    /// The Stable-Diffusion.cpp runtime (installed and ready, route allowed).
+    Sdcpp,
+    /// PyTorch in the backend OR Stable-Diffusion.cpp (a tool that runs on either).
+    TorchOrSdcpp,
 }
 
 impl AiRequirement {
@@ -58,6 +64,8 @@ impl AiRequirement {
             AiRequirement::Torch => ok(caps.torch),
             AiRequirement::Onnx => ok(caps.ort),
             AiRequirement::TorchOrOnnx => ok(caps.torch) || ok(caps.ort),
+            AiRequirement::Sdcpp => ok(caps.sdcpp),
+            AiRequirement::TorchOrSdcpp => ok(caps.torch) || ok(caps.sdcpp),
         }
     }
 
@@ -79,28 +87,64 @@ impl AiRequirement {
             }
             AiRequirement::Onnx => t!("widgets.ai_button.requires_onnxruntime"),
             AiRequirement::TorchOrOnnx => t!("widgets.ai_button.requires_pytorch_or_onnxruntime"),
+            AiRequirement::Sdcpp => t!("widgets.ai_button.requires_sdcpp_tooltip"),
+            AiRequirement::TorchOrSdcpp => t!("widgets.ai_button.requires_pytorch_or_sdcpp_tooltip"),
         }
     }
 }
 
-/// Immutable snapshot of the three process-global AI capability slots. Kept pure
+/// Immutable snapshot of the four process-global AI capability signals. Kept pure
 /// (no globals in `satisfied`) so the requirement logic is unit-testable.
 #[derive(Debug, Clone, Copy)]
 pub struct AiCaps {
     pub backend: Option<bool>,
     pub torch: Option<bool>,
     pub ort: Option<bool>,
+    /// Stable-Diffusion.cpp: route allowed AND installed and ready ([`combine_sdcpp`]).
+    pub sdcpp: Option<bool>,
+    /// A backend start is underway (armed autostart, or a launch not yet connected): a
+    /// `backend == Some(false)` then means "still booting", not "down". Not a capability — no
+    /// requirement reads it; decisions that must tell the two apart do.
+    pub backend_starting: bool,
 }
 
 impl AiCaps {
-    /// Reads the three process-global capability slots into a snapshot.
+    /// Reads the process-global capability signals into a snapshot: three atomic slots plus
+    /// the sd.cpp route slot and `ms_sdcpp::ready` (one short lock, no clone, no I/O).
     #[must_use]
     pub fn current() -> Self {
         Self {
             backend: ms_sysprobe::ai_backend_capabilities::backend_available(),
             torch: ms_sysprobe::ai_backend_capabilities::torch_available(),
             ort: ms_sysprobe::ai_backend_capabilities::ort_available(),
+            sdcpp: combine_sdcpp(ms_sysprobe::ai_backend_capabilities::sdcpp_route_allowed(), sdcpp_ready),
+            backend_starting: ms_sysprobe::ai_backend_capabilities::backend_starting(),
         }
+    }
+}
+
+/// The installed-and-ready answer of `ms_sdcpp` on targets that link the runtime.
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+fn sdcpp_ready() -> Option<bool> {
+    ms_sdcpp::ready()
+}
+
+/// No sd.cpp runtime is linked on this target (wasm, Android): never ready.
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
+fn sdcpp_ready() -> Option<bool> {
+    Some(false)
+}
+
+/// Combines the sd.cpp route slot (`--no-ai` + platform) with the runtime's readiness: a
+/// closed route is `Some(false)` without asking `ready`; an unpublished route is unknown
+/// (`None`); an open route is whatever `ready` answers. Pure apart from the `ready` call, which
+/// the caller supplies, so the rule is unit-testable.
+#[must_use]
+fn combine_sdcpp(route: Option<bool>, ready: impl FnOnce() -> Option<bool>) -> Option<bool> {
+    match route {
+        Some(false) => Some(false),
+        None => None,
+        Some(true) => ready(),
     }
 }
 
@@ -367,7 +411,8 @@ fn paint_marker_badge(ui: &egui::Ui, button_rect: egui::Rect, label: &str, enabl
 #[cfg(test)]
 mod tests {
     use super::{
-        AiCaps, AiRequirement, marker_badge_radius, marker_badge_rect, marker_badge_size,
+        AiCaps, AiRequirement, combine_sdcpp, marker_badge_radius, marker_badge_rect,
+        marker_badge_size,
     };
     use eframe::egui;
     use egui::Vec2;
@@ -403,69 +448,111 @@ mod tests {
     }
 
     /// Convenience constructor for a capability snapshot in tests.
-    fn caps(backend: Option<bool>, torch: Option<bool>, ort: Option<bool>) -> AiCaps {
+    fn caps(backend: Option<bool>, torch: Option<bool>, ort: Option<bool>, sdcpp: Option<bool>) -> AiCaps {
         AiCaps {
             backend,
             torch,
             ort,
+            sdcpp,
+            backend_starting: false,
         }
     }
 
     #[test]
     fn backend_requirement_needs_backend_up() {
-        assert!(AiRequirement::Backend.satisfied(&caps(Some(true), None, None)));
-        assert!(!AiRequirement::Backend.satisfied(&caps(Some(false), Some(true), Some(true))));
-        assert!(!AiRequirement::Backend.satisfied(&caps(None, Some(true), Some(true))));
+        assert!(AiRequirement::Backend.satisfied(&caps(Some(true), None, None, None)));
+        assert!(!AiRequirement::Backend.satisfied(&caps(Some(false), Some(true), Some(true), None)));
+        assert!(!AiRequirement::Backend.satisfied(&caps(None, Some(true), Some(true), None)));
     }
 
     #[test]
     fn torch_requirement_needs_torch_present() {
-        assert!(AiRequirement::Torch.satisfied(&caps(Some(true), Some(true), None)));
-        assert!(!AiRequirement::Torch.satisfied(&caps(Some(true), Some(false), Some(true))));
-        assert!(!AiRequirement::Torch.satisfied(&caps(Some(true), None, Some(true))));
+        assert!(AiRequirement::Torch.satisfied(&caps(Some(true), Some(true), None, None)));
+        assert!(!AiRequirement::Torch.satisfied(&caps(Some(true), Some(false), Some(true), None)));
+        assert!(!AiRequirement::Torch.satisfied(&caps(Some(true), None, Some(true), None)));
     }
 
     #[test]
     fn onnx_requirement_needs_ort_present() {
-        assert!(AiRequirement::Onnx.satisfied(&caps(None, None, Some(true))));
-        assert!(!AiRequirement::Onnx.satisfied(&caps(Some(true), Some(true), Some(false))));
-        assert!(!AiRequirement::Onnx.satisfied(&caps(Some(true), Some(true), None)));
+        assert!(AiRequirement::Onnx.satisfied(&caps(None, None, Some(true), None)));
+        assert!(!AiRequirement::Onnx.satisfied(&caps(Some(true), Some(true), Some(false), None)));
+        assert!(!AiRequirement::Onnx.satisfied(&caps(Some(true), Some(true), None, None)));
     }
 
     #[test]
     fn torch_or_onnx_requirement_needs_either() {
         // Either present satisfies it.
-        assert!(AiRequirement::TorchOrOnnx.satisfied(&caps(Some(true), Some(true), None)));
-        assert!(AiRequirement::TorchOrOnnx.satisfied(&caps(Some(true), None, Some(true))));
-        assert!(AiRequirement::TorchOrOnnx.satisfied(&caps(Some(true), Some(false), Some(true))));
+        assert!(AiRequirement::TorchOrOnnx.satisfied(&caps(Some(true), Some(true), None, None)));
+        assert!(AiRequirement::TorchOrOnnx.satisfied(&caps(Some(true), None, Some(true), None)));
+        assert!(AiRequirement::TorchOrOnnx.satisfied(&caps(Some(true), Some(false), Some(true), None)));
         // Neither present (absent/unknown) gates off.
-        assert!(!AiRequirement::TorchOrOnnx.satisfied(&caps(Some(true), Some(false), Some(false))));
-        assert!(!AiRequirement::TorchOrOnnx.satisfied(&caps(Some(true), None, None)));
+        assert!(!AiRequirement::TorchOrOnnx.satisfied(&caps(Some(true), Some(false), Some(false), None)));
+        assert!(!AiRequirement::TorchOrOnnx.satisfied(&caps(Some(true), None, None, None)));
     }
 
     #[test]
     fn optimistic_mode_treats_unknown_as_available() {
         // `unknown_ok = true`: an unknown capability counts as available.
-        assert!(AiRequirement::Onnx.is_met(&caps(None, None, None), true));
-        assert!(AiRequirement::Torch.is_met(&caps(None, None, None), true));
-        assert!(AiRequirement::TorchOrOnnx.is_met(&caps(None, None, None), true));
+        assert!(AiRequirement::Onnx.is_met(&caps(None, None, None, None), true));
+        assert!(AiRequirement::Torch.is_met(&caps(None, None, None, None), true));
+        assert!(AiRequirement::TorchOrOnnx.is_met(&caps(None, None, None, None), true));
         // But a KNOWN-unavailable capability still gates off even when optimistic.
-        assert!(!AiRequirement::Onnx.is_met(&caps(None, None, Some(false)), true));
-        assert!(!AiRequirement::Torch.is_met(&caps(None, Some(false), None), true));
+        assert!(!AiRequirement::Onnx.is_met(&caps(None, None, Some(false), None), true));
+        assert!(!AiRequirement::Torch.is_met(&caps(None, Some(false), None, None), true));
         // TorchOrOnnx: unknown one side is still optimistically available.
-        assert!(AiRequirement::TorchOrOnnx.is_met(&caps(None, Some(false), None), true));
+        assert!(AiRequirement::TorchOrOnnx.is_met(&caps(None, Some(false), None, None), true));
         // Both known-unavailable gates off.
-        assert!(!AiRequirement::TorchOrOnnx.is_met(&caps(None, Some(false), Some(false)), true));
+        assert!(!AiRequirement::TorchOrOnnx.is_met(&caps(None, Some(false), Some(false), None), true));
     }
 
     #[test]
     fn strict_mode_rejects_unknown() {
         // `satisfied` (strict) and `is_met(.., false)` reject unknown capabilities.
-        assert!(!AiRequirement::Onnx.satisfied(&caps(None, None, None)));
-        assert!(!AiRequirement::Onnx.is_met(&caps(None, None, None), false));
-        assert!(!AiRequirement::Torch.is_met(&caps(None, None, None), false));
+        assert!(!AiRequirement::Onnx.satisfied(&caps(None, None, None, None)));
+        assert!(!AiRequirement::Onnx.is_met(&caps(None, None, None, None), false));
+        assert!(!AiRequirement::Torch.is_met(&caps(None, None, None, None), false));
         // A known-available capability satisfies both modes.
-        assert!(AiRequirement::Onnx.is_met(&caps(None, None, Some(true)), false));
-        assert!(AiRequirement::Onnx.is_met(&caps(None, None, Some(true)), true));
+        assert!(AiRequirement::Onnx.is_met(&caps(None, None, Some(true), None), false));
+        assert!(AiRequirement::Onnx.is_met(&caps(None, None, Some(true), None), true));
+    }
+
+    #[test]
+    fn sdcpp_requirement_needs_sdcpp_ready() {
+        assert!(AiRequirement::Sdcpp.satisfied(&caps(None, None, None, Some(true))));
+        assert!(!AiRequirement::Sdcpp.satisfied(&caps(Some(true), Some(true), Some(true), Some(false))));
+        assert!(!AiRequirement::Sdcpp.satisfied(&caps(Some(true), Some(true), Some(true), None)));
+        // Optimistic: unknown counts, a known `Some(false)` never does.
+        assert!(AiRequirement::Sdcpp.is_met(&caps(None, None, None, None), true));
+        assert!(!AiRequirement::Sdcpp.is_met(&caps(None, None, None, Some(false)), true));
+    }
+
+    #[test]
+    fn torch_or_sdcpp_requirement_needs_either() {
+        // Either present satisfies it.
+        assert!(AiRequirement::TorchOrSdcpp.satisfied(&caps(Some(true), Some(true), None, None)));
+        assert!(AiRequirement::TorchOrSdcpp.satisfied(&caps(None, None, None, Some(true))));
+        assert!(AiRequirement::TorchOrSdcpp.satisfied(&caps(Some(true), Some(false), None, Some(true))));
+        assert!(AiRequirement::TorchOrSdcpp.satisfied(&caps(Some(false), Some(false), Some(false), Some(true))));
+        // onnxruntime does not count.
+        assert!(!AiRequirement::TorchOrSdcpp.satisfied(&caps(Some(true), Some(false), Some(true), Some(false))));
+        // Neither present (absent/unknown) gates off in strict mode.
+        assert!(!AiRequirement::TorchOrSdcpp.satisfied(&caps(Some(true), Some(false), None, Some(false))));
+        assert!(!AiRequirement::TorchOrSdcpp.satisfied(&caps(Some(true), None, None, None)));
+        // Optimistic: one unknown side is enough; both known-unavailable gates off.
+        assert!(AiRequirement::TorchOrSdcpp.is_met(&caps(None, Some(false), None, None), true));
+        assert!(AiRequirement::TorchOrSdcpp.is_met(&caps(None, None, None, Some(false)), true));
+        assert!(!AiRequirement::TorchOrSdcpp.is_met(&caps(None, Some(false), None, Some(false)), true));
+    }
+
+    #[test]
+    fn sdcpp_capability_combines_route_and_readiness() {
+        // A closed route is unavailable without asking the runtime.
+        assert_eq!(combine_sdcpp(Some(false), || panic!("ready must not be read on a closed route")), Some(false));
+        // An unpublished route is unknown, whatever the runtime says.
+        assert_eq!(combine_sdcpp(None, || Some(true)), None);
+        // An open route follows the runtime's readiness.
+        assert_eq!(combine_sdcpp(Some(true), || Some(true)), Some(true));
+        assert_eq!(combine_sdcpp(Some(true), || Some(false)), Some(false));
+        assert_eq!(combine_sdcpp(Some(true), || None), None);
     }
 }

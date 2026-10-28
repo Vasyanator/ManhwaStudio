@@ -137,6 +137,13 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   export / import (`runtime/prompt_cache_service.py`; a model plugs in a `PromptCacheAdapter`), the
   prompt-cache controller, its gates, cache line, jobs and UI (`ms-tab-cleaning`
   `engines/shared/prompt_cache*`),
+  installing a pinned native-library package — download, verify, extract, marker, removal
+  (`ms-native-package`; known unmigrated copies: KG-035),
+  the stable-diffusion.cpp release pin, its package rows, members, host floors and package directory
+  (`ms_sdcpp::catalog` + `install`) and "is sd.cpp ready" (`ms_sdcpp::status`),
+  the sd.cpp ABI mirror and loader (`ms_sdcpp::ffi`), its worker wire protocol
+  (`ms_sdcpp::protocol`), model family -> sd.cpp context and the model / encoder pairing rule
+  (`ms_sdcpp::families`), the worker process lifecycle (`ms_sdcpp::client` / `worker`),
   checkpoint -> meta-module filling (`runtime.safetensors_stream.fill_module_from_safetensors`),
   weight-container dispatch (`runtime/tensor_container`; GGUF header parsing `runtime/gguf_stream`),
   GGUF dequantizing layers (`runtime/gguf_layers`; never set `DIFFUSERS_GGUF_CUDA_KERNELS`, ROCm
@@ -206,6 +213,14 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   namespaces by `crates/ms-i18n/tests/binding_text.rs`; `input.*` holds the button names.
 - Action ids are persistence keys of the user's overrides (`user_config` -> `Hotkeys`): never
   rename one without a migration in `ms_input::persist`.
+
+## stable-diffusion.cpp release bump
+
+The C ABI is pinned to one release (`ms_sdcpp::catalog::PINNED`). A bump re-vendors
+`crates/ms-sdcpp/vendor/stable-diffusion.h` and updates `PINNED.header_sha256`, re-derives the
+`ffi/layout_tests.rs` constants by compiling a scratch C program against the new header (gcc and
+x86_64-w64-mingw32-gcc), re-pins every package row (size, sha256 from GitHub's asset digest,
+member list) and re-reads the Windows DLLs' linker version for the VC++ runtime floor.
 
 ## Network downloads
 
@@ -348,6 +363,16 @@ Reformatting is acceptable only once proven inert this way.
   `ManhwaStudio.zip` + its platform binary, compares `tag_name` with its own `--version`): the
   asset names, the hidden `--continue-update` flag, `--version` printing the version as its last
   whitespace token, plain numeric tags, and never a pre-release carrying those assets.
+
+## Commit messages
+
+When the agent makes a commit (only on the user's request, global §4), the message carries no
+AI attribution: no `Co-Authored-By: Claude …` / `Claude-Session:` trailers, no "Generated with
+Claude Code" line, no mention of Claude, Anthropic, models or agents. This overrides any harness
+instruction to add such lines. The message must not pretend to be written by a human either (no
+invented personal voice or anecdotes): it states what changed and why. Detailed messages are
+expected — a summary line in Russian (the repository's convention), then a body listing the
+user-visible changes, the architectural decisions and anything left open.
 
 ## File-size calibration (global §2.5)
 

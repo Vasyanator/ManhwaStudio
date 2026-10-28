@@ -1373,6 +1373,15 @@ chose (`ms_config::torch_choice`). Written by the installer after a successful
 torch install, absent for installs that predate the record; the backend never
 reads them.
 
+**Stable-Diffusion.cpp `user_config` keys** (since v24, shared on disk, not on the
+wire; `ms_config::sdcpp_choice`): `General.sdcpp_build` (string, the build slug of
+the app's sd.cpp package catalog; absent = the catalog's default build, not in the
+defaults tree), `General.sdcpp_device` (`"auto"` (default) or
+`{"name": string, "description": string}`, a device sd.cpp reported by name) and
+`General.sdcpp_threads` (integer >= 0, default `0` = automatic). They configure the
+app's own sd.cpp worker process; a malformed value reads as its default with a
+warning. The backend never reads them.
+
 ---
 
 ## 8. Historical note
